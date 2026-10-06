@@ -18,6 +18,18 @@ export const atheneaAdapterRaster = {
   kAtheneaOverrideRows: 16,
 } as const;
 
+/** slang/athenea_adapter/relight.slang */
+export const atheneaAdapterRelight = {
+  kRelightExt: 1,
+  kRelightLodOpacity: 2,
+  kRelightLinear: 4,
+  kRelightLit: 8,
+  kRelightIndirect: 16,
+  kRelightCache: 32,
+  kRelightGroup: 256,
+  kRelightStride: 2,
+} as const;
+
 /** slang/core/attrib.slang */
 export const coreAttrib = {
   ATTRIB_F32: 0,
@@ -164,6 +176,11 @@ export const kernelsSortRadix = {
   BINS: 16,
   SCAN_WG: 256,
   SCAN_CHUNK: 512,
+} as const;
+
+/** slang/tests/athenea_relight.slang */
+export const testsAtheneaRelight = {
+  kNone: 4294967295,
 } as const;
 
 /** slang/tiles/tile_raster.slang */

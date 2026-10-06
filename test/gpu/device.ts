@@ -36,6 +36,28 @@ async function open(): Promise<GPUDevice | null> {
 
 export const device = await open();
 
+/**
+ * A second device on the same adapter with the adapter's storage-buffer
+ * count (what splatRequiredLimits asks for), for kernels past the default
+ * eight (the athenea relight pass binds ten); null where there is none.
+ */
+let wideAdapter: GPUAdapter | null = null;
+export const wideDevice: GPUDevice | null = await (async () => {
+  if (!gpu || !device) return null;
+  try {
+    // An adapter makes one device: a second one needs an adapter of its own.
+    wideAdapter = await gpu.requestAdapter();
+    const most = wideAdapter?.limits.maxStorageBuffersPerShaderStage ?? 0;
+    if (!wideAdapter || most <= 8) return null;
+    return await wideAdapter.requestDevice({
+      requiredFeatures: [...device.features] as GPUFeatureName[],
+      requiredLimits: { maxStorageBuffersPerShaderStage: most },
+    });
+  } catch {
+    return null;
+  }
+})();
+
 // Thin wrappers over the library's own buffer helpers, so tests allocate and
 // read back exactly as the renderer does.
 

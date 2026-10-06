@@ -9,12 +9,17 @@
     "athenea.raster": {
       "module": "athenea_adapter.raster",
       "colour": "AtheneaRasterColour"
+    },
+    "athenea.relight": {
+      "module": "athenea_adapter.relight_colour",
+      "colour": "AtheneaRelightColour"
     }
   },
   "presets": [
     { "name": "tint", "plugins": ["example.tint"] },
     { "name": "fade", "plugins": ["example.fade"] },
     { "name": "tint-fade", "plugins": ["example.tint", "example.fade"] },
-    { "name": "athenea-raster", "plugins": ["athenea.raster"] }
+    { "name": "athenea-raster", "plugins": ["athenea.raster"] },
+    { "name": "athenea-relight", "plugins": ["athenea.relight"] }
   ]
 }

@@ -529,17 +529,6 @@
           ${outputs.gsplat}.quaternion = slerp(${inputs.gsplat1}.quaternion, ${inputs.gsplat2}.quaternion, ${inputs.t});
           ${outputs.gsplat}.rgba = mix(${inputs.gsplat1}.rgba, ${inputs.gsplat2}.rgba, ${inputs.t});
         `),
-        // WebGPU runs dynos as WGSL: the same code, translated.
-        wgsl: {
-          statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-            ${outputs.gsplat} = ${inputs.gsplat1};
-            let center2 = ${inputs.gsplat2}.center + vec3f(0.0, 0.0, ${inputs.translate});
-            ${outputs.gsplat}.center = mix(${inputs.gsplat1}.center, center2, ${inputs.t});
-            ${outputs.gsplat}.scales = mix(${inputs.gsplat1}.scales, ${inputs.gsplat2}.scales, ${inputs.t});
-            ${outputs.gsplat}.quaternion = slerp(${inputs.gsplat1}.quaternion, ${inputs.gsplat2}.quaternion, ${inputs.t});
-            ${outputs.gsplat}.rgba = mix(${inputs.gsplat1}.rgba, ${inputs.gsplat2}.rgba, ${inputs.t});
-          `),
-        },
       }).outputs.gsplat;
     }
 
@@ -566,26 +555,6 @@
           displace.w = 1.0 - displace.w;
           ${outputs.gsplat}.center += ${inputs.rustleBlend} * displace.xyz * displace.w;
         `),
-        wgsl: {
-          globals: () => [dyno.unindent(/* wgsl */ `
-            fn colorWave(rgba: vec4f, p: vec3f, t: f32) -> vec4f {
-              let len = length(p);
-              var magnitude = sin(len + t + 1.7 * p.x + 2.3 * p.z + 0.9 * p.y);
-              magnitude *= sin(1.3 * len - t * 0.88 + 0.9 * p.y);
-              magnitude *= exp(-0.01 * len * len);
-              let dir = p / len;
-              let color = abs(dir);
-              let wave = vec4f(color, rgba.a * magnitude);
-              return mix(rgba, wave, 1.0 - sqr(1.0 - magnitude));
-            }
-          `)],
-          statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-            ${outputs.gsplat} = ${inputs.gsplat};
-            var displace = colorWave(${outputs.gsplat}.rgba, ${outputs.gsplat}.center, ${inputs.t});
-            displace.w = 1.0 - displace.w;
-            ${outputs.gsplat}.center += ${inputs.rustleBlend} * displace.xyz * displace.w;
-          `),
-        },
       }).outputs.gsplat;
     }
 
@@ -622,35 +591,6 @@
               ${outputs.gsplat}.rgba.rgb += 0.15 * abs(force.xyz);
             }
           `);
-        },
-        wgsl: {
-          statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-            ${outputs.gsplat} = ${inputs.gsplat};
-            let center = ${outputs.gsplat}.center;
-
-            var force = vec4f(0.0);
-            for (var i = 0u; i < 10u; i++) {
-              let centerRadius = ${inputs.tips}[i];
-              var radius = centerRadius.w;
-              if (radius == 0.0) {
-                continue;
-              }
-              radius *= 10.0;
-
-              let delta = center - centerRadius.xyz;
-              let dist = length(delta);
-              if (dist < radius) {
-                let dir = delta / dist;
-                let weight = 1.0 - dist / radius;
-                force += vec4f(dir * weight, weight);
-              }
-            }
-
-            if (force.w > 0.0) {
-              ${outputs.gsplat}.center += 0.025 * force.xyz;
-              ${outputs.gsplat}.rgba = vec4f(${outputs.gsplat}.rgba.rgb + 0.15 * abs(force.xyz), ${outputs.gsplat}.rgba.a);
-            }
-          `),
         },
       }).outputs.gsplat;
     }
@@ -710,44 +650,6 @@
               ${outputs.gsplat}.rgba.rgb *= lighting;
             }
           `);
-        },
-        wgsl: {
-          globals: () => [dyno.unindent(/* wgsl */ `
-            fn computeSpotlight(
-              worldVertex: vec3f,
-              worldOrigin: vec3f,
-              worldDir: vec3f,
-              spreadFov: f32,
-              smoothDeg: f32,
-              brightness: f32,
-              attenuation: f32
-            ) -> f32 {
-              var lightToPoint = worldVertex - worldOrigin;
-              let dist = length(lightToPoint);
-              lightToPoint /= dist;
-              let cosAngle = dot(lightToPoint, worldDir);
-              let outerAngle = radians(spreadFov * 0.5);
-              let innerAngle = outerAngle - radians(smoothDeg);
-              let outerCutoff = cos(outerAngle);
-              let innerCutoff = cos(innerAngle);
-              var intensity = smoothstep(outerCutoff, innerCutoff, cosAngle);
-              intensity *= brightness / (attenuation * dist * dist);
-              return clamp(intensity, 0.0, 1.0);
-            }
-          `)],
-          statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-            ${outputs.gsplat} = ${inputs.gsplat};
-            if (${inputs.spotlightFovs}[0] > 0.0 || ${inputs.spotlightFovs}[1] > 0.0) {
-              var lighting = 0.0;
-              for (var i = 0u; i < 2u; i++) {
-                let origin = ${inputs.spotlightOrigins}[i];
-                let dir = ${inputs.spotlightDirs}[i];
-                let fov = ${inputs.spotlightFovs}[i];
-                lighting += computeSpotlight(${outputs.gsplat}.center, origin, dir, fov, 10.0, 1.0, 0.05);
-              }
-              ${outputs.gsplat}.rgba = vec4f(${outputs.gsplat}.rgba.rgb * lighting, ${outputs.gsplat}.rgba.a);
-            }
-          `),
         },
       }).outputs.gsplat;
     }

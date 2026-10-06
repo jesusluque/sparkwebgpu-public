@@ -17,8 +17,6 @@ export async function init({ THREE: _THREE, scene, camera, renderer, spark }) {
     cameraRotation: true,
   };
   const PAUSE_SECONDS = 2.0;
-  // getCenterOfMass in WGSL, set with centerGLSL once the meshes load.
-  let centerWGSL = "";
 
   function getTransitionState(t, fadeInTime, fadeOutTime, period) {
     const one = dyno.dynoFloat(1.0);
@@ -88,46 +86,6 @@ export async function init({ THREE: _THREE, scene, camera, renderer, spark }) {
         ${outputs.gsplat}.rgba.a *= applyOpacity(${inputs.t}, ${inputs.gt}, ${inputs.objectIndex});
         ${outputs.gsplat}.rgba.rgb *= applyBrightness(${inputs.t});
       `),
-      // WebGPU runs dynos as WGSL: the same code, translated.
-      wgsl: {
-        globals: () => [
-          dyno.unindent(/* wgsl */ `
-          fn hash13(p: vec3f) -> f32 { var p3 = fract(p * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-          fn hash11(x: f32) -> f32 { var p = fract(x * .1031); p += p * (p + 33.33); return fract(p * p); }
-          fn fadeInOut(t: f32) -> f32 { return abs(mix(-1., 1., t)); }
-          ${centerWGSL}
-          fn applyBrightness(t: f32) -> f32 { return .5 + fadeInOut(t) * .5; }
-          fn applyCenter(center: vec3f, t: f32, id: f32, idx: i32, waves: f32) -> vec3f {
-            let next = (idx + 1) % 3;
-            let cNext = getCenterOfMass(next);
-            let cOwn = getCenterOfMass(idx);
-            let f = fadeInOut(t);
-            let v = .5 + hash11(id) * 2.;
-            let p = select(mix(cOwn, center, pow(f, v)), mix(cNext, center, pow(f, v)), t < .5);
-            return p + length(sin(p * 2.5)) * waves * (1. - f) * smoothstep(0.5, 0., t) * 2.;
-          }
-          fn applyScale(s: vec3f, t: f32, fixedMin: bool) -> vec3f { return mix(select(s * .2, vec3f(.02), fixedMin), s, pow(fadeInOut(t), 3.)); }
-          fn applyOpacity(t: f32, gt: f32, idx: i32) -> f32 {
-            let p = f32(${PAUSE_SECONDS});
-            let c = 1.0 + p;
-            let tot = 3.0 * c;
-            // GLSL's mod (floored), not WGSL's % (truncated).
-            let x = gt + p + .5;
-            let w = x - tot * floor(x / tot);
-            let cur = i32(floor(w / c));
-            return select(0.0, .1 + fadeInOut(t), cur == idx);
-          }
-        `),
-        ],
-        statements: ({ inputs, outputs }) =>
-          dyno.unindentLines(/* wgsl */ `
-          ${outputs.gsplat} = ${inputs.gsplat};
-          ${outputs.gsplat}.center = applyCenter(${inputs.gsplat}.center, ${inputs.t}, f32(${inputs.gsplat}.index), ${inputs.objectIndex}, ${inputs.waves});
-          ${outputs.gsplat}.scales = applyScale(${inputs.gsplat}.scales, ${inputs.t}, ${inputs.fixedMinScale});
-          ${outputs.gsplat}.rgba.a *= applyOpacity(${inputs.t}, ${inputs.gt}, ${inputs.objectIndex});
-          ${outputs.gsplat}.rgba = vec4f(${outputs.gsplat}.rgba.rgb * applyBrightness(${inputs.t}), ${outputs.gsplat}.rgba.a);
-        `),
-      },
     });
   }
 
@@ -227,14 +185,6 @@ export async function init({ THREE: _THREE, scene, camera, renderer, spark }) {
       if (idx == 1) return vec3(${centers[1].x}, ${centers[1].y}, ${centers[1].z});
       if (idx == 2) return vec3(${centers[2].x}, ${centers[2].y}, ${centers[2].z});
       return vec3(0.0);
-    }
-  `;
-  centerWGSL = /* wgsl */ `
-    fn getCenterOfMass(idx: i32) -> vec3f {
-      if (idx == 0) { return vec3f(${centers[0].x}, ${centers[0].y}, ${centers[0].z}); }
-      if (idx == 1) { return vec3f(${centers[1].x}, ${centers[1].y}, ${centers[1].z}); }
-      if (idx == 2) { return vec3f(${centers[2].x}, ${centers[2].y}, ${centers[2].z}); }
-      return vec3f(0.0);
     }
   `;
 

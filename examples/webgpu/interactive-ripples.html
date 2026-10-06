@@ -119,36 +119,6 @@
               // Apply shockwave function to color
               ${outputs.gsplat}.rgba = shockwaveColor(${inputs.gsplat}.rgba, ${inputs.gsplat}.center, ${inputs.time}, ${inputs.hitpoint});
             `),
-            // WebGPU runs dynos as WGSL: the same code, translated.
-            wgsl: {
-              globals: () => [
-                dyno.unindent(/* wgsl */ `
-                // GLSL's smoothstep formula, which these call with edge0 > edge1.
-                fn rippleSmoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-                  let k = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
-                  return k * k * (3.0 - 2.0 * k);
-                }
-                fn shockwave(center: vec3f, t: f32, hitpoint: vec3f) -> vec3f {
-                  let direction = center - hitpoint;
-                  let dist = length(direction);
-                  return center + normalize(direction) * sin(t * 4.0 - dist * 5.0) * exp(-t) * rippleSmoothstep(t * 2.0, 0.0, dist) * 0.5;
-                }
-                fn shockwaveColor(rgba: vec4f, center: vec3f, t: f32, hitpoint: vec3f) -> vec4f {
-                  let direction = center - hitpoint;
-                  let dist = length(direction);
-                  let wave = sin(t * 4.0 - dist * 5.0) * exp(-t * 0.7) * rippleSmoothstep(t * 2.0, 0.0, dist);
-                  let brightness = pow(abs(wave), 3.0) * 10.0; // Increase brightness on wave crests
-                  return vec4f(rgba.rgb + brightness, rgba.a);
-                }
-              `),
-              ],
-              statements: ({ inputs, outputs }) =>
-                dyno.unindentLines(/* wgsl */ `
-                ${outputs.gsplat} = ${inputs.gsplat};
-                ${outputs.gsplat}.center = shockwave(${inputs.gsplat}.center, ${inputs.time}, ${inputs.hitpoint});
-                ${outputs.gsplat}.rgba = shockwaveColor(${inputs.gsplat}.rgba, ${inputs.gsplat}.center, ${inputs.time}, ${inputs.hitpoint});
-              `),
-            },
           });
           return {
             gsplat: shader.apply({

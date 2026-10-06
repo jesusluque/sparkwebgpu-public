@@ -122,101 +122,11 @@ vec4 flare(vec3 pos, float t) {
 }
 `;
 
-// The same functions in WGSL: no swizzle assignment (pos.xy *= m becomes a
-// component-wise copy), explicit types, var/let.
-const WGSL_GLOBALS = /* wgsl */ `
-fn fx_hash(p: vec3f) -> vec3f {
-  return fract(sin(p * 123.456) * 123.456);
-}
-
-fn fx_rot(a: f32) -> mat2x2f {
-  let s = sin(a);
-  let c = cos(a);
-  return mat2x2f(c, -s, s, c);
-}
-
-fn fx_headMovement(pos: vec3f, t: f32) -> vec3f {
-  let xy = pos.xy * fx_rot(smoothstep(-1.0, -2.0, pos.y) * 0.2 * sin(t * 2.0));
-  return vec3f(xy, pos.z);
-}
-
-fn fx_breathAnimation(p: vec3f, t: f32) -> vec3f {
-  let b = sin(t * 1.5);
-  let yz = p.yz * fx_rot(smoothstep(-1.0, -3.0, p.y) * 0.15 * -b);
-  var pos = vec3f(p.x, yz);
-  pos.z += 0.3;
-  pos.y += 1.2;
-  pos *= 1.0 + exp(-3.0 * length(pos)) * b;
-  pos.z -= 0.3;
-  pos.y -= 1.2;
-  return pos;
-}
-
-fn fx_fractal1(pos: vec3f, t: f32, intensity: f32) -> vec4f {
-  var m = 100.0;
-  var p = pos * 0.1;
-  p.y += 0.5;
-  for (var i = 0; i < 8; i++) {
-    p = abs(p) / clamp(abs(p.x * p.y), 0.3, 3.0) - 1.0;
-    p = vec3f(p.xy * fx_rot(radians(90.0)), p.z);
-    if (i > 1) {
-      m = min(m, length(p.xy) + step(0.3, fract(p.z * 0.5 + t * 0.5 + f32(i) * 0.2)));
-    }
-  }
-  m = step(m, 0.5) * 1.3 * intensity;
-  return vec4f(-pos.y * 0.3, 0.5, 0.7, 0.3) * intensity + m;
-}
-
-fn fx_fractal2(center: vec3f, scales: vec3f, rgba: vec4f, t: f32, intensity: f32) -> vec4f {
-  var pos = center;
-  let splatSize = length(scales);
-  var p = pos * 0.65;
-  pos.y += 2.0;
-  var c = 0.0;
-  var l = 0.0;
-  var l2 = length(p);
-  var m = 100.0;
-  for (var i = 0; i < 10; i++) {
-    p = abs(p) / dot(p, p) - 0.8;
-    l = length(p);
-    c += exp(-1.0 * abs(l - l2) * (1.0 + sin(t * 1.5 + pos.y)));
-    l2 = length(p);
-    m = min(m, length(p));
-  }
-  c = smoothstep(0.3, 0.5, m + sin(t * 1.5 + pos.y * 0.5)) + c * 0.1;
-  return vec4f(vec3f(length(rgba.rgb)) * vec3f(c, c * c, c * c * c) * intensity,
-               rgba.a * exp(-20.0 * splatSize) * m * intensity);
-}
-
-fn fx_sin3D(p: vec3f, t: f32) -> vec4f {
-  let m = exp(-2.0 * length(sin(p * 5.0 + t * 3.0))) * 5.0;
-  return vec4f(m) + 0.3;
-}
-
-fn fx_disintegrate(pos: vec3f, t: f32, intensity: f32) -> vec4f {
-  var p = pos + (fx_hash(pos) * 2.0 - 1.0) * intensity;
-  let tt = smoothstep(-1.0, 0.5, -sin(t + -pos.y * 0.5));
-  let xz = p.xz * fx_rot(tt * 2.0 + p.y * 2.0 * tt);
-  p.x = xz.x;
-  p.z = xz.y;
-  return vec4f(mix(p, pos, tt), tt);
-}
-
-fn fx_flare(pos: vec3f, t: f32) -> vec4f {
-  var p = vec3f(0.0, -1.5, 0.0);
-  var tt = smoothstep(-1.0, 0.5, sin(t + fx_hash(pos).x));
-  tt = tt * tt;
-  p.x += sin(t * 2.0) * tt;
-  p.z += sin(t * 2.0) * tt;
-  p.y += sin(t) * tt;
-  return vec4f(mix(pos, p, tt), tt);
-}
-`;
-
 /**
- * examples/splat-shader-effects' modifier, in GLSL and WGSL. `effect` and
- * `intensity` are a name and a number, or dyno uniforms (dynoInt with an
- * EFFECTS value, dynoFloat) to change them while it runs.
+ * examples/splat-shader-effects' modifier, in GLSL (translated to WGSL on
+ * WebGPU). `effect` and `intensity` are a name and a number, or dyno
+ * uniforms (dynoInt with an EFFECTS value, dynoFloat) to change them while
+ * it runs.
  */
 export function makeEffectModifier(dyno, animateT, effect, intensity) {
   return dyno.dynoBlock(
@@ -265,42 +175,6 @@ export function makeEffectModifier(dyno, animateT, effect, intensity) {
               ${outputs.gsplat}.rgba.a = mix(splatColor.a, 0.3, abs(e.w));
             }
           `),
-        wgsl: {
-          globals: () => [WGSL_GLOBALS],
-          statements: ({ inputs, outputs }) =>
-            dyno.unindentLines(/* wgsl */ `
-              ${outputs.gsplat} = ${inputs.gsplat};
-              let localPos = ${inputs.gsplat}.center;
-              let splatScales = ${inputs.gsplat}.scales;
-              let splatColor = ${inputs.gsplat}.rgba;
-              if (${inputs.effectType} == 1) {
-                ${outputs.gsplat}.center = fx_headMovement(localPos, ${inputs.t});
-                let effect1 = fx_fractal1(localPos, ${inputs.t}, ${inputs.intensity});
-                ${outputs.gsplat}.rgba = mix(splatColor, splatColor * effect1, ${inputs.intensity});
-              } else if (${inputs.effectType} == 2) {
-                let effectColor = fx_fractal2(localPos, splatScales, splatColor, ${inputs.t}, ${inputs.intensity});
-                ${outputs.gsplat}.rgba = mix(splatColor, effectColor, ${inputs.intensity});
-                ${outputs.gsplat}.center = fx_breathAnimation(localPos, ${inputs.t});
-              } else if (${inputs.effectType} == 3) {
-                let effect = fx_sin3D(localPos, ${inputs.t});
-                ${outputs.gsplat}.rgba = mix(splatColor, splatColor * effect, ${inputs.intensity});
-                var pos = localPos;
-                pos.y += 1.0;
-                pos *= 1.0 + effect.x * 0.05 * ${inputs.intensity};
-                pos.y -= 1.0;
-                ${outputs.gsplat}.center = pos;
-              } else if (${inputs.effectType} == 5) {
-                let e = fx_disintegrate(localPos, ${inputs.t}, ${inputs.intensity});
-                ${outputs.gsplat}.center = e.xyz;
-                ${outputs.gsplat}.scales = mix(vec3f(0.01), ${inputs.gsplat}.scales, e.w);
-              } else if (${inputs.effectType} == 4) {
-                let e = fx_flare(localPos, ${inputs.t});
-                ${outputs.gsplat}.center = e.xyz;
-                let rgb = mix(splatColor.rgb, vec3f(1.0), abs(e.w));
-                ${outputs.gsplat}.rgba = vec4f(rgb, mix(splatColor.a, 0.3, abs(e.w)));
-              }
-            `),
-        },
       });
       gsplat = d.apply({
         gsplat,

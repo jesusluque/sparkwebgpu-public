@@ -81,6 +81,22 @@ describe("planAttribPaging", () => {
     expect(at(3).bytes).toBeLessThanOrEqual(1536 * MIB);
   });
 
+  it("reserves no more pages for a paged group than the cloud has", () => {
+    // The pawn body: 16 pages (5 of merged nodes, 11 chunks), at T3.
+    const plan = planAttribPaging(TX, 256, {
+      budget: tierSpec(3).attribBudget,
+      tier: 3,
+      demand: "all",
+      cloudPages: 16,
+    });
+    expect(plan.groups.map((g) => [g.name, g.slots])).toEqual([
+      ["core", 256],
+      ["material", 256],
+      ["relight", 16],
+    ]);
+    expect(plan.groups[2].bytes).toBe(2 * 4 * 256 + 16 * page(32 + 224));
+  });
+
   it("takes pages as asked, the group's budget be what it may", () => {
     const plan = planAttribPaging(TX, 8, {
       budget: 0,

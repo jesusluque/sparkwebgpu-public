@@ -86,7 +86,7 @@ The attribute pool is one storage binding, so it is sized within a byte budget: 
 | `material` | `normalOct`, `emission`, `pbr`, `lobes` | `.athc` v3 section `MATL` (data tier 2) | T1 |
 | `relight` | `shadowBits`, `transfer` | `SHAD`, `TXDI`, `TXIN`, `TXFD` (data tier 3) | T2 |
 
-In that order, a group that fits the rest of the budget at the page pool's full capacity is interleaved in the pool and arrives with its pages, as before. One that does not is **paged**: it gets as many pages as the budget leaves (`slots`), in a region of its own per attribute (`ATTRIB_PAGED` in `slang/core/attrib.slang`): a page table (one word per page of the pool: its slot, or `ATTRIB_NONE`) and the slots' records. A group no page of which fits is left out.
+In that order, a group that fits the rest of the budget at the page pool's full capacity is interleaved in the pool and arrives with its pages, as before. One that does not is **paged**: it gets as many pages as the budget leaves (`slots`), and never more than the cloud the schema is from has (`WgpuLod` passes its page count), in a region of its own per attribute (`ATTRIB_PAGED` in `slang/core/attrib.slang`): a page table (one word per page of the pool: its slot, or `ATTRIB_NONE`) and the slots' records. A group no page of which fits is left out.
 
 `AttribResidency` gives a paged group's slots to the pages the LoD traversal ranks first (the pager's fetch priority, each time it drives its fetchers). A page that arrives with the group's data takes a free slot; a wanted page without it is **upgraded**: `PagedSplats.fetchStreams` fetches just that group (a `.athc` v3 chunk: one Range request of its sections; v2: of its arrays; a merged page or a `.rad` chunk: decoded again), and takes a free slot or one held by a page no longer wanted. Nothing waits: a splat whose page is not resident reads as zeros, `attribResident(pool, id, splat)` says so, and readers fall back (`slang/athenea_adapter/athc.slang`: the frame's normal, a capture's plain pbr and lobes, no emission, every direction open, `athcTransferResident` false so a relight keeps the captured colour).
 
@@ -113,6 +113,8 @@ A TX cloud (every_stream's streams: `athcGroup` 8 B, material 24 B, shadow bits 
 | T2, `"indirect"` | 256 | 537 MB | 25 pages, 262 MB | 799 MB |
 | T2, `"direct"` | 256 | 537 MB | 63 pages, 264 MB | 801 MB |
 | T3 (1.5 GiB budget) | 256 | 537 MB | 63 pages (4.1M splats), 1.06 GB | 1.6 GB |
+
+athenea's pawn body (674k splats, full TX, 16 virtual pages, `publish-r2/sparkwebgpu/pawn/body-full-gz.athc` converted again to the three tiers), in Chrome on a T3 Mac (`examples/webgpu/athc.html?url=…&paged=1&streams=all`): a 537 MB pool (core and material whole, relight 16 of 16 pages, every page resident as it arrives, no upgrade), 22 Range requests, 152 MB fetched, 60 fps. With no plugin asking for the relight streams: a 268 MB pool and 22 MB fetched. In Dawn's default 128 MiB binding (`test/gpu/athcPaging.test.ts`) its relight streams page in 6 of the 16 pages, the first-ranked resident.
 
 ## LoD merge rules
 

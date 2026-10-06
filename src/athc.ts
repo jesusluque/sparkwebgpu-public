@@ -540,7 +540,8 @@ export async function fetchAthcPage(
   }
   const firstChunkPage = paging.tree.splatBase / ATHC_PAGE_SPLATS;
   if (page < paging.mergedPages.length) {
-    return paging.mergedPages[page];
+    // A copy: the loader worker takes its bytes, and an upgrade decodes it again.
+    return paging.mergedPages[page].slice();
   }
   if (page < firstChunkPage) {
     throw new Error(`.athc page ${page} is between the levels and the splats`);

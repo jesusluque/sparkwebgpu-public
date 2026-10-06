@@ -49,6 +49,10 @@ export class AttribResidency<S extends StreamSource> {
   /** Per group: the pages it should hold now. */
   private wanted = new Map<PagedGroup, Set<number>>();
   private inflight = new Map<string, PageTenant<S>>();
+  /** Groups that arrived with their page and took a slot. */
+  arrived = 0;
+  /** Groups that arrived with their page and found no slot. */
+  dropped = 0;
   /** Upgrades that came back, for tests and reports. */
   upgrades = 0;
   failed = 0;
@@ -75,8 +79,12 @@ export class AttribResidency<S extends StreamSource> {
     for (const g of this.pool.groups) {
       if (!Pool.covers(g, chunk)) continue;
       const slot = this.slotFor(g, page);
-      if (slot >= 0)
+      if (slot >= 0) {
         this.pool.assign(g, page, slot, count, chunk as AttribPool);
+        this.arrived += 1;
+      } else {
+        this.dropped += 1;
+      }
     }
   }
 
@@ -91,8 +99,9 @@ export class AttribResidency<S extends StreamSource> {
     group.pageOf.forEach((holder, slot) => {
       if (wanted?.has(holder)) return;
       const r = this.rank.get(holder) ?? Number.POSITIVE_INFINITY;
-      // Only evict for a page ranked better (or a holder nobody ranks).
-      if (r <= mine && r !== Number.POSITIVE_INFINITY) return;
+      // Only for a page ranked better than the holder (a page nobody
+      // ranks yet takes free slots only).
+      if (!(r > mine)) return;
       if (r > worstRank) {
         worst = slot;
         worstRank = r;

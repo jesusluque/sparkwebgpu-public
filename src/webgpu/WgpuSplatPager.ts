@@ -81,10 +81,14 @@ export class WgpuSplatPager extends SplatPager {
   residency: AttribResidency<PagedSplats> | null = null;
   private attribSchema: AttributeSpec[] | null = null;
   private attribPlan: AttribPagingPlan | null = null;
+  /** Pages of the cloud the schema is from (caps paged groups' slots). */
+  private cloudPages?: number;
   private readonly attribOptions: AttribPagingOptions;
   private readonly attributeDemand?: () => readonly string[] | null;
   /** Splats on each page, as last uploaded. */
   private pageCounts: number[] = [];
+  /** The tenant each page was last uploaded for (mapped pages wait for theirs). */
+  private uploaded: unknown[] = [];
 
   constructor(device: GPUDevice, options: WgpuSplatPagerOptions) {
     const ext = options.extSplats ?? false;
@@ -153,8 +157,11 @@ export class WgpuSplatPager extends SplatPager {
    * The attribute schema of the pool (all paged meshes share it), before
    * the first page arrives; later schemas are ignored.
    */
-  setAttribSchema(specs: AttributeSpec[]) {
-    if (!this.attribSchema && specs.length) this.attribSchema = specs;
+  setAttribSchema(specs: AttributeSpec[], cloudPages?: number) {
+    if (!this.attribSchema && specs.length) {
+      this.attribSchema = specs;
+      this.cloudPages = cloudPages;
+    }
   }
 
   /**
@@ -176,6 +183,7 @@ export class WgpuSplatPager extends SplatPager {
       demand: o.attributes ?? this.attributeDemand?.() ?? null,
       pages: o.pages,
       transferForm: o.transferForm,
+      cloudPages: this.cloudPages,
     };
     let plan = planAttribPaging(this.attribSchema, this.maxPages, options);
     if (plan.bytes > limit) {
@@ -263,7 +271,13 @@ export class WgpuSplatPager extends SplatPager {
     const order: number[] = [];
     for (const { splats, chunk } of this.fetchPriority) {
       const entry = this.getSplatsChunk(splats, chunk);
-      if (entry) order.push(entry.page);
+      // A page mapped but not yet uploaded brings its own streams.
+      if (
+        entry &&
+        this.uploaded[entry.page] === this.pageToSplatsChunk[entry.page]
+      ) {
+        order.push(entry.page);
+      }
     }
     this.residency.update(order);
   }
@@ -320,6 +334,7 @@ export class WgpuSplatPager extends SplatPager {
     const core = this.pools.core;
     const count = packedArray.length / 4;
     this.pageCounts[page] = count;
+    this.uploaded[page] = this.pageToSplatsChunk[page];
     this.mirror(this.packedTexture, base, packedArray);
     if (extArray) this.mirror(this.extTexture, base, extArray);
     // Every page, so one without attributes clears the previous tenant's.

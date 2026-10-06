@@ -217,7 +217,10 @@ export class WgpuLod {
       const attributes = (meta as { attributes?: RadAttributeMeta[] })
         .attributes;
       if (attributes) {
-        this.ensurePager().setAttribSchema(specsFromRadMeta(attributes));
+        this.ensurePager().setAttribSchema(
+          specsFromRadMeta(attributes),
+          meta.chunks?.length,
+        );
       }
       source = this.ensurePager().source(splats);
     } else {

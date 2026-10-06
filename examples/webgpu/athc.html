@@ -34,6 +34,11 @@
     // `paged: true` streams it a 65 536-splat chunk at a time (src/athc.ts).
     //   ?url=<.athc>   (default: test/fixtures/athc/two_cards.athc)
     //   &paged=1       page it
+    //   &cam=x,y,z,tx,ty,tz   camera position and target (a paged cloud has
+    //                  no bounds before its pages arrive)
+    //   &streams=all   page every stream (default: those the plugins use;
+    //                  with none, not the relight ones); the status line then
+    //                  shows the pages holding each paged stream group
     //   ?scene=<athenea-web scene.json>   open what athenea-web publishes:
     //                  its .athc (or other format), transform, camera, background
     import * as THREE from "three/webgpu";
@@ -65,7 +70,11 @@
       renderer.setSize(innerWidth, innerHeight);
     });
 
-    const spark = new SparkRenderer({ renderer });
+    const streams = params.get("streams");
+    const spark = new SparkRenderer({
+      renderer,
+      pagedAttributes: streams ? { attributes: streams === "all" ? "all" : streams.split(",") } : undefined,
+    });
     scene.add(spark);
 
     const sceneUrl = params.get("scene");
@@ -73,12 +82,16 @@
     const mesh = athenea ? atheneaSceneMesh(athenea) : new SplatMesh({ url, paged });
     scene.add(mesh);
     if (athenea?.background.color) scene.background = new THREE.Color(athenea.background.color);
-    window.__athc = { mesh, loaded: false, error: null };
+    window.__athc = { mesh, spark, loaded: false, error: null };
     try {
       await mesh.initialized;
       window.__athc.loaded = true;
       const box = mesh.getBoundingBox?.(false);
-      if (athenea?.cameras.length) {
+      const cam = params.get("cam")?.split(",").map(Number);
+      if (cam?.length === 6) {
+        camera.position.set(cam[0], cam[1], cam[2]);
+        camera.lookAt(cam[3], cam[4], cam[5]);
+      } else if (athenea?.cameras.length) {
         applyAtheneaCamera(camera, athenea.cameras[0]);
       } else if (box && !box.isEmpty()) {
         const centre = box.getCenter(new THREE.Vector3());
@@ -99,10 +112,20 @@
     }
 
     const controls = new SparkControls({ canvas: renderer.domElement });
+    let label = null;
     renderer.setAnimationLoop(() => {
       controls.update(camera);
       renderer.render(scene, camera);
       window.__sparkFrames = (window.__sparkFrames ?? 0) + 1;
+      // Paged stream groups: pages resident of their slots.
+      const pager = spark.webgpu?.lod?.pager;
+      const memory = pager?.attribs?.memory();
+      if (memory) {
+        label ??= status.textContent;
+        window.__athc.attribs = memory;
+        const groups = memory.groups.map((g) => `${g.name} ${g.resident}/${g.slots} pages`);
+        status.textContent = `${label} · attributes ${(memory.total / 1e6).toFixed(0)} MB${groups.length ? ` · ${groups.join(", ")}` : ""}`;
+      }
     });
   </script>
 </body>

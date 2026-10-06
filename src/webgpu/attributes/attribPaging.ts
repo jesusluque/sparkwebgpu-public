@@ -141,6 +141,9 @@ function headerBytes(n: number) {
  * schema): which streams it keeps, at how many pages each group, within
  * `budget` bytes. `demand` is the streams of the groups to load (null: the
  * default of AttribPagingOptions.attributes); `tier` the device's.
+ * `cloudPages`, the pages of the cloud the schema is from: a paged group
+ * never takes more slots than that (a pawn of 16 pages does not reserve 79
+ * pages of transfer because the budget would hold them).
  */
 export function planAttribPaging(
   specs: readonly AttributeSpec[],
@@ -151,12 +154,14 @@ export function planAttribPaging(
     demand = null,
     pages = {},
     transferForm = "full",
+    cloudPages,
   }: {
     budget: number;
     tier: Tier;
     demand?: "all" | readonly string[] | null;
     pages?: Record<string, number>;
     transferForm?: TransferForm;
+    cloudPages?: number;
   },
 ): AttribPagingPlan {
   const dropped: AttribPagingPlan["dropped"] = [];
@@ -215,6 +220,9 @@ export function planAttribPaging(
       );
     }
     const paged = slots < maxPages;
+    if (paged && asked === undefined && cloudPages !== undefined) {
+      slots = Math.min(slots, cloudPages);
+    }
     if (paged && slots === 0 && asked === undefined) {
       for (const s of groupSpecs)
         dropped.push({ name: s.name, reason: "budget" });

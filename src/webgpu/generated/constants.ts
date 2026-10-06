@@ -13,6 +13,25 @@ export const atheneaAdapterEnv = {
   kTwoPiSquared: 19.739208802178677,
 } as const;
 
+/** slang/athenea_adapter/lights.slang */
+export const atheneaAdapterLights = {
+  kAtheneaLightsMaxGroups: 16,
+  kAtheneaLightsMaxPages: 256,
+  kLightsDirect: 1,
+  kLightsIndirect: 2,
+  kLightsEmission: 4,
+  kLightsField: 8,
+  kLightsWhole: 0,
+  kLightsPaged: 1,
+  kAthlHeaderWords: 16,
+  kAthlGroupWords: 32,
+  kAthlPolygonWords: 32,
+  kAthlProfileHeadWords: 12,
+  kAthlBlockSplats: 256,
+  kAthlTwoSided: 1,
+  kAthlNone: 4294967295,
+} as const;
+
 /** slang/athenea_adapter/raster.slang */
 export const atheneaAdapterRaster = {
   kAtheneaOverrideRows: 16,

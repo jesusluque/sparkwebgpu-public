@@ -29,6 +29,11 @@ export const pluginSlang: Record<string, { module: string; colour: string | null
     "module": "athenea_adapter.relight_colour",
     "colour": "AtheneaRelightColour",
     "blend": null
+  },
+  "athenea.lights": {
+    "module": "athenea_adapter.lights",
+    "colour": "AtheneaLightsColour",
+    "blend": null
   }
 };
 
@@ -73,6 +78,32 @@ export const presets = [
     ],
     "colour": "athenea.relight",
     "blend": null
+  },
+  {
+    "name": "athenea-lights",
+    "plugins": [
+      "athenea.lights"
+    ],
+    "colour": "athenea.lights",
+    "blend": null
+  },
+  {
+    "name": "athenea-raster-lights",
+    "plugins": [
+      "athenea.raster",
+      "athenea.lights"
+    ],
+    "colour": "athenea.raster+athenea.lights",
+    "blend": null
+  },
+  {
+    "name": "athenea-relight-lights",
+    "plugins": [
+      "athenea.relight",
+      "athenea.lights"
+    ],
+    "colour": "athenea.relight+athenea.lights",
+    "blend": null
   }
 ] as const;
 
@@ -94,6 +125,24 @@ export const colourVariants: Record<string, KernelVariant> = {
     plugins: ["athenea.relight"],
     load: async () => ({
       "kernels/generate": (await import("./variants/athenea-relight/kernels/generate")).default,
+    }),
+  },
+  "athenea.lights": {
+    plugins: ["athenea.lights"],
+    load: async () => ({
+      "kernels/generate": (await import("./variants/athenea-lights/kernels/generate")).default,
+    }),
+  },
+  "athenea.raster+athenea.lights": {
+    plugins: ["athenea.raster","athenea.lights"],
+    load: async () => ({
+      "kernels/generate": (await import("./variants/athenea-raster__athenea-lights/kernels/generate")).default,
+    }),
+  },
+  "athenea.relight+athenea.lights": {
+    plugins: ["athenea.relight","athenea.lights"],
+    load: async () => ({
+      "kernels/generate": (await import("./variants/athenea-relight__athenea-lights/kernels/generate")).default,
     }),
   },
 };

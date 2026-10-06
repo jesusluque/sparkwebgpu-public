@@ -114,6 +114,36 @@ export {
   distantMatrix,
 } from "./athenea/lights";
 export {
+  ATHENEA_LIGHTS_ID,
+  type AtheneaLightTerms,
+  type AtheneaLightsAssetOptions,
+  type AtheneaLightsOptions,
+  type AtheneaLightsPlugin,
+  type LightGroupState,
+  atheneaLightsPlugin,
+  athlPagerChunks,
+  lightGroupSwatch,
+} from "./athenea/lightsPlugin";
+export {
+  type AthlData,
+  type AthlHeader,
+  type AthlLayer,
+  AthlStore,
+  athcCloudHash,
+  athlChunkRange,
+  decodeAthl,
+  decodeAthlChunk,
+  readAthlHeader,
+} from "./athenea/athl";
+export {
+  type LightGroupSpec,
+  type LightSidecar,
+  LightRig,
+  blackbody,
+  parseLightSidecar,
+} from "./athenea/lightSidecar";
+export { type UsdLayer, type UsdPrim, parseUsda } from "./athenea/usda";
+export {
   type AtheneaPick,
   atheneaGroupOf,
   pickAtheneaGroup,

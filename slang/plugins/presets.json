@@ -13,6 +13,10 @@
     "athenea.relight": {
       "module": "athenea_adapter.relight_colour",
       "colour": "AtheneaRelightColour"
+    },
+    "athenea.lights": {
+      "module": "athenea_adapter.lights",
+      "colour": "AtheneaLightsColour"
     }
   },
   "presets": [
@@ -20,6 +24,15 @@
     { "name": "fade", "plugins": ["example.fade"] },
     { "name": "tint-fade", "plugins": ["example.tint", "example.fade"] },
     { "name": "athenea-raster", "plugins": ["athenea.raster"] },
-    { "name": "athenea-relight", "plugins": ["athenea.relight"] }
+    { "name": "athenea-relight", "plugins": ["athenea.relight"] },
+    { "name": "athenea-lights", "plugins": ["athenea.lights"] },
+    {
+      "name": "athenea-raster-lights",
+      "plugins": ["athenea.raster", "athenea.lights"]
+    },
+    {
+      "name": "athenea-relight-lights",
+      "plugins": ["athenea.relight", "athenea.lights"]
+    }
   ]
 }

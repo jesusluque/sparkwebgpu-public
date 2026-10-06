@@ -89,10 +89,16 @@ one Range request of its chunk, wrapped in a 160-byte `ATHV` head (format in
 
 The streams become attributes of the splats' `AttribPool`: `normalOct`,
 `emission`, `pbr`, `lobes` (u32, as stored), `transfer` (f16 × count) and
-`shadowBits` (u32). `slang/athenea_adapter/athc.slang` reads them with
+`shadowBits` (u32), plus `athcGroup` (u32 x 2) on every file: the finest
+LoD groups `[lo, hi)` an element covers, a splat its own and a merged node
+its subtree, which is what a `.athc` can be picked and overridden by (it keeps
+no Cryptomatte id; see [athenea raster](webgpu-athenea-raster.md)). Merged
+ATHV pages carry these ranges after their block. `slang/athenea_adapter/athc.slang` reads the streams with
 athenea's own unpack functions. A linear cloud's colours are sRGB-encoded at
-decode (the base exactly, rest harmonics through the curve's slope) until the
-linear blend of phase 3; `DecodeOptions::keep_linear` keeps them.
+decode (the base exactly, rest harmonics through the curve's slope) unless
+the ATHV head's decode flags (byte 152) carry `ATHV_KEEP_LINEAR`
+(`PagedSplats({ athcKeepLinear: true })`, `DecodeOptions::keep_linear`), for
+the linear blend of the athenea raster.
 
 ## Version 3 (sparkwebGPU's, for the web)
 

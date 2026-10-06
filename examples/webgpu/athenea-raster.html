@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • athenea raster (WebGPU)</title>
+  <style>
+    body { margin: 0; background-color: black; }
+    canvas { display: block; touch-action: none; }
+    .overlay { position: fixed; margin: 12px; bottom: 0; color: white; font-family: sans-serif; white-space: pre; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "@sparkjsdev/spark/webgpu": "../../dist/spark.webgpu.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
+      }
+    }
+  </script>
+  <div class="overlay"><p id="status">loading…</p></div>
+  <canvas id="canvas" tabindex="0" style="outline: none;"></canvas>
+  <script type="module">
+    // athenea's base raster (plan-athenea.md, phase 3): a .athc's splats
+    // coloured as athenea's splat_project colours them -- linear light,
+    // emission, overrides by finest-group range -- blended in linear light
+    // into a half-float target, then shown through athenea's display
+    // transform (exposure in stops, Standard / AgX / ACES 2.0).
+    //
+    //   ?url=<.athc>   default every_stream.athc (linear, emission)
+    //   ?linear=0      decode a linear cloud to sRGB as Spark's blend wants
+    //   ?view=agx|aces2|standard  ?exposure=<stops>  ?gui=0
+    //   ?raster=0  Spark's colours (no athenea raster)   ?fx=0  no display transform
+    //   ?ext=0     8-bit paged splats (linear colours lose their darks)
+    import * as THREE from "three/webgpu";
+    import GUI from "lil-gui";
+    import { SparkRenderer, SplatMesh, SparkControls, PagedSplats } from "@sparkjsdev/spark";
+    import {
+      splatRequiredLimits,
+      fx,
+      plugins,
+      atheneaRasterPlugin,
+      atheneaOutputPlugin,
+    } from "@sparkjsdev/spark/webgpu";
+
+    const params = new URLSearchParams(location.search);
+    const url = params.get("url") ?? "../../test/fixtures/athc/every_stream.athc";
+    const keepLinear = params.get("linear") !== "0";
+    const status = document.getElementById("status");
+    window.__athenea = { loaded: false, error: null };
+
+    const adapter = await navigator.gpu?.requestAdapter();
+    const renderer = new THREE.WebGPURenderer({
+      canvas: document.getElementById("canvas"),
+      requiredLimits: adapter ? splatRequiredLimits(adapter) : {},
+    });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    await renderer.init();
+
+    const scene = new THREE.Scene();
+    // Linear light behind the splats; the display transform shows it.
+    scene.background = new THREE.Color().setRGB(0.02, 0.02, 0.025, THREE.LinearSRGBColorSpace);
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.01, 1000);
+
+    // The splats blend into a half-float target in linear light; the chain
+    // ends with the display transform, written for three's sRGB output.
+    const target = new THREE.RenderTarget(1, 1, {
+      type: THREE.HalfFloatType,
+      depthTexture: new THREE.DepthTexture(1, 1),
+    });
+    const output = new THREE.QuadMesh(new THREE.MeshBasicNodeMaterial({ colorNode: THREE.TSL.texture(target.texture) }));
+    const chain = new fx.FxChain(renderer.backend.device);
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+      target.setSize(size.x, size.y);
+    }
+    resize();
+    addEventListener("resize", resize);
+
+    const spark = new SparkRenderer({ renderer, pagedExtSplats: params.get("ext") !== "0" });
+    scene.add(spark);
+    const paged = new PagedSplats({ rootUrl: url, athcKeepLinear: keepLinear });
+    const mesh = new SplatMesh({ url, paged });
+    scene.add(mesh);
+
+    const raster = atheneaRasterPlugin();
+    const view = params.get("view") ?? "agx";
+    const display = atheneaOutputPlugin({ view, exposure: Number(params.get("exposure") ?? 0) });
+    let host = null;
+
+    try {
+      await mesh.initialized;
+      await spark.webgpuReady;
+      window.__athenea.loaded = true;
+    } catch (error) {
+      window.__athenea.error = String(error);
+      status.textContent = `error: ${error}`;
+      console.error(error);
+    }
+
+    // Overrides by finest-group range: what a pick returns, any level's
+    // group being a range of them.
+    const override = { from: 0, to: 0, hide: false, tint: "#ffffff", replace: false };
+    function applyOverride() {
+      const t = new THREE.Color(override.tint);
+      const list = override.to > override.from
+        ? [{ groups: [override.from, override.to], tint: [t.r, t.g, t.b], replace: override.replace, opacity: override.hide ? 0 : 1 }]
+        : [];
+      raster.setOverrides(mesh, list);
+    }
+    if (params.get("gui") !== "0") {
+      const gui = new GUI({ title: "athenea raster" });
+      for (const c of display.ui) {
+        const o = { [c.label]: c.get() };
+        if (c.type === "select") gui.add(o, c.label, c.options).onChange(c.set);
+        else gui.add(o, c.label, c.min, c.max, c.step).onChange(c.set);
+      }
+      const e = { emission: raster.emission };
+      gui.add(e, "emission", 0, 4, 0.05).onChange((v) => raster.setEmission(v));
+      const g = gui.addFolder("override (finest groups)");
+      g.add(override, "from", 0, 4096, 1).onChange(applyOverride);
+      g.add(override, "to", 0, 4096, 1).onChange(applyOverride);
+      g.add(override, "hide").onChange(applyOverride);
+      g.addColor(override, "tint").onChange(applyOverride);
+      g.add(override, "replace").onChange(applyOverride);
+    }
+    window.__athenea.raster = raster;
+    window.__athenea.display = display;
+    window.__athenea.mesh = mesh;
+    window.__athenea.spark = spark;
+    window.__athenea.camera = camera;
+
+    // Framed on the cloud once its first page has its bounds.
+    let framed = false;
+    function frameCloud() {
+      const box = mesh.getBoundingBox?.(false);
+      if (!box || box.isEmpty()) return;
+      const centre = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3()).length();
+      camera.position.copy(centre).add(new THREE.Vector3(0, 0, size * 1.1));
+      camera.lookAt(centre);
+      framed = true;
+    }
+    const controls = new SparkControls({ canvas: renderer.domElement });
+    let frames = 0;
+    let last = performance.now();
+    renderer.setAnimationLoop(() => {
+      if (!framed) frameCloud();
+      controls.update(camera);
+      renderer.setRenderTarget(target);
+      renderer.render(scene, camera);
+      // The backend's splat renderer exists once a frame has drawn.
+      const splats = spark.webgpu?.splats;
+      if (!host && splats) {
+        host = new plugins.PluginHost({ capabilities: splats.capabilities });
+        // ?raster=0: Spark's own colours, for comparison.
+        if (params.get("raster") !== "0") host.register(raster);
+        host.register(display).attach(splats);
+        if (params.get("fx") !== "0") host.applyFx(chain);
+        window.__athenea.host = host;
+      }
+      chain.applyToRenderTarget(renderer, target);
+      renderer.setRenderTarget(null);
+      output.render(renderer);
+      window.__sparkFrames = (window.__sparkFrames ?? 0) + 1;
+      frames++;
+      const now = performance.now();
+      if (now - last > 500) {
+        const fps = (frames * 1000) / (now - last);
+        const p = display.params;
+        status.textContent = `${url.split("/").pop()} · ${paged.athcStoredLinear ? "linear light" : "sRGB-encoded"} colours · ` +
+          `${["Standard", "AgX", "ACES 2.0"][p.view ?? 1]} · ${(p.exposure ?? 0).toFixed(1)} stops · ${fps.toFixed(0)} fps`;
+        frames = 0;
+        last = now;
+        if (host && window.__sparkFrames > 30) window.__ready = true;
+      }
+    });
+  </script>
+</body>
+</html>

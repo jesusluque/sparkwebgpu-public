@@ -1,0 +1,69 @@
+#usda 1.0
+(
+    doc = "Synthetic light sidecar for car.athc (sparkwebGPU, rust/build-lod athenea-lights): three groups as athenea's 066/067 sidecar describes them."
+)
+
+def Scope "Lights"
+{
+    string athenea:lightSidecar:cloudHash = "0ed494bf248313e1"
+    asset athenea:lightSidecar:athl = @./car.lights.athl@
+    float athenea:lightSidecar:nitsPerUnit = 1
+    token athenea:lightSidecar:defaultState = "aparcado"
+
+    def Scope "LightGroups"
+    {
+        def Scope "cruce" (prepend apiSchemas = ["AtheneaLightGroupAPI"])
+        {
+            token athenea:lightGroup:function = "lowBeam"
+            token athenea:lightGroup:technology = "xenon"
+            float athenea:lightGroup:radiance = 300
+            float athenea:lightGroup:temperatureK = 6000
+            float athenea:lightGroup:riseSeconds = 2
+        }
+        def Scope "drl" (prepend apiSchemas = ["AtheneaLightGroupAPI"])
+        {
+            token athenea:lightGroup:function = "daytimeRunning"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:radiance = 60
+            float athenea:lightGroup:temperatureK = 6500
+            float athenea:lightGroup:riseSeconds = 0.15
+        }
+        def Scope "pilotos" (prepend apiSchemas = ["AtheneaLightGroupAPI"])
+        {
+            token athenea:lightGroup:function = "tail"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:radiance = 40
+            float athenea:lightGroup:riseSeconds = 0.08
+        }
+    }
+
+    def Scope "LightStates"
+    {
+        def Scope "aparcado"     { dictionary athenea:lightState:targets = {} }
+        def Scope "diurno"       { dictionary athenea:lightState:targets = { double drl = 1 } }
+        def Scope "noche_ciudad" { dictionary athenea:lightState:targets = { double cruce = 1  double drl = 1  double pilotos = 1 } }
+        def Scope "frenando"     {
+            token athenea:lightState:base = "noche_ciudad"
+            dictionary athenea:lightState:targets = { double pilotos = 4 }
+        }
+    }
+
+    def Scope "LightRules"
+    {
+        def Scope "drl_off_with_low_beam" {
+            token athenea:lightRule:when = "cruce"
+            token athenea:lightRule:target = "drl"
+            double athenea:lightRule:scale = 0
+        }
+    }
+
+    def Scope "Sequences"
+    {
+        def Scope "bienvenida" {
+            double[] athenea:lightSequence:times = [0, 1.5, 3, 7, 9]
+            token[] athenea:lightSequence:states = ["aparcado", "diurno", "noche_ciudad", "frenando", "noche_ciudad"]
+            double athenea:lightSequence:duration = 12
+            bool athenea:lightSequence:loop = true
+        }
+    }
+}

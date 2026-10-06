@@ -38,6 +38,7 @@ nav:
   - athenea .athc: docs/athc-v3.md
   - athenea raster: docs/webgpu-athenea-raster.md
   - athenea relight: docs/webgpu-athenea-relight.md
+  - athenea light groups (.athl): docs/athl.md
   - Community Resources: docs/community-resources.md
 markdown_extensions:
   - pymdownx.highlight:

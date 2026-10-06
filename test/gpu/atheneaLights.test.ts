@@ -503,3 +503,87 @@ describe.skipIf(!wideDevice)("athenea light groups after the relight", () => {
     }
   });
 });
+
+// The synthetic asset (rust/build-lod athenea-lights) through the real WASM
+// reader: the three files agree, the layers are sparse, and one page's
+// layers read alone from its byte range decode as in the whole file.
+describe("the synthetic light sidecar", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { vi } = await import("vitest");
+  const wasm = await vi.importActual<typeof import("spark-rs")>("spark-rs");
+  wasm.initSync({
+    module: readFileSync(
+      new URL("../../rust/spark-rs/pkg/spark_rs_bg.wasm", import.meta.url),
+    ),
+  });
+  const { AthlStore, athcCloudHash, athlChunkRange } = await import(
+    "../../src/webgpu/athenea/athl"
+  );
+  const { parseLightSidecar } = await import(
+    "../../src/webgpu/athenea/lightSidecar"
+  );
+  const file = (n: string) =>
+    new Uint8Array(
+      readFileSync(
+        new URL(`../../examples/webgpu/athenea-lights/${n}`, import.meta.url),
+      ),
+    );
+  const athc = file("car.athc");
+  const bytes = file("car.lights.athl");
+  const sidecar = parseLightSidecar(
+    new TextDecoder().decode(file("car.lights.usda")),
+  );
+
+  it("decodes, matches its cloud and its sidecar, and is sparse", () => {
+    const data = wasm.decode_athl(bytes) as AthlData & {
+      header: { sections: { tag: number }[] };
+    };
+    expect(data.groups.map((g) => g.name)).toEqual(
+      sidecar.groups.map((g) => g.name),
+    );
+    expect(sidecar.warnings).toEqual([]);
+    expect(data.header.cloudHash).toBe(athcCloudHash(athc));
+    expect(sidecar.cloudHash).toBe(data.header.cloudHash);
+    const { merged, splatBase, splatCount, elementCount } = data.header;
+    expect(splatBase % 65536).toBe(0);
+    expect(elementCount).toBe(splatBase + splatCount);
+    expect(merged).toBeGreaterThan(0);
+    // Indirect layers reach some blocks of each chunk, not all.
+    const blocks = Math.ceil(merged / 256) + Math.ceil(splatCount / 256);
+    for (let g = 0; g < 3; g++) {
+      const n = data.layers
+        .filter((l) => l.group === g && l.kind === 0)
+        .reduce((a, l) => a + l.blocks.length, 0);
+      expect(n).toBeGreaterThan(0);
+      expect(n).toBeLessThan(blocks);
+    }
+    const packed = new AthlStore(data).pack();
+    expect(packed[0]).toBe(3);
+    expect(packed[1]).toBe(Math.ceil(elementCount / 65536));
+  });
+
+  it("reads one page's layers from its byte range", () => {
+    const data = wasm.decode_athl(bytes) as AthlData;
+    const header = wasm.athl_header(
+      bytes.slice(0, wasm.athl_prefix_bytes(bytes.slice(0, 128))),
+    );
+    const chunk = Math.floor(header.splatBase / 65536);
+    const range = athlChunkRange(header, chunk) as [number, number];
+    const slice = bytes.slice(range[0], range[1]);
+    const sections = header.sections.filter(
+      (s: { tag: number; chunk: number }) =>
+        s.tag === 0x5259414c && s.chunk === chunk,
+    );
+    expect(sections.length).toBeGreaterThan(0);
+    for (const s of sections) {
+      const l = wasm.decode_athl_layer(
+        slice.subarray(s.offset - range[0], s.offset - range[0] + s.bytes),
+      );
+      const whole = data.layers.find(
+        (x) => x.chunk === chunk && x.group === l.group && x.kind === l.kind,
+      );
+      expect(whole && [...whole.blocks]).toEqual([...l.blocks]);
+      expect(whole?.data.length).toBe(l.data.length);
+    }
+  });
+});

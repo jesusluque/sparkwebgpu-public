@@ -30,6 +30,8 @@ type V3 = [f32; 3];
 struct Builder {
     s: CloudStreams,
     albedo: Vec<V3>,
+    /// Splat size over half the spacing (1.1: just touching).
+    spread: f32,
 }
 
 impl Builder {
@@ -38,7 +40,7 @@ impl Builder {
         self.s.positions.extend_from_slice(&p);
         self.s.scales.extend_from_slice(&scale);
         self.s.rotations.extend_from_slice(&rotation);
-        self.s.opacities.push(0.95);
+        self.s.opacities.push(1.0);
         self.s.normals.extend_from_slice(&normal);
         // Linear colour: base = 0.5 + SH0 * dc.
         self.s.sh.extend(albedo.map(|c| (c - 0.5) / SH0));
@@ -59,7 +61,7 @@ impl Builder {
                 let a = ((i as f32 + 0.5) / nu as f32) * 2.0 - 1.0;
                 let b = ((j as f32 + 0.5) / nv as f32) * 2.0 - 1.0;
                 let p = add(centre, add(scale(u, a), scale(v, b)));
-                let s = [lu / nu as f32 * 1.1, lv / nv as f32 * 1.1, 0.004];
+                let s = [lu / nu as f32 * self.spread, lv / nv as f32 * self.spread, 0.004];
                 // The splat's x/y are u/v only for axis-aligned quads, which is
                 // all this scene has; z along the normal stays thin.
                 self.splat(p, aligned_scale(u, v, n, s), rotation, n, albedo);
@@ -155,21 +157,29 @@ fn main() -> Result<()> {
         },
     ];
 
-    let mut b = Builder { s: CloudStreams { coefficients: 1, linear: true, ..Default::default() }, albedo: Vec::new() };
+    let mut b = Builder { s: CloudStreams { coefficients: 1, linear: true, ..Default::default() }, albedo: Vec::new(), spread: 1.1 };
     let grey = [0.45, 0.45, 0.45];
     // Ground, and a wall ahead for the beam's cut-off.
     b.quad([0.0, 0.0, 1.0], [3.5, 0.0, 0.0], [0.0, 0.0, -5.0], 0.12, grey);
     b.quad([0.0, 1.25, 6.0], [-3.5, 0.0, 0.0], [0.0, 1.25, 0.0], 0.1, [0.7, 0.7, 0.68]);
-    // The body: a box over the ground, its faces outward.
-    let paint = [0.55, 0.06, 0.05];
-    let (x, y0, y1, z) = (0.8, 0.25, 1.0, 2.0);
-    let yc = (y0 + y1) / 2.0;
-    let hy = (y1 - y0) / 2.0;
-    b.quad([0.0, y1, 0.0], [x, 0.0, 0.0], [0.0, 0.0, -z], 0.08, paint); // top (+y)
-    b.quad([0.0, yc, z], [x, 0.0, 0.0], [0.0, hy, 0.0], 0.05, paint); // front (+z)
-    b.quad([0.0, yc, -z], [-x, 0.0, 0.0], [0.0, hy, 0.0], 0.05, paint); // back (-z)
-    b.quad([x, yc, 0.0], [0.0, 0.0, -z], [0.0, hy, 0.0], 0.08, paint); // right (+x)
-    b.quad([-x, yc, 0.0], [0.0, 0.0, z], [0.0, hy, 0.0], 0.08, paint); // left (-x)
+    // The body: a box over the ground, its faces outward, and a dark shell
+    // just inside: one layer of Gaussians lets a few per cent through
+    // between centres, and a lamp hundreds of times the dome would show
+    // through it.
+    let body = |b: &mut Builder, inset: f32, paint: V3| {
+        let (x, y0, y1, z) = (0.8 - inset, 0.25 + inset, 1.0 - inset, 2.0 - inset);
+        let yc = (y0 + y1) / 2.0;
+        let hy = (y1 - y0) / 2.0;
+        b.quad([0.0, y1, 0.0], [x, 0.0, 0.0], [0.0, 0.0, -z], 0.07, paint); // top (+y)
+        b.quad([0.0, yc, z], [x, 0.0, 0.0], [0.0, hy, 0.0], 0.05, paint); // front (+z)
+        b.quad([0.0, yc, -z], [-x, 0.0, 0.0], [0.0, hy, 0.0], 0.05, paint); // back (-z)
+        b.quad([x, yc, 0.0], [0.0, 0.0, -z], [0.0, hy, 0.0], 0.07, paint); // right (+x)
+        b.quad([-x, yc, 0.0], [0.0, 0.0, z], [0.0, hy, 0.0], 0.07, paint); // left (-x)
+    };
+    b.spread = 1.5;
+    body(&mut b, 0.0, [0.55, 0.06, 0.05]);
+    body(&mut b, 0.03, [0.02, 0.02, 0.02]);
+    b.spread = 1.1;
     // The lamps' own splats, just in front of the body.
     let dark = [0.05, 0.05, 0.05];
     for lamp in &lamps {
@@ -194,12 +204,12 @@ fn main() -> Result<()> {
         [high_half(s[2]), low_half(s[3]), high_half(s[3])]
     };
 
-    // The low beam's profile (076 (b)): 128 x 64 over +-40 deg, -10 .. +5 deg,
+    // The low beam's profile (076 (b)): 128 x 64 over +-40 deg, -20 .. +5 deg,
     // a cut-off line at -0.6 deg on the left rising 15 deg to +1 deg on the
     // right, soft over a texel, the beam bright in the centre.
     let (w, h) = (128u32, 64u32);
     let lon = [-40f32.to_radians(), 40f32.to_radians()];
-    let lat = [-10f32.to_radians(), 5f32.to_radians()];
+    let lat = [-20f32.to_radians(), 5f32.to_radians()];
     let mut texels = Vec::with_capacity((3 * w * h) as usize);
     for j in 0..h {
         for i in 0..w {
@@ -278,7 +288,9 @@ fn main() -> Result<()> {
                 emission[3 * i..3 * i + 3].copy_from_slice(&lamp.emit);
                 continue;
             }
-            // A stand-in bounce: a tenth of the direct light, near the lamp.
+            // A stand-in bounce: a third of the direct light, and a faint
+            // glow that reaches zero 2.5 m from the lamp (so the sparse
+            // blocks end where the light does, not at a threshold).
             let mut f = 0.0;
             for poly in &polygons[g.polygon_first as usize..(g.polygon_first + g.polygon_count) as usize] {
                 f += polygon_form_factor(p, normal(i), &poly.vertices, lamp.two_sided);
@@ -286,15 +298,15 @@ fn main() -> Result<()> {
             let shape = if g.profile >= 0 { profile_sample(&profiles[g.profile as usize], g, p) } else { [1.0; 3] };
             let a = albedo(i);
             let dist = len(sub(p, g.origin));
-            let falloff = (-dist / 1.5).exp();
+            let falloff = (1.0 - dist / 2.5).max(0.0).powi(2);
             for c in 0..3 {
-                indirect[3 * i + c] = 0.1 * a[c] * g.tint[c] * shape[c] * f * falloff + 0.02 * a[c] * g.tint[c] * falloff * falloff;
+                indirect[3 * i + c] = 0.3 * a[c] * g.tint[c] * shape[c] * f * falloff + 2e-4 * a[c] * g.tint[c] * falloff * falloff;
             }
         }
         let emission = virtual_values(&file, &tree, &emission, 3)?;
         let indirect = virtual_values(&file, &tree, &indirect, 3)?;
-        let e = sparse_layers(k as u16, KIND_EMISSION, 3, &emission, 1e-3)?;
-        let ind = sparse_layers(k as u16, KIND_INDIRECT, 3, &indirect, 2e-3)?;
+        let e = sparse_layers(k as u16, KIND_EMISSION, 3, &emission, 0.0)?;
+        let ind = sparse_layers(k as u16, KIND_INDIRECT, 3, &indirect, 0.0)?;
         stats.push(serde_json::json!({
             "group": lamp.name,
             "emissionBlocks": e.iter().map(|l| l.blocks.len()).sum::<usize>(),
@@ -309,7 +321,7 @@ fn main() -> Result<()> {
     for i in 0..n {
         let p = position(i);
         if (p[1] - 1.0).abs() < 0.01 && p[2] > 1.2 {
-            let s = 0.25 * ((p[2] - 1.2) / 0.8);
+            let s = 0.004 * ((p[2] - 1.2) / 0.8);
             let c = FIELD_COMPONENTS as usize * i;
             for ch in 0..3 {
                 field[c + ch] = s * 0.282_095; // DC
@@ -318,7 +330,7 @@ fn main() -> Result<()> {
         }
     }
     let field = virtual_values(&file, &tree, &field, FIELD_COMPONENTS)?;
-    athl.layers.extend(sparse_layers(1, KIND_FIELD, FIELD_COMPONENTS, &field, 1e-3)?);
+    athl.layers.extend(sparse_layers(1, KIND_FIELD, FIELD_COMPONENTS, &field, 0.0)?);
     validate(&athl)?;
     let athl_bytes = athl.write()?;
 
@@ -341,7 +353,7 @@ def Scope "Lights"
         {{
             token athenea:lightGroup:function = "lowBeam"
             token athenea:lightGroup:technology = "xenon"
-            float athenea:lightGroup:radiance = 6
+            float athenea:lightGroup:radiance = 300
             float athenea:lightGroup:temperatureK = 6000
             float athenea:lightGroup:riseSeconds = 2
         }}
@@ -349,7 +361,7 @@ def Scope "Lights"
         {{
             token athenea:lightGroup:function = "daytimeRunning"
             token athenea:lightGroup:technology = "led"
-            float athenea:lightGroup:radiance = 3
+            float athenea:lightGroup:radiance = 60
             float athenea:lightGroup:temperatureK = 6500
             float athenea:lightGroup:riseSeconds = 0.15
         }}
@@ -357,7 +369,7 @@ def Scope "Lights"
         {{
             token athenea:lightGroup:function = "tail"
             token athenea:lightGroup:technology = "led"
-            float athenea:lightGroup:radiance = 2
+            float athenea:lightGroup:radiance = 40
             float athenea:lightGroup:riseSeconds = 0.08
         }}
     }}

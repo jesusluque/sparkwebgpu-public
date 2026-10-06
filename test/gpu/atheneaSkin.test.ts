@@ -17,17 +17,26 @@
 // joint. With the Jacobian off the adapter is the blend of the joints'
 // linear parts (athenea before 7dff879), which the strip shows wrong.
 
+import { readFileSync } from "node:fs";
 import * as THREE from "three";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { AthcSkeleton } from "../../src/athc";
+import type { AttribValues } from "../../src/defines";
 import {
   decodeQuatOctXy1010R12,
   encodeExtSplat,
   fromHalf,
   toHalf,
 } from "../../src/utils";
+import { GpuSplatSource } from "../../src/webgpu/GpuSplatSource";
 import type { KernelModule } from "../../src/webgpu/KernelModule";
 import { KernelRegistry } from "../../src/webgpu/KernelRegistry";
-import { transposeRows } from "../../src/webgpu/athenea/skinPlugin";
+import { WgpuSplatRenderer } from "../../src/webgpu/WgpuSplatRenderer";
+import { atheneaRelightPlugin } from "../../src/webgpu/athenea/relightPlugin";
+import {
+  atheneaSkinPlugin,
+  transposeRows,
+} from "../../src/webgpu/athenea/skinPlugin";
 import { AttribPool } from "../../src/webgpu/attributes/schema";
 import skinModule from "../../src/webgpu/generated/athenea_adapter/skin";
 import { atheneaAdapterSkin as C } from "../../src/webgpu/generated/constants";
@@ -38,6 +47,7 @@ import {
   readAndDestroy,
   upload,
 } from "../../src/webgpu/gpuBuffers";
+import { PluginHost } from "../../src/webgpu/plugins";
 import { UniformWriter } from "../../src/webgpu/uniforms";
 import { wideDevice } from "./device";
 
@@ -702,3 +712,217 @@ describe.skipIf(!wideDevice)("athenea skinning", () => {
     expect(off).toBeGreaterThan(N / 8);
   });
 });
+
+// --- a skinned .athc through the plugins ------------------------------------
+
+// test/unit/setup.ts stubs the wasm package; these tests need the real one.
+const wasm = await vi.importActual<typeof import("spark-rs")>("spark-rs");
+wasm.initSync({
+  module: readFileSync(
+    new URL("../../rust/spark-rs/pkg/spark_rs_bg.wasm", import.meta.url),
+  ),
+});
+
+/**
+ * athenea's own skinned corner (tests/data/skinned_corner.usda, a floor
+ * carried by one joint that turns a quarter turn about y over two time
+ * codes), converted by athenea `mesh2splat --skinned --transfer --time 1`
+ * (athenea-tx 4c7dc40, its test's arguments) and by `usd-athc`: a zonal
+ * transfer in each splat's frame, 2x8x8 open-direction bits, the SKIN
+ * section and the skeleton (one clip of three samples).
+ */
+const CORNER = new Uint8Array(
+  readFileSync(
+    new URL("../fixtures/athc/skinned_corner.athc", import.meta.url),
+  ),
+);
+
+type ExtDecoded = {
+  numSplats: number;
+  ext0: Uint32Array;
+  ext1: Uint32Array;
+  attribSpecs: AttribValues["specs"];
+  attribColumns: AttribValues["values"];
+};
+
+function decodeCorner() {
+  const decoder = wasm.decode_to_extsplats(
+    undefined,
+    "corner.athc",
+    undefined,
+    undefined,
+    undefined,
+  );
+  decoder.push(CORNER);
+  const d = decoder.finish() as ExtDecoded;
+  return d;
+}
+
+describe.skipIf(!wideDevice)(
+  "athenea skinning: a skinned .athc, posed and relit",
+  () => {
+    const d = wideDevice as GPUDevice;
+    const skeleton = wasm.athc_skeleton(CORNER) as AthcSkeleton;
+
+    const color = d.createTexture({
+      size: [32, 32],
+      format: "rgba16float",
+      usage:
+        GPUTextureUsage.RENDER_ATTACHMENT |
+        GPUTextureUsage.COPY_SRC |
+        GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const target = {
+      texture: { colorSpace: THREE.LinearSRGBColorSpace },
+      samples: 0,
+    } as unknown as THREE.RenderTarget;
+    const fakeRenderer = {
+      backend: {
+        isWebGPUBackend: true,
+        device: d,
+        context: {} as GPUCanvasContext,
+        get: (r: object) =>
+          r === target.texture ? { texture: color } : undefined,
+      },
+    };
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 100);
+    camera.position.set(0.5, 2.5, 4);
+    camera.lookAt(0, 0, 0);
+    camera.updateMatrixWorld();
+
+    function sky(w: number, h: number) {
+      const data = new Float32Array(w * h * 4);
+      for (let y = 0; y < h; y++) {
+        const up = 1 - (y + 0.5) / h;
+        for (let x = 0; x < w; x++) {
+          const v =
+            up > 0.5
+              ? [0.3 + 0.5 * up, 0.5 + 0.4 * up, 0.9 * up + 0.2]
+              : [0.25, 0.2, 0.15];
+          // Brighter towards +x of the map, so a turn shows in the light.
+          const k = 0.5 + x / w;
+          data.set([v[0] * k, v[1] * k, v[2] * k, 1], (y * w + x) * 4);
+        }
+      }
+      return { width: w, height: h, data };
+    }
+
+    /** The relit colours of the corner, its splats posed as `pose` says. */
+    async function relit(
+      pose: { time: number } | null,
+      object: THREE.Object3D,
+    ) {
+      const decoded = decodeCorner();
+      const src = GpuSplatSource.fromExt(
+        d,
+        decoded.ext0,
+        decoded.ext1,
+        decoded.numSplats,
+      );
+      src.attribs = AttribPool.fromValues({
+        count: decoded.numSplats,
+        specs: decoded.attribSpecs,
+        values: decoded.attribColumns,
+      });
+      const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+        depthTest: false,
+        alwaysGenerate: true,
+      });
+      const mesh = splats.add(src, object);
+      const host = new PluginHost({
+        capabilities: splats.capabilities,
+        tier: 2,
+      });
+      const relight = atheneaRelightPlugin({
+        hdri: sky(128, 64),
+        sun: { direction: [0.6, 0.7, 0.3], intensity: 2 },
+      });
+      let skin: ReturnType<typeof atheneaSkinPlugin> | null = null;
+      if (pose) {
+        skin = atheneaSkinPlugin({ skeleton, playing: false, time: pose.time });
+        host.register(skin);
+      }
+      host.register(relight).attach(splats);
+      await host.ready();
+      splats.render(camera, target);
+      await d.queue.onSubmittedWorkDone();
+      const buffer = relight.buffers?.("splat", { frame: null, mesh })
+        .atheneaRelit as GPUBuffer;
+      const colours = new Float32Array(await read(d, buffer));
+      const posed = new Uint32Array(await read(d, src.src));
+      const stats = skin?.stats;
+      host.detach();
+      splats.dispose();
+      return { colours, posed, count: decoded.numSplats, stats };
+    }
+
+    it("reads athenea's rig from the file", () => {
+      expect(skeleton.joints).toEqual(["root"]);
+      expect(skeleton.influences).toBe(4);
+      expect(skeleton.gradientWords).toBe(3);
+      expect(Array.from(skeleton.clips[0].times)).toEqual([0, 1, 2]);
+      // The sample at 1: an eighth turn about y (the stage's 0.9238795, 0, 0.3826834, 0).
+      const m = skeleton.clips[0].xforms.subarray(16, 32);
+      expect(m[0]).toBeCloseTo(Math.SQRT1_2, 6);
+      expect(m[2]).toBeCloseTo(-Math.SQRT1_2, 6);
+      const decoded = decodeCorner();
+      expect(decoded.attribSpecs.map((s) => s.name)).toContain(
+        "skinInfluences",
+      );
+      expect(
+        decoded.attribSpecs.find((s) => s.name === "transfer")?.components,
+      ).toBe(10);
+    });
+
+    it("shades a cloud its joint turns as the same cloud turned by its transform", async () => {
+      // athenea's own check (fe1f6e6, athenea_usd_tests [zonal]): carried by a
+      // rotating joint, the cloud shades as the same cloud still under an
+      // Xform of that rotation -- the zonal lobes and the cells turn with the
+      // frame. Here at time 1 (an eighth turn) and 1.5 (between the samples:
+      // USD's interpolation of the matrices, which is no rotation, so only
+      // the splats' centres are compared there).
+      const still = new THREE.Object3D();
+      still.updateMatrixWorld();
+      const turned = new THREE.Object3D();
+      turned.quaternion.set(0, 0.3826834, 0, 0.9238795);
+      turned.updateMatrixWorld();
+      const skinned = await relit({ time: 1 }, still);
+      const rigid = await relit(null, turned);
+      expect(skinned.stats?.posed).toBe(1);
+      let worst = 0;
+      let lit = 0;
+      for (let i = 0; i < skinned.count; i++) {
+        const a = Array.from(skinned.colours.subarray(20 * i, 20 * i + 3));
+        const b = Array.from(rigid.colours.subarray(20 * i, 20 * i + 3));
+        if (Math.max(...b) <= 0) continue;
+        lit += 1;
+        worst = Math.max(
+          worst,
+          ...a.map((v, c) => Math.abs(v - b[c]) / Math.max(b[c], 0.05)),
+        );
+      }
+      console.log(
+        "skinned corner vs turned:",
+        JSON.stringify({ splats: skinned.count, lit, worst }),
+      );
+      expect(lit).toBeGreaterThan(skinned.count / 2);
+      // The posed frame is re-encoded (ExtSplats' 10-10-12 rotation).
+      expect(worst).toBeLessThan(4e-3);
+      // And the centres are the turned ones.
+      const rest = decodeCorner();
+      const q = new THREE.Quaternion(0, 0.3826834, 0, 0.9238795);
+      for (let i = 0; i < skinned.count; i += 37) {
+        const at = new Float32Array(
+          rest.ext0.buffer,
+          rest.ext0.byteOffset + 16 * i,
+          3,
+        );
+        const want = new THREE.Vector3(at[0], at[1], at[2]).applyQuaternion(q);
+        const got = new Float32Array(skinned.posed.buffer, 32 * i, 3);
+        expect(
+          Math.hypot(got[0] - want.x, got[1] - want.y, got[2] - want.z),
+        ).toBeLessThan(1e-6);
+      }
+    }, 120_000);
+  },
+);

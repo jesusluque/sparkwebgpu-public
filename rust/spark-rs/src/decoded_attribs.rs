@@ -7,7 +7,9 @@
 //! A whole .athc with a full TX transfer is 112 halves a splat: as f64 that
 //! is 896 bytes a splat, 2.4 GB for the Corvette's paint, more than a wasm32
 //! heap holds next to the file (the decoder aborted, "unreachable"); as its
-//! words, 224. Columns are allocated when first written.
+//! words, 224. Columns are allocated when first written. The words go
+//! straight into JS arrays (outside the wasm heap, which never shrinks):
+//! the heap then holds the file being decoded, not its result as well.
 
 use js_sys::{Array, Float64Array, Object, Reflect, Uint32Array};
 use spark_lib::attrib::{AttribArray, AttribSpec};
@@ -18,7 +20,7 @@ pub struct DecodedAttribs {
     specs: Vec<AttribSpec>,
     count: usize,
     values: Vec<Vec<f64>>,
-    words: Vec<Option<Vec<u32>>>,
+    words: Vec<Option<Uint32Array>>,
 }
 
 impl DecodedAttribs {
@@ -65,8 +67,8 @@ impl DecodedAttribs {
         }
         let per = words.len() / count;
         let total = self.count * per;
-        let col = self.words[attrib].get_or_insert_with(|| vec![0; total]);
-        col[base * per..(base + count) * per].copy_from_slice(&words[..count * per]);
+        let col = self.words[attrib].get_or_insert_with(|| Uint32Array::new_with_length(total as u32));
+        col.subarray((base * per) as u32, ((base + count) * per) as u32).copy_from(&words[..count * per]);
     }
 
     /// attribSpecs and attribColumns on `object` (nothing without attributes).
@@ -82,7 +84,7 @@ impl DecodedAttribs {
         for (k, spec) in self.specs.iter().enumerate() {
             if let Some(words) = &self.words[k] {
                 Reflect::set(&specs.get(k as u32), &JsValue::from_str("packed"), &JsValue::TRUE).unwrap();
-                columns.push(&Uint32Array::from(&words[..]));
+                columns.push(words);
             } else if self.values[k].is_empty() {
                 columns.push(&Float64Array::new_with_length((self.count * spec.components) as u32));
             } else {

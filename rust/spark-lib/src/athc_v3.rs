@@ -1098,6 +1098,21 @@ pub fn tables_bytes(bytes: &[u8]) -> Result<u64> {
     u64_at(bytes, 136)
 }
 
+/// The bytes of the whole v3 file whose first `tables_bytes` (or more) are
+/// `prefix`: the end of its last section, or of the finest groups' starts.
+/// A whole-file decoder reserves this once instead of doubling its buffer
+/// as the file streams in (a wasm32 heap keeps its peak).
+pub fn file_bytes(prefix: &[u8]) -> Result<u64> {
+    let layout = parse_v3(prefix)?;
+    let mut end = layout.starts_offset + 4 * layout.header.finest_groups as u64;
+    for b in &layout.blocks {
+        for span in &b.spans {
+            end = end.max(span.offset + span.stored as u64);
+        }
+    }
+    Ok(end)
+}
+
 /// v3 bytes (the whole file) back to the v2 cloud.
 pub fn read_v3(bytes: &[u8]) -> Result<AthcFile> {
     let layout = parse_v3(bytes)?;
@@ -1154,6 +1169,20 @@ mod tests {
                     let back = read_v3(&v3).unwrap().write().unwrap();
                     assert!(back == v2, "{name} (compression {compression}, encoding {encoding}) did not come back byte for byte");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn file_bytes_reads_the_size_from_the_tables() {
+        for v2 in [TWO_CARDS, EVERY] {
+            let file = AthcFile::read(v2).unwrap();
+            for compression in [COMPRESSION_NONE, COMPRESSION_GZIP] {
+                let v3 = write_v3(&file, compression).unwrap();
+                let tables = tables_bytes(&v3).unwrap() as usize;
+                let end = file_bytes(&v3[..tables]).unwrap();
+                // The file is padded to whole pages after its last bytes.
+                assert!(end <= v3.len() as u64 && v3.len() as u64 - end < PAGE, "{end} vs {}", v3.len());
             }
         }
     }

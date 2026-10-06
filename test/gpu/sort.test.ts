@@ -108,3 +108,75 @@ describe.skipIf(!device)("GpuSorter with fewer key bits", () => {
     },
   );
 });
+
+describe.skipIf(!device)("GpuSorter with depth-range keys", () => {
+  const registry = new KernelRegistry(device as GPUDevice);
+  const sorter = new GpuSorter(registry);
+
+  it("sorts by the place in the range on 24 bits, stably, clamping outside", async () => {
+    const n = 300_001;
+    const lo = 100.05;
+    const hi = 300;
+    const m = new Float32Array(n);
+    let s = 5;
+    for (let i = 0; i < n; i++) {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      const r = s / 2 ** 32;
+      m[i] =
+        i % 61 === 0
+          ? Number.POSITIVE_INFINITY
+          : i % 97 === 0
+            ? lo - 1 // below the range: the nearest
+            : i % 89 === 0
+              ? hi + 3 // above: the farthest
+              : i % 7 === 0
+                ? 150 // exact ties
+                : lo + r * (hi - lo);
+    }
+    const d = device as GPUDevice;
+    const enc = d.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    sorter.encode(pass, storage(m), n, 32, { lo, hi });
+    pass.end();
+    registry.submit(enc.finish());
+
+    // CPU reference with the kernel's f32 maths.
+    const keys = 16777215;
+    const scale = Math.fround(keys / (hi - lo));
+    const flo = Math.fround(lo);
+    const key = (i: number) => {
+      const t = Math.min(
+        Math.max(Math.fround(Math.fround(m[i] - flo) * scale), 0),
+        keys,
+      );
+      return keys - Math.floor(t);
+    };
+    const idx = Array.from({ length: n }, (_, i) => i).filter((i) =>
+      Number.isFinite(m[i]),
+    );
+    idx.sort((a, b) => key(a) - key(b) || a - b);
+    expect(new Uint32Array(await readBack(sorter.drawArgs))[1]).toBe(
+      idx.length,
+    );
+    const got = new Uint32Array(await readBack(sorter.ordering)).subarray(
+      0,
+      idx.length,
+    );
+    let firstBad = -1;
+    for (let i = 0; i < idx.length; i++) {
+      if (got[i] !== idx[i]) {
+        firstBad = i;
+        break;
+      }
+    }
+    expect(firstBad).toBe(-1);
+    // Back to front: never a nearer metric before a farther one by more
+    // than a key step.
+    const step = (hi - lo) / keys;
+    for (let i = 1; i < idx.length; i++) {
+      const a = Math.min(Math.max(m[got[i - 1]], lo), hi);
+      const b = Math.min(Math.max(m[got[i]], lo), hi);
+      if (b > a + 2 * step) throw new Error(`order at ${i}: ${a} then ${b}`);
+    }
+  });
+});

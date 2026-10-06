@@ -156,6 +156,13 @@ export interface SplatPlugin {
     ctx: PluginUniformContext,
   ): Record<string, GPUBuffer>;
   passes?: readonly PrePass[];
+  /**
+   * Whether its blend term (slang.blend) changes anything this frame
+   * (default true). False leaves it out of the draw's variant, so the draw
+   * runs without its per-fragment reads, e.g. a term that only acts on
+   * records an option turns on.
+   */
+  blendActive?(): boolean;
   fx?: readonly EffectDesc[];
   ui?: readonly ControlSpec[];
   /**

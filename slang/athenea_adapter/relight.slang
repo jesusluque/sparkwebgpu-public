@@ -90,6 +90,9 @@ public struct AtheneaRelightParams {
     public float emissionScale;
     public uint  curvature;        ///< the curvature attribute (ATTRIB_NONE: absent)
     public float footprint;        ///< the footprint prefilter's gain (0: none; footprintRoughness)
+    public uint  listCount;        ///< > 0: relight only these splats, the list at listBase (below)
+    public uint  listBase;         ///< uint4 index in `relit` of the list (four splat indices each)
+    public uint  pad0;
     public float4 encoding;        ///< packed src: rgbMin, rgbMax, lnScaleMin, lnScaleMax
     public float4 row0;            ///< object to world, rows of a 3x4
     public float4 row1;
@@ -521,14 +524,32 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     return float4(light, alpha);
 }
 
-void relightAt<let kTransfer : int>(uint i) {
+/// The splat thread t relights: the t-th of the list after the records
+/// (listCount > 0: the splats a LoD cut draws, the host's copy of the
+/// mesh's lodIndices), else splat t; count when there is none.
+uint relightTarget(uint t) {
+    if (relightParams.listCount == 0u) {
+        return t;
+    }
+    if (t >= relightParams.listCount) {
+        return relightParams.count;
+    }
+    return relit[relightParams.listBase + t / 4u][t % 4u];
+}
+
+void relightAt<let kTransfer : int>(uint t) {
+    const uint i = relightTarget(t);
     if (i >= relightParams.count) {
         return;
     }
     RelightPixel pixel;
     relit[i * kRelightStride] = asuint(relitColour<kTransfer>(i, pixel));
-    relit[i * kRelightStride + kRelightPixel] = pixel.slopes;
-    relit[i * kRelightStride + kRelightPixel + 1u] = pixel.polish;
+    // The draw reads the slope and polish records only under a mark in the
+    // centre's (kRelightSlope): without it they are left as they are.
+    if (hasFlag(kRelightSlope)) {
+        relit[i * kRelightStride + kRelightPixel] = pixel.slopes;
+        relit[i * kRelightStride + kRelightPixel + 1u] = pixel.polish;
+    }
     relit[i * kRelightStride + kRelightPixel + 2u] = pixel.centre;
 }
 

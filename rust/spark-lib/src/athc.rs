@@ -1695,6 +1695,8 @@ fn begin<T: SplatReceiver>(receiver: &mut T, num_splats: usize, h: &AthcHeader, 
 pub struct AthcDecoder<T: SplatReceiver> {
     splats: T,
     buffer: Vec<u8>,
+    /// The whole file's size was read from its tables and reserved.
+    reserved: bool,
     pub options: DecodeOptions,
     /// Set after finish(): the tree a whole file was decoded with.
     pub tree: Option<VirtualTree>,
@@ -1702,7 +1704,7 @@ pub struct AthcDecoder<T: SplatReceiver> {
 
 impl<T: SplatReceiver> AthcDecoder<T> {
     pub fn new(splats: T) -> Self {
-        Self { splats, buffer: Vec::new(), options: DecodeOptions::default(), tree: None }
+        Self { splats, buffer: Vec::new(), reserved: false, options: DecodeOptions::default(), tree: None }
     }
 
     pub fn into_splats(self) -> T {
@@ -1807,6 +1809,27 @@ impl<T: SplatReceiver> AthcDecoder<T> {
 impl<T: SplatReceiver> ChunkReceiver for AthcDecoder<T> {
     fn push(&mut self, bytes: &[u8]) -> Result<()> {
         self.buffer.extend_from_slice(bytes);
+        // A v3 file says its size in its tables: reserve it once, so the
+        // buffer holds the file and not up to twice it (Vec doubling), and
+        // is not copied as it grows. Its sections are decoded next to it.
+        if !self.reserved && self.buffer.len() >= 144 && u32_at(&self.buffer, 0) == crate::athc_v3::ATH3_MAGIC {
+            match crate::athc_v3::tables_bytes(&self.buffer) {
+                Ok(tables) if self.buffer.len() as u64 >= tables => {
+                    self.reserved = true;
+                    if let Ok(end) = crate::athc_v3::file_bytes(&self.buffer) {
+                        // Files end padded to a whole page.
+                        let want = aligned(end) as usize;
+                        if want > self.buffer.len() && want < (1usize << 31) {
+                            let mut whole = Vec::with_capacity(want);
+                            whole.extend_from_slice(&self.buffer);
+                            self.buffer = whole;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => self.reserved = true,
+            }
+        }
         Ok(())
     }
 

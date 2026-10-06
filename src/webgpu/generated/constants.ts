@@ -104,6 +104,13 @@ export const drawSplatAttribDraw = {
   COLOR_VALUE: 4,
 } as const;
 
+/** slang/draw/splat_draw.slang */
+export const drawSplatDraw = {
+  PROJECTED_WORDS: 4,
+  PROJECT_WG: 256,
+  PROJECT_ROUNDS: 4,
+} as const;
+
 /** slang/draw/splat_shape.slang */
 export const drawSplatShape = {
   DRAW_EXT: 1,
@@ -212,6 +219,10 @@ export const kernelsSortRadix = {
   BINS: 16,
   SCAN_WG: 256,
   SCAN_CHUNK: 512,
+  KEY_FLOAT: 0,
+  KEY_DEPTH: 1,
+  DEPTH_BITS: 24,
+  DEPTH_KEYS: 16777215,
 } as const;
 
 /** slang/tests/athenea_relight.slang */

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • athenea .athc (WebGPU)</title>
+  <style>
+    body { margin: 0; background-color: black; }
+    canvas { display: block; touch-action: none; }
+    .overlay { position: fixed; margin: 12px; bottom: 0; color: white; font-family: sans-serif; }
+  </style>
+</head>
+
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "@sparkjsdev/spark/webgpu": "../../dist/spark.webgpu.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
+      }
+    }
+  </script>
+  <div class="overlay"><p id="status">loading…</p></div>
+  <canvas id="canvas" tabindex="0" style="outline: none;"></canvas>
+  <script type="module">
+    // athenea's native cloud format: `new SplatMesh({ url: "x.athc" })` reads
+    // the whole file (athenea's levels become Spark's LoD tree), and
+    // `paged: true` streams it a 65 536-splat chunk at a time (src/athc.ts).
+    //   ?url=<.athc>   (default: test/fixtures/athc/two_cards.athc)
+    //   &paged=1       page it
+    import * as THREE from "three/webgpu";
+    import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
+    import { splatRequiredLimits } from "@sparkjsdev/spark/webgpu";
+
+    const params = new URLSearchParams(location.search);
+    const url = params.get("url") ?? "../../test/fixtures/athc/two_cards.athc";
+    const paged = params.get("paged") === "1";
+    const status = document.getElementById("status");
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#202020");
+    const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 1000);
+    const adapter = await navigator.gpu?.requestAdapter();
+    const renderer = new THREE.WebGPURenderer({
+      canvas: document.getElementById("canvas"),
+      requiredLimits: adapter ? splatRequiredLimits(adapter) : {},
+    });
+    renderer.setSize(innerWidth, innerHeight);
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    const spark = new SparkRenderer({ renderer });
+    scene.add(spark);
+
+    const mesh = new SplatMesh({ url, paged });
+    scene.add(mesh);
+    window.__athc = { mesh, loaded: false, error: null };
+    try {
+      await mesh.initialized;
+      window.__athc.loaded = true;
+      const box = mesh.getBoundingBox?.(false);
+      if (box && !box.isEmpty()) {
+        const centre = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3()).length();
+        camera.position.copy(centre).add(new THREE.Vector3(0, 0, size * 1.2));
+        camera.lookAt(centre);
+      } else {
+        camera.position.set(1.25, 1.25, 6);
+        camera.lookAt(1.25, 1.25, -2);
+      }
+      status.textContent = `${url.split("/").pop()}${paged ? " (paged)" : ""}`;
+    } catch (error) {
+      window.__athc.error = String(error);
+      status.textContent = `error: ${error}`;
+      console.error(error);
+    }
+
+    const controls = new SparkControls({ canvas: renderer.domElement });
+    renderer.setAnimationLoop(() => {
+      controls.update(camera);
+      renderer.render(scene, camera);
+      window.__sparkFrames = (window.__sparkFrames ?? 0) + 1;
+    });
+  </script>
+</body>
+
+</html>

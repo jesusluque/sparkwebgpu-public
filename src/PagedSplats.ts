@@ -132,6 +132,28 @@ export class PagedSplats implements SplatSource {
     if (this.radMetaPromise) {
       return this.radMetaPromise;
     }
+    if (this.fileType === SplatFileType.ATHC) {
+      // A .athc stands in as a .rad of virtual pages (src/athc.ts): what
+      // the WebGPU pager reads of a meta is its attribute schema.
+      this.radMetaPromise = this.getAthc().then(
+        ({ layout, tree, pageCount }) => ({
+          meta: {
+            version: 0,
+            type: "athc",
+            count: tree.splatBase + layout.header.count,
+            lodTree: true,
+            chunkSize: 65536,
+            chunks: Array.from({ length: pageCount }, () => ({
+              offset: 0,
+              bytes: 0,
+            })),
+            attributes: layout.attribSpecs,
+          } as RadMeta,
+          chunksStart: 0,
+        }),
+      );
+      return this.radMetaPromise;
+    }
 
     this.radMetaPromise = (async () => {
       await wasm.initialization;

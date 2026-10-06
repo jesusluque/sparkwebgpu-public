@@ -95,6 +95,25 @@ export {
   atheneaRasterPlugin,
 } from "./athenea/rasterPlugin";
 export {
+  ATHENEA_RELIGHT_ID,
+  type AtheneaRelightOptions,
+  type AtheneaRelightPlugin,
+  type AtheneaSun,
+  atheneaRelightPlugin,
+} from "./athenea/relightPlugin";
+export {
+  AtheneaSky,
+  type AtheneaSkyOptions,
+  type SkyImage,
+} from "./athenea/AtheneaSky";
+export {
+  type AtheneaLightKind,
+  type AtheneaLightRecord,
+  LIGHT_NORMALIZE,
+  LIGHT_SHADOW,
+  distantMatrix,
+} from "./athenea/lights";
+export {
   type AtheneaPick,
   atheneaGroupOf,
   pickAtheneaGroup,

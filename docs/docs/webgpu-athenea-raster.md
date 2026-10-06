@@ -83,4 +83,4 @@ There are no reference renders of athenea's fixtures in its build tree, so the c
 ## Differences from the native raster
 
 - **Footprint.** Spark's splat shape is kept: anti-aliasing blur, `maxStdDev` cut-off, and no 0.99 alpha cap or 1/255 cut. The two rasterisers differ at splat edges, not in the colour path.
-- **Relighting.** Not in this phase: no transfer, lobes, materials or lights.
+- **Relighting.** See [athenea relight](webgpu-athenea-relight.md).

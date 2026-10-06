@@ -37,6 +37,7 @@ nav:
   - WebGPU effects: docs/webgpu-fx.md
   - athenea .athc: docs/athc-v3.md
   - athenea raster: docs/webgpu-athenea-raster.md
+  - athenea relight: docs/webgpu-athenea-relight.md
   - Community Resources: docs/community-resources.md
 markdown_extensions:
   - pymdownx.highlight:

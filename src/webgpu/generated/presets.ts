@@ -24,6 +24,11 @@ export const pluginSlang: Record<string, { module: string; colour: string | null
     "module": "athenea_adapter.raster",
     "colour": "AtheneaRasterColour",
     "blend": null
+  },
+  "athenea.relight": {
+    "module": "athenea_adapter.relight_colour",
+    "colour": "AtheneaRelightColour",
+    "blend": null
   }
 };
 
@@ -60,6 +65,14 @@ export const presets = [
     ],
     "colour": "athenea.raster",
     "blend": null
+  },
+  {
+    "name": "athenea-relight",
+    "plugins": [
+      "athenea.relight"
+    ],
+    "colour": "athenea.relight",
+    "blend": null
   }
 ] as const;
 
@@ -75,6 +88,12 @@ export const colourVariants: Record<string, KernelVariant> = {
     plugins: ["athenea.raster"],
     load: async () => ({
       "kernels/generate": (await import("./variants/athenea-raster/kernels/generate")).default,
+    }),
+  },
+  "athenea.relight": {
+    plugins: ["athenea.relight"],
+    load: async () => ({
+      "kernels/generate": (await import("./variants/athenea-relight/kernels/generate")).default,
     }),
   },
 };

@@ -229,10 +229,12 @@ describe("presets", () => {
       "fade",
       "tint-fade",
       "athenea-raster",
+      "athenea-relight",
     ]);
     expect(Object.keys(colourVariants)).toEqual([
       "example.tint",
       "athenea.raster",
+      "athenea.relight",
     ]);
     expect(Object.keys(blendVariants)).toEqual(["example.fade"]);
   });

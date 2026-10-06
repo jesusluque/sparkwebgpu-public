@@ -549,8 +549,13 @@ export class GlslTranslator {
     if (a.ty.s === b.ty.s) return [a, b];
     const to = (v: Val, s: WgslScalar) =>
       this.convert(v, num(s, (v.ty as Num).rows, (v.ty as Num).cols), pos);
-    if (a.lit && !b.lit) return [to(a, b.ty.s), b];
-    if (b.lit && !a.lit) return [a, to(b, a.ty.s)];
+    // A literal takes the other side's type, unless that would truncate it.
+    if (a.lit && !b.lit && (a.ty.s !== "f32" || b.ty.s === "f32")) {
+      return [to(a, b.ty.s), b];
+    }
+    if (b.lit && !a.lit && (b.ty.s !== "f32" || a.ty.s === "f32")) {
+      return [a, to(b, a.ty.s)];
+    }
     if (a.ty.s === "f32" || b.ty.s === "f32") {
       return [to(a, "f32"), to(b, "f32")];
     }
@@ -1017,6 +1022,9 @@ export class GlslTranslator {
         }
         return prim(`${wgsl}(${cols.join(", ")})`);
       }
+    }
+    if (vals.length === 1 && isVector(ft) && ft.rows === to.rows) {
+      return this.convert(first, to, pos);
     }
     // Components from the values in order; the last may have extra ones.
     const need = to.rows * to.cols;

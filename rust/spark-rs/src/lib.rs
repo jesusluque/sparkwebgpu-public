@@ -878,14 +878,42 @@ pub fn decode_athl_layer(section: Uint8Array) -> Result<JsValue, JsValue> {
 }
 stub_fn!(feature = "athc", decode_athl_layer);
 
+/// The bytes of a .athl `decode_athl_meta` needs, from its prefix.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athl_meta_bytes(prefix: Uint8Array) -> Result<f64, JsValue> {
+    let h = spark_lib::athl::AthlHeader::parse(&prefix.to_vec()).map_err(|e| JsValue::from(e.to_string()))?;
+    Ok(spark_lib::athl::AthlFile::meta_bytes(&h) as f64)
+}
+stub_fn!(feature = "athc", athl_meta_bytes);
+
+/// A .athl without its layers (as decode_athl, `layers` empty), from its
+/// first `athl_meta_bytes` bytes: what a paged reader starts from.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn decode_athl_meta(bytes: Uint8Array) -> Result<JsValue, JsValue> {
+    athl_object(&bytes.to_vec(), false)
+}
+stub_fn!(feature = "athc", decode_athl_meta);
+
 /// A whole .athl: { header, groups, polygons, profiles (texels as a
 /// Uint16Array of f16 bits), layers (as decode_athl_layer) }.
 #[wasm_bindgen]
 #[cfg(feature = "athc")]
 pub fn decode_athl(bytes: Uint8Array) -> Result<JsValue, JsValue> {
-    let bytes = bytes.to_vec();
-    let header = spark_lib::athl::AthlHeader::parse(&bytes).map_err(|e| JsValue::from(e.to_string()))?;
-    let file = spark_lib::athl::AthlFile::read(&bytes).map_err(|e| JsValue::from(e.to_string()))?;
+    athl_object(&bytes.to_vec(), true)
+}
+stub_fn!(feature = "athc", decode_athl);
+
+#[cfg(feature = "athc")]
+fn athl_object(bytes: &[u8], with_layers: bool) -> Result<JsValue, JsValue> {
+    let header = spark_lib::athl::AthlHeader::parse(bytes).map_err(|e| JsValue::from(e.to_string()))?;
+    let file = if with_layers {
+        spark_lib::athl::AthlFile::read(bytes)
+    } else {
+        spark_lib::athl::AthlFile::read_meta(bytes)
+    }
+    .map_err(|e| JsValue::from(e.to_string()))?;
     spark_lib::athl::validate(&file).map_err(|e| JsValue::from(e.to_string()))?;
     let object = js_sys::Object::new();
     let set = |k: &str, v: &JsValue| Reflect::set(&object, &JsValue::from_str(k), v);
@@ -906,7 +934,6 @@ pub fn decode_athl(bytes: Uint8Array) -> Result<JsValue, JsValue> {
     set("layers", &layers)?;
     Ok(JsValue::from(object))
 }
-stub_fn!(feature = "athc", decode_athl);
 
 /// The paged virtual tree of a .athc (spark-lib athc::VirtualTree, splats
 /// from the first page boundary after the merged nodes) and its merged

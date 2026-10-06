@@ -455,6 +455,21 @@ impl AthlFile {
     }
 
     pub fn read(bytes: &[u8]) -> Result<Self> {
+        Self::read_sections(bytes, true)
+    }
+
+    /// Everything but the layers, from the bytes through the last
+    /// non-layer section (`meta_bytes`): what a paged reader fetches first.
+    pub fn read_meta(bytes: &[u8]) -> Result<Self> {
+        Self::read_sections(bytes, false)
+    }
+
+    /// The bytes `read_meta` needs, from the header and section table.
+    pub fn meta_bytes(h: &AthlHeader) -> u64 {
+        h.sections.iter().filter(|s| s.tag != TAG_LAYER).map(|s| s.offset + s.bytes).max().unwrap_or(0)
+    }
+
+    fn read_sections(bytes: &[u8], layers: bool) -> Result<Self> {
         let h = AthlHeader::parse(bytes)?;
         ensure!(h.chunk_splats == CHUNK_SPLATS && h.block_splats == BLOCK_SPLATS, ".athl chunk or block size");
         let section = |s: &AthlSection| -> Result<&[u8]> {
@@ -472,6 +487,9 @@ impl AthlFile {
             ..Default::default()
         };
         for s in &h.sections {
+            if s.tag == TAG_LAYER && !layers {
+                continue;
+            }
             let b = section(s)?;
             match s.tag {
                 TAG_GROUPS => {
@@ -806,6 +824,9 @@ mod tests {
         sorted.layers.sort_by_key(|l| (l.chunk, l.group, l.kind));
         assert_eq!(back, sorted);
         assert_eq!(back.write().unwrap(), bytes);
+        let h = AthlHeader::parse(&bytes).unwrap();
+        let meta = AthlFile::read_meta(&bytes[..AthlFile::meta_bytes(&h) as usize]).unwrap();
+        assert_eq!((meta.groups.len(), meta.profiles.len(), meta.layers.len()), (2, 1, 0));
         let h = AthlHeader::parse(&bytes[..AthlHeader::prefix_bytes(&bytes).unwrap() as usize]).unwrap();
         assert_eq!(h.cloud_hash, "0123456789abcdef");
         // Each LAYR section reads alone, as a Range request returns it.

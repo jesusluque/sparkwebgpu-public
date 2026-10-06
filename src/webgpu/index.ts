@@ -128,12 +128,15 @@ export {
   type AthlData,
   type AthlHeader,
   type AthlLayer,
+  AthlPager,
   AthlStore,
   athcCloudHash,
   athlChunkRange,
   decodeAthl,
   decodeAthlChunk,
+  openAthl,
   readAthlHeader,
+  urlRange,
 } from "./athenea/athl";
 export {
   type LightGroupSpec,

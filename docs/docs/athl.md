@@ -190,10 +190,13 @@ header page does not see a re-bake with the same structure: `bakeHash`
 table of chunks), per chunk a 256-entry directory of blocks, the blocks as
 f16 pairs, the polygons and the profiles (texels padded to two words). A
 lookup is three loads: chunk table, block directory, value. Paging keeps
-only the chunks held: `addLayers` from a page's Range, `dropChunk` when it
-leaves; the packed buffer is rebuilt on change. For a paged cloud the
-uniform `pageChunk` maps each pool page to its `.athl` chunk
-(`athlPagerChunks(pager, splats)`).
+only the chunks held: `openAthl(urlRange(url))` reads the header, groups,
+polygons and profiles (one range) and returns an `AthlPager`, which fetches
+a chunk's layers (one range, every group) when the cloud's pages want it and
+drops them when the page leaves; the packed buffer is rebuilt on change. For
+a paged cloud the uniform `pageChunk` maps each pool page to its `.athl`
+chunk (`athlPagerChunks(pager, splats)`); a whole cloud with an `AthlPager`
+fetches every chunk.
 
 The shader is generate's `ISplatColour` after the relight (preset
 `athenea-relight-lights`) or the raster (`athenea-raster-lights`), or alone
@@ -209,6 +212,9 @@ import { atheneaRelightPlugin, atheneaLightsPlugin, atheneaOutputPlugin,
 
 const lights = atheneaLightsPlugin({ sidecar: usdaText });
 lights.setLights(car, await decodeAthl(athlBytes), { cloudHash: athcCloudHash(athcFirst4k) });
+// or paged with the cloud (SplatMesh({ paged: true })):
+lights.setLights(car, await openAthl(urlRange(athlUrl)), {
+  cloudHash, pageChunks: () => athlPagerChunks(spark.webgpu.lod.pager, car.paged) });
 host.register(atheneaRelightPlugin({ hdri })).register(lights).register(atheneaOutputPlugin());
 
 lights.setLightState("noche_ciudad");   // 066's named states
@@ -237,8 +243,10 @@ from the frame the command came in.
   pixels of the splats it reaches;
 - after the relight plugin (on a 10-storage-buffer device): the groups'
   light adds to the relit colour;
-- the synthetic asset through the real WASM: the three files agree (names,
-  hashes), the layers are sparse, one page's byte range decodes alone.
+- the synthetic asset through the real WASM (`atheneaLightsAsset.test.ts`):
+  the three files agree (names, hashes), the layers are sparse, one page's
+  byte range decodes alone, and an `AthlPager` fetches exactly the ranges of
+  the chunks asked for and drops the rest.
 
 `test/unit/atheneaLights.test.ts`: 067's draft read as written; states,
 rules, LED ramp, blackbody colour; blinkers at 90 a minute, repeaters in
@@ -303,10 +311,16 @@ those clouds (same splats, same order): `sparse_layers` + `virtual_values`.
   origin (their midpoint); 076's far-field approximation, and two
   symmetrical lamps, make this close, but a per-polygon frame would be exact.
 - **IES** profiles are read from the `.usda` but not evaluated.
-- **Paging**: `AthlStore` holds chunks and packs what it holds; feeding it
-  from the pager's page events (Range per page, drop on eviction) is not
-  wired: today a paged cloud needs the whole `.athl` decoded and
-  `pageChunks` from `athlPagerChunks`.
+- **Paging** follows the cloud's pages by polling the pager's page table
+  each frame (`athlPagerChunks`), not by events: a page's layers arrive a
+  frame or more after its splats (drawn without the group's layers
+  meanwhile). The `.athl` pages are not part of AA's attribute budget
+  (`attribPaging.ts`); they are small (a few blocks a page) but uncounted.
+- **The relight pass on a paged cloud** dispatches one thread per pool slot:
+  at the default pool (256 pages) that is 65 536 workgroups, one over
+  WebGPU's limit, and the frame is invalid. The example's `?paged=1` uses a
+  16-page pool. The fix belongs in `relightPlugin.ts` (slice the dispatch,
+  or run over the resident pages only).
 - **Frame skip**: a weight change regenerates the splats (the colour is made
   in generate), and the renderer re-sorts with it; nothing else is redone.
 - The floor's additive layer (062 §4) would be its own catcher cloud with its

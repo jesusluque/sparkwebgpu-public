@@ -40,6 +40,7 @@
     //
     //   ?base=<dir>&name=<name>   the three files (default ./athenea-lights/car)
     //   ?state=<state>            start in a state   ?play=<sequence>
+    //   ?paged=1                  page the cloud, and the .athl's layers with it
     //   ?gui=0                    ?view=agx|aces2|standard
     import * as THREE from "three/webgpu";
     import GUI from "lil-gui";
@@ -52,7 +53,10 @@
       atheneaLightsPlugin,
       atheneaOutputPlugin,
       athcCloudHash,
+      athlPagerChunks,
       decodeAthl,
+      openAthl,
+      urlRange,
       lightGroupSwatch,
     } from "@sparkjsdev/spark/webgpu";
 
@@ -94,9 +98,11 @@
     resize();
     addEventListener("resize", resize);
 
-    const spark = new SparkRenderer({ renderer });
+    const paged = params.get("paged") === "1";
+    // Paged: a small pool (the relight pass runs a thread a pool slot).
+    const spark = new SparkRenderer({ renderer, ...(paged ? { maxPagedSplats: 16 * 65536, pagedExtSplats: true } : {}) });
     scene.add(spark);
-    const car = new SplatMesh({ url: `${base}${name}.athc`, extSplats: true });
+    const car = new SplatMesh({ url: `${base}${name}.athc`, extSplats: true, paged });
     scene.add(car);
 
     // A dim night dome: the cloud's base light (TX would go here; this
@@ -107,15 +113,27 @@
     let host = null;
 
     try {
-      const [athc, athl, usda] = await Promise.all([
-        fetch(`${base}${name}.athc`).then((r) => r.arrayBuffer()),
-        fetch(`${base}${name}.lights.athl`).then((r) => r.arrayBuffer()),
+      const athlUrl = `${base}${name}.lights.athl`;
+      const [head, usda] = await Promise.all([
+        urlRange(`${base}${name}.athc`)(0, 4096),
         fetch(`${base}${name}.lights.usda`).then((r) => r.text()),
       ]);
       lights.setSidecar(usda);
-      lights.setLights(car, await decodeAthl(new Uint8Array(athl)), {
-        cloudHash: athcCloudHash(new Uint8Array(athc, 0, Math.min(4096, athc.byteLength))),
-      });
+      const cloudHash = athcCloudHash(head);
+      if (paged) {
+        // Each page's layers by range as the cloud's page comes in.
+        const none = new Uint32Array(256).fill(0xffffffff);
+        lights.setLights(car, await openAthl(urlRange(athlUrl)), {
+          cloudHash,
+          pageChunks: () => {
+            const pager = spark.webgpu?.lod?.pager;
+            return pager && car.paged ? athlPagerChunks(pager, car.paged) : none;
+          },
+        });
+      } else {
+        const athl = await (await fetch(athlUrl)).arrayBuffer();
+        lights.setLights(car, await decodeAthl(new Uint8Array(athl)), { cloudHash });
+      }
       await car.initialized;
       await spark.webgpuReady;
       if (params.get("state")) lights.setLightState(params.get("state"));

@@ -5,6 +5,8 @@
 //
 //   const lights = atheneaLightsPlugin({ sidecar: await (await fetch(usda)).text() });
 //   lights.setLights(car, await decodeAthl(athlBytes), { cloudHash });
+//   // or paged: each page's layers fetched by range as the cloud's page arrives
+//   lights.setLights(car, await openAthl(urlRange(url)), { pageChunks: () => athlPagerChunks(pager, paged) });
 //   host.register(relight).register(lights).register(atheneaOutputPlugin());
 //   lights.setLightState("noche_ciudad");
 //   lights.playSequence("bienvenida");
@@ -33,7 +35,7 @@ import { atheneaAdapterLights as C } from "../generated/constants";
 import { upload } from "../gpuBuffers";
 import type { ControlSpec, PluginFrame, SplatPlugin } from "../plugins/types";
 import type { UniformWriter } from "../uniforms";
-import { ATHL_NONE, type AthlData, AthlStore } from "./athl";
+import { ATHL_NONE, type AthlData, AthlPager, AthlStore } from "./athl";
 import {
   LightRig,
   type LightSidecar,
@@ -97,10 +99,14 @@ export interface AtheneaLightsPlugin extends SplatPlugin {
   /** The frame clock the commands are stamped with (seconds). */
   readonly time: number;
   setSidecar(sidecar: LightSidecar | string): void;
-  /** `asset`'s .athl (a SplatMesh or WgpuSplatMesh); null removes it. */
+  /**
+   * `asset`'s .athl (a SplatMesh or WgpuSplatMesh); null removes it. An
+   * AthlPager (openAthl) fetches the layers of the chunks the cloud holds:
+   * its pages' (`pageChunks`) or, for a whole cloud, all of them.
+   */
   setLights(
     asset: object,
-    athl: AthlData | AthlStore | null,
+    athl: AthlData | AthlStore | AthlPager | null,
     options?: AtheneaLightsAssetOptions,
   ): void;
   storeOf(asset: object): AthlStore | null;
@@ -124,6 +130,7 @@ export interface AtheneaLightsPlugin extends SplatPlugin {
 
 interface AssetLights {
   store: AthlStore;
+  pager: AthlPager | null;
   options: AtheneaLightsAssetOptions;
   gpu: { buffer: GPUBuffer; version: number } | null;
   refused: string | null;
@@ -170,6 +177,7 @@ export function atheneaLightsPlugin(
   initial: AtheneaLightsOptions = {},
 ): AtheneaLightsPlugin {
   const assets = new WeakMap<object, AssetLights>();
+  const paging = new Set<AssetLights>();
   const linear = new WeakMap<object, boolean>();
   const pools = new WeakMap<AttribPool, PoolOnGpu>();
   const warned = new Set<string>();
@@ -541,6 +549,15 @@ export function atheneaLightsPlugin(
     },
     onFrame(frame: PluginFrame) {
       now = frame.time;
+      for (const a of paging) {
+        const chunks = a.options.pageChunks?.();
+        const all = Array.from({ length: a.store.chunkCount }, (_, k) => k);
+        (a.pager as AthlPager).update(
+          chunks
+            ? [...new Set(Array.from(chunks))].filter((c) => c !== ATHL_NONE)
+            : all,
+        );
+      }
       evaluate(now);
       const was = dirty;
       dirty = false;
@@ -558,18 +575,38 @@ export function atheneaLightsPlugin(
       dirty = true;
     },
     setLights(asset, athl, options = {}) {
+      const old = assets.get(asset);
+      if (old) {
+        old.gpu?.buffer.destroy();
+        paging.delete(old);
+        if (old.pager) old.pager.onChange = null;
+      }
       if (!athl) {
-        const a = assets.get(asset);
-        a?.gpu?.buffer.destroy();
         assets.delete(asset);
         dirty = true;
         return;
       }
-      const store = athl instanceof AthlStore ? athl : new AthlStore(athl);
-      const a: AssetLights = { store, options, gpu: null, refused: null };
+      const pager = athl instanceof AthlPager ? athl : null;
+      const store = pager
+        ? pager.store
+        : athl instanceof AthlStore
+          ? athl
+          : new AthlStore(athl as AthlData);
+      const a: AssetLights = {
+        store,
+        pager,
+        options,
+        gpu: null,
+        refused: null,
+      };
       check(a);
       for (const g of store.groups) baked.add(g.name);
-      assets.get(asset)?.gpu?.buffer.destroy();
+      if (pager) {
+        pager.onChange = () => {
+          dirty = true;
+        };
+        paging.add(a);
+      }
       assets.set(asset, a);
       dirty = true;
     },

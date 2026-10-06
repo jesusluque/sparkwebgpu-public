@@ -5,15 +5,18 @@
 //
 // Paging: a .athl's layers are by chunk of 65 536 splats of the cloud's
 // virtual order, the pager's pages, each (chunk, every group) one byte range
-// (athlChunkRanges). An AthlStore holds the chunks fetched so far; dropping
-// a chunk frees it; the packed buffer holds what is held. A whole file
-// is every chunk at once.
+// (athlChunkRange). An AthlStore holds the chunks fetched so far; dropping
+// a chunk frees it; the packed buffer holds what is held. A whole file is
+// every chunk at once; openAthl reads the groups, polygons and profiles
+// first and an AthlPager then fetches the chunks the cloud's pages want.
 
 import {
   athl_header,
+  athl_meta_bytes,
   athl_prefix_bytes,
   decode_athl,
   decode_athl_layer,
+  decode_athl_meta,
 } from "spark-rs";
 import * as wasm from "../../wasm";
 
@@ -350,4 +353,100 @@ export class AthlStore {
     });
     return out;
   }
+}
+
+export type RangeFetch = (start: number, end: number) => Promise<Uint8Array>;
+
+/** A range fetch of `url` (HTTP Range; [start, end)). */
+export function urlRange(url: string): RangeFetch {
+  return async (start, end) => {
+    const r = await fetch(url, {
+      headers: { Range: `bytes=${start}-${end - 1}` },
+    });
+    if (!r.ok) throw new Error(`.athl: ${url} ${r.status}`);
+    const b = new Uint8Array(await r.arrayBuffer());
+    // A server without ranges sends the whole file.
+    return r.status === 206 ? b : b.subarray(start, end);
+  };
+}
+
+/**
+ * Keeps an AthlStore holding the chunks a cloud wants (its resident
+ * pages'), fetching each missing one by its byte range and dropping those
+ * no longer wanted.
+ */
+export class AthlPager {
+  /** Fetches in flight. */
+  pending = 0;
+  /** At most this many fetches at once. */
+  concurrency = 2;
+  private wanted = new Set<number>();
+  private inFlight = new Set<number>();
+  private failed = new Set<number>();
+  onChange: (() => void) | null = null;
+
+  constructor(
+    readonly store: AthlStore,
+    readonly header: AthlHeader,
+    readonly fetchRange: RangeFetch,
+  ) {}
+
+  /** The chunks to hold from now on. */
+  update(chunks: Iterable<number>) {
+    this.wanted = new Set(chunks);
+    for (const c of this.store.heldChunks) {
+      if (!this.wanted.has(c)) {
+        this.store.dropChunk(c);
+        this.onChange?.();
+      }
+    }
+    const held = new Set(this.store.heldChunks);
+    for (const c of this.wanted) {
+      if (this.pending >= this.concurrency) break;
+      if (held.has(c) || this.inFlight.has(c) || this.failed.has(c)) continue;
+      const range = athlChunkRange(this.header, c);
+      if (!range) continue; // no group reaches this page
+      this.inFlight.add(c);
+      this.pending += 1;
+      this.fetchRange(range[0], range[1])
+        .then((bytes) => decodeAthlChunk(this.header, c, bytes, range[0]))
+        .then((layers) => {
+          // Still wanted: a page can leave while its layers travel.
+          if (this.wanted.has(c)) {
+            this.store.addLayers(layers);
+            this.onChange?.();
+          }
+        })
+        .catch((e) => {
+          this.failed.add(c);
+          console.warn(`athl: chunk ${c}: ${e}`);
+        })
+        .finally(() => {
+          this.inFlight.delete(c);
+          this.pending -= 1;
+          this.update(this.wanted);
+        });
+    }
+  }
+
+  /** Resolves when nothing wanted is still to fetch. */
+  async settled(): Promise<void> {
+    while (this.pending > 0) await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/**
+ * Opens a .athl for paging: its header, then its groups, polygons and
+ * profiles (one range); no layers until an AthlPager asks for them.
+ */
+export async function openAthl(fetchRange: RangeFetch): Promise<AthlPager> {
+  await wasm.initialization;
+  let prefix = await fetchRange(0, 4096);
+  const need = athl_prefix_bytes(prefix.slice(0, 128));
+  if (need > prefix.length) prefix = await fetchRange(0, need);
+  const header = athl_header(prefix) as AthlHeader;
+  const meta = athl_meta_bytes(prefix);
+  if (meta > prefix.length) prefix = await fetchRange(0, meta);
+  const data = decode_athl_meta(prefix) as AthlData;
+  return new AthlPager(new AthlStore(data), header, fetchRange);
 }

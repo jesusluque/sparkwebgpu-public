@@ -193,63 +193,6 @@
                 ${outputs.gsplat}.scales = currentScale;
               }
             `),
-            // WebGPU runs dynos as WGSL: the same code, translated, with the
-            // impulse loop unrolled over the inputs.
-            wgsl: {
-              globals: () => [
-                dyno.unindent(/* wgsl */ `
-                fn holeHash(p: vec3f) -> f32 { return fract(sin(dot(p, vec3f(127.1, 311.7, 74.7))) * 43758.5453); }
-
-                fn simulatePhysics(originalPos: vec3f, dropTime: f32, gravity: f32, damping: f32, floorLevel: f32, friction: f32, explosionStrength: f32) -> vec3f {
-                  let timeVariation = holeHash(originalPos + vec3f(42.0)) * 0.2 - 0.1;
-                  let t = max(0.0, dropTime + timeVariation);
-
-                  let initialVelocity = vec3f(
-                    (holeHash(originalPos + vec3f(1.0)) - 0.5) * explosionStrength * (0.3 + holeHash(originalPos + vec3f(10.0)) * 0.4),
-                    abs(holeHash(originalPos + vec3f(3.0))) * explosionStrength * (0.8 + holeHash(originalPos + vec3f(20.0)) * 0.4) + 0.5,
-                    (holeHash(originalPos + vec3f(2.0)) - 0.5) * explosionStrength * (0.3 + holeHash(originalPos + vec3f(30.0)) * 0.4)
-                  );
-
-                  let frictionDecay = pow(friction, t * 60.0);
-                  var position = originalPos;
-                  position.x += initialVelocity.x * (1.0 - frictionDecay) / (1.0 - friction) / 60.0;
-                  position.z += initialVelocity.z * (1.0 - frictionDecay) / (1.0 - friction) / 60.0;
-                  position.y += initialVelocity.y * t - 0.5 * gravity * t * t;
-
-                  if (position.y <= floorLevel) {
-                    let bounceTime = t;
-                    let bounceCount = floor(bounceTime * 3.0);
-                    let timeSinceBounce = bounceTime - bounceCount / 3.0;
-                    let bounceHeight = initialVelocity.y * pow(damping, bounceCount) * max(0.0, 1.0 - timeSinceBounce * 3.0);
-                    if (bounceHeight > 0.1) {
-                      position.y = floorLevel + abs(sin(timeSinceBounce * 3.14159 * 3.0)) * bounceHeight;
-                    } else {
-                      position.y = floorLevel;
-                      let scatterFactor = holeHash(originalPos + vec3f(50.0)) * 0.2;
-                      position.x += (holeHash(originalPos + vec3f(60.0)) - 0.5) * scatterFactor;
-                      position.z += (holeHash(originalPos + vec3f(70.0)) - 0.5) * scatterFactor;
-                    }
-                  }
-                  return position;
-                }
-              `),
-              ],
-              statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-                ${outputs.gsplat} = ${inputs.gsplat};
-                let originalPos = ${inputs.gsplat}.center;
-                var maskUnion = 0.0;
-                var tMax = 0.0;
-                ${Array.from({ length: MAX_IMPULSES }, (_, i) =>
-                  `{ let m = select(0.0, step(distance(originalPos, ${inputs[`clickCenter${i}`]}), ${inputs[`clickRadius${i}`]}), ${inputs[`clickActive${i}`]} > 0.5); maskUnion = max(maskUnion, m); tMax = max(tMax, max(0.0, ${inputs.time} - ${inputs[`clickStart${i}`]}) * m); }`
-                ).join('\n                ')}
-                if (maskUnion > 0.0) {
-                  let physicsPos = simulatePhysics(originalPos, tMax, ${inputs.gravity}, ${inputs.bounceDamping}, ${inputs.floorLevel}, ${inputs.friction}, ${inputs.explosionStrength});
-                  let factor = exp(-tMax * ${inputs.shrinkSpeed});
-                  ${outputs.gsplat}.center = physicsPos;
-                  ${outputs.gsplat}.scales = mix(${inputs.gsplat}.scales, vec3f(0.005), 1.0 - factor);
-                }
-              `),
-            },
           });
           // Generate apply parameters dynamically
           const applyParams = {

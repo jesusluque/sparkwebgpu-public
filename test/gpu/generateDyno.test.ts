@@ -145,6 +145,36 @@ describe.skipIf(!device)("generate.slang with dyno", () => {
     }
   });
 
+  it("runs GLSL object modifiers, translated to WGSL", async () => {
+    const glslModifier = d.dynoBlock(
+      { gsplat: d.Gsplat },
+      { gsplat: d.Gsplat },
+      ({ gsplat }) => ({
+        gsplat: new d.Dyno({
+          inTypes: { gsplat: d.Gsplat, offset: "vec3" },
+          outTypes: { gsplat: d.Gsplat },
+          inputs: { gsplat, offset },
+          globals: () => [
+            "vec3 lift(vec3 p, vec3 o) {\n  p.yz += o.yz;\n  return p;\n}",
+          ],
+          statements: ({ inputs, outputs }) => [
+            `${outputs.gsplat} = ${inputs.gsplat};`,
+            `${outputs.gsplat}.center = lift(${inputs.gsplat}.center, ${inputs.offset});`,
+            `${outputs.gsplat}.rgba.rg = vec2(1.0, ${inputs.gsplat}.rgba.g);`,
+          ],
+        }).outputs.gsplat,
+      }),
+    );
+    const { splat } = await run({}, { objectModifiers: [glslModifier] });
+    for (const i of [0, 17, N - 1]) {
+      const s = splat(i);
+      const e = toWorld(new THREE.Vector3(i * 0.01, 2, -2));
+      expect(s.center.distanceTo(e)).toBeLessThan(1e-3);
+      expect(s.color.r).toBeCloseTo(1, 2);
+      expect(s.color.g).toBeCloseTo(0.5, 2);
+    }
+  });
+
   it("applies world modifiers after it, and drops deactivated splats", async () => {
     const fade = d.dynoFloat(0.5);
     const worldModifier = d.dynoBlock(

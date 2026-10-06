@@ -195,29 +195,6 @@
 
               ${outputs.gsplat}.center = originalPos;
             `),
-            // WebGPU runs dynos as WGSL: the same code, translated.
-            wgsl: {
-              statements: ({ inputs, outputs }) =>
-                dyno.unindentLines(/* wgsl */ `
-                ${outputs.gsplat} = ${inputs.gsplat};
-                var originalPos = ${inputs.gsplat}.center;
-
-                let distToDrag = distance(originalPos, ${inputs.dragPoint});
-                let dragInfluence = 1.0 - smoothstep(0.0, ${inputs.dragRadius} * 2.0, distToDrag);
-                let time = ${inputs.bounceTime};
-
-                if (${inputs.dragActive} > 0.5 && ${inputs.dragRadius} > 0.0) {
-                  let dragOffset = ${inputs.dragDisplacement} * dragInfluence * ${inputs.dragIntensity} * 50.0;
-                  originalPos += dragOffset;
-                }
-
-                let bounceFrequency = 1.0 + ${inputs.bounceSpeed} * 8.0;
-                let bounceOffset = ${inputs.bounceBaseDisplacement} * dragInfluence * ${inputs.dragIntensity} * 50.0;
-                originalPos += bounceOffset * cos(time * bounceFrequency) * exp(-time * 2.0 * (1.0 - ${inputs.bounceAmount} * 0.9));
-
-                ${outputs.gsplat}.center = originalPos;
-              `),
-            },
           });
 
           return {

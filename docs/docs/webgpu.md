@@ -91,27 +91,29 @@ These throw or warn on WebGPU:
 
 ## Custom dynos
 
-Built-in dynos and modifiers already have WGSL. A `Dyno` with hand-written GLSL needs WGSL too: pass `wgsl: { globals, statements }` next to the GLSL, with the same inputs and outputs.
+Built-in dynos and modifiers already have WGSL. A `Dyno` with hand-written GLSL (`new dyno.Dyno({ globals, statements })` or `dyno.dyno(...)`) runs on WebGPU as it is: its GLSL is translated to WGSL when the graph compiles.
 
 ```typescript
 const effect = new dyno.Dyno({
   inTypes: { gsplat: dyno.Gsplat, t: "float" },
   outTypes: { gsplat: dyno.Gsplat },
+  globals: () => [dyno.unindent(`
+    vec3 wave(vec3 p, float t) {
+      p.xz *= 1.0 + 0.1 * sin(t + p.y);
+      return p;
+    }
+  `)],
   statements: ({ inputs, outputs }) => dyno.unindentLines(`
     ${outputs.gsplat} = ${inputs.gsplat};
-    ${outputs.gsplat}.center.y += sin(${inputs.t});
+    ${outputs.gsplat}.center = wave(${inputs.gsplat}.center, ${inputs.t});
   `),
-  wgsl: {
-    statements: ({ inputs, outputs }) => dyno.unindentLines(`
-      ${outputs.gsplat} = ${inputs.gsplat};
-      ${outputs.gsplat}.center.y += sin(${inputs.t});
-    `),
-  },
 });
 // In a modifier: gsplat = effect.apply({ gsplat, t }).gsplat;
 ```
 
-Much GLSL is valid WGSL once constructor names change, which the backend does for you, but local declarations (`let`/`var`), `?:` (`select`), out parameters and some built-ins differ. A graph that fails to compile drops its mesh and logs the WGSL error with the offending line. `splat-shader-effects.html` and the other ported examples show WGSL versions of their GLSL dynos.
+The translator takes the GLSL ES 3.0 that dynos use: scalar, vector, matrix, struct and array types; functions with `in`/`out`/`inout` parameters and overloads; `const` and global variables; swizzles, including assignments to them; `?:`, compound assignments, `++`/`--`; `if`, `for`, `while`, `do`, `switch`, `break`, `continue`, `return` (a bare `return;` in statements returns the graph's output); object-like `#define`s; and the built-in functions, with GLSL's `mod`, `smoothstep`, `atan(y, x)`, `modf` and the rest mapped to their WGSL equivalents. `texture`, `textureLod`, `texelFetch` and `textureSize` work on sampler inputs, with `texture` sampling level 0, since dynos run in compute shaders. Uniform arrays (a `DynoUniform` with a `count`) and the `Gsplat`, `CovSplat` and splatDefines helpers are available.
+
+What it doesn't cover fails the compile with the line, column and construct: derivatives (`dFdx`, `fwidth`), `discard`, `uniform` declarations and preprocessor conditionals, `?:` on structs, assignments inside expressions, `switch` fallthrough, and out arguments that aren't local variables. Only plain `Dyno`s are translated: a subclass of `Dyno` (or a dyno that needs WGSL of its own) gives `wgsl: { globals, statements }` next to the GLSL, with the same inputs and outputs. A graph that fails to compile drops its mesh and logs the error.
 
 ## Limits
 

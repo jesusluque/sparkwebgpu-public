@@ -894,7 +894,7 @@ function dataTexture(
   t.needsUpdate = true;
   return t;
 }
-const uTex = dataTexture(
+export const uTex = dataTexture(
   Uint32Array.from({ length: 4 * 4 * 3 }, (_, i) => i * 3),
   4,
   3,
@@ -909,7 +909,7 @@ const fTex = dataTexture(
   THREE.FloatType,
 );
 // Two texels, 0 and 255 in red, linearly filtered.
-const bTex = dataTexture(
+export const bTex = dataTexture(
   new Uint8Array([0, 0, 0, 255, 255, 0, 0, 255]),
   2,
   1,

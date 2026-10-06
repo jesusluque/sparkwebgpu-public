@@ -12,7 +12,7 @@
 // become texture (and sampler) bindings. All in one bind group.
 
 import {
-  type Dyno,
+  Dyno,
   type DynoBackend,
   DynoBlock,
   type DynoGenerated,
@@ -81,6 +81,21 @@ export interface WgslUniformField {
   uniform: { value: unknown };
 }
 
+export type GlslTranslatorFn = (
+  dyno: Dyno<IOTypes, IOTypes>,
+  context: GenerateContext<IOTypes, IOTypes>,
+  backend: WgslBackend,
+) => DynoGenerated;
+
+// The GLSL to WGSL translator (glslToWgsl.ts) lives in the WebGPU chunk,
+// which registers it, while this module is in the main bundle.
+let glslTranslator: GlslTranslatorFn | undefined;
+
+/** @internal Set by glslToWgsl.ts. */
+export function registerGlslTranslator(translator: GlslTranslatorFn) {
+  glslTranslator = translator;
+}
+
 // Struct types dyno uniforms may have (e.g. SplatEdit's SdfArray), by name.
 const structs = new Map<string, Record<string, DynoType>>();
 
@@ -95,6 +110,13 @@ export function registerWgslStruct(
   fields: Record<string, DynoType>,
 ) {
   structs.set(type.type, fields);
+}
+
+/** Fields of a struct type registered with registerWgslStruct. */
+export function wgslStructFields(
+  type: string,
+): Record<string, DynoType> | undefined {
+  return structs.get(type);
 }
 
 /** The texture binding for `field` of a struct uniform (an input's value). */
@@ -159,6 +181,8 @@ export class WgslBackend implements DynoBackend {
   private ownGlobals = new Set<string>();
   private blockBytes = 0;
   private nextBinding = 1;
+  /** What a bare `return;` in dyno GLSL returns (the graph's output). */
+  returnValue?: string;
 
   /** Bind group of the uniform block (binding 0) and textures. */
   constructor(readonly group = 1) {}
@@ -179,6 +203,11 @@ export class WgslBackend implements DynoBackend {
         if (!wgslGlobals.has(g)) this.ownGlobals.add(g);
       }
       return result;
+    }
+    // Plain dynos (new Dyno, dyno()) carry user GLSL: translate it. Op
+    // classes' GLSL is valid WGSL once constructor names are mapped.
+    if (glslTranslator && Object.getPrototypeOf(dyno) === Dyno.prototype) {
+      return glslTranslator(dyno, context, this);
     }
     const result = dyno.generate(context);
     if (dyno instanceof DynoBlock) return result;
@@ -203,6 +232,11 @@ export class WgslBackend implements DynoBackend {
 
   resolve(name: string): string {
     return this.aliases.get(name) ?? name;
+  }
+
+  /** Whether a global is already WGSL (from emitters and dyno.wgsl). */
+  isWgslGlobal(global: string): boolean {
+    return this.ownGlobals.has(global);
   }
 
   /** Marks a global as WGSL, for emitters that build them on the fly. */

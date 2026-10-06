@@ -88,9 +88,12 @@
     scene.add(new THREE.AmbientLight(0xffffff, 1));
     scene.add(new THREE.DirectionalLight(0xffffff, 1));
 
+    // WebGPU's clip z is 0..1, WebGL's -1..1: map it to WebGL's, so the
+    // GLSL below (z01 = 0.5 * z / w + 0.5) runs unchanged.
+    const toWebGLClip = new THREE.Matrix4().set(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, -1, 0, 0, 0, 1);
     const worldToProj = new dyno.DynoMat4({
       value: new THREE.Matrix4(),
-      update: (matrix) => matrix.copy(camera.matrixWorld).invert().premultiply(camera.projectionMatrix),
+      update: (matrix) => matrix.copy(camera.matrixWorld).invert().premultiply(camera.projectionMatrix).premultiply(toWebGLClip),
     });
     const minAlpha = 0.1;
 
@@ -129,28 +132,6 @@
             ${outputs.gsplat}.rgba.a = 1.0;
           }
         `),
-        // The same in WGSL. WebGPU's clip z is already 0..1 (and equals
-        // WebGL's 0.5 * z + 0.5 for the same near and far).
-        wgsl: {
-          globals: () => [dyno.unindent(/* wgsl */ `
-            fn packDepthToRGB(v: f32) -> vec3f {
-              if (v <= 0.0) { return vec3f(0.0); }
-              if (v >= 1.0) { return vec3f(1.0); }
-              let bf = fract(v * 65536.0);
-              let x = floor(v * 65536.0) / 256.0;
-              return vec3f(floor(x) / 255.0, fract(x) * 256.0 / 255.0, bf);
-            }
-          `)],
-          statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-            ${outputs.gsplat}.flags = 0u;
-            if (isGsplatActive(${inputs.gsplat}.flags) && (${inputs.gsplat}.rgba.a > ${minAlpha})) {
-              ${outputs.gsplat} = ${inputs.gsplat};
-              let projCenter = ${inputs.worldToProj} * vec4f(${outputs.gsplat}.center, 1.0);
-              let z01 = projCenter.z / projCenter.w;
-              ${outputs.gsplat}.rgba = vec4f(packDepthToRGB(z01), 1.0);
-            }
-          `),
-        },
       }).outputs;
       return { gsplat: outputs.gsplat };
     });

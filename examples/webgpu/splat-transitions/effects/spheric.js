@@ -142,63 +142,6 @@ export async function init({ THREE: _THREE, scene, camera, renderer, spark }) {
           ${outputs.gsplat}.rgba.a = 0.0;
         }
       `),
-      // WebGPU runs dynos as WGSL: the same code, translated.
-      wgsl: {
-        globals: () => [
-          dyno.unindent(/* wgsl */ `
-          fn applyCenter(center: vec3f, t: f32, spereRadius: f32, sphereHeight: f32) -> vec3f {
-            let heightModifier = 0.5 + 0.5 * pow(abs(1.0 - 2.0 * t), 0.2);
-            let targetCenter = vec3f(0.0, heightModifier * sphereHeight, 0.0);
-            let dir = normalize(center - targetCenter);
-            let targetPoint = targetCenter + dir * spereRadius;
-            if (t < 0.25 || t > 0.75) {
-              return center;
-            } else if (t < 0.45) {
-              return mix(center, targetPoint, pow((t - 0.25) * 5.0, 4.0));
-            } else if (t < 0.55) {
-              let churn = 0.1;
-              let transitionT = (t - 0.45) * 10.0;
-              let angle = transitionT * 2.0 * PI;
-              let rotvec = vec3f(sin(angle), 0.0, cos(angle));
-              let strength = sin(transitionT * PI);
-              return targetPoint + cross(dir, rotvec) * churn * strength;
-            } else {
-              return mix(targetPoint, center, pow((t - 0.55) * 5.0, 4.0));
-            }
-          }
-          fn applyScale(scales: vec3f, t: f32, targetScale: f32) -> vec3f {
-            let targetScales = targetScale * vec3f(1.0);
-            if (t < 0.25) { return scales; }
-            else if (t < 0.45) { return mix(scales, targetScales, pow((t - 0.25) * 5.0, 2.0)); }
-            else if (t < 0.55) { return targetScales; }
-            else if (t < 0.75) { return mix(targetScales, scales, pow((t - 0.55) * 5.0, 2.0)); }
-            else { return scales; }
-          }
-          fn applyOpacity(opacity: f32, t: f32, fadeIn: bool) -> f32 {
-            if (fadeIn) {
-              if (t < 0.4) { return 0.0; }
-              else if (t < 0.6) { return mix(0.0, opacity, pow((t - 0.4) * 5.0, 2.0)); }
-              else { return opacity; }
-            } else {
-              if (t < 0.4) { return opacity; }
-              else if (t < 0.6) { return mix(opacity, 0.0, pow((t - 0.4) * 5.0, 2.0)); }
-              else { return 0.0; }
-            }
-          }
-        `),
-        ],
-        statements: ({ inputs, outputs }) =>
-          dyno.unindentLines(/* wgsl */ `
-          ${outputs.gsplat} = ${inputs.gsplat};
-          ${outputs.gsplat}.center = applyCenter(${inputs.gsplat}.center, ${inputs.t}, ${inputs.spereRadius}, ${inputs.sphereHeight});
-          ${outputs.gsplat}.scales = applyScale(${inputs.gsplat}.scales, ${inputs.t}, ${inputs.splatScale});
-          if (${inputs.inTransition}) {
-            ${outputs.gsplat}.rgba.a = applyOpacity(${inputs.gsplat}.rgba.a, ${inputs.t}, ${inputs.fadeIn});
-          } else {
-            ${outputs.gsplat}.rgba.a = 0.0;
-          }
-        `),
-      },
     });
   }
 

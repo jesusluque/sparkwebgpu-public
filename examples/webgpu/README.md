@@ -89,10 +89,12 @@ things:
   black. `render()` does nothing before `await renderer.init()`, but
   `setAnimationLoop` waits for init. Apps that render on demand should await
   `init()` first (see `on-demand.html`).
-- **Custom dyno code.** Dynos with hand-written GLSL also need WGSL: pass
-  `wgsl: { globals, statements }` to `new dyno.Dyno(...)`. See
-  `splat-shader-effects.html`. Built-in dynos and modifiers already have both.
-  A graph that fails to compile drops its mesh and logs the error.
+- **Custom dyno code.** Dynos with hand-written GLSL run as they are: their
+  GLSL is translated to WGSL (see `splat-shader-effects.html` and the other
+  ports, which keep their original GLSL). What the translator doesn't cover
+  fails with the GLSL line and column; such a dyno can pass
+  `wgsl: { globals, statements }` to `new dyno.Dyno(...)`. A graph that fails
+  to compile drops its mesh and logs the error.
 - **three's ShaderMaterial objects.** `ShaderMaterial` objects such as `Sky`
   have node equivalents (`SkyMesh`; see `sogs.html`).
 - **Large paged scenes.** The page pool is limited by the device's
@@ -196,6 +198,9 @@ compacted sort mostly helps when many active splats are off screen.
 
 ## Examples
 
+The ports with GLSL dynos keep the original GLSL; WebGPU translates it to
+WGSL (src/dyno/wgsl/glslToWgsl.ts).
+
 | Example | Changed besides the renderer | Mean diff vs WebGL (/255) |
 |---|---|---|
 | hello-world.html | – | 0.03 |
@@ -209,31 +214,31 @@ compacted sort mostly helps when many active splats are off screen.
 | streaming-lod.html | adapter storage limits | 0.82 (fully streamed) |
 | depth-of-field.html | – | 0.97 |
 | on-demand.html | `await renderer.init()`, adapter storage limits | 0.74 (fully streamed) |
-| splat-shader-effects.html | WGSL for its GLSL dyno | 0.46 |
+| splat-shader-effects.html | – (GLSL dyno translated) | 0.72 |
 | procedural-splats.html | – | random stars differ |
 | sogs.html | `SkyMesh` for `Sky` | 0.97 |
 | debug-color.html, lod-on-demand.html | – | 0.13, 0.23 |
 | particle-animation.html | – | 3.09 (time-driven noise) |
-| glsl.html | WGSL for its GLSL dynos, opaque clear color | 0.16 |
+| glsl.html | opaque clear color | 0.14 |
 | dynamic-lighting.html (lighting on, debug SDFs) | – | 0.22, 0.23 |
 | mobile-joystick.html (still, after look + walk) | opaque clear color | 0.36, 0.38 |
 | multiple-viewpoints.html (still, turning) | the screens' map and UVs (three, see above) | 0.02, 0.05 |
-| interactive-deform.html (still, drag, bounce, rotate) | WGSL for its GLSL dyno, main.js inlined | 0.08, 0.09, 0.09, 0.09 |
-| interactive-ripples.html (still, 30 and 90 frames after a click) | WGSL for its GLSL dyno, main.js inlined | 0.33, 0.33, 0.34 |
-| interactive-holes.html (still, 1 click, 5 clicks, reset) | WGSL for its GLSL dyno (impulse loop unrolled) | 0.50, 0.57, 0.63, 0.50 |
-| splat-dissolve-effects.html (t = 0, 10, 40 s) | WGSL for its GLSL dyno, opaque clear color | 0.15, 0.39, 0.38 |
-| splat-reveal-effects.html (Magic, Spread, Unroll, Twister, Rain) | WGSL for its GLSL dyno, opaque clear color | 0.36, 0.41, 0.34, 1.51, 2.38 (fast particles) |
-| lofi.html (default, next/prev world, bad weather, mid-transition) | WGSL for its 4 GLSL dynos | 0.56, 1.18, 0.98, 1.01, 0.83 |
-| splat-transitions.html (spherical, explosion, flow, morph; 11 states) | WGSL for its GLSL dynos | 0.08–0.39 |
+| interactive-deform.html (still, drag, bounce, rotate) | main.js inlined | 0.08, 0.10, 0.09, 0.12 |
+| interactive-ripples.html (still, 30 and 90 frames after a click) | main.js inlined | 0.33, 0.33, 0.34 |
+| interactive-holes.html (still, 1 click, 5 clicks, reset) | – | 0.52, 0.68, 0.65, 0.52 |
+| splat-dissolve-effects.html (t = 0, 10, 40 s) | opaque clear color | 0.15, 0.39, 0.32 |
+| splat-reveal-effects.html (Magic, Spread, Unroll, Twister, Rain) | opaque clear color | 0.11, 0.41, 0.36, 2.40, 2.34 (fast particles) |
+| lofi.html (default, next/prev world, bad weather, mid-transition) | – | 0.58, 0.76, 0.32, 1.02, 0.84 |
+| splat-transitions.html (spherical, explosion, flow, morph; 11 states) | – | 0.12–0.39 |
 
 `spark-renderer.html` puts a cube through a splat mesh. Use
 `?backend=webgl` for the WebGL version, `&mode=target` or `&mode=post` for the
 in-pass paths, and `&msaa=1` for antialiasing.
 | particle-simulation.html | – | 0.20 (clock at 0) |
-| splat-flow.html | WGSL for its transition dyno | 0.32, 0.25 mid-transition |
+| splat-flow.html | – | 0.09, 0.42 moving |
 | viewer.html (`?url=`, file input) | clear colour | 0.48, 0.17 |
 | splat-painter.html (paint, erase, undo strokes) | `spark.getRgba` for `RgbaArray.render` | 0.57; exported SPZ: same splats, 88 bytes of 40 MB differ |
-| render-cube-depth.html (depth on) | WGSL dyno, TSL depth material, linear output + `rawColor` in depth mode | 1.05 off, 6.13 on (low packed-depth bits); cube readback means within 0.3/255 |
+| render-cube-depth.html (depth on) | clip z mapped to WebGL's for the dyno, TSL depth material, linear output + `rawColor` in depth mode | 1.05 off, 6.01 on (low packed-depth bits); cube readback means within 0.3/255 |
 | portal.html | no fragmentShader (built-in disk clip) | 0.32 (local assets substituted) |
 | newportal.html | adapter storage limits | 0.33 with a non-paged scene; paged LoD streams differently |
 | splat-portal.html (+ splat-portal/main.js) | TSL portal material | 0.58 |

@@ -85,22 +85,6 @@
         ${outputs.gsplat} = ${inputs.gsplat};
         ${outputs.gsplat}.rgba.rgb *= waveRgb(${inputs.gsplat}.center);
       `),
-      // WebGPU runs dynos as WGSL: the same code, translated.
-      wgsl: {
-        globals: () => [dyno.unindent(/* wgsl */ `
-          fn waveRgb(pos: vec3f) -> vec3f {
-            return vec3f(
-              0.6 + 0.4 * sin(pos.x * 56.0),
-              0.6 + 0.4 * sin(pos.y * 78.0),
-              0.6 + 0.4 * cos(pos.z * 90.0)
-            );
-          }
-        `)],
-        statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-          ${outputs.gsplat} = ${inputs.gsplat};
-          ${outputs.gsplat}.rgba = vec4f(${inputs.gsplat}.rgba.rgb * waveRgb(${inputs.gsplat}.center), ${inputs.gsplat}.rgba.a);
-        `),
-      },
     });
 
     // Inject DynoBlock with embedded GLSL shader that uses an external
@@ -133,24 +117,6 @@
             ${outputs.gsplat} = ${inputs.gsplat};
             ${outputs.gsplat}.center = warp(${inputs.gsplat}.center, ${inputs.t});
           `),
-          wgsl: {
-            globals: () => [
-              dyno.unindent(/* wgsl */ `
-                fn warpRadial(r: f32, t: f32) -> f32 {
-                  return r * (1.0 + 0.1 * sin(r * 15.0 + t * 3.0));
-                }
-                fn warp(pos: vec3f, t: f32) -> vec3f {
-                  let r = length(pos);
-                  let newR = warpRadial(r, t);
-                  return pos * (newR / r);
-                }
-              `)
-            ],
-            statements: ({ inputs, outputs }) => dyno.unindentLines(/* wgsl */ `
-              ${outputs.gsplat} = ${inputs.gsplat};
-              ${outputs.gsplat}.center = warp(${inputs.gsplat}.center, ${inputs.t});
-            `),
-          },
         });
         // Apply the GLSL block with appropriate inputs and return the output
         gsplat = d.apply({ gsplat, t: animateT }).gsplat;

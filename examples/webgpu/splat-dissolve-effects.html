@@ -101,39 +101,6 @@
 						// Slow fade out
 						${outputs.gsplat}.rgba.w *= mix(1.0, 1.0 - clamp(moveAmount / 2.0, 0.0, 1.0), shouldOscillate);
 			  	`),
-				// WebGPU runs dynos as WGSL: the same code, translated.
-				wgsl: {
-					globals: () => [
-						dyno.unindent(/* wgsl */ `
-							fn fx_hash(p: vec3f) -> vec3f {
-								return fract(sin(p * 123.456) * 123.456);
-							}
-						`),
-					],
-					statements: ({ inputs, outputs }) =>
-						dyno.unindentLines(/* wgsl */ `
-							${outputs.gsplat} = ${inputs.gsplat};
-							let localPos = ${inputs.gsplat}.center;
-							let hashVal = fx_hash(localPos);
-							let startTime = hashVal.x * 100.0;
-							let shouldOscillate = step(startTime, ${inputs.t});
-							let oscillation = sin(${inputs.t} * 2.0 + hashVal.y * 6.28) * 0.5 + 0.5; // 0 to 1
-							let whiteColor = vec4f(1.0, 1.0, 1.0, 1.0);
-							let moveDirection = normalize(vec3f(
-								1.0,
-								(hashVal.y - 0.5) * 0.9,
-								(hashVal.z - 0.5) * 0.9
-							));
-							let randomSpeed = fract(sin(dot(${inputs.gsplat}.center, vec3f(12.0, 78.0, 45.0))) * 43758.0);
-							let moveAmount = ${inputs.t} * 0.1 * randomSpeed * shouldOscillate;
-							${outputs.gsplat}.center = ${inputs.gsplat}.center + moveDirection * moveAmount;
-							${outputs.gsplat}.rgba = mix(${inputs.gsplat}.rgba,
-								mix(${inputs.gsplat}.rgba, whiteColor, oscillation),
-								shouldOscillate);
-							// Slow fade out
-							${outputs.gsplat}.rgba.w *= mix(1.0, 1.0 - clamp(moveAmount / 2.0, 0.0, 1.0), shouldOscillate);
-						`),
-				},
 			});
 
 			gsplat = d.apply({

@@ -48,11 +48,6 @@ export async function init({ THREE: _THREE, scene, camera, renderer, spark }) {
   const uBirthTime = dyno.dynoFloat(0.0);
   const uBirthDuration = dyno.dynoFloat(0.5);
 
-  // Shared by both dynos' WGSL; a global given once per program.
-  const HASH_WGSL = dyno.unindent(/* wgsl */ `
-    fn hash(p: vec3f) -> f32 { return fract(sin(dot(p, vec3f(127.1, 311.7, 74.7))) * 43758.5453); }
-  `);
-
   function createDeathDynoshader() {
     return dyno.dynoBlock(
       { gsplat: dyno.Gsplat },
@@ -149,79 +144,6 @@ export async function init({ THREE: _THREE, scene, camera, renderer, spark }) {
             ${outputs.gsplat}.center = finalPos;
             ${outputs.gsplat}.scales = finalScale;
           `),
-          // WebGPU runs dynos as WGSL: the same code, translated.
-          wgsl: {
-            globals: () => [
-              HASH_WGSL,
-              dyno.unindent(/* wgsl */ `
-              fn simulatePhysics(originalPos: vec3f, dropTime: f32, progress: f32, gravity: f32, damping: f32, floorLevel: f32, randomOffset: f32, friction: f32, explosionStrength: f32) -> vec3f {
-                if (progress <= 0.0) { return originalPos; }
-                let timeVariation = hash(originalPos + vec3f(42.0)) * 0.2 - 0.1;
-                let t = max(0.0, dropTime + timeVariation);
-                let initialVelocity = vec3f(
-                  (hash(originalPos + vec3f(1.0)) - 0.5) * explosionStrength * (0.3 + hash(originalPos + vec3f(10.0)) * 0.4),
-                  abs(hash(originalPos + vec3f(3.0))) * explosionStrength * (0.8 + hash(originalPos + vec3f(20.0)) * 0.4) + 0.5,
-                  (hash(originalPos + vec3f(2.0)) - 0.5) * explosionStrength * (0.3 + hash(originalPos + vec3f(30.0)) * 0.4)
-                );
-                let frictionDecay = pow(friction, t * 60.0);
-                var position = originalPos;
-                position.x += initialVelocity.x * (1.0 - frictionDecay) / (1.0 - friction) / 60.0;
-                position.z += initialVelocity.z * (1.0 - frictionDecay) / (1.0 - friction) / 60.0;
-                position.y += initialVelocity.y * t - 0.5 * gravity * t * t;
-                if (position.y <= floorLevel) {
-                  let bounceTime = t;
-                  let bounceCount = floor(bounceTime * 3.0);
-                  let timeSinceBounce = bounceTime - bounceCount / 3.0;
-                  let bounceHeight = initialVelocity.y * pow(damping, bounceCount) * max(0.0, 1.0 - timeSinceBounce * 3.0);
-                  if (bounceHeight > 0.1) {
-                    position.y = floorLevel + abs(sin(timeSinceBounce * 3.14159 * 3.0)) * bounceHeight;
-                  } else {
-                    position.y = floorLevel;
-                    let scatterFactor = hash(originalPos + vec3f(50.0)) * 0.2;
-                    position.x += (hash(originalPos + vec3f(60.0)) - 0.5) * scatterFactor;
-                    position.z += (hash(originalPos + vec3f(70.0)) - 0.5) * scatterFactor;
-                  }
-                }
-                return position;
-              }
-              fn elegantReform(currentPos: vec3f, originalPos: vec3f, reformTime: f32, duration: f32) -> vec3f {
-                if (reformTime <= 0.0) { return currentPos; }
-                if (reformTime >= duration) { return originalPos; }
-                let progress = reformTime / duration;
-                return mix(currentPos, originalPos, progress);
-              }
-              fn reformScale(currentScale: vec3f, originalScale: vec3f, reformTime: f32, duration: f32) -> vec3f {
-                if (reformTime <= 0.0) { return currentScale; }
-                if (reformTime >= duration) { return originalScale; }
-                let progress = reformTime / duration;
-                let easeOut = 1.0 - pow(1.0 - progress, 2.0);
-                return mix(currentScale, originalScale, easeOut);
-              }
-            `),
-            ],
-            statements: ({ inputs, outputs }) =>
-              dyno.unindentLines(/* wgsl */ `
-              ${outputs.gsplat} = ${inputs.gsplat};
-              let originalPos = ${inputs.gsplat}.center;
-              let originalScale = ${inputs.gsplat}.scales;
-              var physicsPos = originalPos;
-              var currentScale = originalScale;
-              if (${inputs.dropProgress} > 0.0) {
-                let randomOffset = hash(originalPos) * ${inputs.randomFactor};
-                physicsPos = simulatePhysics(originalPos, ${inputs.dropTime}, ${inputs.dropProgress}, ${inputs.gravity}, ${inputs.bounceDamping}, ${inputs.floorLevel}, randomOffset, ${inputs.friction}, ${inputs.explosionStrength});
-                let factor = exp(-${inputs.dropTime} * ${inputs.shrinkSpeed});
-                currentScale = mix(originalScale, vec3f(0.005), 1.0 - factor);
-              }
-              var finalPos = physicsPos;
-              var finalScale = currentScale;
-              if (${inputs.isReforming} > 0.5) {
-                finalPos = elegantReform(physicsPos, originalPos, ${inputs.reformTime}, ${inputs.reformDuration});
-                finalScale = reformScale(currentScale, originalScale, ${inputs.reformTime}, ${inputs.reformDuration});
-              }
-              ${outputs.gsplat}.center = finalPos;
-              ${outputs.gsplat}.scales = finalScale;
-            `),
-          },
         });
         gsplat = physicsShader.apply({
           gsplat,
@@ -283,27 +205,6 @@ export async function init({ THREE: _THREE, scene, camera, renderer, spark }) {
               ${outputs.gsplat}.rgba.a = alpha;
             }
           `),
-          wgsl: {
-            globals: () => [HASH_WGSL],
-            statements: ({ inputs, outputs }) =>
-              dyno.unindentLines(/* wgsl */ `
-              ${outputs.gsplat} = ${inputs.gsplat};
-              let originalPos = ${inputs.gsplat}.center;
-              let originalScale = ${inputs.gsplat}.scales;
-              if (${inputs.isBirthing} > 0.5 && ${inputs.birthTime} < ${inputs.birthDuration}) {
-                let progress = ${inputs.birthTime} / ${inputs.birthDuration};
-                let birthOffset = hash(originalPos) * 0.1;
-                let adjusted = clamp((progress - birthOffset / ${inputs.birthDuration}) / (1.0 - birthOffset / ${inputs.birthDuration}), 0.0, 1.0);
-                let ease = pow(adjusted * adjusted * (3.0 - 2.0 * adjusted), 0.6);
-                let birthPos = mix(vec3f(0.0), originalPos, ease);
-                let birthScale = mix(vec3f(0.0), originalScale, ease);
-                ${outputs.gsplat}.center = birthPos;
-                ${outputs.gsplat}.scales = birthScale;
-                let alpha = ${inputs.gsplat}.rgba.a * ease;
-                ${outputs.gsplat}.rgba.a = alpha;
-              }
-            `),
-          },
         });
         gsplat = birthShader.apply({
           gsplat,

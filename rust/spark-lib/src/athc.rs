@@ -39,7 +39,17 @@
 //! transfer   u32 x transferWords       flags bit 5: transferCount f16 values,
 //!                     two a word (9, 36, 84, 16, 64, 112, or 10 zonal)
 //! shadowBits u32 x shadowWords (0, 2, 8 or 32): open directions, a bit a cell
+//! curvature  u32 x curvatureWords (0 or 2): sparkwebGPU's, never in a v2
+//!                     file (see below)
 //! ```
+//! `curvature` is not athenea's: it is the per-splat shape operator athenea
+//! keeps in USD (`primvars:athenea:splat:curvature`, 3 floats: the 2x2
+//! symmetric shape operator in the splat's first two axes, xx xy yy) as
+//! three f16 (two words, the last half 0). A `.athc` v3 carries it in its
+//! own section (`CURV`, athc_v3.rs); in memory and in ATHV pages its words a
+//! splat are `ExtraHeader::curvature_words`, the extra header's sixth word
+//! (padding, 0, in every v2 file athenea writes). `AthcFile::write` (v2)
+//! leaves it out, so a v2 file stays athenea's byte for byte.
 //! Flag bit 1 (linear) says the colours are linear light rather than sRGB;
 //! it adds no array. Bit 3 is reserved (athenea's proposal 009) and, like
 //! every bit this reader does not know, refused: it may add an array.
@@ -112,6 +122,9 @@ pub struct ExtraHeader {
     pub transfer_count: u32,
     pub transfer_words: u32,
     pub shadow_words: u32,
+    /// sparkwebGPU's curvature stream (0 or 2 words a splat): the sixth
+    /// word, 0 in athenea's files; never written to a v2 file.
+    pub curvature_words: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -219,13 +232,21 @@ impl ExtraHeader {
             transfer_count: u32_at(b, 8),
             transfer_words: u32_at(b, 12),
             shadow_words: u32_at(b, 16),
+            curvature_words: u32_at(b, 20),
         }
     }
 
     pub fn to_bytes(&self) -> [u8; EXTRA_HEADER_BYTES] {
         let mut b = [0u8; EXTRA_HEADER_BYTES];
-        for (k, w) in [self.pbr_words, self.lobes_words, self.transfer_count, self.transfer_words, self.shadow_words]
-            .iter()
+        for (k, w) in [
+            self.pbr_words,
+            self.lobes_words,
+            self.transfer_count,
+            self.transfer_words,
+            self.shadow_words,
+            self.curvature_words,
+        ]
+        .iter()
             .enumerate()
         {
             b[4 * k..4 * k + 4].copy_from_slice(&w.to_le_bytes());
@@ -234,7 +255,7 @@ impl ExtraHeader {
     }
 
     pub fn words(&self) -> u32 {
-        self.pbr_words + self.lobes_words + self.transfer_words + self.shadow_words
+        self.pbr_words + self.lobes_words + self.transfer_words + self.shadow_words + self.curvature_words
     }
 }
 
@@ -267,6 +288,15 @@ pub fn parse_headers(bytes: &[u8]) -> Result<(AthcHeader, ExtraHeader)> {
     let mut x = ExtraHeader::default();
     if h.flags & (FLAG_MATERIAL | FLAG_TRANSFER) != 0 {
         x = ExtraHeader::from_bytes(&bytes[HEADER_BYTES..]);
+    }
+    // The curvature word is read whatever the flags: an ATHV head carries
+    // it for a v3 cloud; a v2 file holds 0 there (padding, or the page's
+    // zeros after a FileHeader alone).
+    x.curvature_words = u32_at(bytes, HEADER_BYTES + 20);
+    if x.curvature_words != 0 && x.curvature_words != 2 {
+        bail!("not a readable .athc (curvature of {} words a splat)", x.curvature_words);
+    }
+    if h.flags & (FLAG_MATERIAL | FLAG_TRANSFER) != 0 {
         if h.has(FLAG_MATERIAL) != (x.pbr_words == 1)
             || (x.lobes_words != 0 && x.lobes_words != 3)
             || h.has(FLAG_TRANSFER) != (x.transfer_words != 0)
@@ -395,6 +425,8 @@ pub struct AthcBlock {
     pub lobes: Vec<u32>,
     pub transfer: Vec<u32>,
     pub shadow_bits: Vec<u32>,
+    /// sparkwebGPU's curvature, two words a splat (three f16), or empty.
+    pub curvature: Vec<u32>,
 }
 
 fn words_of(b: &[u8], at: &mut usize, n: usize) -> Vec<u32> {
@@ -423,11 +455,12 @@ impl AthcBlock {
         let lobes = opt(x.lobes_words > 0, &mut at, x.lobes_words);
         let transfer = opt(x.transfer_words > 0, &mut at, x.transfer_words);
         let shadow_bits = opt(x.shadow_words > 0, &mut at, x.shadow_words);
-        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits })
+        let curvature = opt(x.curvature_words > 0, &mut at, x.curvature_words);
+        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature })
     }
 
     /// Every array after positions, in file order.
-    fn arrays(&self) -> [&[u32]; 9] {
+    fn arrays(&self) -> [&[u32]; 10] {
         [
             &self.shape,
             &self.sh,
@@ -438,6 +471,7 @@ impl AthcBlock {
             &self.lobes,
             &self.transfer,
             &self.shadow_bits,
+            &self.curvature,
         ]
     }
 
@@ -473,6 +507,7 @@ impl AthcBlock {
             lobes: cut(&self.lobes),
             transfer: cut(&self.transfer),
             shadow_bits: cut(&self.shadow_bits),
+            curvature: cut(&self.curvature),
         }
     }
 
@@ -488,6 +523,7 @@ impl AthcBlock {
         self.lobes.extend_from_slice(&other.lobes);
         self.transfer.extend_from_slice(&other.transfer);
         self.shadow_bits.extend_from_slice(&other.shadow_bits);
+        self.curvature.extend_from_slice(&other.curvature);
     }
 
     /// Words per element of an array of this block (0 when absent).
@@ -530,6 +566,9 @@ impl AthcFile {
     /// The file `writeAthc` writes for this cloud: version, flags, counts and
     /// every offset recomputed from the arrays; bounds as they are.
     pub fn write(&self) -> Result<Vec<u8>> {
+        if self.has_curvature() {
+            return self.without_curvature().write();
+        }
         let first = self.chunks.first().ok_or_else(|| anyhow!("a .athc holds at least one chunk"))?;
         let last_level = &self.levels.last().ok_or_else(|| anyhow!("a .athc holds at least one level"))?.1;
         let mut h = self.header;
@@ -599,6 +638,21 @@ impl AthcFile {
         }
         out.resize(aligned(out.len() as u64) as usize, 0);
         Ok(out)
+    }
+
+    /// Whether a block carries sparkwebGPU's curvature stream.
+    pub fn has_curvature(&self) -> bool {
+        self.chunks.iter().chain(self.levels.iter().map(|(_, b)| b)).any(|b| !b.curvature.is_empty())
+    }
+
+    /// The cloud without its curvature (what a v2 file holds).
+    pub fn without_curvature(&self) -> Self {
+        let mut out = self.clone();
+        out.extra.curvature_words = 0;
+        for b in out.chunks.iter_mut().chain(out.levels.iter_mut().map(|(_, b)| b)) {
+            b.curvature.clear();
+        }
+        out
     }
 
     /// The splats of every chunk, as one block.
@@ -1054,6 +1108,9 @@ pub fn attrib_specs(h: &AthcHeader, x: &ExtraHeader) -> Vec<AttribSpec> {
     if x.shadow_words > 0 {
         out.push(spec("shadowBits", "u32", x.shadow_words, LodMerge::First));
     }
+    if x.curvature_words > 0 {
+        out.push(spec(CURVATURE_ATTRIBUTE, "f16", 3, LodMerge::WeightedMean));
+    }
     // Every .athc: which of athenea's finest LoD groups a splat is in.
     out.push(spec(GROUP_ATTRIBUTE, "u32", 2, LodMerge::First));
     out
@@ -1066,6 +1123,10 @@ pub fn attrib_specs(h: &AthcHeader, x: &ExtraHeader) -> Vec<AttribSpec> {
 /// so these are the ids it can be picked and overridden by: spatial cells
 /// of the Morton octree rather than prims. Any level's group is a range.
 pub const GROUP_ATTRIBUTE: &str = "athcGroup";
+
+/// The curvature stream's attribute: athenea's per-splat shape operator in
+/// the splat's first two axes (xx, xy, yy), 1/metres, on the mesh's normal.
+pub const CURVATURE_ATTRIBUTE: &str = "curvature";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecodeOptions {
@@ -1189,6 +1250,16 @@ pub fn emit_block<T: SplatReceiver>(
     }
     if x.shadow_words > 0 {
         receiver.set_attrib(k, base, block.n, &words(&block.shadow_bits));
+        k += 1;
+    }
+    if x.curvature_words > 0 {
+        let values: Vec<f64> = (0..block.n)
+            .flat_map(|i| {
+                let w = &block.curvature[i * 2..i * 2 + 2];
+                [low_half(w[0]) as f64, high_half(w[0]) as f64, low_half(w[1]) as f64]
+            })
+            .collect();
+        receiver.set_attrib(k, base, block.n, &values);
         k += 1;
     }
     // GROUP_ATTRIBUTE: given for merged nodes; a splat's tail is its group.

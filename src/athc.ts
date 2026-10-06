@@ -71,6 +71,8 @@ export type AthcLayout = {
     transferCount: number;
     transferWords: number;
     shadowWords: number;
+    /** sparkwebGPU's curvature (v3 section CURV): 0 or 2 words a splat. */
+    curvatureWords?: number;
   };
   levels: { level: number; groups: number; offset: number }[];
   chunks: { offset: number; count: number }[];
@@ -89,7 +91,7 @@ export type AthcLayout = {
 
 /** A v3 section (athc_v3.rs Section). */
 export type AthcSection = {
-  id: "CORE" | "SHRS" | "MATL" | "SHAD" | "TXDI" | "TXIN" | "TXFD";
+  id: "CORE" | "SHRS" | "MATL" | "SHAD" | "CURV" | "TXDI" | "TXIN" | "TXFD";
   tier: number;
   encoding: number;
   compression: number;
@@ -148,7 +150,11 @@ export const ATHC_MATERIAL_STREAMS = [
   "pbr",
   "lobes",
 ] as const;
-export const ATHC_RELIGHT_STREAMS = ["shadowBits", "transfer"] as const;
+export const ATHC_RELIGHT_STREAMS = [
+  "shadowBits",
+  "transfer",
+  "curvature",
+] as const;
 
 /**
  * The Want of attribute `names` (the pool's specs, so the transfer's
@@ -185,6 +191,7 @@ export function athcNeeds(
     case "MATL":
       return want.material;
     case "SHAD":
+    case "CURV":
       return want.transferValues > 0;
     case "TXDI":
       return words > 0;
@@ -756,6 +763,8 @@ async function streamColumns(
   }
   const shad = raw.get("SHAD");
   if (shad) sources.set("shadowBits", [{ data: shad, words: x.shadowWords }]);
+  const curv = raw.get("CURV");
+  if (curv) sources.set("curvature", [{ data: curv, words: 2 }]);
   // The transfer's sections in file order: direct, then the rest.
   const tx = layout.sections
     .filter((s) => /^TX/.test(s.id) && raw.has(s.id))

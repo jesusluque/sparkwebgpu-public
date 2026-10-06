@@ -154,8 +154,11 @@ indirect half, 112 with the field; 9, 36, 84 at degree 2). For
 `every_stream.athc` (SH3, TX transfer of 112 values, 16×16 shadow bits,
 material): tier 1 is 128 bytes a splat, tier 2 152, tier 3 408.
 
-(Files written before the three tiers, with `TXIN` holding the field and
-`MATL` last, are refused by name: convert them again.)
+Files written before the three tiers (`TXIN` holding the field, `SHAD` and
+`MATL` after it, all tier 2: the first pawn conversions) are still read and
+paged: a reader takes each block's sections from its table. Their material
+is not a prefix of its own, so a page that wants the material and not the
+transfer reads the transfer too; convert them again to page them well.
 
 Compression is per section, gzip (RFC 1952) as `DecompressionStream("gzip")`
 reads it, since HTTP compression does not apply to Range responses.

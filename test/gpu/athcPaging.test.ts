@@ -6,9 +6,10 @@
 // are resident where the traversal ranks first and fall back elsewhere,
 // read through slang/athenea_adapter as a relight kernel reads them.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { PagedSplats } from "../../src/PagedSplats";
+import { type AthcV3Layout, athvSectionsPage, isAthcV3 } from "../../src/athc";
 import { KernelRegistry } from "../../src/webgpu/KernelRegistry";
 import { WgpuSplatPager } from "../../src/webgpu/WgpuSplatPager";
 import { specsFromRadMeta } from "../../src/webgpu/attributes/PagedAttribPool";
@@ -183,12 +184,16 @@ describe.skipIf(!device)("a .athc paged by stream group", () => {
 
   // The adapter's view of every element of both pages: 28 floats each.
   async function adapterView(pager: WgpuSplatPager) {
+    return adapterViewOf(pager, 2);
+  }
+
+  async function adapterViewOf(pager: WgpuSplatPager, pages: number) {
     const pool = pager.attribs?.pool as AttribPool;
     const id = (name: string) => {
       const k = pool.id(name);
       return k < 0 ? ATTRIB_NONE : k;
     };
-    const count = 2 * PAGE;
+    const count = pages * PAGE;
     const params = UniformWriter.for(athcTest).setAll({
       count,
       normalOct: id("normalOct"),
@@ -350,4 +355,116 @@ describe.skipIf(!device)("a .athc paged by stream group", () => {
     expect(mem.total).toBe(header + interleaved + relight);
     pager.dispose();
   });
+
+  // athenea's pawn body, full TX (112 values, 300 MB of streams): not in
+  // git; PAWN_ATHC names it (publish-r2/sparkwebgpu/pawn/body-full-gz.athc).
+  const pawnPath =
+    process.env.PAWN_ATHC ??
+    new URL(
+      "../../../publish-r2/sparkwebgpu/pawn/body-full-gz.athc",
+      import.meta.url,
+    ).pathname;
+  it.skipIf(!existsSync(pawnPath))(
+    "pages the pawn's transfer in one 128 MiB binding, first-ranked pages first",
+    async () => {
+      const bytes = new Uint8Array(readFileSync(pawnPath));
+      const pages = 16; // 5 of merged nodes, 11 chunks
+      const pager = new WgpuSplatPager(d, {
+        maxSplats: pages * PAGE,
+        autoDrive: false,
+        numFetchers: 4,
+        onUpdate: () => {},
+        // A T2 device's streams, in Dawn's default 128 MiB binding.
+        attributes: { attributes: "all", tier: 2 },
+      });
+      const splats = new PagedSplats({ fileBytes: bytes, pager });
+      const { meta } = await splats.getRadMeta();
+      expect(meta.chunks.length).toBe(pages);
+      pager.setAttribSchema(
+        specsFromRadMeta(
+          meta.attributes as Parameters<typeof specsFromRadMeta>[0],
+        ),
+      );
+      const plan = pager.attributePlan();
+      const relightPlan = plan?.groups.find((g) => g.name === "relight");
+      const slots = relightPlan?.slots ?? 0;
+      expect(relightPlan?.paged).toBe(true);
+      expect(slots).toBeGreaterThan(0);
+      expect(slots).toBeLessThan(pages);
+      expect(plan?.bytes).toBeLessThanOrEqual(
+        d.limits.maxStorageBufferBindingSize,
+      );
+      // The splats first, coarse to fine as a traversal would rank them.
+      const order = [...Array(pages).keys()].reverse();
+      pager.fetchPriority = order.map((chunk) => ({ splats, chunk }));
+      for (let round = 0; round < 6; round++) await settle(pager);
+      const relight = pager.attribs?.group("relight");
+      const pageOf = (chunk: number) =>
+        pager.getSplatsChunk(splats, chunk)?.page as number;
+      for (const [k, chunk] of order.entries()) {
+        expect(relight?.resident(pageOf(chunk))).toBe(k < slots);
+      }
+      expect(relight?.used).toBe(slots);
+      // A resident chunk's transfer as the WASM decoder reads the block.
+      const paging = await splats.getAthc();
+      expect(isAthcV3(paging.layout)).toBe(true);
+      const layout = paging.layout as AthcV3Layout;
+      const chunk = order[0];
+      const block = layout.blocks.filter((b) => b.kind === 1)[
+        chunk - paging.tree.splatBase / PAGE
+      ];
+      const parts = layout.sections.map((section, k) => ({
+        section,
+        stored: bytes.subarray(
+          block.spans[k].offset,
+          block.spans[k].offset + block.spans[k].stored,
+        ),
+        raw: block.spans[k].raw,
+      }));
+      const decoder = (
+        wasm as unknown as {
+          decode_to_packedsplats: typeof wasm.decode_to_packedsplats;
+        }
+      ).decode_to_packedsplats(
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+      );
+      decoder.push(
+        athvSectionsPage(
+          layout,
+          0,
+          block.n,
+          0,
+          layout.extra.transferCount,
+          parts,
+        ),
+      );
+      const r = decoder.finish();
+      const ref = AttribPool.fromValues({
+        count: r.numSplats,
+        specs: r.attribSpecs,
+        values: r.attribColumns,
+      });
+      const view = await adapterViewOf(pager, pages);
+      const at = pageOf(chunk);
+      const notAt = pageOf(order[pages - 1]);
+      for (let i = 0; i < block.n; i += 997) {
+        const o = (at * PAGE + i) * 28;
+        expect(view.got[o + 26]).toBe(1);
+        const t = ref.getAttribute("transfer", i);
+        expect(view.got[o + 23]).toBe(t[0]);
+        expect(view.got[o + 24]).toBe(t[111]);
+        expect(view.bits[o + 25]).toBe(ref.getAttribute("shadowBits", i)[0]);
+        const n = (notAt * PAGE + i) * 28;
+        expect(view.got[n + 26]).toBe(0);
+        expect(view.bits[n + 25]).toBe(0xffffffff);
+      }
+      pager.dispose();
+    },
+    120_000,
+  );
 });

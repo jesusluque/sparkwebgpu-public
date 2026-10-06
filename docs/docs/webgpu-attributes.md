@@ -74,7 +74,45 @@ A `.rad` file lists its attribute schema in its metadata (`attributes: [{ name, 
 
 A `.rad` file doesn't store the `direction` flag: a 3-component attribute with `normalizeMean` is read back as a direction. Files with attributes need a decoder that knows the `attrib` property; older ones reject it.
 
-Paged `.rad` streaming (`PagedSplats` through `WgpuLod`) pages attributes with the splats: `WgpuSplatPager` keeps a third pool (`PagedAttribPool`) in the pool layout over all pages, with the schema from the `.rad` metadata (or the first chunk), and writes each chunk's attributes at its page base, converted to the schema's formats. `SplatAttributes` binds that pool directly instead of uploading it.
+Paged `.rad` streaming (`PagedSplats` through `WgpuLod`) pages attributes with the splats: `WgpuSplatPager` keeps a third pool (`PagedAttribPool`), with the schema from the `.rad` metadata (or the first chunk), and writes each chunk's attributes at its page base, converted to the schema's formats. `SplatAttributes` binds that pool directly instead of uploading it.
+
+### Paging by stream group
+
+The attribute pool is one storage binding, so it is sized within a byte budget: the device tier's (`tiers.ts` `attribBudget`: 128 MiB at T1, 768 MiB at T2, 1.5 GiB at T3), never more than the device's binding size. `attributes/attribPaging.ts` plans it by **group** of streams:
+
+| Group | Attributes | Fetched | Device tier |
+| ----- | ---------- | ------- | ----------- |
+| `core` | every attribute outside the groups below (a `.rad`'s, a `.athc`'s `athcGroup`) | with the splats | any |
+| `material` | `normalOct`, `emission`, `pbr`, `lobes` | `.athc` v3 section `MATL` (data tier 2) | T1 |
+| `relight` | `shadowBits`, `transfer` | `SHAD`, `TXDI`, `TXIN`, `TXFD` (data tier 3) | T2 |
+
+In that order, a group that fits the rest of the budget at the page pool's full capacity is interleaved in the pool and arrives with its pages, as before. One that does not is **paged**: it gets as many pages as the budget leaves (`slots`), in a region of its own per attribute (`ATTRIB_PAGED` in `slang/core/attrib.slang`): a page table (one word per page of the pool: its slot, or `ATTRIB_NONE`) and the slots' records. A group no page of which fits is left out.
+
+`AttribResidency` gives a paged group's slots to the pages the LoD traversal ranks first (the pager's fetch priority, each time it drives its fetchers). A page that arrives with the group's data takes a free slot; a wanted page without it is **upgraded**: `PagedSplats.fetchStreams` fetches just that group (a `.athc` v3 chunk: one Range request of its sections; v2: of its arrays; a merged page or a `.rad` chunk: decoded again), and takes a free slot or one held by a page no longer wanted. Nothing waits: a splat whose page is not resident reads as zeros, `attribResident(pool, id, splat)` says so, and readers fall back (`slang/athenea_adapter/athc.slang`: the frame's normal, a capture's plain pbr and lobes, no emission, every direction open, `athcTransferResident` false so a relight keeps the captured colour).
+
+Which streams of the groups load: `pagedAttributes.attributes` (`"all"` or names), else the `PluginHost`'s `attributeDemand()` (the `requires.attributes` and `requires.reads` of the plugins the device runs; the athenea raster reads `emission` and `athcGroup`), else, with no plugins, everything but the relight streams. The transfer can be kept shorter (`transferForm`): its layouts are prefixes of each other (`transfer_layout.slang`): `"direct"` keeps 16 values (9 at degree 2), `"indirect"` 64 (36) with the indirect half, `"full"` (default) all 112 (84) with the reflected field; the shorter form is read as that layout.
+
+```js
+new SparkRenderer({
+  renderer, backend: "webgpu",
+  pagedAttributes: {
+    budgetBytes: 512 * 1024 * 1024, // default: the tier's, within the binding size
+    pages: { relight: 24 },          // pages a group keeps (overrides the budget)
+    attributes: "all",               // default: the plugins' demand
+    transferForm: "indirect",
+  },
+});
+```
+
+A TX cloud (every_stream's streams: `athcGroup` 8 B, material 24 B, shadow bits 32 B, transfer 224 B a splat) over the default 256 pages would need 4.8 GB whole. Planned:
+
+| Device | Pages | core + material | relight | Pool |
+| ------ | ----- | --------------- | ------- | ---- |
+| T1 (128 MiB), SH3 | 42 | whole, 88 MB | not loaded (T2) | 88 MB |
+| T2 (768 MiB budget) | 256 | whole, 537 MB | 15 pages (0.98M splats), 252 MB | 789 MB |
+| T2, `"indirect"` | 256 | 537 MB | 25 pages, 262 MB | 799 MB |
+| T2, `"direct"` | 256 | 537 MB | 63 pages, 264 MB | 801 MB |
+| T3 (1.5 GiB budget) | 256 | 537 MB | 63 pages (4.1M splats), 1.06 GB | 1.6 GB |
 
 ## LoD merge rules
 

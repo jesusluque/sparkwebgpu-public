@@ -69,6 +69,7 @@ On `WebGPURenderer`, `SparkRenderer` supports:
 
 - `SplatMesh` with PackedSplats and ExtSplats, spherical harmonics up to degree 3, `recolor`, `opacity` and object transforms;
 - Level-of-Detail and paged `.rad` streaming (`WgpuLod`, `WgpuSplatPager`), with the same WASM traversal as WebGL Spark;
+- LoD transitions that fade instead of popping (`WgpuLod` option `lodFadeMs`, default 0: Spark's hard swap; `spark.webgpu.lod.options.lodFadeMs` on a SparkRenderer): splats entering a cut fade in over that time while those leaving stay drawn, then fade out, so the surface stays covered; the fade rides in the top byte of the GPU's LoD indices (`LodFade`). Packed/ext LoD splats only, not paged pools. On the light Corvette (150k budget, the LoD camera dollying in with the view still, 250 ms) the largest frame-to-frame change falls from 0.085 % to 0.029 % of the mean and the largest temporal second difference from 0.093 % to 0.034 %; at rest the image is identical. The CPU side costs 2 ms a frame per 400k splats while a transition runs;
 - dyno generators, `objectModifiers` and `worldModifiers`, `SplatEdit`, `SplatSkinning`, `splatRgba`, and custom dynos that give WGSL (see [Custom dynos](#custom-dynos));
 - depth of field (`focalDistance`, `apertureAngle`), `sortRadial`, `maxStdDev`, `minAlpha`, `falloff` and the other draw options;
 - drawing on the canvas (with or without `antialias`), into `RenderTarget`s, and through `PostProcessing`'s `pass()`, depth-tested against three's scene;

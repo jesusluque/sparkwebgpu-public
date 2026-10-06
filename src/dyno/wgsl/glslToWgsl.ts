@@ -240,20 +240,17 @@ interface Val {
   sampler?: string;
 }
 
-const ARITH: Cls[] = ["primary", "unary", "mul", "add", "shift"];
+// Per operator class, the operand classes that need no parentheses on its
+// left and right.
+const UNARY: Cls[] = ["primary", "unary"];
+const ARITH: Cls[] = [...UNARY, "mul", "add", "shift"];
 const ALLOWED: Record<string, [Cls[], Cls[]]> = {
-  mul: [
-    ["primary", "unary", "mul"],
-    ["primary", "unary"],
-  ],
+  mul: [[...UNARY, "mul"], UNARY],
   add: [
-    ["primary", "unary", "mul", "add"],
-    ["primary", "unary", "mul"],
+    [...UNARY, "mul", "add"],
+    [...UNARY, "mul"],
   ],
-  shift: [
-    ["primary", "unary"],
-    ["primary", "unary"],
-  ],
+  shift: [UNARY, UNARY],
   rel: [ARITH, ARITH],
   and: [
     [...ARITH, "rel", "and"],
@@ -263,18 +260,9 @@ const ALLOWED: Record<string, [Cls[], Cls[]]> = {
     [...ARITH, "rel", "or"],
     [...ARITH, "rel"],
   ],
-  bitand: [
-    ["primary", "unary", "bitand"],
-    ["primary", "unary"],
-  ],
-  bitor: [
-    ["primary", "unary", "bitor"],
-    ["primary", "unary"],
-  ],
-  bitxor: [
-    ["primary", "unary", "bitxor"],
-    ["primary", "unary"],
-  ],
+  bitand: [[...UNARY, "bitand"], UNARY],
+  bitor: [[...UNARY, "bitor"], UNARY],
+  bitxor: [[...UNARY, "bitxor"], UNARY],
 };
 
 const OP_CLASS: Record<string, Cls> = {
@@ -353,7 +341,6 @@ type Ctx = {
   ret: Ty | null;
   /** What dyno code's bare `return;` returns, if it may return. */
   returnValue?: string;
-  loop: number;
 };
 
 export class GlslTranslator {
@@ -520,9 +507,25 @@ export class GlslTranslator {
       v.ty.rows === to.rows &&
       v.ty.cols === to.cols
     ) {
-      // Abstract literals convert by themselves (to a float, or a uint).
-      if (v.lit && (to.s === "f32" || (v.ty.s !== "f32" && to.s !== "bool"))) {
+      // Abstract literals convert by themselves (to a float, or a uint),
+      // except negative ones to uint, which wrap around as GLSL's do.
+      const negative = v.code.startsWith("-");
+      if (
+        v.lit &&
+        (to.s === "f32" ||
+          (v.ty.s !== "f32" &&
+            to.s !== "bool" &&
+            !(negative && to.s === "u32")))
+      ) {
         return { ...v, ty: to };
+      }
+      if (v.lit && negative && to.s === "u32" && v.ty.s === "i32") {
+        const i = this.wgslTy(num("i32", to.rows));
+        return {
+          code: `${this.wgslTy(to)}(${i}(${v.code}))`,
+          ty: to,
+          cls: "primary",
+        };
       }
       if (isMatrix(to)) this.error("matrices have only float components", pos);
       return { code: `${this.wgslTy(to)}(${v.code})`, ty: to, cls: "primary" };
@@ -1065,15 +1068,14 @@ export class GlslTranslator {
       const allScalars = vals.every((v) => isScalar(v.ty));
       if (!allCols && !allScalars) {
         const scalars: string[] = [];
-        vals.forEach((v, i) => {
+        for (const v of vals) {
           const t = v.ty as Num;
           const c = this.convert(v, num("f32", t.rows), pos);
           if (t.rows === 1) scalars.push(c.code);
           else
             for (let k = 0; k < t.rows; k++)
               scalars.push(`${primary(c)}[${k}]`);
-          void i;
-        });
+        }
         return prim(`${wgsl}(${scalars.slice(0, need).join(", ")})`);
       }
     }
@@ -1177,31 +1179,8 @@ export class GlslTranslator {
       return call(fn, args, args[0].ty);
     };
 
+    if (FLOAT_FUNCTIONS.has(name)) return generic(name, [1]);
     switch (name) {
-      case "radians":
-      case "degrees":
-      case "sin":
-      case "cos":
-      case "tan":
-      case "asin":
-      case "acos":
-      case "sinh":
-      case "cosh":
-      case "tanh":
-      case "asinh":
-      case "acosh":
-      case "atanh":
-      case "exp":
-      case "log":
-      case "exp2":
-      case "log2":
-      case "sqrt":
-      case "floor":
-      case "ceil":
-      case "trunc":
-      case "fract":
-      case "round":
-        return generic(name, [1]);
       case "normalize":
         return generic(isScalar(vals[0]?.ty ?? VOID) ? "sign" : name, [1]);
       case "roundEven":
@@ -1217,10 +1196,8 @@ export class GlslTranslator {
         return generic("pow", [2]);
       case "min":
       case "max":
-      case "clamp": {
-        const r = generic(name, name === "clamp" ? [3] : [2], true);
-        return r;
-      }
+      case "clamp":
+        return generic(name, name === "clamp" ? [3] : [2], true);
       case "mix": {
         want(3);
         const last = vals[2];
@@ -1829,7 +1806,7 @@ export class GlslTranslator {
           }
           const test = s.test ? this.condition(s.test) : "";
           const update = s.update ? this.exprStatement(s.update) : [];
-          const body = this.body(s.body, { ...ctx, loop: ctx.loop + 1 });
+          const body = this.body(s.body, ctx);
           // WGSL's for takes one update statement; a loop's continuing
           // block (where continue goes) takes any.
           const loop =
@@ -1858,12 +1835,12 @@ export class GlslTranslator {
       case "while":
         return [
           `while (${this.condition(s.test)}) {`,
-          ...this.body(s.body, { ...ctx, loop: ctx.loop + 1 }),
+          ...this.body(s.body, ctx),
           "}",
         ];
       case "do": {
         // continue goes to the continuing block, which tests, as in GLSL.
-        const body = this.body(s.body, { ...ctx, loop: ctx.loop + 1 });
+        const body = this.body(s.body, ctx);
         const test = this.condition(s.test);
         return [
           "loop {",
@@ -2099,7 +2076,7 @@ export class GlslTranslator {
           });
         }
       }
-      const ctx: Ctx = { ret, loop: 0 };
+      const ctx: Ctx = { ret };
       const lines = this.withScope(() =>
         body.flatMap((s) => this.statement(s, ctx)),
       );
@@ -2191,7 +2168,7 @@ export class GlslTranslator {
           uniformStruct: v.uniformStruct,
         });
       }
-      const ctx: Ctx = { ret: null, returnValue, loop: 0 };
+      const ctx: Ctx = { ret: null, returnValue };
       return this.withScope(() => stmts.flatMap((s) => this.statement(s, ctx)));
     });
   }
@@ -2219,6 +2196,12 @@ function endsInReturn(stmts: Stmt[]): boolean {
   }
   return false;
 }
+
+// genType f(genType) builtins WGSL names the same.
+const FLOAT_FUNCTIONS = new Set(
+  `radians degrees sin cos tan asin acos sinh cosh tanh asinh acosh atanh exp
+  log exp2 log2 sqrt floor ceil trunc fract round`.split(/\s+/),
+);
 
 const BUILTIN_NAMES = new Set(
   `radians degrees sin cos tan asin acos atan sinh cosh tanh asinh acosh atanh

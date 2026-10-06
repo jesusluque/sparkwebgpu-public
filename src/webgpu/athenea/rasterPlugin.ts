@@ -174,6 +174,8 @@ export function atheneaRasterPlugin(
 
   const plugin: AtheneaRasterPlugin = {
     id: ATHENEA_RASTER_ID,
+    // Linear light past 1: the renderer keeps it in float (SplatPlugin.hdr).
+    hdr: true,
     // Read where a cloud has them: a pager loads them for it.
     requires: { reads: ["emission", ATHC_GROUP_ATTRIBUTE] },
     slang: {
@@ -298,6 +300,9 @@ export function atheneaOutputPlugin(
   };
   const plugin: AtheneaOutputPlugin = {
     id: ATHENEA_OUTPUT_ID,
+    // A display transform of scene-referred light: the renderer keeps the
+    // picture in float up to it (SplatPlugin.hdr).
+    hdr: true,
     // After every other effect: the display transform ends the chain.
     order: 1000,
     fx: [fx],

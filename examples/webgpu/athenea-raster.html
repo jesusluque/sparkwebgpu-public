@@ -87,7 +87,7 @@
     resize();
     addEventListener("resize", resize);
 
-    const spark = new SparkRenderer({ renderer, pagedExtSplats: params.get("ext") !== "0" });
+    const spark = new SparkRenderer({ renderer, hdr: true, pagedExtSplats: params.get("ext") !== "0" });
     scene.add(spark);
     const paged = new PagedSplats({ rootUrl: url, athcKeepLinear: keepLinear });
     const mesh = new SplatMesh({ url, paged });

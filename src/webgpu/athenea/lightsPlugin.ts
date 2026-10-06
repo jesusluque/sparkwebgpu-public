@@ -459,6 +459,8 @@ export function atheneaLightsPlugin(
 
   const plugin: AtheneaLightsPlugin = {
     id: ATHENEA_LIGHTS_ID,
+    // Linear light past 1: the renderer keeps it in float (SplatPlugin.hdr).
+    hdr: true,
     minTier: 1,
     after: [ATHENEA_RELIGHT_ID, ATHENEA_RASTER_ID],
     requires: { reads: ["normalOct"] },

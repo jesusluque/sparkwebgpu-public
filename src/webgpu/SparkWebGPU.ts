@@ -170,6 +170,10 @@ export class SparkWebGPU {
     // An -srgb format (three's for 8-bit sRGB targets) encodes on store, so
     // the shader writes linear values to it, as three's materials do.
     const srgbFormat = format.endsWith("-srgb");
+    // HDR (SparkRendererOptions.hdr, or a plugin making linear light past
+    // 1): the light stays in float, blended linearly into a float target.
+    const hdr = splats.hdr && !this.spark.rawColor;
+    const floatFormat = format.includes("float");
     const target: SplatPassTarget = {
       format,
       depthFormat: open.depthFormat,
@@ -178,7 +182,9 @@ export class SparkWebGPU {
       height,
       linear: this.spark.rawColor
         ? srgbFormat
-        : srgbFormat || open.colorSpace !== THREE.SRGBColorSpace,
+        : srgbFormat ||
+          (hdr && floatFormat) ||
+          open.colorSpace !== THREE.SRGBColorSpace,
       extraFormats: open.extraFormats,
       depthCompare: (camera as { reversedDepth?: boolean }).reversedDepth
         ? "greater-equal"
@@ -196,9 +202,13 @@ export class SparkWebGPU {
     // tone map splats. The composite inverts three's operators (see
     // SrgbComposite); for others (a custom node) splats go on the canvas
     // after the output pass.
-    const toneMapping = canvas
-      ? (renderer.toneMapping ?? THREE.NoToneMapping)
-      : THREE.NoToneMapping;
+    // With HDR into a float target the splats are light like three's own
+    // objects: three's output pass tone-maps them with the rest.
+    const floatHdr = hdr && floatFormat;
+    const toneMapping =
+      canvas && !floatHdr
+        ? (renderer.toneMapping ?? THREE.NoToneMapping)
+        : THREE.NoToneMapping;
     const invertible =
       INVERTIBLE_TONE_MAPPINGS.includes(toneMapping) &&
       renderer.outputColorSpace === THREE.SRGBColorSpace &&
@@ -213,10 +223,14 @@ export class SparkWebGPU {
       this.drawAfterOutput(scene, camera, open);
       return;
     }
+    // The 8-bit sRGB layer (WebGL's canvas, for parity) clamps the
+    // background and the splats' light to 1 and quantises both: never with
+    // HDR into a float target.
     if (
       rc.textures &&
       target.linear &&
       !this.spark.rawColor &&
+      !floatHdr &&
       (canvas || this.spark.srgbBlend)
     ) {
       this.drawSrgbBlended(camera, open, target, {
@@ -439,6 +453,7 @@ export class SparkWebGPU {
     o.minSortIntervalMs = spark.minSortIntervalMs;
     o.lodInflate = spark.lodInflate;
     o.depthTest = spark.material.depthTest;
+    o.hdr = spark.hdr;
     const l = (this.lod as WgpuLod).options;
     l.lodSplatCount = spark.lodSplatCount;
     l.lodSplatScale = spark.lodSplatScale;

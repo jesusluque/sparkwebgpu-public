@@ -13,6 +13,11 @@
 // srgb() and linear() are three's own transfer functions; pixels no splat
 // covers are left as they were.
 //
+// The layer is 8 bits and its background clamped: it is for WebGL parity
+// only. With HDR (SparkRendererOptions.hdr, or a plugin making linear light
+// past 1, as athenea's do) into a float target it is never used: the
+// splats blend in linear light straight into that target.
+//
 // With tone mapping, three tone-maps the target in its output pass, after
 // everything is blended, where WebGL Spark blends untone-mapped splats over
 // the tone-mapped picture. So the layer starts from the picture as it will

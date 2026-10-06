@@ -350,6 +350,20 @@ export interface SparkRendererOptions {
    */
   srgbBlend?: boolean;
   /**
+   * WebGPU: keep the splats' light in float end to end (scene-referred, for
+   * HDR pipelines that tone-map or apply a display transform afterwards).
+   * Colours above 1 are kept per splat (the float "ext" accumulator, never
+   * the 8-bit packed one while it fits), splats blend in linear light into
+   * the float target, the canvas's half-float frame buffer included (no
+   * 8-bit sRGB layer over a clamped copy of the background, as `srgbBlend`
+   * and the canvas otherwise use for WebGL parity), and three's tone
+   * mapping, if any, applies to splats in its output pass like any other
+   * object. Implied by plugins that produce linear light (the athenea
+   * raster, relight and lights plugins).
+   * @default false
+   */
+  hdr?: boolean;
+  /**
    * Set the splat shader material to be transparent which determines if the
    * splats are rendered during the first opaque THREE.js render pass or the
    * second transparent render pass.
@@ -415,6 +429,8 @@ export class SparkRenderer extends THREE.Mesh {
   rawColor: boolean;
   /** See SparkRendererOptions.srgbBlend. */
   srgbBlend: boolean;
+  /** See SparkRendererOptions.hdr. */
+  hdr: boolean;
 
   readonly timer: THREE.Timer;
   private readonly ownsTimer: boolean;
@@ -617,6 +633,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.onDirty = options.onDirty;
     this.rawColor = options.rawColor ?? false;
     this.srgbBlend = options.srgbBlend ?? false;
+    this.hdr = options.hdr ?? false;
     this.dirty = true;
     this.autoUpdate = options.autoUpdate ?? true;
     this.preUpdate = options.preUpdate ?? true;

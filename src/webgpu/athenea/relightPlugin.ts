@@ -567,6 +567,8 @@ export function atheneaRelightPlugin(
 
   const plugin: AtheneaRelightPlugin = {
     id: ATHENEA_RELIGHT_ID,
+    // Linear light past 1: the renderer keeps it in float (SplatPlugin.hdr).
+    hdr: true,
     minTier: 2,
     // A pager brings the streams it reads (WgpuSplatPager.attributePlan).
     requires: { reads: STREAMS },

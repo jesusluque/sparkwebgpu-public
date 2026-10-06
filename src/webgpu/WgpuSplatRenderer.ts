@@ -218,6 +218,15 @@ export interface WgpuSplatRendererOptions {
    */
   srgbBlend?: boolean;
   /**
+   * Keep the splats' light in float end to end: colours above 1 kept per
+   * splat (the ext accumulator, half-float colour, even when `accumulator`
+   * says "packed", while it fits a binding), and no 8-bit sRGB layer
+   * (`srgbBlend` is ignored): splats blend in linear light into the float
+   * target. Implied while a plugin with `hdr` is registered and enabled
+   * (the athenea raster, relight, lights and output plugins). Default false.
+   */
+  hdr?: boolean;
+  /**
    * How render() draws the sorted splats. "hardware" (default): instanced
    * quads blended back to front. "tiles" (experimental): a compute tile
    * rasterizer (TileRasterizer) blending each 16 x 16 tile front to back,
@@ -411,6 +420,7 @@ export class WgpuSplatRenderer {
       covSplats: false,
       enable2DGS: false,
       srgbBlend: false,
+      hdr: false,
       rasterizer: "hardware",
       ...options,
     };
@@ -524,12 +534,32 @@ export class WgpuSplatRenderer {
     return m.lodIndices ? m.lodIndices.length : m.source.count;
   }
 
-  // Whether generate writes the packed accumulator for `total` splats.
+  /**
+   * Whether the splats' light stays in float end to end (options.hdr, or a
+   * plugin that makes linear light past 1).
+   */
+  get hdr(): boolean {
+    return Boolean(this.options.hdr || this.plugins?.hdr);
+  }
+
+  private warnedHdrPacked = false;
+
+  // Whether generate writes the packed accumulator for `total` splats. Its
+  // colour is 8 bits clamped to [0, 1] (sRGB-encoded), so HDR keeps the ext
+  // one (half-float colour) whenever it fits.
   private packedFor(total: number) {
     const a = this.options.accumulator;
-    return (
-      a === "packed" || (a === "auto" && total > this.capabilities.maxSplats)
-    );
+    const over = total > this.capabilities.maxSplats;
+    if (this.hdr) {
+      if (over && !this.warnedHdrPacked) {
+        this.warnedHdrPacked = true;
+        console.warn(
+          `WgpuSplatRenderer: ${total} splats is over the ext accumulator's ${this.capabilities.maxSplats} (maxStorageBufferBindingSize; see splatRequiredLimits): HDR colours are clamped to 1 in the packed one`,
+        );
+      }
+      return over;
+    }
+    return a === "packed" || (a === "auto" && over);
   }
 
   private ensureCapacity(total: number) {
@@ -1308,7 +1338,7 @@ export class WgpuSplatRenderer {
         }) ?? null;
     }
     // Blended in sRGB in a layer of their own, composited after.
-    const layer = linear && this.options.srgbBlend && !variant;
+    const layer = linear && this.options.srgbBlend && !variant && !this.hdr;
     const drawParams = this.writeDrawParams(
       camera,
       size.x,

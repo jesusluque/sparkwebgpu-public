@@ -1183,18 +1183,22 @@ describe.skipIf(!wideDevice || !available)(
       const n = cloud.count;
       streamsAgree(cloud, ref, n);
       if (curvatureScale !== 1) {
-        // A crease: the same shape operator, sharper, in both clouds.
-        const k = new Float32Array(3 * n);
-        for (let i = 0; i < n; i++)
-          k.set(
-            cloud.pool
-              .getAttribute("curvature", i)
-              .map((v) => v * curvatureScale),
-            3 * i,
-          );
-        cloud.pool.setAttribute("curvature", k, "f16", 3);
+        // A crease: the same shape operator, sharper, in both clouds. The
+        // attribute is f16 x 4 since .athc carries the merged levels'
+        // normal variance in a fourth half (kept as it is); athenea's
+        // stream is the three of the shape operator.
+        const per = cloud.pool.getAttribute("curvature", 0).length;
+        const k = new Float32Array(per * n);
+        const shape = new Float32Array(3 * n);
+        for (let i = 0; i < n; i++) {
+          const v = cloud.pool.getAttribute("curvature", i);
+          for (let c = 0; c < per; c++)
+            k[per * i + c] = c < 3 ? v[c] * curvatureScale : v[c];
+          for (let c = 0; c < 3; c++) shape[3 * i + c] = k[per * i + c];
+        }
+        cloud.pool.setAttribute("curvature", k, "f16", per);
         const f = new Float32Array(ref.words.buffer);
-        for (let i = 0; i < 3 * n; i++) f[ref.at.curvature + i] = k[i];
+        for (let i = 0; i < 3 * n; i++) f[ref.at.curvature + i] = shape[i];
         d.queue.writeBuffer(ref.native, 0, ref.words);
       }
       const results = [];

@@ -69,6 +69,7 @@ export const atheneaAdapterSkin = {
   kSkinExt: 1,
   kSkinJacobian: 2,
   kSkinNormals: 4,
+  kSkinRest: 8,
   kSkinDispatchRow: 16776960,
   kEps: 0.00001,
 } as const;

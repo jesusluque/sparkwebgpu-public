@@ -123,6 +123,8 @@ page 0   header, 160 bytes
           64 boundsLo[3]   76 extent   80 boundsMin[3]  92 boundsMax[3]
          104 blockCount (levels + chunks)   108 curvatureWords (0, 2)
          112 sectionTable (u64)  120 blockIndex  128 starts  136 dataStart
+         144 skinInfluences (0: not skinned)  148 skinGradientWords
+         152 skeleton (u64, the ATSK blob's offset; 0: none)
 @160     section table, 32 bytes each:
            id (fourcc), tier, encoding (0: v2 words), compression
            (0 none, 1 gzip), words a element, 3 x 0
@@ -131,6 +133,7 @@ page 0   header, 160 bytes
            bounding sphere of the centres (x, y, z, r),
            per section: offset (u64, absolute), stored bytes, raw bytes
 aligned  starts: u32 per finest group (as v2)
+16-aligned  a skinned cloud's skeleton (ATSK, below)
 aligned  blocks: levels coarsest first, then chunks; each on its own page,
          its sections contiguous in table order
 ```
@@ -139,6 +142,7 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 |---|---|---|---|---|
 | S0 | `CORE` | 1 | 36 | positions, shape, tail (as three arrays) |
 | S0p | `SHRS` | 1 | 4 · shWords | rest harmonics |
+| S0s | `SKIN` | 1 | 4 · (influences + gradientWords) | a skinned cloud's rig (sparkwebGPU's, below) |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
 | S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
 | S3c | `CURV` | 3 | 8 | the curvature: athenea's shape operator, three f16 (sparkwebGPU's) |
@@ -154,6 +158,54 @@ a layout of its own (`transfer_layout.slang`: 16 direct values, 64 with the
 indirect half, 112 with the field; 9, 36, 84 at degree 2). For
 `every_stream.athc` (SH3, TX transfer of 112 values, 16×16 shadow bits,
 material): tier 1 is 128 bytes a splat, tier 2 152, tier 3 408.
+
+### A skinned cloud (`SKIN` and the skeleton)
+
+athenea keeps a cloud a skeleton carries (`athenea mesh2splat --skinned`)
+only as a USD stage: UsdSkel's binding on the `ParticleField`
+(`skel:jointIndices`, `skel:jointWeights`, elementSize 4;
+`skel:geomBindTransform`; `skel:joints`; `skel:skeleton`) plus its own
+`AtheneaSplatSkinningAPI`: `jointWeightGradients` (six halves a gaussian:
+d w_k / d u and d w_k / d v along its first two rest axes for the first three
+joints, 7dff879) and `skinningXforms`, the joints' transforms (bind space to
+the skeleton's, `matrix4d[]`) time-sampled at the instants the conversion
+read them. Its `.athc` writer refuses `--skinned`. sparkwebGPU carries it:
+
+- **`SKIN`**, tier 1 (it is geometry: without it the cloud is drawn in its
+  bind pose), right after `SHRS`. Per element, `influences` words, one an
+  influence: joint u16 (low) | weight unorm16 (high) -- athenea's packed
+  layout (`common/influences.slang`, t22 390670e), the running sum of the
+  weights rounded so a gaussian's steps add up to its weights' sum to one
+  step -- then `gradientWords` (0 or influences − 1) words of two halves,
+  `jointWeightGradients` as the file holds them. A merged LoD node carries
+  the opacity × weight blend of its splats' joints (the heaviest
+  `influences`, renormalised) and zero gradients. Header words 144 and 148;
+  in memory and in ATHV pages the v2 extra header's seventh and eighth words
+  (0 in athenea's files). A v2 file has no room for it.
+- **The skeleton**, an `ATSK` blob after the starts (inside the bytes a pager
+  reads first; header word 152 says where):
+
+```text
+0   "ATSK"  4 version 1  8 bytes (the whole blob)  12 joints
+16  clips   20 influences a splat   24 gradient words a splat   28 0
+32  geomBindTransform, 16 f32 (USD rows: p' = p M)
+96  joint names' bytes   100 skeleton path's bytes   104 0 0
+112 the joint names ('\n' between), the skeleton path; padded to 4
+    each clip: name bytes, samples, timeCodesPerSecond (f32), 0;
+      its name, padded to 4; the sample times (f32 time codes, increasing);
+      the transforms, f32 x samples x joints x 16 (USD rows, skinningXforms)
+```
+
+A pose between two samples is each matrix element linearly between them
+(USD's interpolation of matrix samples, which is what athenea's Hydra hands
+its skinner). The decoder makes the attributes `skinInfluences` (u32 ×
+influences) and `skinGradients` (u32 × gradientWords); `athc_skeleton()`
+(WASM) and `readAthcSkeleton({ url })` read the blob. Code:
+`rust/spark-lib/src/athc_skin.rs`; the GPU side is
+[athenea skinning](webgpu-athenea-skin.md).
+
+Paged (`PagedSplats`), a skinned cloud is drawn in its bind pose for now:
+`SKIN` is not fetched with the pages.
 
 ### The curvature (`CURV`)
 
@@ -255,6 +307,9 @@ cargo run --release -p build-lod --bin usd-athc -- cloud.usdc --list   # attribu
 | `transferDirect` (16), `transferIndirect` (48), `transferReflected` (48) | transfer, 112 f16 in that order (`transfer_layout.slang`) |
 | `shadowBits` (int, 8 a splat) | shadowBits |
 | `curvature` (3 a splat) | `CURV`, three f16 (v3 only; `--no-curvature` leaves it out) |
+| `transferZonal` (10 a splat) | the transfer, 10 values (two zonal lobes in the splat's frame), in place of `transferDirect` |
+| `skel:jointIndices`, `skel:jointWeights` (or `athenea:splat:joint*`), `jointWeightGradients` | `SKIN` (v3 only) |
+| `skel:joints`, `skel:geomBindTransform`, `skinningXforms` (time samples) | the skeleton, one clip (`--clip NAME`; `--add-clip NAME=other.usdc` adds another conversion's samples of the same rig) |
 | `cryptoObject`, `cryptoManifest`, `ior`, `relight` | no room in a `.athc`: `--json` reports the constants |
 
 A reduced transfer keeps a layout athenea reads: 64 is the direct and

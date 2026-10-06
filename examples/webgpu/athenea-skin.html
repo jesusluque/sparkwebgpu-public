@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • athenea skinning (WebGPU)</title>
+  <style>
+    body { margin: 0; background-color: black; }
+    canvas { display: block; touch-action: none; }
+    .overlay { position: fixed; margin: 12px; bottom: 0; color: white; font-family: sans-serif; white-space: pre; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "@sparkjsdev/spark/webgpu": "../../dist/spark.webgpu.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
+      }
+    }
+  </script>
+  <div class="overlay"><p id="status">loading…</p></div>
+  <canvas id="canvas" tabindex="0" style="outline: none;"></canvas>
+  <script type="module">
+    // athenea's skinning (plan-athenea.md, phase 5): a cloud a skeleton
+    // carries, as athenea `mesh2splat --skinned` makes it -- each gaussian
+    // with its four joints, how their weights change across it, and (with
+    // --transfer) its transfer as two zonal lobes in its own frame -- read
+    // from a .athc v3 (usd-athc: the SKIN section and the skeleton's clips),
+    // posed every frame by athenea's splat_skin (atheneaSkinPlugin: the
+    // joints' linear blend, the whole Jacobian of it for the frame and the
+    // normal) and relit by athenea's splat_relight under a dome.
+    //
+    //   ?url=<.athc>    the skinned cloud (default ./athenea-skin/sparrow160tx.athc;
+    //                   falls back to the test fixture skinned_corner.athc). Made with
+    //                     athenea mesh2splat SparrowBird.usda --skinned --transfer --time 1 \
+    //                       --bake-samples 64 --bake-extra 0 --bake-bounces 1 --resolution 160 -o sparrow160tx.usdc
+    //                     usd-athc sparrow160tx.usdc sparrow160tx.athc --clip flight
+    //   ?hdri=<.hdr>    the dome, full resolution (default ./hdri-4k/autoshop_01_4k.hdr,
+    //                   the sparrow's bake; a procedural sky if it is not there)
+    //   ?up=z|y         the stage's up axis (default z, athenea's sparrow)
+    //   ?relight=0      the cloud's own colours (no relighting)
+    //   ?time=<code>    paused at that time code   ?gui=0   ?view=agx|aces2|standard
+    import * as THREE from "three/webgpu";
+    import GUI from "lil-gui";
+    import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
+    import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
+    import {
+      splatRequiredLimits,
+      fx,
+      plugins,
+      atheneaRelightPlugin,
+      atheneaOutputPlugin,
+      atheneaSkinPlugin,
+      readAthcSkeleton,
+    } from "@sparkjsdev/spark/webgpu";
+
+    const params = new URLSearchParams(location.search);
+    const fallback = "../../test/fixtures/athc/skinned_corner.athc";
+    let url = params.get("url") ?? "./athenea-skin/sparrow160tx.athc";
+    const hdriUrl = params.get("hdri") ?? "./hdri-4k/autoshop_01_4k.hdr";
+    const relit = params.get("relight") !== "0";
+    const status = document.getElementById("status");
+    window.__athenea = { loaded: false, error: null };
+
+    const adapter = await navigator.gpu?.requestAdapter();
+    const renderer = new THREE.WebGPURenderer({
+      canvas: document.getElementById("canvas"),
+      requiredLimits: adapter ? splatRequiredLimits(adapter) : {},
+    });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    await renderer.init();
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.001, 100);
+    const target = new THREE.RenderTarget(1, 1, {
+      type: THREE.HalfFloatType,
+      depthTexture: new THREE.DepthTexture(1, 1),
+    });
+    const output = new THREE.QuadMesh(new THREE.MeshBasicNodeMaterial({ colorNode: THREE.TSL.texture(target.texture) }));
+    const chain = new fx.FxChain(renderer.backend.device);
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+      target.setSize(size.x, size.y);
+    }
+    resize();
+    addEventListener("resize", resize);
+
+    // The skeleton (and whether the file is there at all) first.
+    let skeleton = null;
+    try {
+      skeleton = await readAthcSkeleton({ url });
+    } catch (error) {
+      if (params.has("url")) throw error;
+      console.warn(`${url}: ${error}; showing ${fallback}`);
+      url = fallback;
+      skeleton = await readAthcSkeleton({ url });
+    }
+    if (!skeleton) {
+      status.textContent = `${url}: no skeleton (not a skinned .athc v3)`;
+      throw new Error("no skeleton");
+    }
+    const corner = url === fallback;
+    const up = params.get("up") ?? (corner ? "y" : "z");
+
+    // athenea's stage: Z-up for the sparrow, turned to three's Y-up. The
+    // relighting runs in the stage's frame (its transfer, cells and dome are
+    // the bake's directions).
+    const stage = new THREE.Group();
+    if (up === "z") stage.rotation.x = -Math.PI / 2;
+    scene.add(stage);
+
+    // The dome behind it, as the relighting reads it.
+    const { TSL } = THREE;
+    const turn = TSL.uniform(new THREE.Vector2(1, 0));
+    const intensity = TSL.uniform(1);
+    const skyTexture = TSL.texture(new THREE.DataTexture(new Float32Array(4), 1, 1, THREE.RGBAFormat, THREE.FloatType));
+    const dir = TSL.positionWorld.sub(TSL.cameraPosition).normalize();
+    const local = TSL.vec3(turn.x.mul(dir.x).sub(turn.y.mul(dir.z)), dir.y, turn.y.mul(dir.x).add(turn.x.mul(dir.z)));
+    const skyUv = TSL.vec2(
+      TSL.fract(TSL.atan(local.z, local.x).add(Math.PI / 2).div(2 * Math.PI)),
+      TSL.acos(TSL.clamp(local.y, -1, 1)).div(Math.PI),
+    );
+    const backdrop = new THREE.Mesh(
+      new THREE.SphereGeometry(50, 64, 32),
+      new THREE.MeshBasicNodeMaterial({ side: THREE.BackSide, depthWrite: false }),
+    );
+    backdrop.material.colorNode = TSL.min(skyTexture.sample(skyUv).rgb.mul(intensity), TSL.vec3(65504));
+    scene.add(backdrop);
+
+    const spark = new SparkRenderer({ renderer, hdr: true });
+    scene.add(spark);
+    const bird = new SplatMesh({ url, extSplats: true });
+    stage.add(bird);
+
+    const clipNames = skeleton.clips.map((c) => c.name);
+    const first = skeleton.clips[0];
+    const state = {
+      clip: clipNames[0],
+      playing: !params.has("time"),
+      time: Number(params.get("time") ?? first.times[0]),
+      speed: 1,
+      jacobian: true,
+      normals: true,
+      rotation: 0,
+      intensity: 1,
+      sun: !corner,
+      sunAzimuth: 30,
+      sunElevation: 45,
+      sunIntensity: 3,
+    };
+    const skin = atheneaSkinPlugin({ skeleton, playing: state.playing, time: state.time });
+    const relight = atheneaRelightPlugin({ frame: stage });
+    const display = atheneaOutputPlugin({ view: params.get("view") ?? "agx", exposure: 0 });
+    let host = null;
+
+    function proceduralSky(w, h) {
+      const data = new Float32Array(w * h * 4);
+      for (let y = 0; y < h; y++) {
+        const upness = 1 - (y + 0.5) / h;
+        for (let x = 0; x < w; x++) {
+          const v = upness > 0.5 ? [0.35 + 0.6 * upness, 0.5 + 0.45 * upness, 0.95 * upness + 0.25] : [0.3, 0.25, 0.18];
+          data.set([...v, 1], (y * w + x) * 4);
+        }
+      }
+      return { width: w, height: h, data, channels: 4 };
+    }
+    async function setSky() {
+      let image = null;
+      try {
+        const tex = await new HDRLoader().setDataType(THREE.FloatType).loadAsync(hdriUrl);
+        image = { width: tex.image.width, height: tex.image.height, data: tex.image.data, channels: 4 };
+        tex.flipY = false;
+        skyTexture.value = tex;
+      } catch {
+        image = proceduralSky(256, 128);
+        const tex = new THREE.DataTexture(image.data, image.width, image.height, THREE.RGBAFormat, THREE.FloatType);
+        tex.needsUpdate = true;
+        skyTexture.value = tex;
+      }
+      relight.set({ hdri: image });
+      applySky();
+    }
+    function applySky() {
+      relight.set({ rotation: THREE.MathUtils.degToRad(state.rotation), intensity: state.intensity });
+      const r = THREE.MathUtils.degToRad(state.rotation);
+      turn.value.set(Math.cos(r), Math.sin(r));
+      intensity.value = state.intensity;
+      const az = THREE.MathUtils.degToRad(state.sunAzimuth);
+      const el = THREE.MathUtils.degToRad(state.sunElevation);
+      relight.set({
+        sun: state.sun
+          ? { direction: [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)], intensity: state.sunIntensity }
+          : null,
+      });
+    }
+    function applySkin() {
+      skin.set({ clip: state.clip, jacobian: state.jacobian, normals: state.normals, speed: state.speed, playing: state.playing });
+    }
+
+    try {
+      await setSky();
+      await bird.initialized;
+      await spark.webgpuReady;
+      // Frame the cloud's rest box (a .athc's splats are its LoD set's).
+      bird.updateMatrixWorld(true);
+      const splats = bird.extSplats?.lodSplats ?? bird.packedSplats?.lodSplats ?? bird.extSplats ?? bird.packedSplats;
+      const box = new THREE.Box3();
+      splats?.forEachSplat((_, center) => box.expandByPoint(center));
+      box.applyMatrix4(bird.matrixWorld);
+      const centre = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3()).length();
+      camera.position.copy(centre).add(new THREE.Vector3(0.35, 0.3, 1).normalize().multiplyScalar(1.6 * size));
+      camera.near = size * 0.01;
+      camera.far = size * 100;
+      camera.updateProjectionMatrix();
+      camera.lookAt(centre);
+      backdrop.scale.setScalar(size);
+      window.__athenea.loaded = true;
+    } catch (error) {
+      window.__athenea.error = String(error);
+      status.textContent = `error: ${error}`;
+      console.error(error);
+    }
+
+    if (params.get("gui") !== "0") {
+      const gui = new GUI({ title: "athenea skinning" });
+      const range = skin.range();
+      gui.add(state, "clip", clipNames).onChange(applySkin);
+      gui.add(state, "playing").onChange(applySkin);
+      const timeCtl = gui.add(state, "time", range.from, range.to, 0.01).name("time code").onChange((t) => {
+        state.playing = false;
+        playCtl.updateDisplay();
+        skin.set({ playing: false, time: t });
+      });
+      const playCtl = gui.controllers.find((c) => c.property === "playing");
+      gui.add(state, "speed", 0, 2, 0.05).onChange(applySkin);
+      gui.add(state, "jacobian").name("whole Jacobian (7dff879)").onChange(applySkin);
+      gui.add(state, "normals").name("turn the normals").onChange(applySkin);
+      const s = gui.addFolder("light");
+      s.add(state, "rotation", -180, 180, 1).name("dome rotation").onChange(applySky);
+      s.add(state, "intensity", 0, 4, 0.05).name("dome intensity").onChange(applySky);
+      s.add(state, "sun").onChange(applySky);
+      s.add(state, "sunAzimuth", -180, 180, 1).onChange(applySky);
+      s.add(state, "sunElevation", -10, 90, 1).onChange(applySky);
+      s.add(state, "sunIntensity", 0, 20, 0.1).onChange(applySky);
+      const o = gui.addFolder("output");
+      for (const c of display.ui) {
+        const v = { [c.label]: c.get() };
+        if (c.type === "select") o.add(v, c.label, c.options).onChange(c.set);
+        else o.add(v, c.label, c.min, c.max, c.step).onChange(c.set);
+      }
+      window.__athenea.timeCtl = timeCtl;
+    }
+    Object.assign(window.__athenea, { skin, relight, display, bird, spark, camera, state, skeleton, url });
+
+    const controls = new SparkControls({ canvas: renderer.domElement });
+    controls.fpsMovement.moveSpeed = 0.2;
+    let frames = 0;
+    let last = performance.now();
+    renderer.setAnimationLoop(() => {
+      controls.update(camera);
+      renderer.setRenderTarget(target);
+      renderer.render(scene, camera);
+      const splats = spark.webgpu?.splats;
+      if (!host && splats && window.__athenea.loaded) {
+        host = new plugins.PluginHost({ capabilities: splats.capabilities });
+        host.register(skin);
+        if (relit) host.register(relight);
+        host.register(display).attach(splats);
+        host.applyFx(chain);
+        window.__athenea.host = host;
+        const why = host.resolve(splats.meshes[0]).inactive.find((r) => r.id === skin.id || r.id === relight.id);
+        if (why) status.textContent = `${why.id} inactive: ${why.reason} ${why.detail ?? ""}`;
+      }
+      chain.applyToRenderTarget(renderer, target);
+      renderer.setRenderTarget(null);
+      output.render(renderer);
+      window.__sparkFrames = (window.__sparkFrames ?? 0) + 1;
+      frames++;
+      const now = performance.now();
+      if (now - last > 500 && window.__athenea.loaded) {
+        const fps = (frames * 1000) / (now - last);
+        status.textContent =
+          `${url.split("/").pop()} · ${skeleton.joints.length} joints · ${state.clip} t ${skin.timeCode.toFixed(2)} · ` +
+          `posed ${skin.stats.posed} · ${relit ? `relit ${relight.stats.relit}` : "own colours"} · ${fps.toFixed(0)} fps`;
+        if (state.playing) {
+          state.time = skin.timeCode;
+          window.__athenea.timeCtl?.updateDisplay();
+        }
+        frames = 0;
+        last = now;
+        if (host && window.__sparkFrames > 30) window.__ready = true;
+      }
+    });
+  </script>
+</body>
+</html>

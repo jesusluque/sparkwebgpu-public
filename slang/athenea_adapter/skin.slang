@@ -40,6 +40,8 @@ import athenea.common.packing;
 public static const uint kSkinExt = 1u;
 public static const uint kSkinJacobian = 2u;
 public static const uint kSkinNormals = 4u;
+/// The bind pose: the rest splats and normals put back.
+public static const uint kSkinRest = 8u;
 /// Splats a dispatch row covers (dispatched as rows past 65535 workgroups).
 public static const uint kSkinDispatchRow = 65535u * 256u;
 
@@ -231,8 +233,13 @@ void atheneaSkin(uint3 tid: SV_DispatchThreadID) {
     } else {
         unpackSplat(restA, center, scales, quaternion, rgba, skinParams.encoding);
     }
-    // An inactive splat (no scale) and a splat nothing carries stay as they are.
-    if (all(scales == float3(0.0)) || skinParams.influences == ATTRIB_NONE) {
+    const bool normals = skinFlag(kSkinNormals) && skinParams.normals != ATTRIB_NONE;
+    // An inactive splat (no scale) and a splat nothing carries stay as they
+    // are; so does every splat in the bind pose.
+    if (all(scales == float3(0.0)) || skinParams.influences == ATTRIB_NONE || skinFlag(kSkinRest)) {
+        if (normals) {
+            skinPool[attribBase(skinPool, attribDesc(skinPool, skinParams.normals), at)] = skinRestNormals[at];
+        }
         if (ext) {
             skinSrc[2u * at] = restA;
             skinSrc[2u * at + 1u] = restB;
@@ -241,7 +248,6 @@ void atheneaSkin(uint3 tid: SV_DispatchThreadID) {
         }
         return;
     }
-    const bool normals = skinFlag(kSkinNormals) && skinParams.normals != ATTRIB_NONE;
     const float3 restNormal = normals ? unpackNormal(skinRestNormals[at]) : float3(0.0, 0.0, 1.0);
     const PosedSplat p = skinSplat(at, center, quaternion, scales, restNormal);
     // The third size and the colour are the conversion's and stay.

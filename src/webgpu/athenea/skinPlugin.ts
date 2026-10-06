@@ -59,6 +59,8 @@ export interface AtheneaSkinOptions {
   jacobian?: boolean;
   /** Turn the shading normals (attribute normalOct) with the frame (default true). */
   normals?: boolean;
+  /** Show the bind pose (the cloud as converted) instead of the clip. */
+  bindPose?: boolean;
   /** Which meshes this skeleton carries (default every mesh with skinInfluences). */
   meshes?: (mesh: WgpuSplatMesh) => boolean;
 }
@@ -298,7 +300,7 @@ export function atheneaSkinPlugin(
       for (const mesh of frame.renderer.meshes) {
         if (!carries(frame.renderer, mesh)) continue;
         const s = states.get(mesh.source);
-        const key = `${poseVersion}|${options.jacobian}|${options.normals}`;
+        const key = `${poseVersion}|${options.jacobian}|${options.normals}|${options.bindPose}`;
         if (!s || s.posedKey !== key) {
           // The relight and generate see a new cloud.
           mesh.source.version += 1;
@@ -315,7 +317,7 @@ export function atheneaSkinPlugin(
           const meshes = r.meshes.filter((m) => carries(r, m));
           if (!meshes.length || !rows) return;
           const { device } = r;
-          const key = `${poseVersion}|${options.jacobian}|${options.normals}`;
+          const key = `${poseVersion}|${options.jacobian}|${options.normals}|${options.bindPose}`;
           const work: { mesh: WgpuSplatMesh; s: SkinState }[] = [];
           for (const mesh of meshes) {
             const s = stateOf(device, mesh);
@@ -344,6 +346,7 @@ export function atheneaSkinPlugin(
             const flags =
               (source.format === "ext" ? C.kSkinExt : 0) |
               (options.jacobian !== false ? C.kSkinJacobian : 0) |
+              (options.bindPose ? C.kSkinRest : 0) |
               (options.normals !== false && s.ids.normals !== ATTRIB_NONE
                 ? C.kSkinNormals
                 : 0);

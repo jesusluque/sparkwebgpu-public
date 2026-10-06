@@ -34,17 +34,14 @@ describe.skipIf(!device)("WgpuSplatRenderer", () => {
     },
   };
 
-  async function readCanvas(): Promise<Uint8Array> {
+  async function readCanvas(texture: GPUTexture = canvas): Promise<Uint8Array> {
     const bytesPerRow = 256 * Math.ceil((W * 4) / 256);
     const buf = d.createBuffer({
       size: bytesPerRow * H,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
     const enc = d.createCommandEncoder();
-    enc.copyTextureToBuffer({ texture: canvas }, { buffer: buf, bytesPerRow }, [
-      W,
-      H,
-    ]);
+    enc.copyTextureToBuffer({ texture }, { buffer: buf, bytesPerRow }, [W, H]);
     d.queue.submit([enc.finish()]);
     await buf.mapAsync(GPUMapMode.READ);
     const src = new Uint8Array(buf.getMappedRange());
@@ -233,5 +230,81 @@ describe.skipIf(!device)("WgpuSplatRenderer", () => {
     const centre = ((H / 2) * W + W / 2) * 4;
     expect(px[centre + 2]).toBeGreaterThan(100);
     splats.dispose();
+  });
+
+  // A multisampled RenderTarget passed to render(): three resolves its
+  // colour into target.texture's single-sample texture, which the splats
+  // draw over, tested against a single-sample copy of its multisampled depth.
+  it("draws into a multisampled render target", async () => {
+    const color = d.createTexture({
+      size: [W, H],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const depth = d.createTexture({
+      size: [W, H],
+      format: "depth24plus",
+      sampleCount: 4,
+      usage:
+        GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const target = new THREE.RenderTarget(W, H, {
+      samples: 4,
+      depthTexture: new THREE.DepthTexture(W, H),
+    });
+    const textures = new Map<object, object>([
+      [target.texture, { texture: color }],
+      [target.depthTexture as THREE.DepthTexture, { texture: depth }],
+    ]);
+    const renderer = {
+      backend: { ...fakeRenderer.backend, get: (o: object) => textures.get(o) },
+    };
+    const a = new Uint32Array(4);
+    const b = new Uint32Array(4);
+    encodeExtSplat([a, b], 0, 0, 0, 0, 0.5, 0.5, 0.5, 0, 0, 0, 1, 1, 1, 1, 1);
+    const splats = new WgpuSplatRenderer(renderer as never);
+    splats.add(GpuSplatSource.fromExt(d, a, b, 1));
+    const camera = new THREE.PerspectiveCamera(60, W / H, 0.05, 100);
+    camera.coordinateSystem = THREE.WebGPUCoordinateSystem;
+    camera.updateProjectionMatrix();
+    camera.position.set(0, 0, 4);
+    camera.updateMatrixWorld();
+    // The scene's depth: far (1), or in front of the splat (0).
+    const centre = async (sceneDepth: number) => {
+      const enc = d.createCommandEncoder();
+      enc
+        .beginRenderPass({
+          colorAttachments: [
+            {
+              view: color.createView(),
+              loadOp: "clear",
+              storeOp: "store",
+              clearValue: [0, 0, 0, 1],
+            },
+          ],
+        })
+        .end();
+      enc
+        .beginRenderPass({
+          colorAttachments: [],
+          depthStencilAttachment: {
+            view: depth.createView(),
+            depthLoadOp: "clear",
+            depthClearValue: sceneDepth,
+            depthStoreOp: "store",
+          },
+        })
+        .end();
+      d.queue.submit([enc.finish()]);
+      splats.markDirty();
+      splats.render(camera, target);
+      const px = await readCanvas(color);
+      return px[((H / 2) * W + W / 2) * 4];
+    };
+    expect(await centre(1)).toBeGreaterThan(100);
+    expect(await centre(0)).toBe(0);
+    splats.dispose();
+    color.destroy();
+    depth.destroy();
   });
 });

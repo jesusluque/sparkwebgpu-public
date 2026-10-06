@@ -548,6 +548,32 @@ export const cases = [
       note: "whole frame, transparent plane included (README's numbers are outside it)",
     },
   ),
+  // SparkRenderer options and inputs on WebGPU, without the transparent
+  // plane: the splats against WebGL's.
+  ...ex(
+    "spark-renderer",
+    [
+      ["plain", "", ""],
+      ["cov", "&cov=1&scale=1.4,0.6,1", "cov=1&scale=1.4,0.6,1"],
+      ["accum-ext", "&accumExt=1", "accumExt=1"],
+      ["2dgs", "&n=20000&flat=1&2dgs=1", "n=20000&flat=1&2dgs=1"],
+      ["source", "&source=1", "source=1"],
+      // Blended in sRGB, as on the canvas.
+      ["msaa-target", "&msaa=1", "mode=target&samples=4&msaa=1&srgb=1"],
+      // An ArrayCamera against WebGL drawing each view with setViewport...
+      ["views", "&views=2", "views=2"],
+      // ...and against WebGPU doing the same.
+      ["views-seq", "&views=2&array=0", "views=2", "webgpu"],
+    ].map(([id, gl, gpu, reference = "webgl"]) => ({
+      id,
+      webgl: `/examples/webgpu/spark-renderer.html?backend=${reference}&glass=0${gl}`,
+      webgpu: `/examples/webgpu/spark-renderer.html?glass=0&${gpu}`,
+    })),
+    {
+      settle: { ready: READY },
+      act: step(3),
+    },
+  ),
   ...ex(
     "compare",
     [
@@ -661,6 +687,14 @@ const PCT = {
   "spark-renderer:target": 11.58,
   "spark-renderer:post": 11.58,
   "spark-renderer:target-srgb": 8.42,
+  "spark-renderer:plain": 0.82,
+  "spark-renderer:cov": 0.82,
+  "spark-renderer:accum-ext": 0.8,
+  "spark-renderer:2dgs": 0.85,
+  "spark-renderer:source": 0.82,
+  "spark-renderer:msaa-target": 0.85,
+  "spark-renderer:views": 1.82,
+  "spark-renderer:views-seq": 0.5,
   "compare:butterfly": 0.5,
   "compare:synthetic": 0.5,
   "dyno:effect": 0.5,
@@ -689,6 +723,14 @@ const MEAN = {
   "spark-renderer:target": 4.53,
   "spark-renderer:post": 4.52,
   "spark-renderer:target-srgb": 3.77,
+  "spark-renderer:plain": 0.57,
+  "spark-renderer:cov": 0.59,
+  "spark-renderer:accum-ext": 0.54,
+  "spark-renderer:2dgs": 0.74,
+  "spark-renderer:source": 0.57,
+  "spark-renderer:msaa-target": 0.57,
+  "spark-renderer:views": 1.13,
+  "spark-renderer:views-seq": 0.15,
   "compare:butterfly": 0.2,
   "compare:synthetic": 0.18,
   "dyno:effect": 0.16,

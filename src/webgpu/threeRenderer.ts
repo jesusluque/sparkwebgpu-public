@@ -14,6 +14,7 @@ export interface WebGPURendererLike extends ThreeWebGPURenderer {
   toneMapping?: THREE.ToneMapping;
   toneMappingExposure?: number;
   getOutputRenderTarget(): THREE.RenderTarget | null;
+  getPixelRatio?(): number;
   getRenderTarget(): THREE.RenderTarget | null;
   getActiveCubeFace(): number;
   getActiveMipmapLevel(): number;

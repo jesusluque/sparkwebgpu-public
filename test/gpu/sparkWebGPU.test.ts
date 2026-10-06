@@ -4,10 +4,11 @@
 
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
+import { ExtSplats } from "../../src/ExtSplats";
 import { PackedSplats } from "../../src/PackedSplats";
 import { RgbaArray } from "../../src/RgbaArray";
 import { SparkRenderer } from "../../src/SparkRenderer";
-import { SplatMesh } from "../../src/SplatMesh";
+import { SplatMesh, type SplatSource } from "../../src/SplatMesh";
 import { loadWebGPU } from "../../src/webgpuLoader";
 import { device } from "./device";
 
@@ -109,11 +110,44 @@ describe.skipIf(!device)("SparkRenderer on WebGPU", () => {
     return lit;
   }
 
-  // A red ball of splats.
-  function ball(count = 2000) {
+  // The lit pixels' bounding box, [width, height], and the lit count in the
+  // left and right halves.
+  async function litBox() {
+    const bytesPerRow = 256;
+    const buf = d.createBuffer({
+      size: bytesPerRow * H,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = d.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: canvas }, { buffer: buf, bytesPerRow }, [
+      W,
+      H,
+    ]);
+    d.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const px = new Uint8Array(buf.getMappedRange());
+    let [x0, y0, x1, y1] = [W, H, -1, -1];
+    const halves = [0, 0];
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (px[y * bytesPerRow + x * 4] <= 40) continue;
+        x0 = Math.min(x0, x);
+        x1 = Math.max(x1, x);
+        y0 = Math.min(y0, y);
+        y1 = Math.max(y1, y);
+        halves[x < W / 2 ? 0 : 1] += 1;
+      }
+    }
+    buf.unmap();
+    buf.destroy();
+    return { size: [x1 - x0 + 1, y1 - y0 + 1], halves };
+  }
+
+  // A red ball of splats; `flat`: zero z scales (2DGS).
+  function ball(count = 2000, flat = false) {
     const packed = new PackedSplats();
     const center = new THREE.Vector3();
-    const scales = new THREE.Vector3().setScalar(0.08);
+    const scales = new THREE.Vector3(0.08, 0.08, flat ? 0 : 0.08);
     const quaternion = new THREE.Quaternion();
     const color = new THREE.Color(1, 0.1, 0.1);
     for (let i = 0; i < count; i++) {
@@ -332,6 +366,175 @@ describe.skipIf(!device)("SparkRenderer on WebGPU", () => {
     expect(Array.from(orig.subarray(0, 4))).toEqual([255, 26, 26, 255]);
     rgba.dispose();
     spark.dispose();
+  });
+
+  // The same ball as ExtSplats (covSplats meshes need them).
+  function extBall(count = 2000) {
+    const ext = new ExtSplats();
+    ball(count).forEachSplat((_, center, scales, quaternion, opacity, color) =>
+      ext.pushSplat(center, scales, quaternion, opacity, color),
+    );
+    return ext;
+  }
+
+  it("accumulates covariance splats with covSplats", async () => {
+    // A ball squashed by a non-uniform scale: an ellipse 4x as wide as tall
+    // with covariance splats; the similarity transform can't do that.
+    const box = async (covSplats: boolean, meshCov: boolean) => {
+      const spark = new SparkRenderer({
+        renderer: fakeRenderer as never,
+        covSplats,
+      });
+      const { spark: other, scene, camera } = setup();
+      scene.remove(other);
+      other.dispose();
+      scene.add(spark);
+      const mesh = new SplatMesh({
+        extSplats: extBall(),
+        covSplats: meshCov,
+      });
+      mesh.scale.set(1.6, 0.4, 1);
+      scene.add(mesh);
+      await render(spark, scene, camera);
+      const options = spark.webgpu?.splats?.options;
+      const result = { ...(await litBox()), cov: options?.covSplats };
+      spark.dispose();
+      return result;
+    };
+    const cov = await box(true, false);
+    expect(cov.cov).toBe(true);
+    expect(cov.size[0] / cov.size[1]).toBeGreaterThan(2.5);
+    // A covSplats mesh turns them on by itself (WebGL throws instead).
+    const meshCov = await box(false, true);
+    expect(meshCov.cov).toBe(true);
+    expect(meshCov.size).toEqual(cov.size);
+    const plain = await box(false, false);
+    expect(plain.cov).toBe(false);
+    expect(plain.size[0] / plain.size[1]).toBeLessThan(1.5);
+  });
+
+  it("follows accumExtSplats and enable2DGS", async () => {
+    const spark = new SparkRenderer({
+      renderer: fakeRenderer as never,
+      accumExtSplats: true,
+      enable2DGS: true,
+    });
+    const { spark: other, scene, camera } = setup();
+    scene.remove(other);
+    other.dispose();
+    scene.add(spark);
+    const mesh = new SplatMesh({ packedSplats: ball(2000, true) });
+    scene.add(mesh);
+    await render(spark, scene, camera);
+    const options = spark.webgpu?.splats?.options;
+    expect(options?.accumulator).toBe("ext");
+    expect(options?.enable2DGS).toBe(true);
+    // Flat splats facing the camera draw as 2D Gaussians.
+    const flat = await litPixels();
+    expect(flat).toBeGreaterThan(W * H * 0.1);
+    spark.accumExtSplats = false;
+    spark.enable2DGS = false;
+    await render(spark, scene, camera);
+    expect(options?.accumulator).toBe("auto");
+    expect(options?.enable2DGS).toBe(false);
+    spark.dispose();
+  });
+
+  // A SplatSource of its own: its fetchSplat graph is read in generate.
+  it("draws SplatMeshes with a custom SplatSource", async () => {
+    const packed = ball();
+    class Wrapped implements SplatSource {
+      prepareFetchSplat() {}
+      dispose() {}
+      getNumSplats() {
+        return packed.getNumSplats();
+      }
+      hasRgbDir() {
+        return false;
+      }
+      getNumSh() {
+        return 0;
+      }
+      setMaxSh() {}
+      fetchSplat(args: Parameters<SplatSource["fetchSplat"]>[0]) {
+        return packed.fetchSplat(args);
+      }
+      forEachSplat(callback: Parameters<SplatSource["forEachSplat"]>[0]) {
+        packed.forEachSplat(callback);
+      }
+    }
+    const { spark, scene, camera } = setup();
+    const own = new SplatMesh({ packedSplats: packed });
+    scene.add(own);
+    await render(spark, scene, camera);
+    const expected = await litPixels();
+    scene.remove(own);
+    const mesh = new SplatMesh({ splats: new Wrapped() });
+    scene.add(mesh);
+    await render(spark, scene, camera);
+    const splats = spark.webgpu?.splats;
+    expect(splats?.meshes.map((m) => m.object)).toEqual([mesh]);
+    expect(await litPixels()).toBe(expected);
+    // Hidden and shown again.
+    mesh.visible = false;
+    await render(spark, scene, camera);
+    expect(await litPixels()).toBe(0);
+    mesh.visible = true;
+    await render(spark, scene, camera);
+    expect(await litPixels()).toBe(expected);
+    spark.dispose();
+  });
+
+  // An ArrayCamera: each sub-camera in its viewport, drawn once three's
+  // frame is submitted (scene.onAfterRender).
+  it("draws an ArrayCamera's views into their viewports", async () => {
+    const { spark, scene } = setup();
+    scene.add(new SplatMesh({ packedSplats: ball() }));
+    const view = (x: number, lookX: number) => {
+      const c = new THREE.PerspectiveCamera(60, W / 2 / H, 0.05, 100);
+      c.coordinateSystem = THREE.WebGPUCoordinateSystem;
+      c.updateProjectionMatrix();
+      c.position.set(0, 0, 3);
+      c.lookAt(lookX, 0, 0);
+      c.updateMatrixWorld();
+      (c as THREE.PerspectiveCamera & { viewport: THREE.Vector4 }).viewport =
+        new THREE.Vector4(x, 0, W / 2, H);
+      return c;
+    };
+    const r = fakeRenderer as Record<string, unknown>;
+    const frameBufferTarget = {};
+    r._frameBufferTarget = frameBufferTarget;
+    r.getPixelRatio = () => 1;
+    Object.assign(rc, { renderTarget: frameBufferTarget, textures: [{}] });
+    const draw = async (a: THREE.Camera, b: THREE.Camera) => {
+      const camera = new THREE.ArrayCamera([a, b]);
+      await render(spark, scene, camera);
+      expect(Object.hasOwn(scene, "onAfterRender")).toBe(true);
+      scene.onAfterRender(
+        fakeRenderer as never,
+        scene,
+        camera,
+        null as never,
+        null as never,
+        null as never,
+      );
+      await d.queue.onSubmittedWorkDone();
+      return (await litBox()).halves;
+    };
+    try {
+      const both = await draw(view(0, 0), view(W / 2, 0));
+      expect(both[0]).toBeGreaterThan(W * H * 0.05);
+      expect(both[1]).toBe(both[0]);
+      // The second view looks away: its half stays dark.
+      const one = await draw(view(0, 0), view(W / 2, 50));
+      expect(one[0]).toBe(both[0]);
+      expect(one[1]).toBe(0);
+    } finally {
+      r._frameBufferTarget = null;
+      r.getPixelRatio = undefined;
+      Object.assign(rc, { renderTarget: null, textures: null });
+      spark.dispose();
+    }
   });
 
   it("refuses what WebGPU doesn't do yet", () => {

@@ -27,6 +27,7 @@ import {
   DrawTimer,
   type RasterPath,
 } from "./AutoRasterizer";
+import { DepthResolve } from "./DepthResolve";
 import { GpuProfiler } from "./GpuProfiler";
 import { GpuSorter } from "./GpuSorter";
 import { GpuSplatSource } from "./GpuSplatSource";
@@ -357,6 +358,8 @@ export class WgpuSplatRenderer {
   private stale = false;
   private dirty = true;
   private drawUniform: GPUBuffer;
+  /** Single-sample copies of multisampled targets' depth (render()). */
+  private depthResolve?: DepthResolve;
   private pipelines = new Map<string, ReflectedRenderPipeline>();
   private emptyBuffer: GPUBuffer;
   private dynoKernels: DynoKernels;
@@ -951,11 +954,9 @@ export class WgpuSplatRenderer {
         "WgpuSplatRenderer: render the scene into the target first",
       );
     }
-    if ((target.samples ?? 0) > 1) {
-      throw new Error(
-        "WgpuSplatRenderer: multisampled targets are not supported yet",
-      );
-    }
+    // A multisampled target (samples > 1): three resolves its colour into
+    // target.texture's single-sample texture at the end of its pass, which
+    // is what `color` is; its depth stays multisampled, resolved in draw().
     const depth = target.depthTexture
       ? (gpuTexture(renderer, target.depthTexture) ?? null)
       : null;
@@ -1321,7 +1322,13 @@ export class WgpuSplatRenderer {
       return;
     const { color: target, depth, linear } = this.resolveTarget(renderTarget);
     const size = { x: target.width, y: target.height };
-    const depthTexture = this.options.depthTest ? depth : null;
+    let depthTexture = this.options.depthTest ? depth : null;
+    if (depthTexture && depthTexture.sampleCount > 1) {
+      // Splats draw single-sampled over the resolved colour, tested against
+      // a single-sample copy of the multisampled depth.
+      this.depthResolve ??= new DepthResolve(this.device);
+      depthTexture = this.depthResolve.resolve(encoder, depthTexture);
+    }
     const depthView = depthTexture?.createView();
     const depthFormat = depthTexture?.format ?? null;
 
@@ -1561,6 +1568,7 @@ export class WgpuSplatRenderer {
     this.sorter.destroy();
     this.srgb?.dispose();
     this.tiles?.destroy();
+    this.depthResolve?.dispose();
     this.profiler?.destroy();
     this.autoTimer?.destroy();
     this.registry.destroy();

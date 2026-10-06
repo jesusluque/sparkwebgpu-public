@@ -74,9 +74,12 @@ On `WebGPURenderer`, `SparkRenderer` supports:
 - drawing on the canvas (with or without `antialias`), into `RenderTarget`s, and through `PostProcessing`'s `pass()`, depth-tested against three's scene;
 - the `target` option with `renderTarget()` / `readTarget()`, `renderCubeMap()` / `readCubeTargets()`, and `getRgba()`;
 - `SparkPortals` and the portal disk clip (`diskCenter`, `diskNormal`, `diskRadius` and `diskTwoSided` extra uniforms);
-- raycasting against packed, ext and LoD meshes.
+- raycasting against packed, ext and LoD meshes;
+- `covSplats` (covariance splats from generate to the draw: non-uniform scales and shears, CovSplat modifiers; a visible `covSplats` SplatMesh turns them on by itself), `enable2DGS`, and `accumExtSplats`, which forces the ext accumulator (without it WebGPU picks ext whenever it fits a storage binding, rather than WebGL's packed default);
+- `SplatMesh`es with a custom `SplatSource`: its `fetchSplat` graph runs as the generate kernel's source, followed by the mesh's own pipeline;
+- `ArrayCamera`s: each sub-camera generates, sorts and draws into its viewport once three has submitted its frame (so transparent objects in front of the splats end up under them, as with custom tone mapping).
 
-The lower-level `WgpuSplatRenderer` also takes `covSplats` and `enable2DGS`, and has the WebGPU-only extras: [per-Gaussian attributes](webgpu-attributes.md) with picking, and [aofx post effects](webgpu-fx.md).
+The lower-level `WgpuSplatRenderer` has the WebGPU-only extras: [per-Gaussian attributes](webgpu-attributes.md) with picking, and [aofx post effects](webgpu-fx.md).
 
 ### Not supported yet
 
@@ -84,9 +87,7 @@ These throw or warn on WebGPU:
 
 - `renderEnvMap` (use `WgpuCubeMap.renderEnvMap`) and `getLodTreeLevel`;
 - a custom `vertexShader` or `fragmentShader` on `SparkRenderer` (the portal disk clip is built in);
-- WebXR and array cameras. three.js's `WebGPURenderer` throws in `XRManager.setSession` on its WebGPU backend, and Chrome and Safari on macOS have no WebXR binding for WebGPU, so XR on WebGPU isn't possible there today. `SparkXr` reports `not_supported` instead of showing a button that fails;
-- `SparkRenderer`'s `covSplats`, `enable2DGS` and `accumExtSplats` (ignored, with a warning);
-- `SplatMesh`es with a custom `SplatSource`;
+- WebXR. three.js's `WebGPURenderer` throws in `XRManager.setSession` on its WebGPU backend, and Chrome and Safari on macOS have no WebXR binding for WebGPU, so XR on WebGPU isn't possible there today. `SparkXr` reports `not_supported` instead of showing a button that fails;
 - raycasting against paged (`.rad`) meshes, whose splats exist only on the GPU.
 
 ## Custom dynos

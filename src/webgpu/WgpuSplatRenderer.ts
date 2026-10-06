@@ -707,6 +707,18 @@ export class WgpuSplatRenderer {
       : undefined;
   }
 
+  /**
+   * Timestamp writes for a plugin's own pass, timed into stats.gpuMs under
+   * `label` with options.profile; undefined otherwise.
+   */
+  passTimestampWrites(
+    label: string,
+  ):
+    | (GPUComputePassTimestampWrites & GPURenderPassTimestampWrites)
+    | undefined {
+    return this.timestampWrites(label);
+  }
+
   // The GPU sort of this frame's metric, a pass per stage when profiling.
   private encodeSort(encoder: GPUCommandEncoder, total: number) {
     const metric = this.metric as GPUBuffer;

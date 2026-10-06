@@ -796,6 +796,117 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     host.detach();
     splats.dispose();
   }, 120_000);
+  it("relights only the splats a LoD cut draws, the same colours, and keeps the view-independent terms", async () => {
+    // Four splats; the LoD draws two of them.
+    const N = 4;
+    const qa = new Uint32Array(4 * N);
+    const qb = new Uint32Array(4 * N);
+    for (let i = 0; i < N; i++) {
+      encodeExtSplat(
+        [qa, qb],
+        i,
+        0.3 * i - 0.45,
+        0.1 * i,
+        0,
+        0.2,
+        0.2,
+        0.01,
+        0,
+        0,
+        0,
+        1,
+        0.6,
+        0.5 - 0.1 * i,
+        0.4,
+        0.3,
+      );
+    }
+    const make = () => {
+      const src = GpuSplatSource.fromExt(d, qa, qb, N);
+      src.setAttribute(
+        "pbr",
+        Array.from({ length: N }, (_, i) => pbrWord(0, 0.2 + 0.2 * i)),
+        "u32",
+        1,
+      );
+      const tx: number[] = [];
+      const sh: number[] = [];
+      for (let i = 0; i < N; i++) {
+        tx.push(...transfer.slice(i * TRANSFER, (i + 1) * TRANSFER));
+        sh.push(...cells.slice(i * CELLS, (i + 1) * CELLS));
+      }
+      src.setAttribute("transfer", tx, "f16", TRANSFER);
+      src.setAttribute("shadowBits", sh, "u32", CELLS);
+      return src;
+    };
+    const view = new THREE.PerspectiveCamera(50, 1, 0.05, 100);
+    view.coordinateSystem = THREE.WebGPUCoordinateSystem;
+    view.position.set(0.2, 0.1, 3);
+    view.updateProjectionMatrix();
+    view.updateMatrixWorld();
+    const run = async (lod: Uint32Array | null) => {
+      const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+        depthTest: false,
+        alwaysGenerate: true,
+      });
+      const mesh = splats.add(make());
+      if (lod) splats.setLodIndices(mesh, lod);
+      const host = new PluginHost({
+        capabilities: splats.capabilities,
+        tier: 2,
+      });
+      const relight = atheneaRelightPlugin({ hdri: sky(128, 64), sun });
+      relight.setStoredLinear(mesh, true);
+      host.register(relight).attach(splats);
+      await host.ready();
+      splats.render(view, target);
+      await d.queue.onSubmittedWorkDone();
+      const relit = relight.buffers?.("splat", { frame: null, mesh })
+        .atheneaRelit as GPUBuffer;
+      const words = new Uint32Array(await read(relit));
+      return { splats, mesh, host, relight, words };
+    };
+    const all = await run(null);
+    const cut = await run(new Uint32Array([3, 1]));
+    const stride = 5 * 4;
+    for (let i = 0; i < N; i++) {
+      const colour = (w: Uint32Array) =>
+        Array.from(w.subarray(i * stride, i * stride + 4));
+      const kept = (w: Uint32Array) =>
+        Array.from(w.subarray(i * stride + 4, i * stride + 8));
+      // The kept terms of every splat; the colour of the drawn ones only.
+      expect(kept(cut.words)).toEqual(kept(all.words));
+      if (i === 1 || i === 3) {
+        expect(colour(cut.words)).toEqual(colour(all.words));
+      } else {
+        expect(colour(cut.words)).toEqual([0, 0, 0, 0]);
+      }
+    }
+    expect([cut.relight.stats.viewless, cut.relight.stats.relit]).toEqual([
+      1, 1,
+    ]);
+    // A new cut: the colours again, not the kept terms.
+    cut.splats.setLodIndices(cut.mesh, new Uint32Array([0, 2]));
+    cut.splats.render(view, target);
+    await d.queue.onSubmittedWorkDone();
+    expect([cut.relight.stats.viewless, cut.relight.stats.relit]).toEqual([
+      1, 2,
+    ]);
+    const relit = cut.relight.buffers?.("splat", {
+      frame: null,
+      mesh: cut.mesh,
+    }).atheneaRelit as GPUBuffer;
+    const again = new Uint32Array(await read(relit));
+    for (const i of [0, 2]) {
+      expect(Array.from(again.subarray(i * stride, i * stride + 4))).toEqual(
+        Array.from(all.words.subarray(i * stride, i * stride + 4)),
+      );
+    }
+    for (const r of [all, cut]) {
+      r.host.detach();
+      r.splats.dispose();
+    }
+  }, 120_000);
   it("draws a shadow catcher as athenea's catcherOpacity", async () => {
     // Ground splats facing +Y, each with its own open cells.
     const M = 6;

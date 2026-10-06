@@ -418,6 +418,7 @@ export class PluginHost {
       .filter(
         (p) =>
           p.slang?.blend &&
+          (p.blendActive?.() ?? true) &&
           (assets.length === 0
             ? !this.reason(p)
             : assets.some((a) => !this.reason(p, a))),

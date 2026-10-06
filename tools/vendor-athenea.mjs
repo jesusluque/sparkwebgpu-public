@@ -3,7 +3,9 @@
 //
 // athenea (~/luc/athenea) is read, never written: every file comes out of
 // `git show <commit>:<path>`, so the branch checked out there does not matter.
-// The roots are shaders/athenea/{common,scene,splat,lod}; every module they
+// The roots are shaders/athenea/{common,scene,splat,lod} and, of
+// technique/, the display transform (display.slang, aces2_prepare.slang: the
+// view transforms AgX and ACES 2.0 of the output stage); every module they
 // import (transitively) comes along, wherever it lives. The copies keep their
 // paths under shaders/athenea/, so `import athenea.common.packing;` resolves
 // with `-I slang` exactly as it does with `-I shaders` in athenea.
@@ -31,7 +33,15 @@ import { findEntries, findSlangc } from "./slang-build/index.mjs";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SLANG_DIR = path.join(ROOT, "slang");
 const OUT = path.join(SLANG_DIR, "athenea");
-const ROOTS = ["common", "scene", "splat", "lod"];
+// Directories, or single files (a path ending in .slang).
+const ROOTS = [
+  "common",
+  "scene",
+  "splat",
+  "lod",
+  "technique/display.slang",
+  "technique/aces2_prepare.slang",
+];
 const PREFIX = "shaders/athenea/";
 
 function arg(name) {
@@ -81,9 +91,10 @@ function importsOf(file, source) {
 }
 
 const files = new Map();
-const queue = [...tree].filter((p) =>
-  ROOTS.includes(p.slice(PREFIX.length).split("/")[0]),
-);
+const queue = [...tree].filter((p) => {
+  const rel = p.slice(PREFIX.length);
+  return ROOTS.includes(rel) || ROOTS.includes(rel.split("/")[0]);
+});
 while (queue.length) {
   const p = queue.shift();
   if (files.has(p)) continue;

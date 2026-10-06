@@ -4,7 +4,7 @@ repo     ~/luc/athenea
 commit   89a04d92055965a92f74d44e0b20c78b96606ef4
 date     2026-10-05T21:14:43+02:00
 subject  A flattened version under any HDR, in a unit Spark keeps, says how it was made
-roots    shaders/athenea/common shaders/athenea/scene shaders/athenea/splat shaders/athenea/lod (and their imports)
+roots    shaders/athenea/common shaders/athenea/scene shaders/athenea/splat shaders/athenea/lod shaders/athenea/technique/display.slang shaders/athenea/technique/aces2_prepare.slang (and their imports)
 
 # sha256  path (under shaders/athenea/)
 875c3f2aaaa0bdb0b4e8eefd0b37fd8d8027b036447a857cdf8488800673db45  common/bake_fit.slang
@@ -71,3 +71,6 @@ b1f67c35f3692ef741c537fd3f7b806bfe189f17ab8865353b22783dfd972579  splat/splat_vi
 974794f734a20ab14d6ed7e3ea3e874ea744958190909c1c377457dadbcc64df  splat/splat_visibility_bake.slang
 c45eab7bf399d0b11c115f50426a430b8034a50bcd792c7ec92090d511b80c43  splat/splat_visibility_common.slang
 d908af49a8906b065e61f563c68846cae023e7b118c6172e5b713d2d0a7766a8  splat/splat_visibility_read.slang
+c026dfc69e07d938ad697ec14a7c426c44b683a4633c71f4dd64399afa99d659  technique/aces2.slang
+b9f3f0854fb70a8e65d727ae7430f48811be6e3828e288efa171ae38bdf3f5ce  technique/aces2_prepare.slang
+d8a8ee1c7d5969693623488e18ba08dcb7d7546cb17a87d5c4c0f941ae3ebce3  technique/display.slang

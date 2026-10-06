@@ -38,6 +38,9 @@ flowchart LR
 - **into three's open pass** (`renderInPass`) for render targets and post-processing passes, testing against three's depth;
 - **on the canvas**, three renders into a linear half-float target. To blend in sRGB as WebGL Spark does, `SparkWebGPU` ends three's pass, draws the splats over an 8-bit layer that starts as the target as the canvas would hold it, `q(srgb(clamp(dst)))`, with the transmittance T in alpha, so each blend rounds as WebGL's does; writes back `linear(layer + T · (srgb(clamp(dst)) − q(…)))`, which leaves uncovered pixels exact (`SrgbComposite.ts`), and resumes three's pass, as three's own `copyFramebufferToTexture` does;
 - **after three's output pass** when tone mapping is on, so that splats aren't tone mapped. A multisampled scene depth is first copied to a single-sample texture (`DepthResolve.ts`), since WebGPU can't resolve depth.
+- **after three's frame**, for an `ArrayCamera`: each sub-camera needs its own generate and sort, which `renderInPass` submits ahead of three's command buffer, so they can't share three's pass. Once three has submitted (`scene.onAfterRender`), each view is generated, sorted and drawn into its viewport in turn, over the canvas or the render target.
+
+`render()` into a multisampled `RenderTarget` draws over the colour three resolved into `target.texture`, testing a `DepthResolve` copy of its depth.
 
 This reaches into three.js r180 internals (the current render context, the backend's per-resource data and utils, and its pipeline cache), declared as narrow interfaces at the top of `SparkWebGPU.ts`.
 

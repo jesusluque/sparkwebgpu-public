@@ -22,6 +22,15 @@
       &msaa=1             antialias: true
       &srgb=1             srgbBlend: target and post modes blend in sRGB too
       &file=<asset>       default butterfly.spz
+      &samples=4          mode=target: a multisampled RenderTarget
+      &cov=1              covSplats: the file as a covSplats ExtSplats mesh
+      &scale=x,y,z        the mesh's scale (non-uniform needs cov=1)
+      &accumExt=1         accumExtSplats
+      &n=<count>&flat=1   a synthetic cloud instead (flat: zero z scales)
+      &2dgs=1             enable2DGS
+      &source=1           the splats through a SplatSource of the page's own
+      &views=2            two views side by side: an ArrayCamera (default),
+                          or &array=0 each rendered with setViewport
   -->
   <script type="importmap">
     {
@@ -38,8 +47,9 @@
     import * as THREE from "three/webgpu";
     import { WebGLRenderer } from "three";
     import { pass } from "three/tsl";
-    import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+    import { PackedSplats, SparkRenderer, SplatMesh, utils } from "@sparkjsdev/spark";
     import { getAssetFileURL } from "../js/get-asset-url.js";
+    import { syntheticPacked } from "./compare.js";
 
     const params = new URLSearchParams(location.search);
     const webgl = params.get("backend") === "webgl";
@@ -53,13 +63,50 @@
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x101018);
     const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
-    const spark = new SparkRenderer({ renderer, srgbBlend: params.get("srgb") === "1" });
+    const cov = params.get("cov") === "1";
+    const n = params.get("n") ? Number(params.get("n")) : null;
+    const spark = new SparkRenderer({
+      renderer,
+      srgbBlend: params.get("srgb") === "1",
+      covSplats: cov,
+      accumExtSplats: params.get("accumExt") === "1",
+      enable2DGS: params.get("2dgs") === "1",
+    });
     scene.add(spark);
 
-    const mesh = new SplatMesh({ url: await getAssetFileURL(params.get("file") ?? "butterfly.spz") });
-    mesh.quaternion.set(1, 0, 0, 0);
+    // A SplatSource of the page's own, reading another one's splats.
+    class Wrapped {
+      constructor(inner) { this.inner = inner; }
+      prepareFetchSplat() { this.inner.prepareFetchSplat(); }
+      dispose() {}
+      getNumSplats() { return this.inner.getNumSplats(); }
+      hasRgbDir() { return this.inner.hasRgbDir(); }
+      getNumSh() { return this.inner.getNumSh(); }
+      setMaxSh(maxSh) { this.inner.setMaxSh(maxSh); }
+      fetchSplat(args) { return this.inner.fetchSplat(args); }
+      forEachSplat(callback) { this.inner.forEachSplat(callback); }
+    }
+    const url = await getAssetFileURL(params.get("file") ?? "butterfly.spz");
+    let mesh;
+    if (n) {
+      const packedSplats = new PackedSplats({ packedArray: syntheticPacked(utils, n, params.get("flat") === "1"), numSplats: n });
+      mesh = params.get("source") === "1"
+        ? new SplatMesh({ splats: new Wrapped(packedSplats) })
+        : new SplatMesh({ packedSplats });
+    } else if (params.get("source") === "1") {
+      const packedSplats = new PackedSplats({ url });
+      await packedSplats.initialized;
+      mesh = new SplatMesh({ splats: new Wrapped(packedSplats) });
+    } else {
+      mesh = new SplatMesh({ url, extSplats: cov, covSplats: cov });
+    }
+    if (!n) {
+      mesh.quaternion.set(1, 0, 0, 0);
+      mesh.rotation.y += 0.6;
+    }
     mesh.position.set(0, 0, -3);
-    mesh.rotation.y += 0.6;
+    const scale = params.get("scale")?.split(",").map(Number);
+    if (scale) mesh.scale.set(...scale);
     scene.add(mesh);
 
     const cube = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), new THREE.MeshBasicMaterial({ color: 0x3060ff }));
@@ -73,7 +120,7 @@
 
     let show = null;
     if (!webgl && mode === "target") {
-      const target = new THREE.RenderTarget(1, 1, { depthTexture: new THREE.DepthTexture(1, 1), type: THREE.HalfFloatType });
+      const target = new THREE.RenderTarget(1, 1, { depthTexture: new THREE.DepthTexture(1, 1), type: THREE.HalfFloatType, samples: Number(params.get("samples") ?? 0) });
       target.setSize(...renderer.getDrawingBufferSize(new THREE.Vector2()).toArray());
       const quad = new THREE.QuadMesh(new THREE.MeshBasicNodeMaterial({ colorNode: THREE.TSL.texture(target.texture) }));
       show = () => {
@@ -86,6 +133,40 @@
       const post = new THREE.PostProcessing(renderer);
       post.outputNode = pass(scene, camera);
       show = () => post.render();
+    }
+
+    // Two views side by side: the left as the single camera sees it, the
+    // right from further to the side.
+    if (params.get("views") === "2") {
+      const width = window.innerWidth / 2;
+      const height = window.innerHeight;
+      const views = [0, 1].map((i) => {
+        const view = new THREE.PerspectiveCamera(60, width / height, 0.1, 100);
+        view.position.set(i * 0.8, 0, i * -0.4);
+        view.lookAt(0, 0, -3);
+        view.viewport = new THREE.Vector4(i * width, 0, width, height);
+        view.updateMatrixWorld();
+        return view;
+      });
+      if (params.get("array") !== "0" && !webgl) {
+        const array = new THREE.ArrayCamera(views);
+        show = () => renderer.render(scene, array);
+      } else {
+        // One render per view, as WebGL Spark draws them.
+        renderer.setScissorTest(true);
+        renderer.autoClear = false;
+        show = () => {
+          renderer.setScissor(0, 0, window.innerWidth, window.innerHeight);
+          renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+          renderer.clear();
+          for (const view of views) {
+            const vp = view.viewport;
+            renderer.setViewport(vp.x, vp.y, vp.z, vp.w);
+            renderer.setScissor(vp.x, vp.y, vp.z, vp.w);
+            renderer.render(scene, view);
+          }
+        };
+      }
     }
 
     let frames = 0;

@@ -151,9 +151,14 @@ things:
 These throw or warn:
 
 - custom `vertexShader`/`fragmentShader` (the portal disk clip is built in);
-- WebXR and array cameras;
-- `covSplats`, `enable2DGS`, `accumExtSplats`;
-- SplatMeshes with a custom `SplatSource`.
+- WebXR.
+
+`ArrayCamera` views are drawn after three's frame, one sub-camera at a time,
+so transparent objects in front of the splats end up under them.
+`accumExtSplats: false` lets WebGPU pick its accumulator (ext while it fits a
+storage binding) rather than WebGL's packed one. `spark-renderer.html` checks
+`covSplats`, `enable2DGS`, `accumExtSplats`, a custom `SplatSource`, a
+multisampled target and two views against WebGL (`?cov=1`, `?2dgs=1`, ...).
 
 ## Performance
 

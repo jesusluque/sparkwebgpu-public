@@ -10,10 +10,15 @@ import {
 } from "../../SplatEdit";
 import type {
   CovSplatModifier,
+  GsplatGenerator,
   GsplatModifier,
   SplatGenerator,
 } from "../../SplatGenerator";
-import { type SplatMesh, maybeInjectSplatRgba } from "../../SplatMesh";
+import {
+  type SplatMesh,
+  type SplatSource,
+  maybeInjectSplatRgba,
+} from "../../SplatMesh";
 import { type Dyno, type IOTypes, dynoBlock } from "../../dyno/base";
 import { CovSplat, Gsplat, splitGsplat } from "../../dyno/splats";
 import { DynoBool } from "../../dyno/uniforms";
@@ -140,6 +145,46 @@ export function splatMeshDyno(
       updateSplatMeshEdits(mesh, globalEdits?.() ?? []);
     },
   };
+}
+
+/**
+ * splatMeshDyno for a SplatMesh drawing a custom SplatSource (not a
+ * PackedSplats, ExtSplats or PagedSplats): the source's fetchSplat graph is
+ * the generator, read per splat index in the generate kernel, then the
+ * mesh's pipeline runs as for its own splats (SplatMesh.constructGenerator /
+ * constructCovGenerator). Use WgpuSplatRenderer.addGenerator with
+ * source.getNumSplats() and the mesh as the object. The source's SH, if it
+ * evaluates any, sees the camera in object space, as on WebGL.
+ */
+export function splatSourceMeshDyno(
+  mesh: SplatMesh,
+  source: SplatSource,
+  options: { globalEdits?: () => SplatEdit[] } = {},
+): WgpuDyno {
+  const base = splatMeshDyno(mesh, options);
+  const { context } = mesh;
+  const generator: GsplatGenerator = dynoBlock(
+    { index: "int" },
+    { gsplat: Gsplat },
+    ({ index }) => {
+      if (!index) throw new Error("index is undefined");
+      source.setMaxSh(mesh.maxSh);
+      source.prepareFetchSplat();
+      const viewOrigin = mesh.covSplats
+        ? context.covViewToObject.offset
+        : context.viewToObject.translate;
+      return { gsplat: source.fetchSplat({ index, viewOrigin }) };
+    },
+  );
+  // The base's getters stay live: modifiers changed later are picked up.
+  return Object.defineProperties(
+    { generator },
+    Object.fromEntries(
+      Object.entries(Object.getOwnPropertyDescriptors(base)).filter(
+        ([key]) => key !== "generator",
+      ),
+    ),
+  ) as WgpuDyno;
 }
 
 function covSplatMeshDyno(

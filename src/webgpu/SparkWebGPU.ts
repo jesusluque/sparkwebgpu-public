@@ -17,13 +17,14 @@
 // splatMeshDyno, and other SplatGenerators through splatGeneratorDyno.
 
 import * as THREE from "three";
-import type { ExtSplats } from "../ExtSplats";
+import { ExtSplats } from "../ExtSplats";
 import { PackedSplats } from "../PackedSplats";
+import { PagedSplats } from "../PagedSplats";
 import type { RgbaArray } from "../RgbaArray";
 import type { SparkRenderer } from "../SparkRenderer";
 import { type SplatEdit, isSplatEdit } from "../SplatEdit";
 import { SplatGenerator } from "../SplatGenerator";
-import { SplatMesh } from "../SplatMesh";
+import { EmptySplatSource, SplatMesh, type SplatSource } from "../SplatMesh";
 import { DepthResolve } from "./DepthResolve";
 import { GpuSplatSource } from "./GpuSplatSource";
 import { type CompositeToneMapping, SRGB_LAYER_FORMAT } from "./SrgbComposite";
@@ -35,7 +36,11 @@ import {
   WgpuSplatRenderer,
 } from "./WgpuSplatRenderer";
 import type { WgpuDyno } from "./dyno/DynoKernels";
-import { splatGeneratorDyno, splatMeshDyno } from "./dyno/adapters";
+import {
+  splatGeneratorDyno,
+  splatMeshDyno,
+  splatSourceMeshDyno,
+} from "./dyno/adapters";
 import { depthTestAttachment } from "./renderPipeline";
 import {
   type OpenPass,
@@ -67,6 +72,8 @@ interface Entry {
   lodMesh?: WgpuLodMesh;
   /** Uploaded splats shared with other meshes drawing the same ones. */
   shared?: SharedSource;
+  /** Drawn from a dyno generator of this many splats (a custom SplatSource). */
+  generated?: number;
   /** A WgpuLod.add in flight. */
   pending?: boolean;
   detached?: boolean;
@@ -97,6 +104,10 @@ export class SparkWebGPU {
   private lastCamera: THREE.Camera | null = null;
   private failed = false;
   private depthResolve?: DepthResolve;
+  /** A visible SplatMesh has covSplats (see applyOptions). */
+  private covMeshes = false;
+  /** WgpuSplatRenderer's accumulator option before accumExtSplats. */
+  private baseAccumulator: WgpuSplatRenderer["options"]["accumulator"] = "auto";
   private pmrem?: {
     Class: unknown;
     generator: {
@@ -136,11 +147,8 @@ export class SparkWebGPU {
       );
       return;
     }
-    if (
-      (camera as THREE.ArrayCamera).isArrayCamera ||
-      renderer.xr?.isPresenting
-    ) {
-      warnOnce("XR and array cameras are not supported yet");
+    if (renderer.xr?.isPresenting) {
+      warnOnce("XR is not supported");
       return;
     }
     const open = openPass(renderer);
@@ -151,7 +159,13 @@ export class SparkWebGPU {
     const rc = open.context;
 
     const splats = this.ensureRenderer();
-    this.lastCamera = camera;
+    // An ArrayCamera (with sub-cameras) draws each into its viewport, as
+    // three does; its first one is the frame's camera for LoD and getRgba.
+    const views = (camera as THREE.ArrayCamera).isArrayCamera
+      ? (camera as THREE.ArrayCamera).cameras
+      : [];
+    const mainCamera: THREE.Camera = views[0] ?? camera;
+    this.lastCamera = mainCamera;
     const width = rc.viewport ? rc.viewportValue.z : rc.width;
     const height = rc.viewport ? rc.viewportValue.w : rc.height;
 
@@ -159,11 +173,23 @@ export class SparkWebGPU {
     if (frame !== this.lastFrame) {
       // Once per frame, as SparkRenderer updates on a new frame.
       this.lastFrame = frame;
-      this.applyOptions();
       this.sync(scene, camera);
+      this.applyOptions();
       if (this.lod?.active && this.spark.enableDriveLod) {
-        this.lod.update(this.lodCamera ?? camera, { x: width, y: height });
+        const size = views.length
+          ? this.viewportOf(views[0], width, height)
+          : { z: width, w: height };
+        this.lod.update(this.lodCamera ?? mainCamera, {
+          x: size.z,
+          y: size.w,
+        });
       }
+    }
+    if (views.length) {
+      splats.diskClip = diskClip(host);
+      this.spark.dirty = false;
+      this.drawViewsAfterRender(scene, views, open);
+      return;
     }
 
     const format = open.colorFormat;
@@ -324,11 +350,127 @@ export class SparkWebGPU {
     size: { x: number; y: number },
   ) {
     const { renderer } = this;
+    this.drawAfter(
+      camera,
+      canvasContext(renderer).getCurrentTexture(),
+      sceneDepth,
+      viewport,
+      size,
+      !this.spark.rawColor &&
+        renderer.outputColorSpace !== THREE.SRGBColorSpace,
+    );
+  }
+
+  // The viewport three gives an ArrayCamera's sub-camera (its viewport in
+  // CSS pixels times the pixel ratio), else the whole target.
+  private viewportOf(
+    camera: THREE.Camera,
+    width: number,
+    height: number,
+  ): THREE.Vector4 {
+    const vp = (camera as { viewport?: THREE.Vector4 }).viewport;
+    if (!vp) return new THREE.Vector4(0, 0, width, height);
+    const ratio = this.renderer.getPixelRatio?.() ?? 1;
+    return new THREE.Vector4(
+      Math.floor(vp.x * ratio),
+      Math.floor(vp.y * ratio),
+      Math.floor(vp.z * ratio),
+      Math.floor(vp.w * ratio),
+    );
+  }
+
+  // An ArrayCamera: every sub-camera needs its own generate and sort, which
+  // are submitted ahead of three's pass, so they can't share it. The views
+  // are drawn once three has submitted its frame (scene.onAfterRender), one
+  // after another, each over three's colour in its viewport and tested
+  // against three's depth (resolved when multisampled): on the canvas after
+  // the output pass, as drawAfterOutput, or into the render target.
+  // Transparent objects in front of the splats are then drawn under them.
+  private drawViewsAfterRender(
+    scene: THREE.Scene,
+    views: THREE.Camera[],
+    open: OpenPass,
+  ) {
+    const { renderer, spark } = this;
+    const rc = open.context;
+    const canvas =
+      open.isFrameBufferTarget &&
+      !renderer.getOutputRenderTarget() &&
+      (scene as THREE.Scene).isScene;
+    if (spark.srgbBlend && !canvas) {
+      warnOnce("srgbBlend is ignored with an ArrayCamera");
+    }
+    if (splatsSortCpu(this.splats)) {
+      warnOnce(
+        'an ArrayCamera with sort "cpu" draws its views in one sort order',
+      );
+    }
+    const depth = open.depthTexture();
+    // three's frame buffer target is converted onto the canvas by its output
+    // pass; other targets keep what three drew in their own texture.
+    const color = canvas ? null : open.resolvedColorTexture();
+    const format = open.colorFormat;
+    const linear = canvas
+      ? !spark.rawColor && renderer.outputColorSpace !== THREE.SRGBColorSpace
+      : spark.rawColor
+        ? format.endsWith("-srgb")
+        : format.endsWith("-srgb") ||
+          (this.splats as WgpuSplatRenderer).hdr ||
+          open.colorSpace !== THREE.SRGBColorSpace;
+    const viewports = views.map((v) => this.viewportOf(v, rc.width, rc.height));
+    const previous = scene.onAfterRender;
+    scene.onAfterRender = (...args) => {
+      scene.onAfterRender = previous;
+      previous.apply(scene, args);
+      const target = color ?? canvasContext(renderer).getCurrentTexture();
+      const splats = this.splats as WgpuSplatRenderer;
+      // Each view sorts for itself, whatever minSortIntervalMs says.
+      const interval = splats.options.minSortIntervalMs;
+      splats.options.minSortIntervalMs = 0;
+      let resolved = depth;
+      if (depth && depth.sampleCount > 1) {
+        const encoder = splats.device.createCommandEncoder({
+          label: "depth resolve",
+        });
+        this.depthResolve ??= new DepthResolve(splats.device);
+        resolved = this.depthResolve.resolve(encoder, depth);
+        splats.device.queue.submit([encoder.finish()]);
+      }
+      try {
+        views.forEach((view, i) => {
+          // As three draws an object only for sub-cameras seeing its layers.
+          if (spark.layers.test(view.layers)) {
+            const vp = viewports[i];
+            this.drawAfter(
+              view,
+              target,
+              resolved,
+              vp,
+              { x: vp.z, y: vp.w },
+              linear,
+            );
+          }
+        });
+      } finally {
+        splats.options.minSortIntervalMs = interval;
+      }
+    };
+  }
+
+  // Draws the splats over `color` in a pass of their own, submitted now:
+  // after three's frame.
+  private drawAfter(
+    camera: THREE.Camera,
+    color: GPUTexture,
+    sceneDepth: GPUTexture | null,
+    viewport: THREE.Vector4 | null,
+    size: { x: number; y: number },
+    linear: boolean,
+  ) {
     const splats = this.splats as WgpuSplatRenderer;
     let depth = sceneDepth;
-    const color = canvasContext(renderer).getCurrentTexture();
     const encoder = splats.device.createCommandEncoder({
-      label: "splats on canvas",
+      label: "splats after three",
     });
     if (depth && depth.sampleCount > 1) {
       this.depthResolve ??= new DepthResolve(splats.device);
@@ -353,9 +495,7 @@ export class SparkWebGPU {
       sampleCount: 1,
       width: viewport ? viewport.z : size.x,
       height: viewport ? viewport.w : size.y,
-      linear:
-        !this.spark.rawColor &&
-        renderer.outputColorSpace !== THREE.SRGBColorSpace,
+      linear,
       depthCompare: (camera as { reversedDepth?: boolean }).reversedDepth
         ? "greater-equal"
         : "less-equal",
@@ -426,10 +566,7 @@ export class SparkWebGPU {
         pagedAttributes: spark.pagedAttributes,
         onDirty: () => spark.setDirty(),
       });
-      if (spark.covSplats || spark.accumExtSplats) {
-        warnOnce("covSplats and accumExtSplats are ignored");
-      }
-      if (spark.enable2DGS) warnOnce("enable2DGS is not supported yet");
+      this.baseAccumulator = this.splats.options.accumulator;
     }
     return this.splats;
   }
@@ -438,6 +575,17 @@ export class SparkWebGPU {
   private applyOptions() {
     const spark = this.spark;
     const o = (this.splats as WgpuSplatRenderer).options;
+    // Covariance splats in the accumulator (generate writes them, the draw
+    // reads the covariance directly): SparkRenderer.covSplats, or a visible
+    // SplatMesh with covSplats, whose CovSplat pipeline needs them (WebGL
+    // throws there instead).
+    o.covSplats = spark.covSplats || this.covMeshes;
+    o.enable2DGS = spark.enable2DGS;
+    // accumExtSplats: always the ext accumulator (float centres, half-float
+    // colour). Otherwise WgpuSplatRenderer's own choice ("auto": ext while it
+    // fits a binding, packed above), not WebGL's packed default: the ext one
+    // is more precise and draws as fast.
+    o.accumulator = spark.accumExtSplats ? "ext" : this.baseAccumulator;
     o.maxStdDev = spark.maxStdDev;
     o.minPixelRadius = spark.minPixelRadius;
     o.maxPixelRadius = spark.maxPixelRadius;
@@ -490,6 +638,15 @@ export class SparkWebGPU {
       }
     });
     this.globalEdits = globalEdits;
+    const covMeshes = visible.some(
+      (n) => n instanceof SplatMesh && n.covSplats,
+    );
+    if (covMeshes && !this.spark.covSplats) {
+      warnOnce(
+        "SplatMeshes with covSplats turn on covariance splats (SparkRenderer covSplats)",
+      );
+    }
+    this.covMeshes = covMeshes;
 
     const time = performance.now() / 1000;
     const deltaTime = time - this.lastTime;
@@ -523,26 +680,40 @@ export class SparkWebGPU {
         this.watchInit(node);
         return false;
       }
-      if (node.covSplats) warnOnce("covSplats meshes are drawn as ext splats");
-      const base = node.packedSplats ?? node.extSplats;
-      const lodSplats = base?.lodSplats;
-      const useLod = this.spark.enableLod && !!(node.paged || lodSplats);
-      const splats = node.paged ?? base;
-      if (node.splats && node.splats !== splats) {
-        warnOnce("SplatMeshes with a custom SplatSource are not supported");
-        return false;
+      const { base, paged, custom } = meshSplats(node);
+      if (custom) {
+        // A custom SplatSource: its fetchSplat graph generates the splats.
+        const count = custom.getNumSplats();
+        if (count <= 0) return false;
+        key = [custom, count];
+        build = () => {
+          const dyno = splatSourceMeshDyno(node, custom, {
+            globalEdits: () => this.globalEdits,
+          });
+          const splats = this.splats as WgpuSplatRenderer;
+          return {
+            key,
+            dyno,
+            mesh: splats.addGenerator(count, dyno, node),
+            generated: count,
+          };
+        };
+      } else {
+        const lodSplats = base?.lodSplats;
+        const useLod = this.spark.enableLod && !!(paged || lodSplats);
+        const splats = paged ?? base;
+        if (!splats || (!useLod && (base as BaseSplats).numSplats === 0)) {
+          return false;
+        }
+        key = [useLod, splats, lodSplats];
+        build = () => {
+          const dyno = splatMeshDyno(node, {
+            globalEdits: () => this.globalEdits,
+          });
+          if (useLod) return this.addLod(node, { key: [], dyno });
+          return this.addBase(node, base as BaseSplats, dyno);
+        };
       }
-      if (!splats || (!useLod && (base as BaseSplats).numSplats === 0)) {
-        return false;
-      }
-      key = [useLod, splats, lodSplats];
-      build = () => {
-        const dyno = splatMeshDyno(node, {
-          globalEdits: () => this.globalEdits,
-        });
-        if (useLod) return this.addLod(node, { key: [], dyno });
-        return this.addBase(node, base as BaseSplats, dyno);
-      };
     } else {
       if (!node.generator || node.numSplats <= 0) return false;
       key = [node.numSplats];
@@ -619,10 +790,12 @@ export class SparkWebGPU {
             indices: drawn,
           })
         : undefined;
-    if (node.paged) return;
+    const { base, paged, custom } = meshSplats(node);
+    if (paged) return;
     node.context.enableLod.value = false;
-    const base = node.packedSplats ?? node.extSplats;
-    node.context.numSplats.value = entry.pending ? 0 : (base?.numSplats ?? 0);
+    node.context.numSplats.value = entry.pending
+      ? 0
+      : (custom?.getNumSplats() ?? base?.numSplats ?? 0);
   }
 
   // A new WgpuSplatMesh for the same splats: DynoKernels compiles a mesh's
@@ -652,7 +825,8 @@ export class SparkWebGPU {
   private addLod(node: SplatMesh, entry: Entry): Entry {
     entry.pending = true;
     const lod = this.lod as WgpuLod;
-    const splats = node.paged ?? node.packedSplats ?? node.extSplats;
+    const { base, paged } = meshSplats(node);
+    const splats = paged ?? base;
     lod
       .add(splats as PackedSplats, node, { lodScale: node.lodScale })
       .then((lodMesh) => {
@@ -683,6 +857,8 @@ export class SparkWebGPU {
     } else if (entry.lodMesh) {
       // LoD: shown again, with its sources and tree.
       this.lod?.setVisible(entry.lodMesh, true);
+    } else if (entry.generated !== undefined) {
+      entry.mesh = splats.addGenerator(entry.generated, entry.dyno, node);
     } else if (node instanceof SplatMesh) {
       if (!entry.pending) this.addLod(node, entry);
     } else {
@@ -784,6 +960,27 @@ function diskClip(spark: SparkRenderer): SplatDiskClip | null {
     radius,
     twoSided: !!u.diskTwoSided?.value,
   };
+}
+
+// What a SplatMesh draws, as SplatMesh.update picks it (its splats first):
+// PackedSplats or ExtSplats, PagedSplats, or another SplatSource.
+function meshSplats(node: SplatMesh): {
+  base?: BaseSplats;
+  paged?: PagedSplats;
+  custom?: SplatSource;
+} {
+  const own = node.splats;
+  if (own instanceof PackedSplats || own instanceof ExtSplats) {
+    return { base: own };
+  }
+  if (own instanceof PagedSplats) return { paged: own };
+  if (own && !(own instanceof EmptySplatSource)) return { custom: own };
+  const base = node.packedSplats ?? node.extSplats;
+  return node.paged ? { base, paged: node.paged } : { base };
+}
+
+function splatsSortCpu(splats?: WgpuSplatRenderer) {
+  return splats?.options.sort === "cpu";
 }
 
 function sameKey(a: unknown[], b: unknown[]) {

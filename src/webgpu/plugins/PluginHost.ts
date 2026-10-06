@@ -242,6 +242,16 @@ export class PluginHost {
     return this.sorted;
   }
 
+  /** Whether an enabled plugin makes linear light past 1 (SplatPlugin.hdr). */
+  get hdr(): boolean {
+    return this.sorted.some(
+      (p) =>
+        p.hdr &&
+        !this.deviceReason(p) &&
+        (this.global.get(p.id) ?? p.enabled ?? true),
+    );
+  }
+
   // A plugin naming Slang must match what slang-build compiled for its id.
   private checkSlang(plugin: SplatPlugin) {
     const s = plugin.slang;

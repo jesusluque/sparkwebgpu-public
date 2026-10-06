@@ -131,6 +131,12 @@ export interface SplatPlugin {
   requires?: PluginRequirements;
   /** Active unless switched off (default true). */
   enabled?: boolean;
+  /**
+   * Its colours are linear light that may exceed 1 (scene-referred, for a
+   * display transform after the draw): while it is registered and enabled
+   * the renderer keeps them in float end to end (WgpuSplatRendererOptions.hdr).
+   */
+  hdr?: boolean;
   /** Stage ordering: runs after / before these plugin ids, then by order. */
   after?: readonly string[];
   before?: readonly string[];

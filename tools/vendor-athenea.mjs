@@ -152,10 +152,9 @@ fs.writeFileSync(
     "2026-10-06) as a read-only dependency; changes belong upstream in",
     "athenea, adaptations in slang/athenea_adapter/.",
     "",
-    "athenea's tree at that commit carries no LICENSE file; the plan names",
-    "Apache-2.0 as its intended licence. Until a LICENSE is added upstream",
-    "these files are under their author's copyright, not under Spark's MIT",
-    "licence.",
+    "Licence: MIT, by decision of their author (2026-10-06), the same",
+    "licence as Spark. athenea's tree at that commit carries no LICENSE",
+    "file yet; when one is added upstream it governs these copies.",
     "",
   ].join("\n"),
 );

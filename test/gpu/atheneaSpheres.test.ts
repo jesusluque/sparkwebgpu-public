@@ -896,6 +896,9 @@ describe.skipIf(!wideDevice || !available)(
         lights,
         pixelDetail: opts.pixelDetail ?? false,
         frame: opts.stage ?? null,
+        // athenea's centre shading, without the web footprint prefilter:
+        // this battery validates against athenea itself.
+        footprint: 0,
       });
       relight.setStoredLinear(mesh, cloud.storedLinear);
       if (opts.ior) relight.setIor(mesh, opts.ior);

@@ -37,7 +37,10 @@ import {
 } from "../../src/webgpu/WgpuSplatRenderer";
 import { AtheneaSky, type SkyImage } from "../../src/webgpu/athenea/AtheneaSky";
 import { packLightRecords } from "../../src/webgpu/athenea/lights";
-import { atheneaRelightPlugin } from "../../src/webgpu/athenea/relightPlugin";
+import {
+  FOOTPRINT_GAIN,
+  atheneaRelightPlugin,
+} from "../../src/webgpu/athenea/relightPlugin";
 import { AttribPool, attribWords } from "../../src/webgpu/attributes/schema";
 import refModule from "../../src/webgpu/generated/tests/athenea_relight";
 import {
@@ -383,8 +386,16 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       },
     };
 
-    /** The plugin as the Corvette page runs it (`frame`: the car, or none). */
-    async function plugin(frame: THREE.Object3D | null, pixelDetail = false) {
+    /**
+     * The plugin as the Corvette page runs it (`frame`: the car, or none);
+     * without the footprint prefilter unless asked (athenea's relitSplat
+     * shades a splat at its centre).
+     */
+    async function plugin(
+      frame: THREE.Object3D | null,
+      pixelDetail = false,
+      footprint = 0,
+    ) {
       const splats = new WgpuSplatRenderer(fakeRenderer as never, {
         depthTest: false,
         alwaysGenerate: true,
@@ -401,6 +412,7 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
         rotation: domeTurn,
         frame,
         pixelDetail,
+        footprint,
       });
       host.register(relight).attach(splats);
       await host.ready();
@@ -462,6 +474,27 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       );
       // The plugin relit in athenea's stage is athenea's relitSplat.
       expect(worst).toBeLessThan(2e-3);
+      // The footprint prefilter (relight.slang footprintRoughness) hardly
+      // touches the detailed cloud: its splats are small against the hood's
+      // curvature.
+      const filtered = await plugin(car, false, FOOTPRINT_GAIN);
+      let sumFiltered = 0;
+      let filteredOff = 0;
+      for (let i = 0; i < N; i++) {
+        const r = luma(ref, 4 * i);
+        const f = luma(filtered.got, 20 * i);
+        sumFiltered += f;
+        filteredOff = Math.max(
+          filteredOff,
+          Math.abs(f - r) / Math.max(r, 0.05),
+        );
+      }
+      log(
+        `with the footprint prefilter (gain ${FOOTPRINT_GAIN}): mean ${(sumFiltered / N).toFixed(4)}, worst splat ${filteredOff.toExponential(2)}`,
+      );
+      expect(Math.abs(sumFiltered - sumRef) / sumRef).toBeLessThan(2e-3);
+      expect(filteredOff).toBeLessThan(0.03);
+      filtered.done();
       // The coat is a large part of the hood's light ...
       expect(sumRef - sumNoCoat).toBeGreaterThan(0.2 * sumRef);
       // ... which the turned relight lost.

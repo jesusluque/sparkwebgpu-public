@@ -58,6 +58,15 @@ import {
 } from "./lights";
 
 export const ATHENEA_RELIGHT_ID = "athenea.relight";
+/**
+ * The footprint prefilter's default gain (AtheneaRelightOptions.footprint;
+ * relight.slang footprintRoughness). Measured on the light Corvette's door
+ * (golden_gate_hills, the page's camera, a 4k frame's window), against the
+ * detailed cloud blurred alike: the 0.7-2 px band from 20.6% of the mean to
+ * 5.7% (the detailed cloud 4.1%), the gap to the detailed cloud from 4.7%
+ * to 3.9% (0.35: 4.1%, 1: 4.6%, 2: 7.3%); the detailed cloud moves 0.2%.
+ */
+export const FOOTPRINT_GAIN = 0.5;
 /** Storage buffers the relight kernel binds. */
 export const RELIGHT_STORAGE_BUFFERS = 10;
 
@@ -106,6 +115,17 @@ export interface AtheneaRelightOptions {
    */
   pixelDetail?: boolean;
   /**
+   * Without pixelDetail, each splat is shaded once and drawn as one colour:
+   * its reflections are widened by how far the normal turns over its
+   * gaussian (from the cloud's curvature), so splats coarse against a
+   * curved mirror (a light cloud's merged cells) blur a sharp reflection
+   * instead of showing their layout as a moire. The gain on that spread
+   * (0: off; default FOOTPRINT_GAIN).
+   */
+  footprint?: number;
+  /** For investigations: the lighting's parts left out, or a debug view. */
+  debug?: AtheneaRelightDebug;
+  /**
    * athenea's stage: the object whose space the clouds were baked in, where
    * the page has placed or turned it (the Corvette's Z-up stage under a car
    * turned to three's Y-up). A TX transfer, its cells and its reflected
@@ -118,7 +138,29 @@ export interface AtheneaRelightOptions {
   frame?: THREE.Object3D | null;
 }
 
-type RelightState = Required<Omit<AtheneaRelightOptions, "hdri" | "frame">> & {
+export interface AtheneaRelightDebug {
+  /** The open-direction cells (shadowBits) are not read. */
+  noCells?: boolean;
+  /**
+   * In place of the light: "place", a smooth colour of the splat's place
+   * (what the draw makes of a smooth field); "normal", the shading normal;
+   * "footprint", the footprint prefilter's spread (red) and the coat's own
+   * roughness (green), blue where the cloud keeps no curvature.
+   */
+  view?: "none" | "place" | "normal" | "footprint";
+}
+
+const DEBUG_VIEWS: Record<string, number> = {
+  none: 0,
+  place: C.kRelightDebugPlace,
+  normal: C.kRelightDebugNormal,
+  footprint: C.kRelightDebugFootprint,
+};
+
+type RelightState = Required<
+  Omit<AtheneaRelightOptions, "hdri" | "frame" | "debug">
+> & {
+  debug?: AtheneaRelightDebug;
   hdri: SkyImage | null;
   frame: THREE.Object3D | null;
 };
@@ -246,6 +288,7 @@ export function atheneaRelightPlugin(
     ior: 0,
     emission: 1,
     pixelDetail: false,
+    footprint: FOOTPRINT_GAIN,
     frame: null,
   };
   const linear = new WeakMap<object, boolean>();
@@ -522,7 +565,9 @@ export function atheneaRelightPlugin(
       (storedLinear ? C.kRelightLinear : 0) |
       (options.litBody ? C.kRelightLit : 0) |
       (options.indirect ? C.kRelightIndirect : 0) |
-      (slopeOn ? C.kRelightSlope : 0);
+      (slopeOn ? C.kRelightSlope : 0) |
+      (options.debug?.noCells ? C.kRelightNoCells : 0) |
+      (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
     const e = world.elements;
     const row = (k: number) => [e[k], e[k + 4], e[k + 8], e[k + 12]];
     const params = UniformWriter.for(relightModule, "relightParams").setAll({
@@ -542,6 +587,7 @@ export function atheneaRelightPlugin(
       ior: iorOf(mesh),
       emissionScale: options.emission,
       curvature: id("curvature"),
+      footprint: options.footprint,
       encoding: source.encoding,
       row0: row(0),
       row1: row(1),
@@ -565,6 +611,7 @@ export function atheneaRelightPlugin(
     };
     const placed = [
       lightsVersion,
+      flags,
       options.indirect,
       options.litBody,
       e.join(),
@@ -597,7 +644,7 @@ export function atheneaRelightPlugin(
       state.viewlessKey = placed;
       stats.viewless += 1;
     }
-    const key = `${placed}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${slopeOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
+    const key = `${placed}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${slopeOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
@@ -776,6 +823,8 @@ export function atheneaRelightPlugin(
       if (o.ior !== undefined) options.ior = o.ior;
       if (o.emission !== undefined) options.emission = o.emission;
       if (o.pixelDetail !== undefined) options.pixelDetail = o.pixelDetail;
+      if (o.footprint !== undefined) options.footprint = o.footprint;
+      if (o.debug !== undefined) options.debug = { ...o.debug };
       if (o.frame !== undefined) options.frame = o.frame;
       if (skyChanged && sky) sky.dirty = true;
       lightsDirty = true;

@@ -64,7 +64,7 @@ ConstantBuffer<AttribDrawParams> attribParams;
 // crashes slangc 2026.14 when both stages compile together.)
 struct AttribVertexOut {
     float4 position : SV_Position;
-    float4 rgba : COLOR0;
+    nointerpolation float4 rgba : COLOR0; // the same at the four corners
     float2 splatUv : TEXCOORD0;
     nointerpolation float adjustedStdDev : TEXCOORD1;
     nointerpolation uint splatIndex : TEXCOORD2;

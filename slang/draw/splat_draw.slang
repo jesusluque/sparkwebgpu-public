@@ -32,7 +32,7 @@ StructuredBuffer<uint4> projected;
 
 struct VertexOut {
     float4 position : SV_Position;
-    float4 rgba : COLOR0;
+    nointerpolation float4 rgba : COLOR0; // the same at the four corners
     float2 splatUv : TEXCOORD0;
     nointerpolation float adjustedStdDev : TEXCOORD1;
     nointerpolation uint splatIndex : TEXCOORD2;

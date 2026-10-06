@@ -59,13 +59,14 @@
     const gl = renderer.getContext();
     const pixel = new Uint8Array(4);
     // Throughput: the normal animation loop for `seconds`, the object turning
-    // every frame; frames counted (run Chrome without vsync to uncap it).
-    window.__fps = (seconds) =>
+    // `spin` radians every frame (0: still, the draw alone); frames counted
+    // (run Chrome without vsync to uncap it).
+    window.__fps = (seconds, spin = 0.01) =>
       new Promise((resolve) => {
         let count = 0;
         const t0 = performance.now();
         renderer.setAnimationLoop(() => {
-          mesh.rotation.y += 0.01;
+          mesh.rotation.y += spin;
           renderer.render(scene, camera);
           count++;
           const t = performance.now() - t0;
@@ -80,7 +81,12 @@
       return bench(count, () => {
         mesh.rotation.y += 0.01;
         renderer.render(scene, camera);
-        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel); // waits for the GPU
+        // Waits for the GPU. Spark's async readbacks may leave a PIXEL_PACK
+        // buffer bound, which makes this readPixels fail without waiting.
+        const pack = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pack);
       });
     };
   </script>

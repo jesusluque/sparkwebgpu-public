@@ -8,6 +8,7 @@ import type { GpuProfiler } from "./GpuProfiler";
 import type { KernelRegistry } from "./KernelRegistry";
 import { kernelsSortRadix } from "./generated/constants";
 import sortModule from "./generated/kernels/sort_radix";
+import scatterSubgroupModule from "./generated/kernels/sort_scatter_subgroup";
 import { createStorage as storage } from "./gpuBuffers";
 import { UniformWriter } from "./uniforms";
 
@@ -26,10 +27,14 @@ export class GpuSorter {
   private scanLevels: GPUBuffer[] = [];
   private empty: GPUBuffer;
 
-  /** `label` prefixes the profiler's stage labels. */
+  /**
+   * `label` prefixes the profiler's stage labels. `subgroups`: the scatter
+   * ranks keys with subgroup ballots (default: where the device has them).
+   */
   constructor(
     readonly registry: KernelRegistry,
     readonly label = "sort",
+    readonly subgroups = registry.device.features.has("subgroups"),
   ) {
     this.device = registry.device;
     this.drawArgs = storage(
@@ -248,7 +253,10 @@ export class GpuSorter {
         this.dispatchArgs,
       );
       this.encodeScan(stagePass("scan"), BINS * numBlocks);
-      get("radixScatter").dispatchIndirect(
+      const scatter = this.subgroups
+        ? this.registry.get(scatterSubgroupModule, "radixScatterSubgroup")
+        : get("radixScatter");
+      scatter.dispatchIndirect(
         stagePass("scatter"),
         {
           buffers: {

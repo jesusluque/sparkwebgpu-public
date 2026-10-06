@@ -21,13 +21,35 @@ export interface TierSpec {
   minBindingBytes: number;
   /** Splats the tier is sized for (frame-time budgets start from this). */
   splatBudget: number;
+  /**
+   * Bytes the paged attribute pool may take (WgpuSplatPager, one buffer and
+   * binding: never more than the device's binding size). Streams that do
+   * not fit at the page pool's capacity are paged with fewer pages
+   * (src/webgpu/attributes/attribPaging.ts).
+   */
+  attribBudget: number;
 }
 
 export const TIERS: readonly TierSpec[] = [
-  { tier: 0, minBindingBytes: 0, splatBudget: 0 },
-  { tier: 1, minBindingBytes: 128 * MIB, splatBudget: 1_250_000 },
-  { tier: 2, minBindingBytes: 1024 * MIB, splatBudget: 2_500_000 },
-  { tier: 3, minBindingBytes: 2048 * MIB - 4, splatBudget: 4_500_000 },
+  { tier: 0, minBindingBytes: 0, splatBudget: 0, attribBudget: 0 },
+  {
+    tier: 1,
+    minBindingBytes: 128 * MIB,
+    splatBudget: 1_250_000,
+    attribBudget: 128 * MIB,
+  },
+  {
+    tier: 2,
+    minBindingBytes: 1024 * MIB,
+    splatBudget: 2_500_000,
+    attribBudget: 768 * MIB,
+  },
+  {
+    tier: 3,
+    minBindingBytes: 2048 * MIB - 4,
+    splatBudget: 4_500_000,
+    attribBudget: 1536 * MIB,
+  },
 ];
 
 /** The tier of a device's capabilities; null (no WebGPU) is T0. */
@@ -42,6 +64,25 @@ export function tierOf(caps: GpuCapabilities | null | undefined): Tier {
   let tier: Tier = 0;
   for (const t of TIERS) {
     if (bytes >= t.minBindingBytes) tier = t.tier;
+  }
+  return tier;
+}
+
+/**
+ * The tier of a device's limits alone (a GPUDevice's `limits`), for code
+ * that has a device but no GpuCapabilities: T1 to T3 by binding size.
+ */
+export function tierOfLimits(limits: {
+  maxStorageBufferBindingSize: number;
+  maxBufferSize: number;
+}): Tier {
+  const bytes = Math.min(
+    limits.maxStorageBufferBindingSize,
+    limits.maxBufferSize,
+  );
+  let tier: Tier = 1;
+  for (const t of TIERS) {
+    if (t.tier > 0 && bytes >= t.minBindingBytes) tier = t.tier;
   }
   return tier;
 }

@@ -13,6 +13,9 @@
     "emitDeclarationOnly": true,
     "sourceMap": true,
     "outDir": "./dist",
+    "paths": {
+      "spark-rs": ["./rust/spark-rs/pkg/spark_rs.d.ts"]
+    },
     "rootDir": "./src",
     "types": [
       "vite/client",

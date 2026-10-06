@@ -24,6 +24,7 @@ import {
   uploadU32DataTextureRows,
 } from "./utils";
 import type { SparkWebGPU, WebGPURendererLike } from "./webgpu/SparkWebGPU";
+import type { AttribPagingOptions } from "./webgpu/attributes/attribPaging";
 import {
   isWebGPURenderer,
   loadWebGPUBackend,
@@ -232,6 +233,13 @@ export interface SparkRendererOptions {
    * @default 16777216 (256 * 65536) for desktop, 6291456 for iOS, 8,388,608 for other mobile
    */
   maxPagedSplats?: number;
+  /**
+   * WebGPU: how paged attributes are kept (src/webgpu/attributes/
+   * attribPaging.ts): the pool's byte budget, pages per stream group
+   * ("material", "relight"), which streams, the transfer form. By default
+   * the device tier's budget and the streams the PluginHost's plugins use.
+   */
+  pagedAttributes?: AttribPagingOptions;
   /**
    * Number of parallel chunk fetchers for LoD. These are run within a shared pool
    * of 4 background WebWorker threads, so setting it above 4 will not have any
@@ -447,6 +455,7 @@ export class SparkRenderer extends THREE.Mesh {
   lodTraverseMode: "dynamic" | "standard";
   pagedExtSplats: boolean;
   maxPagedSplats: number;
+  pagedAttributes?: SparkRendererOptions["pagedAttributes"];
   numLodFetchers: number;
   lodCleanupTimeoutMs: number;
   behindFoveate: number;
@@ -643,6 +652,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? (isIos() ? 96 : 128) : 256;
     this.maxPagedSplats = options.maxPagedSplats ?? defaultPages * 65536;
+    this.pagedAttributes = options.pagedAttributes;
     this.numLodFetchers = options.numLodFetchers ?? 3;
     this.lodCleanupTimeoutMs = options.lodCleanupTimeoutMs ?? 3000;
     this.behindFoveate = options.behindFoveate ?? 0.2;

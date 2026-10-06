@@ -48,7 +48,7 @@ export const ATTRIB_FORMATS: Record<AttribFormat, number> = {
   u16: coreAttrib.ATTRIB_U16,
   u32: coreAttrib.ATTRIB_U32,
 };
-export const { ATTRIB_NONE, ATTRIB_DIRECTION } = coreAttrib;
+export const { ATTRIB_NONE, ATTRIB_DIRECTION, ATTRIB_PAGED } = coreAttrib;
 
 export function formatBytes(format: AttribFormat): number {
   return format === "f32" || format === "u32"

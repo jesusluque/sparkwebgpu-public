@@ -351,6 +351,25 @@ export class PluginHost {
     return null;
   }
 
+  /**
+   * The attributes the registered plugins this device runs (and not
+   * switched off for every asset) require or read: what a pager that loads
+   * streams on demand loads (WgpuSplatPager, attribPaging.ts). Asset
+   * requirements are not checked: an asset carries an attribute only once
+   * it is loaded.
+   */
+  attributeDemand(): string[] {
+    const names = new Set<string>();
+    for (const plugin of this.sorted) {
+      if (this.deviceReason(plugin)) continue;
+      const on = this.global.get(plugin.id) ?? plugin.enabled ?? true;
+      if (!on) continue;
+      for (const n of plugin.requires?.attributes ?? []) names.add(n);
+      for (const n of plugin.requires?.reads ?? []) names.add(n);
+    }
+    return [...names];
+  }
+
   isActive(id: string, asset?: object): boolean {
     const plugin = this.get(id);
     return Boolean(plugin && !this.reason(plugin, asset));

@@ -408,6 +408,7 @@ export class SparkWebGPU {
         pagedExtSplats: spark.pagedExtSplats,
         maxPagedSplats: spark.maxPagedSplats,
         numLodFetchers: spark.numLodFetchers,
+        pagedAttributes: spark.pagedAttributes,
         onDirty: () => spark.setDirty(),
       });
       if (spark.covSplats || spark.accumExtSplats) {

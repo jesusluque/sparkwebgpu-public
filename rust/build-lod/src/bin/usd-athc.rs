@@ -14,6 +14,7 @@
 //!          [--chunk 65536] [--gzip] [--v2] [--json out.json]
 //!          [--add more.usdc]... [--only-prim TEXT]... [--exclude-prim TEXT]...
 //!          [--thin RATIO | --target SPLATS | --cell SIDE [--fill 1.0]]
+//!          [--drop-backs THICKNESS]
 //! usd-athc in.usdc --list            the prim's attributes, their types and lengths
 //! ```
 //!
@@ -27,7 +28,12 @@
 //! density even), `--target` finds the cell for about that many splats, and
 //! `--fill` widens each merged Gaussian; `--thin` keeps about one splat in
 //! that many instead (`athc_build::reduce_thin`: a real splat's shape, grown
-//! to its run's area), which keeps surfaces closed.
+//! to its run's area), which keeps surfaces closed. `--drop-backs` (metres,
+//! before any reduction) drops the closed back face of a shell up to that
+//! thick (`athc_build::drop_hidden_backs`): mesh2splat bakes both faces of
+//! a solidified panel, and the dark inner one shows through the outer one
+//! in moiré bands wherever the draw's sort interleaves them (LoD levels,
+//! thinned clouds).
 //!
 //! USD attribute -> `.athc` array:
 //!
@@ -57,7 +63,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use openusd::sdf::{self, AbstractData, Value};
 use serde_json::{json, Value as Json};
 use spark_lib::athc_build::{
-    build_lod, cell_for_target, pack_streams, reduce_cells, reduce_thin, BuildOptions,
+    build_lod, cell_for_target, drop_hidden_backs, pack_streams, reduce_cells, reduce_thin, BuildOptions,
     CloudStreams, TransferKeep,
 };
 use spark_lib::athc_v3::{gzip, parse_v3, write_v3, COMPRESSION_GZIP, COMPRESSION_NONE};
@@ -395,6 +401,7 @@ fn main() -> Result<()> {
         "--cell",
         "--fill",
         "--thin",
+        "--drop-backs",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -481,6 +488,16 @@ fn main() -> Result<()> {
     let mut packed = pack_streams(&streams, &options)?;
     let source_splats = streams.count;
     drop(streams);
+    let drop_backs: Option<f32> = arg(&args, "--drop-backs")
+        .map(|t| t.parse())
+        .transpose()
+        .context("--drop-backs")?;
+    let mut dropped_backs = None;
+    if let Some(t) = drop_backs {
+        let (kept, dropped) = drop_hidden_backs(&packed, t)?;
+        packed = kept;
+        dropped_backs = Some(dropped);
+    }
     let fill: f32 = arg(&args, "--fill")
         .map_or(Ok(1.0), |f| f.parse())
         .context("--fill")?;
@@ -522,6 +539,8 @@ fn main() -> Result<()> {
         "sourceSplats": source_splats,
         "reduceCell": cell,
         "thin": thin,
+        "dropBacks": drop_backs,
+        "droppedBacks": dropped_backs,
         "fill": fill,
         "prim": prim_path,
         "output": output,

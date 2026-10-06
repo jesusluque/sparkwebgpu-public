@@ -1336,6 +1336,109 @@ pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
     })
 }
 
+/// How open a splat is to the environment: its shadow bits' open
+/// directions, or without them its direct transfer's first value.
+fn exposure(b: &AthcBlock, i: usize) -> Option<f32> {
+    if !b.shadow_bits.is_empty() {
+        let per = b.shadow_bits.len() / b.n;
+        let words = &b.shadow_bits[i * per..(i + 1) * per];
+        return Some(words.iter().map(|w| w.count_ones()).sum::<u32>() as f32);
+    }
+    if !b.transfer.is_empty() {
+        let per = b.transfer.len() / b.n;
+        return Some(f16_of(b.transfer[i * per] & 0xffff));
+    }
+    None
+}
+
+/// Drops the hidden back of a panel with thickness: a splat whose normal
+/// faces away from another splat of the cloud no more than `thickness`
+/// behind it (back to back: normals opposed, each behind the other, within
+/// half the thickness sideways) and less than half as open to the
+/// environment as that splat (shadow bits, or the direct transfer). A
+/// mesh2splat bake of a solidified panel (Car_Paint_Main: every door and
+/// fender is a 3 mm shell) has both faces on the same grid; the inner one
+/// is dark (it sees the cabin), and wherever the draw's centre sort
+/// interleaves the two (splats as wide as the shell is thick: the LoD's
+/// merged levels, a thinned cloud) the back shows through the front in
+/// moiré bands. A panel open on both sides keeps both faces. Returns the
+/// cloud and how many splats were dropped.
+pub fn drop_hidden_backs(cloud: &PackedCloud, thickness: f32) -> Result<(PackedCloud, usize)> {
+    let src = &cloud.block;
+    let n = src.n;
+    if src.normals.is_empty() {
+        bail!("dropping hidden backs needs normals");
+    }
+    if exposure(src, 0).is_none() && n > 0 {
+        bail!("dropping hidden backs needs shadow bits or a transfer");
+    }
+    if thickness.is_nan() || thickness <= 0.0 {
+        bail!("the shell thickness must be positive");
+    }
+    let lateral = 0.5 * thickness;
+    let apart = thickness / 16.0;
+    let cell_of = |i: usize| {
+        let p = &src.positions[i * 4..i * 4 + 3];
+        [0, 1, 2].map(|k| (p[k] / thickness).floor() as i32)
+    };
+    let mut cells: std::collections::HashMap<[i32; 3], Vec<u32>> = std::collections::HashMap::new();
+    for i in 0..n {
+        cells.entry(cell_of(i)).or_default().push(i as u32);
+    }
+    let normals: Vec<[f32; 3]> = src.normals.iter().map(|&w| crate::athc::unpack_normal(w)).collect();
+    let open: Vec<f32> = (0..n).map(|i| exposure(src, i).unwrap_or(0.0)).collect();
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let keep: Vec<u32> = (0..n)
+        .filter(|&i| {
+            let (pi, ni) = (&src.positions[i * 4..i * 4 + 3], normals[i]);
+            let c = cell_of(i);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let Some(list) = cells.get(&[c[0] + dx, c[1] + dy, c[2] + dz]) else {
+                            continue;
+                        };
+                        for &j in list {
+                            let j = j as usize;
+                            let nj = normals[j];
+                            if dot(ni, nj) > -0.7 || 2.0 * open[i] >= open[j] {
+                                continue;
+                            }
+                            let pj = &src.positions[j * 4..j * 4 + 3];
+                            let d = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+                            let (behind_i, behind_j) = (-dot(d, ni), dot(d, nj));
+                            if behind_i < apart || behind_i > thickness || behind_j < apart {
+                                continue;
+                            }
+                            if dot(d, d) - behind_i * behind_i <= lateral * lateral {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        })
+        .map(|i| i as u32)
+        .collect();
+    let dropped = n - keep.len();
+    let mut block = reorder(src, &keep);
+    block.n = keep.len();
+    Ok((
+        PackedCloud {
+            block,
+            rest_per_colour: cloud.rest_per_colour,
+            sh_words: cloud.sh_words,
+            transfer_count: cloud.transfer_count,
+            linear: cloud.linear,
+            bounds_min: cloud.bounds_min,
+            bounds_max: cloud.bounds_max,
+            dropped: cloud.dropped,
+        },
+        dropped,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,6 +1766,49 @@ mod tests {
             .positions
             .chunks(4)
             .all(|p| p[3] > 0.0 && p[3] <= 0.99));
+    }
+
+    #[test]
+    fn drops_the_hidden_back_of_a_shell() {
+        // Three 3 mm shells on a 2 mm grid: one open outside and closed
+        // inside (its back goes), one open on both sides (both stay), one
+        // single face (stays).
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let mut face = |x0: f32, z: f32, up: bool, open: u32| {
+            for a in 0..10 {
+                for b in 0..10 {
+                    s.positions.extend_from_slice(&[x0 + a as f32 * 0.002, b as f32 * 0.002, z]);
+                    s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                    s.scales.extend_from_slice(&[0.002, 0.002, 0.0002]);
+                    s.opacities.push(1.0);
+                    s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+                    s.normals.extend_from_slice(&[0.0, 0.0, if up { 1.0 } else { -1.0 }]);
+                    s.transfer_direct.extend((0..16).map(|_| 0.1));
+                    s.shadow_bits.extend((0..8).map(|w| if w < open { u32::MAX } else { 0 }));
+                    s.count += 1;
+                }
+            }
+        };
+        face(0.0, 0.003, true, 3); // shell 1: outer face, open
+        face(0.0, 0.0, false, 0); //           inner face, closed
+        face(1.0, 0.003, true, 3); // shell 2: open both sides
+        face(1.0, 0.0, false, 2);
+        face(2.0, 0.0, true, 0); // a lone face, however closed
+        let o = BuildOptions { transfer: TransferKeep::Count(16), ..Default::default() };
+        let cloud = pack_streams(&s, &o).unwrap();
+        let (kept, dropped) = drop_hidden_backs(&cloud, 0.008).unwrap();
+        assert_eq!(dropped, 100);
+        let b = &kept.block;
+        assert_eq!(b.n, 400);
+        for v in [&b.shape, &b.normals, &b.transfer, &b.shadow_bits] {
+            assert_eq!(v.len() % b.n, 0);
+        }
+        // What went is shell 1's inner face, all of it.
+        assert!((0..b.n).all(|i| {
+            let p = &b.positions[i * 4..i * 4 + 3];
+            !(p[0] < 0.5 && p[2] < 0.001)
+        }));
+        assert!(build_lod(&kept, &o).is_ok());
     }
 
     #[test]

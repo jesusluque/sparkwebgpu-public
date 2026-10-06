@@ -62,8 +62,10 @@ export interface DynoDispatch {
 interface Compiled {
   graphs: unknown[];
   program: WgslDynoProgram;
-  module: KernelModule;
   layouts: TextureLayouts;
+  hooks: DynoHookFunctions;
+  /** The program patched into each base kernel it ran in, by base name. */
+  modules: Map<string, KernelModule>;
   /** What the last refresh saw: uniform bytes and texture versions. */
   state?: {
     uniforms: Uint8Array;
@@ -166,9 +168,18 @@ export class DynoKernels {
     );
   }
 
-  /** The kernel and dyno bindings for `owner`'s next dispatch. */
-  prepare(owner: object, dyno: WgpuDyno): DynoDispatch {
-    const { program, module, layouts } = this.compile(owner, dyno);
+  /**
+   * The kernel and dyno bindings for `owner`'s next dispatch, patched into
+   * `base` (a plugin preset's generate variant; this.base by default).
+   */
+  prepare(
+    owner: object,
+    dyno: WgpuDyno,
+    base: KernelModule = this.base,
+  ): DynoDispatch {
+    const compiled = this.compile(owner, dyno);
+    const { program, layouts } = compiled;
+    const module = this.patched(compiled, base);
     program.update();
     const bindings = dynoResources(program, layouts, this.textures, (data) =>
       this.registry.uniforms.push(data),
@@ -253,21 +264,31 @@ export class DynoKernels {
     const program = new WgslDynoProgram({ functions, group: 1 });
 
     const layouts = textureLayouts(program);
-    const key = `${program.code}\n${JSON.stringify(layouts)}`;
-    let module = this.modules.get(key);
+    const compiled = { graphs, program, layouts, hooks, modules: new Map() };
+    this.compiled.set(owner, compiled);
+    return compiled;
+  }
+
+  // The compiled program patched into `base`, shared by programs with the
+  // same code.
+  private patched(compiled: Compiled, base: KernelModule): KernelModule {
+    let module = compiled.modules.get(base.name);
+    if (module) return module;
+    const { program, layouts } = compiled;
+    const key = `${base.name}\n${program.code}\n${JSON.stringify(layouts)}`;
+    module = this.modules.get(key);
     if (!module) {
       module = patchKernel(
-        this.base,
+        base,
         program,
-        hooks,
-        `${this.base.name}+dyno${this.modules.size}`,
+        compiled.hooks,
+        `${base.name}+dyno${this.modules.size}`,
         layouts,
       );
       this.modules.set(key, module);
       this.reportErrors(module);
     }
-    const compiled = { graphs, program, module, layouts };
-    this.compiled.set(owner, compiled);
-    return compiled;
+    compiled.modules.set(base.name, module);
+    return module;
   }
 }

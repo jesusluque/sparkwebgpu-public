@@ -10,6 +10,7 @@
 
 import type { GpuProfiler } from "./GpuProfiler";
 import { GpuSorter, createScanLevels, encodeExclusiveScan } from "./GpuSorter";
+import type { KernelModule } from "./KernelModule";
 import type { KernelRegistry } from "./KernelRegistry";
 import { tilesTileRaster } from "./generated/constants";
 import tileModule from "./generated/tiles/tile_raster";
@@ -44,6 +45,9 @@ export interface TileRasterInput {
   /** Clamp each splat's colour to 1, as blending into unorm targets does. */
   clamp: boolean;
   profiler: GpuProfiler | null;
+  /** A blend-plugin variant of tiles/tile_raster (PluginHost), and its uniform blocks by name. */
+  module?: KernelModule;
+  pluginUniforms?: Record<string, ArrayBuffer>;
 }
 
 export class TileRasterizer {
@@ -161,7 +165,8 @@ export class TileRasterizer {
     });
     encoder.clearBuffer(this.ranges, 0, numTiles * 8);
 
-    const tileParams = UniformWriter.for(tileModule, "tileParams").setAll({
+    const module = input.module ?? tileModule;
+    const tileParams = UniformWriter.for(module, "tileParams").setAll({
       slots: input.slots,
       tilesX,
       tilesY,
@@ -172,14 +177,18 @@ export class TileRasterizer {
         (input.depth ? TILE_DEPTH_TEST : 0) | (input.clamp ? TILE_CLAMP : 0),
       minTransmittance: this.minTransmittance,
     }).data;
-    const get = (entry: string) => this.registry.get(tileModule, entry);
+    const get = (entry: string) => this.registry.get(module, entry);
     const pass = (label: string) =>
       encoder.beginComputePass({
         label,
         timestampWrites: profiler?.timestampWrites(label),
       });
     // splat_draw's params too, for the footprint and alpha maths.
-    const uniforms = { tileParams, params: input.drawParams };
+    const uniforms = {
+      ...input.pluginUniforms,
+      tileParams,
+      params: input.drawParams,
+    };
     const buffers: Record<string, GPUBuffer> = {
       ordering: input.ordering,
       sortCount: input.sortCount,

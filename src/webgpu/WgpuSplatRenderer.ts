@@ -30,6 +30,7 @@ import {
 import { GpuProfiler } from "./GpuProfiler";
 import { GpuSorter } from "./GpuSorter";
 import { GpuSplatSource } from "./GpuSplatSource";
+import type { KernelModule } from "./KernelModule";
 import { KernelRegistry } from "./KernelRegistry";
 import {
   SRGB_LAYER_BLEND,
@@ -53,6 +54,7 @@ import {
   createUniform,
   upload,
 } from "./gpuBuffers";
+import type { PixelKernels, PluginHost } from "./plugins/PluginHost";
 import {
   type ReflectedRenderPipeline,
   createBindGroups,
@@ -231,6 +233,8 @@ export interface SplatDrawContext {
   depthStencil?: GPUDepthStencilState;
   width: number;
   height: number;
+  /** The frame's blend-plugin kernels and resources (PluginHost), if any. */
+  plugin?: PixelKernels | null;
 }
 
 /** A render pass someone else opened (three's), for renderInPass. */
@@ -305,6 +309,8 @@ export class WgpuSplatRenderer {
    * next draws (default draw and attribute variants).
    */
   diskClip: SplatDiskClip | null = null;
+  /** Plugins (src/webgpu/plugins), set by PluginHost.attach. */
+  plugins: PluginHost | null = null;
 
   private capacity = 0;
   private accumBytes = 0;
@@ -328,6 +334,8 @@ export class WgpuSplatRenderer {
   private bakePipeline?: GPUComputePipeline;
   private srgb?: SrgbComposite;
   private tiles?: TileRasterizer;
+  // This frame's blend-plugin kernels (null: the default ones).
+  private pixel: PixelKernels | null = null;
   // rasterizer "auto": the policy, its draw timer (without options.profile),
   // and the first tile encode a probe needs the pair count of.
   private auto?: AutoRasterizer;
@@ -679,6 +687,7 @@ export class WgpuSplatRenderer {
     const { cameraPos, cameraDir } = this.updateDynos(camera);
 
     const encoder = this.device.createCommandEncoder({ label: "splats" });
+    this.plugins?.encodePasses(encoder);
     if (this.options.sort === "gpu") {
       if (this.changedSince(camera, total)) {
         this.generateAll(encoder, camera, cameraPos, cameraDir);
@@ -716,6 +725,7 @@ export class WgpuSplatRenderer {
     this.ensureCapacity(total);
     const { cameraPos, cameraDir } = this.updateDynos(camera);
     const encoder = this.device.createCommandEncoder({ label: "splats" });
+    this.plugins?.encodePasses(encoder);
     const gpu = this.options.sort === "gpu";
     let readback: GPUBuffer | null = null;
     if (gpu) {
@@ -745,7 +755,10 @@ export class WgpuSplatRenderer {
       target.linear && !target.layer,
     );
     const depthFormat = this.options.depthTest ? target.depthFormat : null;
+    const pixel = this.plugins?.pixelKernels(this.device) ?? null;
+    const module = pixel?.draw ?? drawModule;
     const key = [
+      module.name,
       target.format,
       target.depthFormat,
       depthFormat ? "test" : "",
@@ -758,7 +771,7 @@ export class WgpuSplatRenderer {
     if (!rp) {
       const { colorTarget } = this.pipelineStates(target.format, null);
       if (target.layer) colorTarget.blend = SRGB_LAYER_BLEND;
-      rp = createReflectedRenderPipeline(this.device, drawModule, {
+      rp = createReflectedRenderPipeline(this.device, module, {
         vertex: "splatVertex",
         fragment: "splatFragment",
         targets: [
@@ -786,6 +799,7 @@ export class WgpuSplatRenderer {
       ordering: gpu ? this.sorter.ordering : (this.ordering as GPUBuffer),
       splats: this.accumulator as GPUBuffer,
       params: this.drawUniform,
+      ...pixel?.buffers,
     });
     pass.setPipeline(rp.pipeline);
     groups.forEach((g, i) => pass.setBindGroup(i, g));
@@ -811,6 +825,9 @@ export class WgpuSplatRenderer {
     const time = performance.now() / 1000;
     const deltaTime = time - this.lastTime;
     this.lastTime = time;
+    if (this.plugins?.frame({ renderer: this, camera, time, deltaTime })) {
+      this.dirty = true;
+    }
     for (const mesh of this.meshes) {
       mesh.dyno?.update?.({
         camera,
@@ -951,7 +968,9 @@ export class WgpuSplatRenderer {
     },
   ) {
     const { base, count, cameraPos, cameraDir } = out;
-    const kernel = this.registry.get(generateModule, "generate");
+    const plugin = this.plugins?.generateKernel(mesh) ?? null;
+    const module = plugin?.module ?? generateModule;
+    const kernel = this.registry.get(module, "generate");
     const position = new THREE.Vector3();
     const rotation = new THREE.Quaternion();
     const scale = new THREE.Vector3();
@@ -962,7 +981,7 @@ export class WgpuSplatRenderer {
     object.matrixWorld.decompose(position, rotation, scale);
     let dyno: DynoDispatch | null = null;
     if (DynoKernels.active(mesh.dyno)) {
-      dyno = this.dynoKernels.prepare(mesh, mesh.dyno);
+      dyno = this.dynoKernels.prepare(mesh, mesh.dyno, module);
       if (mesh.dyno.worldSpace) {
         position.set(0, 0, 0);
         rotation.identity();
@@ -1022,8 +1041,11 @@ export class WgpuSplatRenderer {
         lodIndices: mesh.lodBuffer ?? this.emptyBuffer,
         outSplats: out.outSplats,
         sortMetric: out.sortMetric,
+        ...plugin?.buffers,
       },
-      uniforms: params.data,
+      uniforms: plugin
+        ? { ...plugin.uniforms, params: params.data }
+        : params.data,
     });
   }
 
@@ -1176,8 +1198,9 @@ export class WgpuSplatRenderer {
     format: GPUTextureFormat,
     depthFormat: GPUTextureFormat | null,
     layer = false,
+    module: KernelModule = drawModule,
   ) {
-    const key = `${format}/${depthFormat}${layer ? "/layer" : ""}`;
+    const key = `${format}/${depthFormat}${layer ? "/layer" : ""}/${module.name}`;
     let p = this.pipelines.get(key);
     if (!p) {
       const { colorTarget, depthStencil } = this.pipelineStates(
@@ -1185,7 +1208,7 @@ export class WgpuSplatRenderer {
         depthFormat,
       );
       if (layer) colorTarget.blend = SRGB_LAYER_BLEND;
-      p = createReflectedRenderPipeline(this.device, drawModule, {
+      p = createReflectedRenderPipeline(this.device, module, {
         vertex: "splatVertex",
         fragment: "splatFragment",
         targets: [colorTarget],
@@ -1214,6 +1237,8 @@ export class WgpuSplatRenderer {
     const depthView = depthTexture?.createView();
     const depthFormat = depthTexture?.format ?? null;
 
+    const pixel = this.plugins?.pixelKernels(this.device) ?? null;
+    this.pixel = pixel;
     let variant: SplatDrawVariant | null = null;
     for (const s of this.stages) {
       variant ??=
@@ -1221,6 +1246,7 @@ export class WgpuSplatRenderer {
           ...this.pipelineStates(target.format, depthFormat),
           width: size.x,
           height: size.y,
+          plugin: pixel,
         }) ?? null;
     }
     // Blended in sRGB in a layer of their own, composited after.
@@ -1257,12 +1283,13 @@ export class WgpuSplatRenderer {
     const rp =
       variant?.pipeline ??
       (layer
-        ? this.pipeline(SRGB_LAYER_FORMAT, depthFormat, true)
-        : this.pipeline(target.format, depthFormat));
+        ? this.pipeline(SRGB_LAYER_FORMAT, depthFormat, true, pixel?.draw)
+        : this.pipeline(target.format, depthFormat, false, pixel?.draw));
     const groups = createBindGroups(this.device, rp, {
       ordering: gpu ? this.sorter.ordering : (this.ordering as GPUBuffer),
       splats: this.accumulator as GPUBuffer,
       params: this.drawUniform,
+      ...pixel?.buffers,
       ...variant?.buffers,
     });
     const depthAttachment: GPURenderPassDepthStencilAttachment | undefined =
@@ -1371,6 +1398,8 @@ export class WgpuSplatRenderer {
       depth,
       clamp: format.includes("unorm"),
       profiler: this.options.profile && profile ? this.profiler : null,
+      module: this.pixel?.tiles,
+      pluginUniforms: this.pixel?.uniforms,
     });
     return format;
   }

@@ -1292,6 +1292,27 @@ export class GlslTranslator {
           const diff = name === "length" ? x : this.binary("-", x, y, pos);
           return call("abs", [diff], F32);
         }
+        if (name === "dot") {
+          // WGSL leaves dot()'s rounding to the compiler, and on the same Mac
+          // Safari's differs from Chrome's and from GLSL's by an ulp now and
+          // then, which the fract(sin(dot(p, k)) * 43758.5453) hash turns into
+          // a different random number. Spell out the fma chain Metal's dot
+          // uses (Chrome and WebGL on Mac): the same bits everywhere.
+          const t = x.ty as Num;
+          const w = this.wgslTy(t);
+          const c = "xyzw".slice(0, t.rows);
+          const fn = this.helper(`glsl_dot_${w}`, () => {
+            let body = "a.x * b.x";
+            for (const k of c.slice(1)) body = `fma(a.${k}, b.${k}, ${body})`;
+            return [
+              "// dot() as Metal rounds it: a forward fma chain.",
+              `fn glsl_dot_${w}(a: ${w}, b: ${w}) -> f32 {`,
+              `    return ${body};`,
+              "}",
+            ].join("\n");
+          });
+          return call(fn, [x, y], F32);
+        }
         return call(name, floats(), F32);
       }
       case "cross":

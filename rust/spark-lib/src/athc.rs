@@ -125,6 +125,11 @@ pub struct ExtraHeader {
     /// sparkwebGPU's curvature stream (0 or 2 words a splat): the sixth
     /// word, 0 in athenea's files; never written to a v2 file.
     pub curvature_words: u32,
+    /// sparkwebGPU's skin (`athc_skin`): influences a splat (the seventh
+    /// word) and gradient words a splat (the eighth), 0 in athenea's files;
+    /// never written to a v2 file.
+    pub skin_influences: u32,
+    pub skin_gradient_words: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -233,6 +238,8 @@ impl ExtraHeader {
             transfer_words: u32_at(b, 12),
             shadow_words: u32_at(b, 16),
             curvature_words: u32_at(b, 20),
+            skin_influences: u32_at(b, 24),
+            skin_gradient_words: u32_at(b, 28),
         }
     }
 
@@ -245,6 +252,8 @@ impl ExtraHeader {
             self.transfer_words,
             self.shadow_words,
             self.curvature_words,
+            self.skin_influences,
+            self.skin_gradient_words,
         ]
         .iter()
             .enumerate()
@@ -255,7 +264,12 @@ impl ExtraHeader {
     }
 
     pub fn words(&self) -> u32 {
-        self.pbr_words + self.lobes_words + self.transfer_words + self.shadow_words + self.curvature_words
+        self.pbr_words + self.lobes_words + self.transfer_words + self.shadow_words + self.curvature_words + self.skin_words()
+    }
+
+    /// Skin words a splat (`athc_skin`): influences and gradients.
+    pub fn skin_words(&self) -> u32 {
+        self.skin_influences + self.skin_gradient_words
     }
 }
 
@@ -295,6 +309,16 @@ pub fn parse_headers(bytes: &[u8]) -> Result<(AthcHeader, ExtraHeader)> {
     x.curvature_words = u32_at(bytes, HEADER_BYTES + 20);
     if x.curvature_words != 0 && x.curvature_words != 2 {
         bail!("not a readable .athc (curvature of {} words a splat)", x.curvature_words);
+    }
+    // So are the skin words (athc_skin): 0 in a v2 file.
+    x.skin_influences = u32_at(bytes, HEADER_BYTES + 24);
+    x.skin_gradient_words = u32_at(bytes, HEADER_BYTES + 28);
+    if x.skin_influences > 16 || x.skin_gradient_words != 0 && x.skin_gradient_words + 1 != x.skin_influences {
+        bail!(
+            "not a readable .athc (skin of {} influences and {} gradient words)",
+            x.skin_influences,
+            x.skin_gradient_words
+        );
     }
     if h.flags & (FLAG_MATERIAL | FLAG_TRANSFER) != 0 {
         if h.has(FLAG_MATERIAL) != (x.pbr_words == 1)
@@ -427,6 +451,9 @@ pub struct AthcBlock {
     pub shadow_bits: Vec<u32>,
     /// sparkwebGPU's curvature, two words a splat (three f16), or empty.
     pub curvature: Vec<u32>,
+    /// sparkwebGPU's skin (`athc_skin`): influences then gradient words a
+    /// splat, or empty.
+    pub skin: Vec<u32>,
 }
 
 fn words_of(b: &[u8], at: &mut usize, n: usize) -> Vec<u32> {
@@ -456,11 +483,12 @@ impl AthcBlock {
         let transfer = opt(x.transfer_words > 0, &mut at, x.transfer_words);
         let shadow_bits = opt(x.shadow_words > 0, &mut at, x.shadow_words);
         let curvature = opt(x.curvature_words > 0, &mut at, x.curvature_words);
-        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature })
+        let skin = opt(x.skin_words() > 0, &mut at, x.skin_words());
+        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin })
     }
 
     /// Every array after positions, in file order.
-    fn arrays(&self) -> [&[u32]; 10] {
+    fn arrays(&self) -> [&[u32]; 11] {
         [
             &self.shape,
             &self.sh,
@@ -472,6 +500,7 @@ impl AthcBlock {
             &self.transfer,
             &self.shadow_bits,
             &self.curvature,
+            &self.skin,
         ]
     }
 
@@ -508,6 +537,7 @@ impl AthcBlock {
             transfer: cut(&self.transfer),
             shadow_bits: cut(&self.shadow_bits),
             curvature: cut(&self.curvature),
+            skin: cut(&self.skin),
         }
     }
 
@@ -524,6 +554,7 @@ impl AthcBlock {
         self.transfer.extend_from_slice(&other.transfer);
         self.shadow_bits.extend_from_slice(&other.shadow_bits);
         self.curvature.extend_from_slice(&other.curvature);
+        self.skin.extend_from_slice(&other.skin);
     }
 
     /// Words per element of an array of this block (0 when absent).
@@ -568,6 +599,9 @@ impl AthcFile {
     pub fn write(&self) -> Result<Vec<u8>> {
         if self.has_curvature() {
             return self.without_curvature().write();
+        }
+        if self.has_skin() {
+            return self.without_skin().write();
         }
         if self.over_capped() {
             return self.capped().write();
@@ -646,6 +680,22 @@ impl AthcFile {
     /// Whether a block carries sparkwebGPU's curvature stream.
     pub fn has_curvature(&self) -> bool {
         self.chunks.iter().chain(self.levels.iter().map(|(_, b)| b)).any(|b| !b.curvature.is_empty())
+    }
+
+    /// Whether a block carries sparkwebGPU's skin stream.
+    pub fn has_skin(&self) -> bool {
+        self.chunks.iter().chain(self.levels.iter().map(|(_, b)| b)).any(|b| !b.skin.is_empty())
+    }
+
+    /// The cloud without its skin (what a v2 file holds).
+    pub fn without_skin(&self) -> Self {
+        let mut out = self.clone();
+        out.extra.skin_influences = 0;
+        out.extra.skin_gradient_words = 0;
+        for b in out.chunks.iter_mut().chain(out.levels.iter_mut().map(|(_, b)| b)) {
+            b.skin.clear();
+        }
+        out
     }
 
     /// The cloud without its curvature (what a v2 file holds).
@@ -1531,6 +1581,13 @@ pub fn attrib_specs(h: &AthcHeader, x: &ExtraHeader) -> Vec<AttribSpec> {
     if x.curvature_words > 0 {
         out.push(spec(CURVATURE_ATTRIBUTE, "f16", 4, LodMerge::WeightedMean));
     }
+    // The skin as stored (athc_skin): merged nodes carry their own.
+    if x.skin_influences > 0 {
+        out.push(spec(crate::athc_skin::SKIN_INFLUENCES_ATTRIBUTE, "u32", x.skin_influences, LodMerge::First));
+    }
+    if x.skin_gradient_words > 0 {
+        out.push(spec(crate::athc_skin::SKIN_GRADIENTS_ATTRIBUTE, "u32", x.skin_gradient_words, LodMerge::First));
+    }
     // Every .athc: which of athenea's finest LoD groups a splat is in.
     out.push(spec(GROUP_ATTRIBUTE, "u32", 2, LodMerge::First));
     out
@@ -1669,6 +1726,24 @@ pub fn emit_block<T: SplatReceiver>(
         receiver.set_attrib_words(k, base, block.n, &block.curvature, 4, true);
         k += 1;
     }
+    if x.skin_influences > 0 {
+        let (i, g) = (x.skin_influences as usize, x.skin_gradient_words as usize);
+        // A block without the stream (a page that left SKIN out) reads as
+        // carried by nothing: zero weights, which the skinner leaves at rest.
+        let whole = block.skin.len() == block.n * (i + g);
+        let column = |from: usize, per: usize| -> Vec<u32> {
+            if !whole {
+                return vec![0; block.n * per];
+            }
+            (0..block.n).flat_map(|e| block.skin[e * (i + g) + from..e * (i + g) + from + per].to_vec()).collect()
+        };
+        receiver.set_attrib_words(k, base, block.n, &column(0, i), i, false);
+        k += 1;
+        if g > 0 {
+            receiver.set_attrib_words(k, base, block.n, &column(i, g), g, false);
+            k += 1;
+        }
+    }
     // GROUP_ATTRIBUTE: given for merged nodes; a splat's tail is its group.
     let ranges: Vec<u32> = match groups {
         Some(g) => g.to_vec(),
@@ -1695,6 +1770,8 @@ fn begin<T: SplatReceiver>(receiver: &mut T, num_splats: usize, h: &AthcHeader, 
 pub struct AthcDecoder<T: SplatReceiver> {
     splats: T,
     buffer: Vec<u8>,
+    /// The whole file's size was read from its tables and reserved.
+    reserved: bool,
     pub options: DecodeOptions,
     /// Set after finish(): the tree a whole file was decoded with.
     pub tree: Option<VirtualTree>,
@@ -1702,7 +1779,7 @@ pub struct AthcDecoder<T: SplatReceiver> {
 
 impl<T: SplatReceiver> AthcDecoder<T> {
     pub fn new(splats: T) -> Self {
-        Self { splats, buffer: Vec::new(), options: DecodeOptions::default(), tree: None }
+        Self { splats, buffer: Vec::new(), reserved: false, options: DecodeOptions::default(), tree: None }
     }
 
     pub fn into_splats(self) -> T {
@@ -1807,6 +1884,27 @@ impl<T: SplatReceiver> AthcDecoder<T> {
 impl<T: SplatReceiver> ChunkReceiver for AthcDecoder<T> {
     fn push(&mut self, bytes: &[u8]) -> Result<()> {
         self.buffer.extend_from_slice(bytes);
+        // A v3 file says its size in its tables: reserve it once, so the
+        // buffer holds the file and not up to twice it (Vec doubling), and
+        // is not copied as it grows. Its sections are decoded next to it.
+        if !self.reserved && self.buffer.len() >= 144 && u32_at(&self.buffer, 0) == crate::athc_v3::ATH3_MAGIC {
+            match crate::athc_v3::tables_bytes(&self.buffer) {
+                Ok(tables) if self.buffer.len() as u64 >= tables => {
+                    self.reserved = true;
+                    if let Ok(end) = crate::athc_v3::file_bytes(&self.buffer) {
+                        // Files end padded to a whole page.
+                        let want = aligned(end) as usize;
+                        if want > self.buffer.len() && want < (1usize << 31) {
+                            let mut whole = Vec::with_capacity(want);
+                            whole.extend_from_slice(&self.buffer);
+                            self.buffer = whole;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => self.reserved = true,
+            }
+        }
         Ok(())
     }
 

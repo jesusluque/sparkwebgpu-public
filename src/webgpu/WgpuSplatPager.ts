@@ -133,6 +133,11 @@ export class WgpuSplatPager extends SplatPager {
     return pool.buffer;
   }
 
+  // The sources over the pool, whose version a page upload bumps (what a
+  // slot holds changed: per-splat caches keyed on it, such as the relight
+  // pass's kept terms, are computed again).
+  private sources: GpuSplatSource[] = [];
+
   /** The pool as a source for WgpuSplatRenderer, with `splats`' encoding. */
   source(splats: PagedSplats): GpuSplatSource {
     const sh = this.pools.sh.buffer;
@@ -150,6 +155,7 @@ export class WgpuSplatPager extends SplatPager {
     );
     source.shStride = this.pools.sh.wordsPerSplat / 4;
     source.attribs = this.attribs?.pool ?? null;
+    this.sources.push(source);
     return source;
   }
 
@@ -335,6 +341,7 @@ export class WgpuSplatPager extends SplatPager {
     const count = packedArray.length / 4;
     this.pageCounts[page] = count;
     this.uploaded[page] = this.pageToSplatsChunk[page];
+    for (const source of this.sources) source.version += 1;
     this.mirror(this.packedTexture, base, packedArray);
     if (extArray) this.mirror(this.extTexture, base, extArray);
     // Every page, so one without attributes clears the previous tenant's.

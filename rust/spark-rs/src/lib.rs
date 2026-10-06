@@ -829,6 +829,53 @@ pub fn athc_layout(prefix: Uint8Array, file_bytes: f64) -> Result<JsValue, JsVal
 }
 stub_fn!(feature = "athc", athc_layout);
 
+/// The skeleton of a skinned .athc v3 (athc_skin.rs), from the file's
+/// bytes through its tables (`athc_prefix_bytes`): { influences,
+/// gradientWords, joints, skeleton, geomBind (USD rows), clips: [{ name,
+/// timeCodesPerSecond, times: Float32Array, xforms: Float32Array (samples x
+/// joints x 16, USD rows) }] }, or null when the cloud has none.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athc_skeleton(prefix: Uint8Array) -> Result<JsValue, JsValue> {
+    let bytes = prefix.to_vec();
+    let Some(s) =
+        spark_lib::athc_v3::read_v3_skeleton(&bytes).map_err(|e| JsValue::from(e.to_string()))?
+    else {
+        return Ok(JsValue::NULL);
+    };
+    let object = Object::new();
+    let set = |o: &Object, k: &str, v: &JsValue| Reflect::set(o, &JsValue::from_str(k), v);
+    set(
+        &object,
+        "influences",
+        &JsValue::from_f64(s.influences as f64),
+    )?;
+    set(
+        &object,
+        "gradientWords",
+        &JsValue::from_f64(s.gradient_words as f64),
+    )?;
+    set(&object, "joints", &serde_wasm_bindgen::to_value(&s.joints)?)?;
+    set(&object, "skeleton", &JsValue::from_str(&s.skeleton))?;
+    set(&object, "geomBind", &Float32Array::from(&s.geom_bind[..]))?;
+    let clips = js_sys::Array::new();
+    for c in &s.clips {
+        let clip = Object::new();
+        set(&clip, "name", &JsValue::from_str(&c.name))?;
+        set(
+            &clip,
+            "timeCodesPerSecond",
+            &JsValue::from_f64(c.time_codes_per_second as f64),
+        )?;
+        set(&clip, "times", &Float32Array::from(&c.times[..]))?;
+        set(&clip, "xforms", &Float32Array::from(&c.xforms[..]))?;
+        clips.push(&clip);
+    }
+    set(&object, "clips", &clips)?;
+    Ok(object.into())
+}
+stub_fn!(feature = "athc", athc_skeleton);
+
 /// The bytes of a .athl through its section table, from at least its
 /// first 128 bytes (docs/docs/athl.md).
 #[wasm_bindgen]

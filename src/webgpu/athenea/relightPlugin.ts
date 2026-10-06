@@ -196,6 +196,13 @@ export interface AtheneaRelightDebug {
    * roughness (green), blue where the cloud keeps no curvature.
    */
   view?: "none" | "place" | "normal" | "footprint";
+  /**
+   * For A/B timings: relight every splat of the cloud each frame, not only
+   * those the LoD draws (relightList); and keep the blend term in the draw
+   * without pixelDetail. Same image either way.
+   */
+  everySplat?: boolean;
+  alwaysBlend?: boolean;
 }
 
 const DEBUG_VIEWS: Record<string, number> = {
@@ -253,6 +260,8 @@ interface MeshState {
   viewlessKey: string;
   /** What the colours were computed for. */
   relitKey: string;
+  /** The LoD list copied after the records (relightList). */
+  listKey: string;
 }
 
 const STREAMS = [
@@ -301,6 +310,21 @@ function identity(o: object | null | undefined): number {
 export function relightGrid(count: number): [number, number] {
   const row = C.kRelightDispatchRow;
   return count <= row ? [count, 1] : [row, Math.ceil(count / row)];
+}
+
+/**
+ * The splats of `mesh` the relight pass colours each frame: its LoD indices
+ * when the LoD draws fewer than the cloud holds (a far car, a budget), so
+ * the per-eye pass costs what the draw shows; null: every splat. Only drawn
+ * splats are read (generate remaps through the same indices), so the image
+ * is the same.
+ */
+export function relightList(mesh: {
+  lodIndices: Uint32Array | null;
+  source: { count: number };
+}): Uint32Array | null {
+  const list = mesh.lodIndices;
+  return list && list.length < mesh.source.count ? list : null;
 }
 
 /** A zeroed uniform block for the blend term until the first pass fills it. */
@@ -534,7 +558,9 @@ export function atheneaRelightPlugin(
   };
 
   const stateOf = (device: GPUDevice, mesh: WgpuSplatMesh): MeshState => {
-    const bytes = Math.max(mesh.source.count, 1) * C.kRelightStride * 16;
+    // The records, then room for a LoD list of every splat (relightList).
+    const count = Math.max(mesh.source.count, 1);
+    const bytes = count * C.kRelightStride * 16 + Math.ceil(count / 4) * 16;
     let s = states.get(mesh);
     if (!s || s.relit.size !== bytes) {
       s?.relit.destroy();
@@ -543,6 +569,7 @@ export function atheneaRelightPlugin(
         pool: s?.pool ?? null,
         viewlessKey: "",
         relitKey: "",
+        listKey: "",
       };
       states.set(mesh, s);
     }
@@ -630,6 +657,7 @@ export function atheneaRelightPlugin(
       (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
     const e = world.elements;
     const row = (k: number) => [e[k], e[k + 4], e[k + 8], e[k + 12]];
+    const list = options.debug?.everySplat ? null : relightList(mesh);
     const params = UniformWriter.for(relightModule, "relightParams").setAll({
       count: source.count,
       flags,
@@ -648,6 +676,7 @@ export function atheneaRelightPlugin(
       emissionScale: options.emission,
       curvature: id("curvature"),
       footprint: options.footprint,
+      listBase: source.count * C.kRelightStride,
       encoding: source.encoding,
       row0: row(0),
       row1: row(1),
@@ -688,7 +717,6 @@ export function atheneaRelightPlugin(
       source.version,
       pool?.version ?? -1,
       identity(pool?.buffer),
-      identity(mesh.lodIndices),
       storedLinear,
     ].join("|");
     if (isCatcher(mesh)) {
@@ -712,10 +740,27 @@ export function atheneaRelightPlugin(
       state.viewlessKey = placed;
       stats.viewless += 1;
     }
-    const key = `${placed}|${flags & eyeFlags}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
+    // The colours of the splats the LoD draws: a list of them when it cuts
+    // some (relightList), every splat otherwise. The kept terms above stay
+    // per splat of the cloud: they change only with the sky, lights or place.
+    const key = `${placed}|${flags & eyeFlags}|${identity(mesh.lodIndices)}|${mesh.lodIndices?.length ?? -1}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
+    if (list) {
+      const listKey = `${identity(list)}|${list.length}`;
+      if (state.listKey !== listKey) {
+        device.queue.writeBuffer(
+          state.relit,
+          source.count * C.kRelightStride * 16,
+          list.buffer,
+          list.byteOffset,
+          list.byteLength,
+        );
+        state.listKey = listKey;
+      }
+      params.set("listCount", list.length);
+    }
     const entry =
       kTransfer === 2
         ? "atheneaRelight"
@@ -723,7 +768,7 @@ export function atheneaRelightPlugin(
           ? "atheneaRelightFirst"
           : "atheneaRelightPlain";
     r.registry.get(relightModule, entry).dispatch(pass, {
-      grid: relightGrid(source.count),
+      grid: relightGrid(list ? list.length : source.count),
       buffers,
       uniforms: params.data,
     });
@@ -745,6 +790,11 @@ export function atheneaRelightPlugin(
     },
     options,
     stats,
+    // AtheneaRelightBlend shades only the splats the pass marks, which it
+    // does with pixelDetail alone (kRelightSlope): without it the draw is
+    // the plain one, with no record read per fragment.
+    blendActive: () =>
+      Boolean(options.pixelDetail || options.debug?.alwaysBlend),
     get sky() {
       return sky;
     },
@@ -803,7 +853,10 @@ export function atheneaRelightPlugin(
             encoder.clearBuffer(records);
             pixelLayout = layout;
           }
-          const pass = encoder.beginComputePass({ label: "athenea relight" });
+          const pass = encoder.beginComputePass({
+            label: "athenea relight",
+            timestampWrites: r.passTimestampWrites("relight"),
+          });
           for (const mesh of meshes) relightMesh(pass, r, mesh, camera);
           pass.end();
         },

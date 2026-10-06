@@ -323,7 +323,11 @@ export function workgroupStorageBytes(wgsl) {
 
 function compileOne(exe, file) {
   const source = fs.readFileSync(file, "utf8");
-  const entries = findEntries(source);
+  // A wrapper that #includes a vendored kernel (slang/tests) has its entries.
+  const included = [...source.matchAll(/^#include\s+"(athenea\/[^"]+)"/gm)].map(
+    (m) => fs.readFileSync(path.join(SLANG_DIR, m[1]), "utf8"),
+  );
+  const entries = findEntries([source, ...included].join("\n"));
   if (entries.length === 0) return null;
   const rel = path.relative(SLANG_DIR, file).replace(/\.slang$/, "");
   return compileEntries(exe, file, rel, entries);

@@ -101,11 +101,10 @@ Per transfer, the kernel is athenea's: a TX transfer with cells (`kTransfer` 2: 
 - **One dome**, as athenea's raster keeps (the first prepared dome).
 - **Footprint**: Spark's splat shape (see the raster page); at the edges of a ball this shows as a lighter rim.
 
-## Not yet: athenea's skinning (phase 5, second half)
+## Skinned clouds
 
-athenea skins a cloud in `scene/splat_skin.slang` (vendored): linear blend of up to four joints a splat (`skel:jointIndices`, `skel:jointWeights`, `skel:geomBindTransform` on the `ParticleField`), the frame turned by the blend's linear part and re-orthonormalised, and a zonal transfer (`transferZonal`, 10 values) re-evaluated in the posed frame. Spark's `SplatSkinning` is dual-quaternion over its own bone weights. What it takes here:
-
-- **Data.** The only skinned cloud on this machine is `athenea-c1/build/bench/sparrow256.usdc` (300 862 splats, four joints each, no transfer); its skeleton's animation is in the sparrow's own stage, which is not here, and no skinned cloud carries the zonal transfer. A skinned TX cloud from `mesh2splat` (with `--transfer`) and its `SkelAnimation` are the test data this needs.
-- **Format.** Joint indices (4 × u8 or u16) and weights (4 × unorm8) as a `.athc` v3 section of their own (`SKIN`, tier 2: they are geometry), written by `usd-athc` from the primvars above, decoded to attributes; the skeleton (joint names, rest and bind transforms) and its animation in a sidecar (`.athc` has no room for them).
-- **Kernel.** A dyno or `ISplatColour`-stage object modifier calling `splat_skin`'s functions over the attribute pool: the centre by the blend of joint matrices, the covariance by the blend's Jacobian (the elastic term `Σ (X_j p) ⊗ ∇w_j` the analysis at `~/luc/athenea-skinning-analysis.md` says athenea leaves out, and a 2×2 polar decomposition in place of Gram-Schmidt), and the relight pass's frame (`splatTransferFrame`) from the skinned rotation, so the zonal transfer turns with the joint.
-- **Validation.** athenea's `tests/scene/test_loading.cpp` skin cases and `skin_check.slang` on Dawn, as the sky's were.
+A cloud a skeleton carries (athenea `mesh2splat --skinned`, a zonal transfer
+in each gaussian's frame with `--transfer`) is posed before this pass by
+the skin plugin, in place, so the relighting reads the posed frames and
+normals and the zonal lobes turn with each splat
+([athenea skinning](webgpu-athenea-skin.md)).

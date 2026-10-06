@@ -104,6 +104,16 @@ export {
   atheneaRelightPlugin,
 } from "./athenea/relightPlugin";
 export {
+  ATHENEA_SKIN_ID,
+  type AtheneaSkinOptions,
+  type AtheneaSkinPlugin,
+  SKIN_GRADIENTS_ATTRIBUTE,
+  SKIN_INFLUENCES_ATTRIBUTE,
+  atheneaSkinPlugin,
+  atheneaSkinPose,
+  skinClipIndex,
+} from "./athenea/skinPlugin";
+export {
   AtheneaSky,
   type AtheneaSkyOptions,
   type SkyImage,
@@ -156,7 +166,10 @@ export {
 export {
   type AthcLayout,
   type AthcPaging,
+  type AthcSkeleton,
+  type AthcSkinClip,
   readAthcLayout,
+  readAthcSkeleton,
   unpackAthcLobes,
   unpackAthcNormal,
   unpackAthcPbr,

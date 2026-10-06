@@ -44,6 +44,13 @@ export type SplatSkinningOptions = {
   // Set the mode of skinning to use.
   // (default: DUAL_QUATERNION)
   mode?: SplatSkinningMode;
+  // LINEAR_BLEND only: also take how each Gsplat's weights change across it
+  // (setSplatWeightGradients), so its covariance follows the whole Jacobian
+  // of the blend, J = sum_k w_k A_k + sum_k (X_k p) grad(w_k)^T, rather than
+  // the blend of the bones' linear parts alone -- athenea's skinner (its
+  // 7dff879): exact under any affine blend, and what stretches a Gsplat
+  // across a bend. (default: false)
+  weightGradients?: boolean;
 };
 
 export class SplatSkinning {
@@ -66,6 +73,13 @@ export class SplatSkinning {
     scale: THREE.Vector3;
   }[];
   boneRestInvMats: THREE.Matrix4[];
+
+  // With weightGradients: three texels a Gsplat (RGBA32F, xyz used), the
+  // gradients of its first three bones' weights in its rest space; the
+  // fourth's is minus their sum. A 1-texel placeholder otherwise.
+  gradientData: Float32Array<ArrayBuffer>;
+  gradientTexture: THREE.DataArrayTexture;
+  hasGradients: boolean;
 
   uniform: DynoUniform<typeof GsplatSkinning, "skinning">;
 
@@ -111,6 +125,24 @@ export class SplatSkinning {
       this.boneRestInvMats = [];
     }
 
+    this.hasGradients =
+      Boolean(options.weightGradients) &&
+      this.mode === SplatSkinningMode.LINEAR_BLEND;
+    const grad = this.hasGradients
+      ? getTextureSize(this.numSplats * 3)
+      : { width: 1, height: 1, depth: 1, maxSplats: 1 };
+    this.gradientData = new Float32Array(grad.maxSplats * 4);
+    this.gradientTexture = new THREE.DataArrayTexture(
+      this.gradientData,
+      grad.width,
+      grad.height,
+      grad.depth,
+    );
+    this.gradientTexture.format = THREE.RGBAFormat;
+    this.gradientTexture.type = THREE.FloatType;
+    this.gradientTexture.internalFormat = "RGBA32F";
+    this.gradientTexture.needsUpdate = true;
+
     this.uniform = new DynoUniform({
       key: "skinning",
       type: GsplatSkinning,
@@ -120,6 +152,8 @@ export class SplatSkinning {
         numBones: this.numBones,
         skinTexture: this.skinTexture,
         boneTexture: this.boneTexture,
+        gradientTexture: this.gradientTexture,
+        hasGradients: this.hasGradients ? 1 : 0,
       },
     });
   }
@@ -309,6 +343,26 @@ export class SplatSkinning {
       (boneIndices.w << 8);
   }
 
+  // With weightGradients: how the weights of the Gsplat's first three bones
+  // (in setSplatBones' order) change across it, per unit of its rest space
+  // (the fourth's is minus their sum: the weights sum to one). Set
+  // gradientTexture.needsUpdate after the last.
+  setSplatWeightGradients(
+    splatIndex: number,
+    gradient0: THREE.Vector3,
+    gradient1: THREE.Vector3,
+    gradient2: THREE.Vector3,
+  ) {
+    if (!this.hasGradients) {
+      throw new Error(
+        "setSplatWeightGradients needs LINEAR_BLEND with weightGradients",
+      );
+    }
+    [gradient0, gradient1, gradient2].forEach((g, k) => {
+      this.gradientData.set([g.x, g.y, g.z, 0], (splatIndex * 3 + k) * 4);
+    });
+  }
+
   // Call this to indicate that the bones have changed and the Gsplats need to be
   // re-generated with updated skinning.
   updateBones() {
@@ -335,6 +389,8 @@ export const defineGsplatSkinning = /*@__PURE__*/ unindent(/* glsl */ `
     int numBones;
     usampler2DArray skinTexture;
     sampler2D boneTexture;
+    sampler2DArray gradientTexture;
+    int hasGradients;
   };
 `);
 
@@ -460,6 +516,8 @@ registerWgslStruct(GsplatSkinning, {
   numBones: "int",
   skinTexture: "usampler2DArray",
   boneTexture: "sampler2D",
+  gradientTexture: "sampler2DArray",
+  hasGradients: "int",
 });
 
 function applyGsplatSkinning(
@@ -586,6 +644,7 @@ export const defineApplyCovSplatLBSkinning = /*@__PURE__*/ unindent(/* glsl */ `
   void applyCovSplatLBSkinning(
     int numSplats, int numBones,
     usampler2DArray skinTexture, sampler2D boneTexture,
+    sampler2DArray gradientTexture, int hasGradients,
     int splatIndex, inout vec3 center, inout vec3 xxyyzz, inout vec3 xyxzyz
   ) {
     if ((splatIndex < 0) || (splatIndex >= numSplats)) {
@@ -608,24 +667,48 @@ export const defineApplyCovSplatLBSkinning = /*@__PURE__*/ unindent(/* glsl */ `
 
     mat3 basis = mat3(0.0);
     vec3 offset = vec3(0.0);
+    // The whole Jacobian (weightGradients): each bone's carried point and
+    // its weight's gradient, the last minus the sum of the others.
+    vec3 carried[4];
+    vec3 grads[4];
+    vec3 gradSum = vec3(0.0);
 
     for (int i = 0; i < 4; i++) {
-      if (weights[i] > 0.0) {
+      carried[i] = vec3(0.0);
+      grads[i] = vec3(0.0);
+      if (hasGradients != 0) {
+        grads[i] = (i < 3) ? texelFetch(gradientTexture, splatTexCoord(splatIndex * 3 + i), 0).xyz : -gradSum;
+        gradSum += grads[i];
+      }
+      if (weights[i] > 0.0 || grads[i] != vec3(0.0)) {
         int boneIndex = int(boneIndices[i]);
         if (boneIndex < numBones) {
           vec4 v0 = texelFetch(boneTexture, ivec2(0, boneIndex), 0);
           vec4 v1 = texelFetch(boneTexture, ivec2(1, boneIndex), 0);
           vec4 v2 = texelFetch(boneTexture, ivec2(2, boneIndex), 0);
-          basis += weights[i] * mat3(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, v2.x);
-          offset += weights[i] * vec3(v2.y, v2.z, v2.w);
+          mat3 m = mat3(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, v2.x);
+          vec3 o = vec3(v2.y, v2.z, v2.w);
+          carried[i] = m * center + o;
+          basis += weights[i] * m;
+          offset += weights[i] * o;
+        } else {
+          grads[i] = vec3(0.0);
         }
       }
     }
 
     center = basis * center + offset;
+    mat3 jacobian = basis;
+    if (hasGradients != 0) {
+      // Taken about the blended point: the same term (the gradients sum to
+      // zero), a difference of nearby points.
+      for (int i = 0; i < 4; i++) {
+        jacobian += outerProduct(carried[i] - center, grads[i]);
+      }
+    }
 
     mat3 cov = mat3(xxyyzz.x, xyxzyz.x, xyxzyz.y, xyxzyz.x, xxyyzz.y, xyxzyz.z, xyxzyz.y, xyxzyz.z, xxyyzz.z);
-    cov = basis * cov * transpose(basis);
+    cov = jacobian * cov * transpose(jacobian);
     xxyyzz = vec3(cov[0][0], cov[1][1], cov[2][2]);
     xyxzyz = vec3(cov[0][1], cov[0][2], cov[1][2]);
   }
@@ -689,6 +772,7 @@ export const wgslApplyCovSplatLBSkinning = /*@__PURE__*/ unindent(/* wgsl */ `
   fn applyCovSplatLBSkinning(
     numSplats: i32, numBones: i32,
     skinTexture: texture_2d_array<u32>, boneTexture: texture_2d<f32>,
+    gradientTexture: texture_2d_array<f32>, hasGradients: i32,
     splatIndex: i32, center: ptr<function, vec3f>,
     xxyyzz: ptr<function, vec3f>, xyxzyz: ptr<function, vec3f>
   ) {
@@ -703,28 +787,56 @@ export const wgslApplyCovSplatLBSkinning = /*@__PURE__*/ unindent(/* wgsl */ `
 
     var basis = mat3x3f();
     var offset = vec3f(0.0);
+    var carried: array<vec3f, 4>;
+    var grads: array<vec3f, 4>;
+    var gradSum = vec3f(0.0);
+    let rest = *center;
     for (var i = 0; i < 4; i++) {
-      if (weights[i] > 0.0) {
+      carried[i] = vec3f(0.0);
+      grads[i] = vec3f(0.0);
+      if (hasGradients != 0) {
+        if (i < 3) {
+          let gc = splatTexCoord(splatIndex * 3 + i);
+          grads[i] = textureLoad(gradientTexture, gc.xy, gc.z, 0).xyz;
+        } else {
+          grads[i] = -gradSum;
+        }
+        gradSum += grads[i];
+      }
+      if (weights[i] > 0.0 || any(grads[i] != vec3f(0.0))) {
         let boneIndex = i32(boneIndices[i]);
         if (boneIndex < numBones) {
           let v0 = textureLoad(boneTexture, vec2i(0, boneIndex), 0);
           let v1 = textureLoad(boneTexture, vec2i(1, boneIndex), 0);
           let v2 = textureLoad(boneTexture, vec2i(2, boneIndex), 0);
-          basis += weights[i] * mat3x3f(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, v2.x);
+          let m = mat3x3f(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, v2.x);
+          carried[i] = m * rest + v2.yzw;
+          basis += weights[i] * m;
           offset += weights[i] * v2.yzw;
+        } else {
+          grads[i] = vec3f(0.0);
         }
       }
     }
 
-    *center = basis * *center + offset;
-    let cov = basis * covSplatMatrix(*xxyyzz, *xyxzyz) * transpose(basis);
+    let posed = basis * rest + offset;
+    *center = posed;
+    var jacobian = basis;
+    if (hasGradients != 0) {
+      for (var i = 0; i < 4; i++) {
+        let d = carried[i] - posed;
+        let g = grads[i];
+        jacobian += mat3x3f(d * g.x, d * g.y, d * g.z);
+      }
+    }
+    let cov = jacobian * covSplatMatrix(*xxyyzz, *xyxzyz) * transpose(jacobian);
     *xxyyzz = vec3f(cov[0][0], cov[1][1], cov[2][2]);
     *xyxzyz = vec3f(cov[0][1], cov[0][2], cov[1][2]);
   }
 `);
 
 // The WGSL statements both cov skinnings share: fn is the function above.
-function wgslCovSkinning(fn: string, globals: string) {
+function wgslCovSkinning(fn: string, globals: string, gradients = false) {
   return {
     globals: () => [globals],
     statements: ({
@@ -738,6 +850,9 @@ function wgslCovSkinning(fn: string, globals: string) {
       const covsplat = outputs.covsplat as string;
       const skinTexture = wgslStructTexture(skinning, "skinTexture");
       const boneTexture = wgslStructTexture(skinning, "boneTexture");
+      const extra = gradients
+        ? `${wgslStructTexture(skinning, "gradientTexture")}, ${skinning}.hasGradients,`
+        : "";
       return unindentLines(/* wgsl */ `
         ${covsplat} = ${inputs.covsplat};
         if (isCovSplatActive(${covsplat}.flags)) {
@@ -746,7 +861,7 @@ function wgslCovSkinning(fn: string, globals: string) {
           var xyxzyz = ${covsplat}.xyxzyz;
           ${fn}(
             ${skinning}.numSplats, ${skinning}.numBones,
-            ${skinTexture}, ${boneTexture},
+            ${skinTexture}, ${boneTexture}, ${extra}
             ${covsplat}.index, &center, &xxyyzz, &xyxzyz
           );
           ${covsplat}.center = center;
@@ -813,6 +928,7 @@ function applyCovSplatLBSkinning(
           applyCovSplatLBSkinning(
             ${skinning}.numSplats, ${skinning}.numBones,
             ${skinning}.skinTexture, ${skinning}.boneTexture,
+            ${skinning}.gradientTexture, ${skinning}.hasGradients,
             ${covsplat}.index, ${covsplat}.center, ${covsplat}.xxyyzz, ${covsplat}.xyxzyz
           );
         }
@@ -821,6 +937,7 @@ function applyCovSplatLBSkinning(
     wgsl: wgslCovSkinning(
       "applyCovSplatLBSkinning",
       wgslApplyCovSplatLBSkinning,
+      true,
     ),
   });
   return dyno.outputs.covsplat;

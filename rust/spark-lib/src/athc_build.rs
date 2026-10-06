@@ -76,6 +76,19 @@ pub struct CloudStreams {
     /// `curvature`: 3 a splat, the shape operator in the splat's first two
     /// axes (xx, xy, yy), on the mesh's normal (sparkwebGPU's `CURV`)
     pub curvature: Vec<f32>,
+    /// `transferZonal`: 10 a splat, two zonal lobes in the splat's frame
+    /// (a skinned cloud's transfer); read in place of `transferDirect`.
+    pub transfer_zonal: Vec<f32>,
+    /// The rig (`athc_skin`): `skel:jointIndices` / `skel:jointWeights`,
+    /// `skin_influences` a splat, empty when nothing carries the cloud.
+    pub joint_indices: Vec<i32>,
+    pub joint_weights: Vec<f32>,
+    pub skin_influences: usize,
+    /// Joints the skeleton has (a joint past it holds nothing).
+    pub joint_count: u32,
+    /// `jointWeightGradients`: `2 (skin_influences - 1)` halves a splat (bits),
+    /// or empty.
+    pub weight_gradients: Vec<u16>,
 }
 
 /// The layers' arrays (`GpuClouds.cpp` `lobeArrays`, in its order).
@@ -346,6 +359,8 @@ pub fn packed_of(file: &AthcFile) -> PackedCloud {
         bounds_min: file.header.bounds_min,
         bounds_max: file.header.bounds_max,
         dropped: 0,
+        skin_influences: file.extra.skin_influences,
+        skin_gradient_words: file.extra.skin_gradient_words,
     }
 }
 
@@ -383,6 +398,10 @@ pub struct PackedCloud {
     pub bounds_max: [f32; 3],
     /// Records dropped by validation (opacity under 1/255, not finite).
     pub dropped: usize,
+    /// The skin's layout (`athc_skin`): influences and gradient words a
+    /// splat in `block.skin`, 0 for a cloud nothing carries.
+    pub skin_influences: u32,
+    pub skin_gradient_words: u32,
 }
 
 fn half_safe(v: f32) -> f32 {
@@ -446,7 +465,22 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 /// The transfer's values a splat in the kept layout, from USD's three arrays.
 fn transfer_layout(s: &CloudStreams, keep: TransferKeep) -> Result<(u32, u32, u32, bool)> {
     let n = s.count;
-    if s.transfer_direct.is_empty() || keep == TransferKeep::None {
+    if keep == TransferKeep::None {
+        return Ok((0, 0, 0, false));
+    }
+    // A zonal transfer (a skinned cloud's) is read in place of the direct
+    // half, and kept whole: ten values (`kTransferZonalCount`).
+    if !s.transfer_zonal.is_empty() {
+        if s.transfer_zonal.len() != n * 10 {
+            bail!("transferZonal holds {} values for {n} splats", s.transfer_zonal.len());
+        }
+        return match keep {
+            TransferKeep::Full | TransferKeep::Count(10) => Ok((10, 10, 0, false)),
+            TransferKeep::Count(c) => bail!("a zonal transfer keeps its 10 values, not {c}"),
+            TransferKeep::None => unreachable!(),
+        };
+    }
+    if s.transfer_direct.is_empty() {
         return Ok((0, 0, 0, false));
     }
     let direct = if s.transfer_direct.len() >= n * 16 {
@@ -543,6 +577,22 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
     };
     let src_direct = s.transfer_direct.len() / n;
     let src_indirect = s.transfer_indirect.len() / n;
+    let zonal = transfer_count == 10 && !s.transfer_zonal.is_empty();
+    // The rig: athenea's packed influences (390670e) and the gradients as
+    // the file holds them.
+    let k_skin = if s.joint_indices.is_empty() { 0 } else { s.skin_influences };
+    if k_skin > 0 && (s.joint_indices.len() != n * k_skin || s.joint_weights.len() != n * k_skin || k_skin > 16) {
+        bail!(
+            "{} joint indices and {} weights for {n} splats of {k_skin} influences",
+            s.joint_indices.len(),
+            s.joint_weights.len()
+        );
+    }
+    let g_skin = if k_skin > 1 && s.weight_gradients.len() == n * 2 * (k_skin - 1) { k_skin - 1 } else { 0 };
+    if k_skin > 1 && g_skin == 0 && !s.weight_gradients.is_empty() {
+        bail!("jointWeightGradients holds {} halves for {n} splats of {k_skin} joints", s.weight_gradients.len());
+    }
+    let mut skin_out_of_range = 0usize;
 
     let mut b = AthcBlock::default();
     let mut lo = [f32::INFINITY; 3];
@@ -654,7 +704,13 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
             }
             b.normals.push(pack_normal(normalize3(nv)));
         }
-        if transfer_count > 0 {
+        if zonal {
+            for w in 0..5 {
+                let lo16 = f16_bits(half_safe(s.transfer_zonal[i * 10 + 2 * w])) & 0xffff;
+                let hi16 = f16_bits(half_safe(s.transfer_zonal[i * 10 + 2 * w + 1])) & 0xffff;
+                b.transfer.push((hi16 << 16) | lo16);
+            }
+        } else if transfer_count > 0 {
             let d = direct as usize;
             let ind = indirect as usize;
             values[..d].copy_from_slice(&s.transfer_direct[i * src_direct..i * src_direct + d]);
@@ -673,6 +729,19 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
             b.shadow_bits
                 .extend_from_slice(&s.shadow_bits[i * shadow_words..(i + 1) * shadow_words]);
         }
+        if k_skin > 0 {
+            let (words, bad) = crate::athc_skin::pack_gaussian(
+                &s.joint_indices[i * k_skin..(i + 1) * k_skin],
+                &s.joint_weights[i * k_skin..(i + 1) * k_skin],
+                s.joint_count.max(1),
+            );
+            skin_out_of_range += bad as usize;
+            b.skin.extend_from_slice(&words);
+            for w in 0..g_skin {
+                let at = i * 2 * g_skin + 2 * w;
+                b.skin.push(s.weight_gradients[at] as u32 | (s.weight_gradients[at + 1] as u32) << 16);
+            }
+        }
         if curvature {
             let k = &s.curvature[i * 3..i * 3 + 3];
             let safe = |v: f32| if v.is_finite() { half_safe(v) } else { 0.0 };
@@ -685,6 +754,9 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
     if b.n == 0 {
         bail!("no splat survives validation");
     }
+    if skin_out_of_range > 0 {
+        eprintln!("warning: {skin_out_of_range} splats name a joint past the skeleton or a weight outside [0, 1]");
+    }
     Ok(PackedCloud {
         block: b,
         rest_per_colour: keep as u32,
@@ -694,6 +766,8 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
         bounds_min: lo,
         bounds_max: hi,
         dropped,
+        skin_influences: k_skin as u32,
+        skin_gradient_words: g_skin as u32,
     })
 }
 
@@ -761,6 +835,7 @@ fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         transfer: pick(&b.transfer),
         shadow_bits: pick(&b.shadow_bits),
         curvature: pick(&b.curvature),
+        skin: pick(&b.skin),
     }
 }
 
@@ -1260,6 +1335,16 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
         if !splats.curvature.is_empty() {
             block.curvature = extras_merge(&splats.curvature, 2, 1, &level.starts, &splats);
         }
+        // The skin: each group carried by its splats' heaviest joints.
+        if !splats.skin.is_empty() {
+            block.skin = crate::athc_skin::skin_merge(
+                &splats.skin,
+                cloud.skin_influences as usize,
+                cloud.skin_gradient_words as usize,
+                &level.starts,
+                &splats,
+            );
+        }
         block.tail = level.cells.clone();
         stored.push((r, block));
         fine_moments = moments;
@@ -1286,6 +1371,10 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
     }
     if !whole.curvature.is_empty() {
         extra.curvature_words = 2;
+    }
+    if !whole.skin.is_empty() {
+        extra.skin_influences = cloud.skin_influences;
+        extra.skin_gradient_words = cloud.skin_gradient_words;
     }
     let flags = (if whole.normals.is_empty() {
         0
@@ -1467,6 +1556,15 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
     if !splats.curvature.is_empty() {
         block.curvature = extras_merge(&splats.curvature, 2, 1, &level.starts, &splats);
     }
+    if !splats.skin.is_empty() {
+        block.skin = crate::athc_skin::skin_merge(
+            &splats.skin,
+            cloud.skin_influences as usize,
+            cloud.skin_gradient_words as usize,
+            &level.starts,
+            &splats,
+        );
+    }
     Ok(PackedCloud {
         block,
         rest_per_colour: cloud.rest_per_colour,
@@ -1476,6 +1574,8 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
         bounds_min: cloud.bounds_min,
         bounds_max: cloud.bounds_max,
         dropped: cloud.dropped,
+        skin_influences: cloud.skin_influences,
+        skin_gradient_words: cloud.skin_gradient_words,
     })
 }
 
@@ -1610,6 +1710,15 @@ pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
     if !splats.curvature.is_empty() {
         block.curvature = extras_merge(&splats.curvature, 2, 1, &starts, &splats);
     }
+    if !splats.skin.is_empty() {
+        block.skin = crate::athc_skin::skin_merge(
+            &splats.skin,
+            cloud.skin_influences as usize,
+            cloud.skin_gradient_words as usize,
+            &starts,
+            &splats,
+        );
+    }
     Ok(PackedCloud {
         block,
         rest_per_colour: cloud.rest_per_colour,
@@ -1619,6 +1728,8 @@ pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
         bounds_min: cloud.bounds_min,
         bounds_max: cloud.bounds_max,
         dropped: cloud.dropped,
+        skin_influences: cloud.skin_influences,
+        skin_gradient_words: cloud.skin_gradient_words,
     })
 }
 
@@ -1720,6 +1831,8 @@ pub fn drop_hidden_backs(cloud: &PackedCloud, thickness: f32) -> Result<(PackedC
             bounds_min: cloud.bounds_min,
             bounds_max: cloud.bounds_max,
             dropped: cloud.dropped,
+            skin_influences: cloud.skin_influences,
+            skin_gradient_words: cloud.skin_gradient_words,
         },
         dropped,
     ))
@@ -1777,6 +1890,7 @@ mod tests {
             bounds_min: h.bounds_min,
             bounds_max: h.bounds_max,
             dropped: 0,
+            ..Default::default()
         };
         let built = build_lod(&cloud, &BuildOptions::default()).unwrap();
         let b = built.header;
@@ -2007,6 +2121,7 @@ mod tests {
             bounds_min: h.bounds_min,
             bounds_max: h.bounds_max,
             dropped: 0,
+            ..Default::default()
         };
         let n = cloud.block.n;
         let area = |b: &AthcBlock| -> f32 {
@@ -2627,5 +2742,119 @@ mod tests {
             std::fs::write(path, &bytes).unwrap();
         }
         assert_eq!(std::fs::read(path).unwrap(), bytes, "UPDATE_FIXTURES=1 rewrites {path}");
+    }
+
+    #[test]
+    fn carries_a_skin_through_the_levels_and_v3() {
+        use crate::athc_skin::{element_skin, AthcSkeleton, SkinClip};
+        // A strip of splats, the first half on joint 0, the second on 1,
+        // blended in the middle; gradients on every splat.
+        let n = 64;
+        let mut s = CloudStreams {
+            count: n,
+            skin_influences: 2,
+            joint_count: 2,
+            ..Default::default()
+        };
+        for i in 0..n {
+            s.positions.extend_from_slice(&[i as f32 * 0.1, 0.0, 0.0]);
+            s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+            s.scales.extend_from_slice(&[0.05, 0.05, 0.005]);
+            s.opacities.push(1.0);
+            let w = (i as f32 / (n - 1) as f32).clamp(0.0, 1.0);
+            s.joint_indices.extend_from_slice(&[0, 1]);
+            s.joint_weights.extend_from_slice(&[1.0 - w, w]);
+            s.weight_gradients.extend_from_slice(&[
+                half::f16::from_f32(-0.5).to_bits(),
+                half::f16::from_f32(0.25).to_bits(),
+            ]);
+        }
+        let packed = pack_streams(&s, &BuildOptions::default()).unwrap();
+        assert_eq!((packed.skin_influences, packed.skin_gradient_words), (2, 1));
+        let file = build_lod(&packed, &BuildOptions::default()).unwrap();
+        assert!(file.levels.iter().all(|(_, b)| b.skin.len() == b.n * 3));
+        let skeleton = AthcSkeleton {
+            influences: 2,
+            gradient_words: 1,
+            joints: vec!["a".into(), "a/b".into()],
+            skeleton: "/Skel".into(),
+            geom_bind: std::array::from_fn(|k| if k % 5 == 0 { 1.0 } else { 0.0 }),
+            clips: vec![SkinClip {
+                name: "c".into(),
+                time_codes_per_second: 24.0,
+                times: vec![0.0],
+                xforms: vec![0.0; 32],
+            }],
+        };
+        let v3 = crate::athc_v3::write_v3_skinned(
+            &file,
+            crate::athc_v3::COMPRESSION_GZIP,
+            Some(&skeleton),
+        )
+        .unwrap();
+        let back = crate::athc_v3::read_v3(&v3).unwrap();
+        assert_eq!(back.extra.skin_influences, 2);
+        assert_eq!(back.splats().skin, file.splats().skin);
+        assert_eq!(
+            crate::athc_v3::read_v3_skeleton(&v3).unwrap().unwrap(),
+            skeleton
+        );
+        // Every encoding, and the size the tables give, cover the skeleton.
+        use crate::athc_v3::{
+            file_bytes, parse_v3, read_v3, read_v3_skeleton, tables_bytes, write_v3_full,
+            write_v3_smallest_with, COMPRESSION_GZIP, ENCODING_BYTE_PLANES, ENCODING_DELTA_PLANES,
+        };
+        for planes in [ENCODING_BYTE_PLANES, ENCODING_DELTA_PLANES] {
+            let enc = write_v3_full(&file, COMPRESSION_GZIP, false, &|_| planes, Some(&skeleton)).unwrap();
+            assert_eq!(read_v3(&enc).unwrap().splats().skin, file.splats().skin);
+            assert_eq!(read_v3_skeleton(&enc).unwrap().unwrap(), skeleton);
+        }
+        let (smallest, _) = write_v3_smallest_with(&file, COMPRESSION_GZIP, Some(&skeleton)).unwrap();
+        assert_eq!(read_v3_skeleton(&smallest).unwrap().unwrap(), skeleton);
+        assert_eq!(read_v3(&smallest).unwrap().splats().skin, file.splats().skin);
+        let tables = tables_bytes(&v3).unwrap() as usize;
+        let end = file_bytes(&v3[..tables]).unwrap();
+        let at = parse_v3(&v3).unwrap().skeleton_offset;
+        assert!(at > 0 && end >= at + skeleton.to_bytes().len() as u64);
+        assert_eq!(crate::athc::aligned(end), v3.len() as u64);
+        // A splat's influences and gradient as packed; the weights sum to one.
+        let (pairs, grads) = element_skin(&back.splats().skin, 2, 1, 0);
+        assert!((pairs[0].1 + pairs[1].1 - 1.0).abs() < 1e-6);
+        assert_eq!(grads[0], [-0.5, 0.25]);
+        // A v2 file drops the skin.
+        assert_eq!(
+            AthcFile::read(&file.write().unwrap())
+                .unwrap()
+                .extra
+                .skin_influences,
+            0
+        );
+        // A merged root: both joints, no gradient.
+        let (pairs, grads) = element_skin(&back.levels[0].1.skin, 2, 1, 0);
+        assert!(pairs.iter().all(|p| p.1 > 0.2));
+        assert_eq!(grads[0], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn keeps_a_zonal_transfer_whole() {
+        let n = 4;
+        let mut s = CloudStreams {
+            count: n,
+            ..Default::default()
+        };
+        for i in 0..n {
+            s.positions.extend_from_slice(&[i as f32, 0.0, 0.0]);
+            s.opacities.push(1.0);
+            s.transfer_zonal.extend((0..10).map(|k| k as f32 * 0.125));
+        }
+        let packed = pack_streams(&s, &BuildOptions::default()).unwrap();
+        assert_eq!(packed.transfer_count, 10);
+        assert_eq!(packed.block.transfer.len(), n * 5);
+        assert_eq!(f16_of(packed.block.transfer[4] >> 16), 1.125);
+        let o = BuildOptions {
+            transfer: TransferKeep::Count(16),
+            ..Default::default()
+        };
+        assert!(pack_streams(&s, &o).is_err());
     }
 }

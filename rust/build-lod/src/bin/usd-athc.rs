@@ -62,7 +62,26 @@
 //!                                             (v3 section CURV; not in a v2)
 //! cryptoObject, cryptoManifest, ior, relight  not in a .athc:
 //!                                             reported in --json
+//! primvars:athenea:splat:transferZonal       transfer of 10 values (two zonal
+//!   (float[], 10 a splat)                     lobes in the splat's frame; a
+//!                                             skinned cloud's), in place of
+//!                                             transferDirect
+//! skel:jointIndices, skel:jointWeights        SKIN: athenea's packed influences
+//!   (or athenea:splat:joint*; elementSize k)  (joint u16 | weight unorm16)
+//! primvars:athenea:splat:jointWeightGradients SKIN: gradient words (two halves)
+//!   (half[], 2 (k - 1) a splat)
+//! skel:joints, skel:geomBindTransform,        the skeleton (ATSK blob, v3 only;
+//!   primvars:athenea:splat:skinningXforms     athc_skin.rs): joints, bind
+//!   (matrix4d[], time sampled)                transform, one clip of samples
 //! ```
+//!
+//! A skinned cloud (`athenea mesh2splat --skinned`) keeps its rig: the
+//! `SKIN` section and the skeleton (docs/docs/athc-v3.md). `--clip NAME`
+//! names the clip its `skinningXforms` make (default `default`), and
+//! `--add-clip NAME=other.usdc` adds the samples another conversion of the
+//! same rig holds as a second clip. `--add`, `--cell`, `--target` and
+//! `--thin` are refused with a skin; a v2 file drops it. A `.usda` layer is
+//! read too.
 
 use std::collections::BTreeMap;
 
@@ -73,7 +92,8 @@ use spark_lib::athc_build::{
     build_lod, cell_for_target, crop_box, drop_hidden_backs, pack_streams, reduce_cells, reduce_thin, BuildOptions,
     CloudStreams, LobeStreams, TransferKeep,
 };
-use spark_lib::athc_v3::{gzip, parse_v3, write_v3, COMPRESSION_GZIP, COMPRESSION_NONE};
+use spark_lib::athc_skin::{AthcSkeleton, SkinClip};
+use spark_lib::athc_v3::{gzip, parse_v3, write_v3_skinned, COMPRESSION_GZIP, COMPRESSION_NONE};
 
 /// A float array of any of the value types athenea writes (or USD allows).
 fn floats(v: &Value) -> Option<Vec<f32>> {
@@ -120,9 +140,34 @@ fn kind(v: &Value) -> String {
     format!("{name}[{len}]")
 }
 
-/// One prim's authored attribute defaults.
+/// One prim's authored attribute defaults, and the time samples of those
+/// that have them.
 pub struct Prim {
     pub attributes: BTreeMap<String, Value>,
+    pub samples: BTreeMap<String, Vec<(f64, Value)>>,
+}
+
+/// A `.usdc` or a `.usda` layer.
+fn read_layer(path: &str) -> Result<Box<dyn AbstractData>> {
+    if path.ends_with(".usda") {
+        return Ok(Box::new(openusd::usda::read_file(path).with_context(|| format!("reading {path}"))?));
+    }
+    openusd::usdc::read_file(path).with_context(|| format!("reading {path}"))
+}
+
+/// The layer's `timeCodesPerSecond` (USD's default, 24, where it says none).
+fn time_codes_per_second(data: &dyn AbstractData) -> f32 {
+    let Ok(root) = sdf::path("/") else { return 24.0 };
+    match data.try_field(&root, "timeCodesPerSecond").ok().flatten().map(|v| v.into_owned()) {
+        Some(Value::Double(f)) => f as f32,
+        Some(Value::Float(f)) => f,
+        _ => 24.0,
+    }
+}
+
+/// A matrix4d as 16 floats, USD rows.
+fn matrix(m: &openusd::gf::Matrix4d) -> [f32; 16] {
+    m.0.map(|v| v as f32)
 }
 
 impl Prim {
@@ -139,16 +184,25 @@ impl Prim {
             None => bail!("no prim {prim} with properties"),
         };
         let mut attributes = BTreeMap::new();
+        let mut samples = BTreeMap::new();
         for name in names {
             let at = sdf::path(format!("{prim}.{name}")).map_err(|e| anyhow!("{name}: {e}"))?;
             if let Some(v) = data
                 .try_field(&at, "default")
                 .map_err(|e| anyhow!("{name}: {e}"))?
             {
-                attributes.insert(name, v.into_owned());
+                attributes.insert(name.clone(), v.into_owned());
+            }
+            // Only the rig's transforms are read over time.
+            if name.ends_with("skinningXforms") {
+                if let Some(Value::TimeSamples(t)) =
+                    data.try_field(&at, "timeSamples").map_err(|e| anyhow!("{name}: {e}"))?.map(|v| v.into_owned())
+                {
+                    samples.insert(name, t);
+                }
             }
         }
-        Ok(Self { attributes })
+        Ok(Self { attributes, samples })
     }
 
     /// Keeps the elements of every per-splat array where `keep` is true
@@ -275,8 +329,139 @@ impl Prim {
             transfer_reflected: self.floats(&["athenea:splat:transferReflected"])?,
             shadow_bits: self.ints("athenea:splat:shadowBits")?,
             curvature: self.floats(&["athenea:splat:curvature"])?,
+            transfer_zonal: self.floats(&["athenea:splat:transferZonal"])?,
+            joint_indices: self.joint_indices()?,
+            joint_weights: self.joint_weights()?,
+            skin_influences: self.skin_influences(count)?,
+            joint_count: self.joints().len() as u32,
+            weight_gradients: match self.get("athenea:splat:jointWeightGradients") {
+                Some(Value::HalfVec(h)) => h.iter().map(|v| v.to_bits()).collect(),
+                Some(v) => bail!("jointWeightGradients is {}, not halves", kind(v)),
+                None => Vec::new(),
+            },
         })
     }
+
+    /// `skel:jointIndices` (UsdSkel's binding), or athenea's older name.
+    fn joint_indices(&self) -> Result<Vec<i32>> {
+        for name in ["skel:jointIndices", "athenea:splat:jointIndices"] {
+            match self.get(name) {
+                Some(Value::IntVec(x)) => return Ok(x.clone()),
+                Some(v) => bail!("{name} is {}, not ints", kind(v)),
+                None => {}
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn joint_weights(&self) -> Result<Vec<f32>> {
+        for name in ["skel:jointWeights", "athenea:splat:jointWeights"] {
+            if let Some(v) = self.get(name) {
+                return floats(v).ok_or_else(|| anyhow!("{name} is {}, not floats", kind(v)));
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Influences a splat: the arrays' length over the count (a constant
+    /// binding, one set for every splat, is spread to each).
+    fn skin_influences(&self, count: usize) -> Result<usize> {
+        let n = self.joint_indices()?.len();
+        if n == 0 || count == 0 {
+            return Ok(0);
+        }
+        if n % count != 0 {
+            bail!("{n} joint indices for {count} splats");
+        }
+        Ok(n / count)
+    }
+
+    /// `skel:joints`.
+    fn joints(&self) -> Vec<String> {
+        match self.get("skel:joints") {
+            Some(Value::TokenVec(t)) => t.iter().map(|t| t.to_string()).collect(),
+            Some(Value::StringVec(t)) => t.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The rig as `athc_skin` keeps it, one clip of the cached transforms,
+    /// or None for a cloud nothing carries.
+    fn skeleton(
+        &self,
+        clip: &str,
+        fps: f32,
+        influences: u32,
+        gradient_words: u32,
+    ) -> Result<Option<AthcSkeleton>> {
+        if influences == 0 {
+            return Ok(None);
+        }
+        let geom_bind = match self
+            .get("skel:geomBindTransform")
+            .or_else(|| self.get("athenea:splat:geomBindTransform"))
+        {
+            Some(Value::Matrix4d(m)) => matrix(m),
+            Some(v) => bail!("geomBindTransform is {}, not a matrix4d", kind(v)),
+            None => matrix(&openusd::gf::Matrix4d::IDENTITY),
+        };
+        let mut joints = self.joints();
+        let clip = self.clip(clip, fps)?;
+        let count = clip.xforms.len() / 16 / clip.times.len().max(1);
+        if joints.is_empty() {
+            joints = (0..count).map(|j| format!("joint{j}")).collect();
+        }
+        if joints.len() != count {
+            bail!("{} joints and {count} skinning transforms", joints.len());
+        }
+        let skeleton = match self.get("athenea:splat:skeleton") {
+            Some(Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let s = AthcSkeleton {
+            influences,
+            gradient_words,
+            joints,
+            skeleton,
+            geom_bind,
+            clips: vec![clip],
+        };
+        s.check()?;
+        Ok(Some(s))
+    }
+
+    /// `skinningXforms`, as a clip: its time samples, or its default alone.
+    fn clip(&self, name: &str, fps: f32) -> Result<SkinClip> {
+        let key = "primvars:athenea:splat:skinningXforms";
+        let mut out = SkinClip {
+            name: name.to_string(),
+            time_codes_per_second: fps,
+            ..Default::default()
+        };
+        let mut add = |t: f64, v: &Value| -> Result<()> {
+            match v {
+                Value::Matrix4dVec(m) => {
+                    out.times.push(t as f32);
+                    out.xforms.extend(m.iter().flat_map(matrix));
+                    Ok(())
+                }
+                other => bail!("skinningXforms is {}, not matrix4d[]", kind(other)),
+            }
+        };
+        if let Some(samples) = self.samples.get(key) {
+            for (t, v) in samples {
+                add(*t, v)?;
+            }
+        } else if let Some(v) = self.get("athenea:splat:skinningXforms") {
+            add(0.0, v)?;
+        } else {
+            bail!(
+                "a skinned cloud without skinningXforms (resolve its Skeleton's animation first)"
+            );
+        }
+        Ok(out)
+    }
+
 
     /// What a `.athc` has no room for, for a page to set on the cloud.
     fn constants(&self) -> Json {
@@ -291,13 +476,8 @@ impl Prim {
                 out.insert(name.trim_start_matches("athenea:splat:").to_string(), v);
             }
         }
-        for name in [
-            "athenea:splat:emission",
-            "athenea:splat:transferZonal",
-        ] {
-            if self.get(name).is_some() {
-                eprintln!("warning: {name} is not carried yet");
-            }
+        if self.get("athenea:splat:emission").is_some() {
+            eprintln!("warning: athenea:splat:emission is not carried yet");
         }
         if let Some(Value::IntVec(ids)) = self.get("athenea:splat:cryptoObject") {
             let mut distinct: Vec<i32> = ids.clone();
@@ -447,6 +627,8 @@ fn main() -> Result<()> {
         "--fill",
         "--thin",
         "--drop-backs",
+        "--clip",
+        "--add-clip",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -464,7 +646,7 @@ fn main() -> Result<()> {
     };
     let prim_path = arg(&args, "--prim").unwrap_or("/World/Splats");
     let t = std::time::Instant::now();
-    let data = openusd::usdc::read_file(input).with_context(|| format!("reading {input}"))?;
+    let data = read_layer(input)?;
     let prim = Prim::read(data.as_ref(), prim_path)?;
     let up_axis = up_axis(data.as_ref());
     if flag("--list") {
@@ -502,13 +684,41 @@ fn main() -> Result<()> {
         prim.streams()
     };
     let constants = prim.constants();
+    // The rig, before the prim's arrays are moved into streams.
+    let fps = time_codes_per_second(data.as_ref());
+    let rig = {
+        let count = prim.floats(&["positions", "positionsh"])?.len() / 3;
+        let k = prim.skin_influences(count)? as u32;
+        let has_gradients = matches!(prim.get("athenea:splat:jointWeightGradients"),
+            Some(Value::HalfVec(h)) if k > 1 && h.len() == count * 2 * (k as usize - 1));
+        prim.skeleton(arg(&args, "--clip").unwrap_or("default"), fps, k, if has_gradients { k - 1 } else { 0 })?
+    };
     let mut streams = filtered(prim, &[])?;
     let mut sources = vec![json!({ "source": input, "splats": streams.count })];
+    if rig.is_some() {
+        for f in ["--add", "--cell", "--target", "--thin"] {
+            if flag(f) {
+                bail!("{f} is not supported on a skinned cloud");
+            }
+        }
+    }
+    let mut rig = rig;
+    for added in args_all(&args, "--add-clip") {
+        let Some(r) = rig.as_mut() else { bail!("--add-clip on a cloud nothing carries") };
+        let (name, more) = added.split_once('=').ok_or_else(|| anyhow!("--add-clip NAME=file.usdc"))?;
+        let other = read_layer(more)?;
+        let p = Prim::read(other.as_ref(), prim_path)?;
+        if !p.joints().is_empty() && p.joints() != r.joints {
+            bail!("{more}: another skeleton's joints");
+        }
+        r.clips.push(p.clip(name, time_codes_per_second(other.as_ref()))?);
+        r.check()?;
+    }
     for added in args_all(&args, "--add") {
         // path::TEXT,TEXT drops those prims from this cloud only
         let (more, own) = added.split_once("::").unwrap_or((added, ""));
         let own: Vec<&str> = own.split(',').filter(|t| !t.is_empty()).collect();
-        let data = openusd::usdc::read_file(more).with_context(|| format!("reading {more}"))?;
+        let data = read_layer(more)?;
         let s = filtered(Prim::read(data.as_ref(), prim_path)?, &own)?;
         sources.push(json!({ "source": more, "splats": s.count }));
         append(&mut streams, s)?;
@@ -627,9 +837,12 @@ fn main() -> Result<()> {
         COMPRESSION_NONE
     };
     let bytes = if flag("--v2") {
+        if rig.is_some() {
+            eprintln!("warning: a v2 file has no room for the skin; written without it");
+        }
         file.write()?
     } else {
-        write_v3(&file, compression)?
+        write_v3_skinned(&file, compression, rig.as_ref())?
     };
     std::fs::write(output, &bytes)?;
 
@@ -657,6 +870,19 @@ fn main() -> Result<()> {
         "shadowWords": file.extra.shadow_words,
         "curvature": file.has_curvature() && !flag("--v2"),
         "lobesWords": file.extra.lobes_words,
+        "skin": rig.as_ref().filter(|_| !flag("--v2")).map(|r| json!({
+            "joints": r.joints.len(),
+            "influences": r.influences,
+            "gradientWords": r.gradient_words,
+            "skeleton": r.skeleton,
+            "clips": r.clips.iter().map(|c| json!({
+                "name": c.name,
+                "samples": c.times.len(),
+                "from": c.times.first(),
+                "to": c.times.last(),
+                "timeCodesPerSecond": c.time_codes_per_second,
+            })).collect::<Vec<_>>(),
+        })),
         "boundsMin": h.bounds_min,
         "boundsMax": h.bounds_max,
         "constants": constants,
@@ -741,7 +967,7 @@ mod tests {
         assert_eq!((packed.block.n, packed.transfer_count), (3, 112));
         let file = build_lod(&packed, &options).unwrap();
         assert_eq!(file.extra.shadow_words, 8);
-        let bytes = write_v3(&file, COMPRESSION_GZIP).unwrap();
+        let bytes = spark_lib::athc_v3::write_v3(&file, COMPRESSION_GZIP).unwrap();
         let back = spark_lib::athc_v3::read_v3(&bytes).unwrap();
         assert_eq!(back.splats().transfer.len(), 3 * 56);
     }

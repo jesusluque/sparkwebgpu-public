@@ -12,7 +12,19 @@ import scatterSubgroupModule from "./generated/kernels/sort_scatter_subgroup";
 import { createStorage as storage } from "./gpuBuffers";
 import { UniformWriter } from "./uniforms";
 
-const { TILE, SCAN_CHUNK, BINS } = kernelsSortRadix;
+const { TILE, SCAN_CHUNK, BINS, KEY_DEPTH, KEY_FLOAT, DEPTH_BITS, DEPTH_KEYS } =
+  kernelsSortRadix;
+
+/**
+ * The range every active metric lies in (generate's cull keeps the view
+ * depth between the camera's planes): the sort keys the metrics by their
+ * place in it on DEPTH_BITS (24) bits, 6 radix passes, instead of their
+ * float bits (sort_radix.slang KEY_DEPTH). Metrics outside are clamped.
+ */
+export interface SortDepthRange {
+  lo: number;
+  hi: number;
+}
 
 export class GpuSorter {
   readonly device: GPUDevice;
@@ -84,8 +96,9 @@ export class GpuSorter {
     metric: GPUBuffer,
     count: number,
     bits: 16 | 24 | 32 = 32,
+    depth?: SortDepthRange | null,
   ) {
-    this.encodeStages(() => pass, metric, count, bits);
+    this.encodeStages(() => pass, metric, count, bits, depth);
   }
 
   /**
@@ -99,9 +112,10 @@ export class GpuSorter {
     metric: GPUBuffer,
     count: number,
     bits: 16 | 24 | 32 = 32,
+    depth?: SortDepthRange | null,
   ) {
     this.withStagePasses(encoder, profiler, (stagePass) =>
-      this.encodeStages(stagePass, metric, count, bits),
+      this.encodeStages(stagePass, metric, count, bits, depth),
     );
   }
 
@@ -172,9 +186,11 @@ export class GpuSorter {
     stagePass: (stage: string) => GPUComputePassEncoder,
     metric: GPUBuffer,
     count: number,
-    bits: 16 | 24 | 32,
+    floatBits: 16 | 24 | 32,
+    depth?: SortDepthRange | null,
   ) {
     this.ensure(count);
+    const bits = depth ? DEPTH_BITS : floatBits;
     this.device.queue.writeBuffer(
       this.drawArgs,
       0,
@@ -186,6 +202,9 @@ export class GpuSorter {
         count,
         shift,
         numBlocks,
+        keyMode: depth ? KEY_DEPTH : KEY_FLOAT,
+        keyLo: depth?.lo ?? 0,
+        keyScale: depth ? DEPTH_KEYS / Math.max(depth.hi - depth.lo, 1e-30) : 0,
       }).data;
     const get = (entry: string) => this.registry.get(sortModule, entry);
 

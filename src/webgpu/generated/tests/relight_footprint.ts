@@ -219,6 +219,27 @@ export const reflection = {
           "components": 1
         },
         {
+          "name": "listCount",
+          "offset": 68,
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
+        },
+        {
+          "name": "listBase",
+          "offset": 72,
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
+        },
+        {
+          "name": "pad0",
+          "offset": 76,
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
+        },
+        {
           "name": "encoding",
           "offset": 80,
           "size": 16,

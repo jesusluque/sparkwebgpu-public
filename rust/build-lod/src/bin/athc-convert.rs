@@ -20,7 +20,7 @@ use anyhow::{bail, Result};
 use spark_lib::athc_build::{build_lod, packed_of, BuildOptions};
 use spark_lib::athc::{truncate_creases, truncate_levels, uncap_levels, AthcFile, VirtualTree};
 use spark_lib::athc_v3::{
-    parse_v3, read_v3, write_v3_encoded, write_v3_smallest, SectionId, ATH3_MAGIC, COMPRESSION_GZIP, COMPRESSION_NONE,
+    parse_v3, read_v3, read_v3_skeleton, write_v3_encoded, write_v3_full, write_v3_smallest_with, SectionId, ATH3_MAGIC, COMPRESSION_GZIP, COMPRESSION_NONE,
 };
 
 fn read_any(bytes: &[u8]) -> Result<AthcFile> {
@@ -110,16 +110,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let Some(output) = paths.get(1) else { bail!("no output path") };
+    // A skinned v3 cloud keeps its skeleton (athc_skin); a v2 file drops it.
+    let skeleton = read_v3_skeleton(&bytes)?;
     let out = if flag("--v2") {
         file.write()?
     } else {
         let compression = if flag("--gzip") { COMPRESSION_GZIP } else { COMPRESSION_NONE };
         if flag("--planes") {
-            let (out, chosen) = write_v3_smallest(&file, compression)?;
+            let (out, chosen) = write_v3_smallest_with(&file, compression, skeleton.as_ref())?;
             println!("encodings: {:?}", chosen);
             out
         } else {
-            write_v3_encoded(&file, compression, &encoding)?
+            write_v3_full(&file, compression, false, &encoding, skeleton.as_ref())?
         }
     };
     std::fs::write(output, &out)?;

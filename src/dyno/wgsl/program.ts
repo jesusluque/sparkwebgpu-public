@@ -11,6 +11,7 @@ import type { DynoType } from "../types";
 import { typeLiteral } from "../types";
 import { WgslBackend, type WgslUniformField } from "./backend";
 import "./ops";
+import "./glslToWgsl";
 import { WGSL_PRELUDE } from "./prelude";
 import { typeShape, uniformLayout, wgslType } from "./types";
 
@@ -58,6 +59,8 @@ export class WgslDynoProgram {
       }
       const out = `out_${fn.output}`;
       compile.declares.add(out);
+      // A bare `return;` in a dyno's GLSL returns what the graph has so far.
+      backend.returnValue = out;
       const statements = fn.graph.compile({
         inputs,
         outputs: { [fn.output]: out },

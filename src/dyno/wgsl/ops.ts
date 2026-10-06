@@ -471,7 +471,7 @@ registerWgsl(
   }),
 );
 
-const INVERSE: Record<number, string> = {
+export const INVERSE: Record<number, string> = {
   2: unindent(/* wgsl */ `
     fn dyno_inverse2(m: mat2x2f) -> mat2x2f {
       return mat2x2f(m[1][1], -m[0][1], -m[1][0], m[0][0]) * (1.0 / determinant(m));

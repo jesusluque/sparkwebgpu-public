@@ -158,8 +158,11 @@ These throw or warn:
 `compare-webgl.html` and `compare-webgpu.html` render the same scene with
 each backend (`?n=` synthetic splats, `?file=`, `?lod=1`, `?rad=1` for the
 paged hobbiton scene). `window.__fps(seconds)` measures the animation loop
-with the object turning, so every frame regenerates and re-sorts; run Chrome
-with `--disable-gpu-vsync --disable-frame-rate-limit`. On WebGPU,
+with the object turning, so every frame regenerates and re-sorts
+(`__fps(seconds, 0)`: held still, the draw alone); run Chrome with
+`--disable-gpu-vsync --disable-frame-rate-limit`. Measure each page in a
+browser of its own, one at a time: pages left open in other browsers skew
+each other's fps by up to 2x. On WebGPU,
 `?profile=1` turns on `WgpuSplatRenderer`'s `profile` option (timestamp
 queries, where the browser has them) and `window.__profile(frames)` returns
 the median GPU milliseconds of generate, each sort stage and the draw.
@@ -193,6 +196,50 @@ GPU time per frame (sequential, `__profile`): hobbiton 5.9 → 5.5 ms (draw
 its 2.5M slots active and the traversal already culls the frustum, and
 inactive keys sort almost for free (all equal, coherent scatter), so the
 compacted sort mostly helps when many active splats are off screen.
+
+Later (October 2026, M5 Pro), GPU ms per frame with `__profile`:
+
+- **The draw** is bound by rasterizing many small overlapping quads, not by
+  the fragment shader: a constant colour without discards costs the same,
+  quads at half size (a quarter of the pixels) still cost 60%, and an
+  octagon in place of the quad (17% fewer pixels, 6 triangles) was slower
+  (synthetic 1M 10.2 → 12.4 ms). Cutting the footprint where `splatAlpha`
+  falls under `minAlpha` (the image is unchanged) only pays off on faint
+  splats: penguin's draw 1.14 → 1.02 ms, the synthetic clouds and valley
+  unchanged.
+- **The sort's scatter** ranks keys with subgroup ballots where the device
+  has subgroups: the whole sort 28–37% faster (1M: 1.08 → 0.76 ms; hobbiton
+  at 2.5M: 3.1 → 2.0 ms). 8-bit digits (4 passes instead of 8) were slower
+  (1M scatter 0.43 → 0.57 ms): the 256-bin ranking and scattered writes
+  cost more than the passes saved.
+- **`minSortIntervalMs`** (as SparkRenderer's): while only the camera and
+  transforms move, the GPU sort runs at most that often and the draw reuses
+  the last order, as WebGL draws its last worker sort; the next still frame
+  sorts exactly. Default 0. At 16 ms, penguin turning goes 645 → 720 fps.
+- **Generate** skipping SH and accumulator writes for culled splats made no
+  difference on hobbiton (its cost is the gather through the LoD indices).
+- **`rasterizer: "tiles"`** stays 2–2.5x faster on the dense synthetic
+  clouds (1M: span 3.6 ms against ~8.5 ms) and slower on captured scenes
+  (valley 4.2 against 2.7 ms), where `tiles.blend` dominates.
+
+GPU ms per frame (`__profile` span, object turning, medians of 4 rounds
+interleaved between the two builds, other jobs on the GPU), before and after
+the subgroup scatter and the footprint cut:
+
+| Scene | before | after | sort before → after |
+|---|---|---|---|
+| synthetic 1M | 9.19 | 8.67 | 1.08 → 0.76 |
+| synthetic 2M | 19.87 | 19.22 | 1.96 → 1.42 |
+| synthetic 4M | 42.88 | 42.94 | 5.39 → 3.75 |
+| synthetic 1M close-up (`dist=1.2`) | 37.17 | 35.11 | 1.65 → 1.13 |
+| penguin | 2.29 | 2.30 | 0.36 → 0.34 |
+| valley | 3.39 | 4.13 (draw noise) | 0.63 → 0.61 |
+| hobbiton .rad, 1M | 7.23 | 6.70 | 0.94 → 0.68 |
+| hobbiton .rad, 2.5M | 18.65 | 16.47 | 3.12 → 1.96 |
+
+fps on a shared GPU varied 2x between runs of the same build, in headless
+Chrome unthrottled and paced (`__bench`) alike, so these GPU times are the
+comparison to trust.
 
 ## Examples
 

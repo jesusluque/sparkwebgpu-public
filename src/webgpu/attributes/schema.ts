@@ -326,11 +326,25 @@ export class AttribPool {
    */
   static fromValues({ count, specs, values }: AttribValues): AttribPool {
     const pool = new AttribPool(count);
-    specs.forEach(({ name, format, components, lodMerge }, k) => {
+    specs.forEach(({ name, format, components, lodMerge, packed }, k) => {
       // The file keeps no flags: a renormalized 3-vector is a direction. An
       // all-zero one is a 3DGS trainer's placeholder normal.
       const direction = lodMerge === "normalizeMean" && components === 3;
       if (direction && values[k].every((v) => v === 0)) return;
+      if (packed) {
+        // Already the column's words (a .athc's streams as stored).
+        const spec: AttributeSpec = {
+          name,
+          format: format as AttribFormat,
+          components,
+          lodMerge: lodMerge as LodMerge,
+          direction,
+          toDraw: true,
+        };
+        spec.lodMerge ??= defaultLodMerge(spec);
+        pool.setColumn({ spec, words: values[k] as Uint32Array });
+        return;
+      }
       pool.setAttribute(name, values[k], format as AttribFormat, components, {
         lodMerge: lodMerge as LodMerge,
         direction,

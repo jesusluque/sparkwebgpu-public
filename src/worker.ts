@@ -213,7 +213,7 @@ type DecodedPackedResult = {
   readonly lodTree?: Uint32Array;
   readonly splatEncoding: SplatEncoding;
   readonly attribSpecs?: AttribValues["specs"];
-  readonly attribColumns?: Float64Array[];
+  readonly attribColumns?: AttribValues["values"];
 };
 
 function toPackedResult(packed: DecodedPackedResult): PackedResult {
@@ -239,7 +239,7 @@ function toPackedResult(packed: DecodedPackedResult): PackedResult {
 function attribValues(result: {
   numSplats: number;
   attribSpecs?: AttribValues["specs"];
-  attribColumns?: Float64Array[];
+  attribColumns?: AttribValues["values"];
 }): AttribValues | undefined {
   const { attribSpecs: specs, attribColumns: values } = result;
   if (!specs?.length || !values) return undefined;
@@ -389,7 +389,7 @@ type DecodedExtResult = {
   sh3Codes?: [Uint32Array, Uint32Array];
   lodTree?: Uint32Array;
   attribSpecs?: AttribValues["specs"];
-  attribColumns?: Float64Array[];
+  attribColumns?: AttribValues["values"];
 };
 
 function toExtResult(packed: DecodedExtResult): ExtResult {

@@ -102,7 +102,9 @@ export type PackedExtra = {
 /**
  * Per-Gaussian attributes as the WASM decoders give them (rust/spark-lib
  * attrib.rs): specs, and one Float64Array of values per attribute,
- * components per splat. AttribPool.from() packs them.
+ * components per splat. AttribPool.from() packs them. A spec marked
+ * `packed` comes as its packed words instead (a Uint32Array, the pool's own
+ * column layout: a .athc's streams as stored, f16 two to a word).
  */
 export type AttribValues = {
   readonly count: number;
@@ -111,8 +113,9 @@ export type AttribValues = {
     format: string;
     components: number;
     lodMerge?: string;
+    packed?: boolean;
   }[];
-  readonly values: readonly Float64Array[];
+  readonly values: readonly (Float64Array | Uint32Array)[];
 };
 
 export type PackedResult = {

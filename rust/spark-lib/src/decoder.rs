@@ -158,6 +158,26 @@ pub trait SplatReceiver: 'static {
     fn add_attrib(&mut self, spec: &AttribSpec) {}
     /// Values of attribute `attrib` for splats base..base + count.
     fn set_attrib(&mut self, attrib: usize, base: usize, count: usize, values: &[f64]) {}
+    /// The same, as stored: `components` u32 words a splat, or, with
+    /// `halves`, `components` f16 two to a word (low half first, the last
+    /// word's high half unused when odd). A receiver that keeps attributes
+    /// packed (the WASM decoders) takes the words as they are; by default
+    /// they are decoded to values for set_attrib.
+    fn set_attrib_words(&mut self, attrib: usize, base: usize, count: usize, words: &[u32], components: usize, halves: bool) {
+        let per = if halves { components.div_ceil(2) } else { components };
+        let mut values = Vec::with_capacity(count * components);
+        for i in 0..count {
+            for c in 0..components {
+                values.push(if halves {
+                    let w = words[i * per + c / 2];
+                    half::f16::from_bits(if c % 2 == 0 { w as u16 } else { (w >> 16) as u16 }).to_f32() as f64
+                } else {
+                    words[i * per + c] as f64
+                });
+            }
+        }
+        self.set_attrib(attrib, base, count, &values);
+    }
 }
 
 #[derive(Default)]

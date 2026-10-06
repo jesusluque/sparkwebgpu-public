@@ -15,7 +15,11 @@ import type { AttribValues } from "../../src/defines";
 import { GpuSplatSource } from "../../src/webgpu/GpuSplatSource";
 import { KernelRegistry } from "../../src/webgpu/KernelRegistry";
 import { WgpuSplatRenderer } from "../../src/webgpu/WgpuSplatRenderer";
-import { ATTRIB_NONE, AttribPool } from "../../src/webgpu/attributes/schema";
+import {
+  ATTRIB_NONE,
+  AttribPool,
+  attribWords,
+} from "../../src/webgpu/attributes/schema";
 import athcTest from "../../src/webgpu/generated/tests/athc_adapter";
 import { UniformWriter } from "../../src/webgpu/uniforms";
 import { device, readBack, storage } from "./device";
@@ -43,7 +47,7 @@ type Decoded = {
     lnScaleMax: number;
   };
   attribSpecs?: AttribValues["specs"];
-  attribColumns?: Float64Array[];
+  attribColumns?: AttribValues["values"];
 };
 
 function decode(bytes: Uint8Array): Decoded {
@@ -127,8 +131,10 @@ describe.skipIf(!device)("usd-athc output on the GPU", () => {
     const n = Math.ceil(dec.numSplats / step);
     const specs = dec.attribSpecs ?? [];
     const columns = (dec.attribColumns ?? []).map((col, k) => {
-      const c = specs[k].components;
-      const out = new Float64Array(n * c);
+      // A .athc's streams come as their packed words (spec.packed).
+      const s = specs[k];
+      const c = s.packed ? attribWords(s as never) : s.components;
+      const out = s.packed ? new Uint32Array(n * c) : new Float64Array(n * c);
       for (let i = 0; i < n; i++)
         out.set(col.subarray(i * step * c, (i * step + 1) * c), i * c);
       return out;

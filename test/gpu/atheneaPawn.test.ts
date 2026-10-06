@@ -26,7 +26,7 @@ import {
 } from "../../src/webgpu/WgpuSplatRenderer";
 import type { SkyImage } from "../../src/webgpu/athenea/AtheneaSky";
 import { atheneaRelightPlugin } from "../../src/webgpu/athenea/relightPlugin";
-import { AttribPool } from "../../src/webgpu/attributes/schema";
+import { AttribPool, attribWords } from "../../src/webgpu/attributes/schema";
 import { PluginHost } from "../../src/webgpu/plugins";
 import { loadExr, loadSky, writePng } from "./atheneaFrames";
 import { wideDevice } from "./device";
@@ -63,8 +63,13 @@ type Decoded = {
   numSplats: number;
   ext0: Uint32Array;
   ext1: Uint32Array;
-  attribSpecs: { name: string; format: string; components: number }[];
-  attribColumns: Float64Array[];
+  attribSpecs: {
+    name: string;
+    format: string;
+    components: number;
+    packed?: boolean;
+  }[];
+  attribColumns: (Float64Array | Uint32Array)[];
 };
 
 /** The cloud's own splats (the file's leaves, after its merged LoD nodes). */
@@ -94,7 +99,10 @@ async function loadCloud(device: GPUDevice, file: string) {
     count,
     specs: d.attribSpecs as never,
     values: d.attribSpecs.map((s, k) =>
-      d.attribColumns[k].subarray(first * s.components),
+      // A .athc's streams come as their packed words (spec.packed).
+      d.attribColumns[k].subarray(
+        first * (s.packed ? attribWords(s as never) : s.components),
+      ),
     ),
   });
   return source;

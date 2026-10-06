@@ -32,7 +32,7 @@ export function sceneParams() {
   };
 }
 
-const EFFECTS = {
+export const EFFECTS = {
   Electronic: 1,
   "Deep Meditation": 2,
   Waves: 3,
@@ -213,7 +213,11 @@ fn fx_flare(pos: vec3f, t: f32) -> vec4f {
 }
 `;
 
-/** examples/splat-shader-effects' modifier, in GLSL and WGSL. */
+/**
+ * examples/splat-shader-effects' modifier, in GLSL and WGSL. `effect` and
+ * `intensity` are a name and a number, or dyno uniforms (dynoInt with an
+ * EFFECTS value, dynoFloat) to change them while it runs.
+ */
 export function makeEffectModifier(dyno, animateT, effect, intensity) {
   return dyno.dynoBlock(
     { gsplat: dyno.Gsplat },
@@ -301,8 +305,12 @@ export function makeEffectModifier(dyno, animateT, effect, intensity) {
       gsplat = d.apply({
         gsplat,
         t: animateT,
-        effectType: dyno.dynoInt(EFFECTS[effect] ?? 1),
-        intensity: dyno.dynoFloat(intensity),
+        effectType:
+          typeof effect === "string"
+            ? dyno.dynoInt(EFFECTS[effect] ?? 1)
+            : effect,
+        intensity:
+          typeof intensity === "number" ? dyno.dynoFloat(intensity) : intensity,
       }).gsplat;
       return { gsplat };
     },

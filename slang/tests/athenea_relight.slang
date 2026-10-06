@@ -39,7 +39,7 @@ struct RefParams {
     uint linearCloud;
 
     float ior;
-    uint pad0;
+    float curvature;      ///< every splat's shape operator (k, 0, k) on its third axis (0: none)
     uint pad1;
     uint pad2;
 
@@ -113,6 +113,12 @@ float3 relitToward<let kTransfer : int>(uint i) {
     surface.cellWords = params.shadowBits >= 8u && params.transferCount >= 9 ? params.shadowBits : 0u;
     surface.cellBase = params.cellsAt + i * surface.cellWords;
     SplatSlope slope = noSlope();
+    // splat_project's mean curvature, on the face the eye sees.
+    if (kTransfer >= 2 && params.curvature != 0.0) {
+        const float3 axisN = float3(r[0][2], r[1][2], r[2][2]);
+        const float faces = dot(cloudNormal, axisN) >= 0.0 ? 1.0 : -1.0;
+        slope.curvature = faces * 0.5 * (params.curvature + params.curvature);
+    }
     return relitSplat<kTransfer>(surface, normalize(params.eyeWorld.xyz - surface.position), lights,
                                  params.lightCount, 0xFFFFFFFFu, 0xFFFFFFFFu, iesValues, 0u, 0u, envTexels, envSh,
                                  envOfLight, params.envLights, params.envBaseSide, envSun, native, native,

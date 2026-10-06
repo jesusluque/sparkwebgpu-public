@@ -40,6 +40,7 @@ import { UniformWriter } from "../../src/webgpu/uniforms";
 import { wideDevice } from "./device";
 
 const NONE = 0xffffffff;
+const XAXIS = new THREE.Vector3(1, 0, 0);
 
 /** packing.slang packNormal. */
 function packNormal(n: number[]): number {
@@ -261,6 +262,9 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
         new THREE.Euler(rand() * 6.28, rand() * 6.28, rand() * 6.28),
       )
       .normalize();
+    // The glass shows the eye its near face (a far face passes nothing on).
+    if (m.name === "glass")
+      q.multiply(new THREE.Quaternion().setFromAxisAngle(XAXIS, Math.PI));
     const x = (i % 4) * 0.6 - 0.9;
     const y = Math.floor(i / 4) * 0.6 - 0.6;
     encodeExtSplat(
@@ -289,14 +293,26 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     for (let k = 0; k < 16; k++)
       for (const t of [0.3, 0.25, 0.2])
         transfer.push(t * transfer[i * TRANSFER + k] * (0.8 + 0.4 * rand()));
+    // The glass's field reads open (a white sky through it): where a lens
+    // shows the sky it bends (splat_relight's `open`).
+    const fieldDc = m.name === "glass" ? 4 : 0;
     for (let k = 0; k < 48; k++)
-      transfer.push(k < 3 ? 0.3 + 0.2 * rand() : 0.05 * (rand() - 0.5));
+      transfer.push(
+        k < 3 ? fieldDc + 0.3 + 0.2 * rand() : 0.05 * (rand() - 0.5),
+      );
     for (let w = 0; w < CELLS; w++)
       cells.push(((rand() * 4294967296) >>> 0) | 0x0f0f0f0f);
   });
 
-  function source() {
+  function source(curvature = 0) {
     const s = GpuSplatSource.fromExt(d, a, b, N);
+    if (curvature)
+      s.setAttribute(
+        "curvature",
+        MATERIALS.flatMap(() => [curvature, 0, curvature]),
+        "f16",
+        3,
+      );
     s.setAttribute(
       "pbr",
       MATERIALS.map((m) => (m.pbr === NONE ? 0 : m.pbr)),
@@ -365,6 +381,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     src: GPUBuffer,
     pbrMissing: boolean,
     indirect: boolean,
+    curvature = 0,
   ) {
     // The streams one after the other, as athenea keeps them a buffer each.
     const words = new Uint32Array(N * (1 + 3 + 1 + 1 + TRANSFER / 2 + CELLS));
@@ -457,6 +474,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
         litBody: 0,
         linearCloud: 1,
         ior: 1.5,
+        curvature,
         w0: row(0),
         w1: row(1),
         w2: row(2),
@@ -528,7 +546,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     );
     let worst = 0;
     MATERIALS.forEach((m, i) => {
-      const g = [0, 1, 2].map((c) => got[8 * i + c]);
+      const g = [0, 1, 2].map((c) => got[20 * i + c]);
       const w = [0, 1, 2].map((c) => want[4 * i + c]);
       const err = Math.max(
         ...g.map((v, c) => Math.abs(v - w[c]) / Math.max(Math.abs(w[c]), 0.05)),
@@ -544,7 +562,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     // The kept terms are halves (athenea's txCache): 2^-11 relative.
     expect(worst).toBeLessThan(2e-3);
     // The thin sheet's alpha floor; everything else keeps its own.
-    const alpha = MATERIALS.map((_, i) => got[8 * i + 3]);
+    const alpha = MATERIALS.map((_, i) => got[20 * i + 3]);
     MATERIALS.forEach((m, i) => {
       if (m.name === "thin sheet")
         expect(alpha[i]).toBeCloseTo(Math.max(0.9 - 1 / 255, 0.1), 3);
@@ -553,6 +571,113 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     host.detach();
     splats.dispose();
   }, 120_000);
+  it("reads a solid glass's far face from the cloud's curvature (a lens)", async () => {
+    const K = 20; // a ball of 5 cm, exact in f16
+    const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+      depthTest: false,
+      alwaysGenerate: true,
+    });
+    const src = source(K);
+    const mesh = splats.add(src, object);
+    const host = new PluginHost({ capabilities: splats.capabilities, tier: 2 });
+    const relight = atheneaRelightPlugin({
+      hdri: sky(256, 128),
+      rotation: 0.6,
+      intensity: 1.5,
+      sun,
+      lights,
+      ior: 1.5,
+    });
+    relight.setStoredLinear(mesh, true);
+    host.register(relight).attach(splats);
+    await host.ready();
+    // The first frame: no target drawn yet, so the lens alone (no slope).
+    splats.render(camera, target);
+    await d.queue.onSubmittedWorkDone();
+    const relit = relight.buffers?.("splat", { frame: null, mesh })
+      .atheneaRelit as GPUBuffer;
+    const got = new Float32Array(await read(relit));
+    const sky0 = relight.sky as AtheneaSky;
+    const lens = await reference(sky0, src.src, false, true, K);
+    const flat = await reference(sky0, src.src, false, true, 0);
+    let worst = 0;
+    MATERIALS.forEach((m, i) => {
+      const g = [0, 1, 2].map((c) => got[20 * i + c]);
+      const w = [0, 1, 2].map((c) => lens[4 * i + c]);
+      worst = Math.max(
+        worst,
+        ...g.map((v, c) => Math.abs(v - w[c]) / Math.max(Math.abs(w[c]), 0.05)),
+      );
+    });
+    expect(worst).toBeLessThan(2e-3);
+    // The glass is where the curvature shows: through both faces.
+    const glass = MATERIALS.findIndex((m) => m.name === "glass");
+    const change = [0, 1, 2].map((c) =>
+      Math.abs(lens[4 * glass + c] - flat[4 * glass + c]),
+    );
+    expect(Math.max(...change)).toBeGreaterThan(1e-3);
+    // The second frame knows the target: every TX splat with a curvature
+    // hands the draw a slope (1) or a sharp lobe (2) about its centre.
+    camera.position.x += 1e-3;
+    camera.updateMatrixWorld();
+    splats.render(camera, target);
+    await d.queue.onSubmittedWorkDone();
+    const words = new Uint32Array(await read(relit));
+    const half = (w: number) => THREE.DataUtils.fromHalfFloat(w >>> 16);
+    const marks = MATERIALS.map((_, i) => half(words[20 * i + 4 * 4 + 3]));
+    expect(marks.every((v) => v === 1 || v === 2)).toBe(true);
+    expect(marks[MATERIALS.findIndex((m) => m.name === "mirror")]).toBe(2);
+    expect(marks[MATERIALS.findIndex((m) => m.name === "matte")]).toBe(1);
+    // Centres in pixels inside the 32 x 32 target.
+    MATERIALS.forEach((_, i) => {
+      const f = new Float32Array(words.buffer, (20 * i + 16) * 4, 2);
+      expect(f[0]).toBeGreaterThan(-32);
+      expect(f[0]).toBeLessThan(64);
+    });
+    host.detach();
+    splats.dispose();
+  }, 120_000);
+
+  it("keeps the captured colour where the transfer's page is not resident", async () => {
+    const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+      depthTest: false,
+      alwaysGenerate: true,
+    });
+    const src = source(20);
+    // A paged pool whose relight streams have no page in: the transfer's
+    // descriptor points at a page table of one empty slot (ATTRIB_PAGED).
+    const pool = src.attribs as NonNullable<typeof src.attribs>;
+    const { words, layout } = pool.pack();
+    const grown = new Uint32Array(words.length + 1);
+    grown.set(words);
+    grown[words.length] = NONE;
+    for (const name of ["transfer", "shadowBits", "curvature"]) {
+      const k = layout.specs.findIndex((spec) => spec.name === name);
+      grown[4 + 4 * k] = words.length;
+      grown[4 + 4 * k + 3] |= 2;
+    }
+    pool.gpuBuffer = upload(d, grown, "paged relight pool");
+    const mesh = splats.add(src, object);
+    const host = new PluginHost({ capabilities: splats.capabilities, tier: 2 });
+    const relight = atheneaRelightPlugin({ hdri: sky(64, 32), sun, ior: 1.5 });
+    relight.setStoredLinear(mesh, true);
+    host.register(relight).attach(splats);
+    await host.ready();
+    splats.render(camera, target);
+    await d.queue.onSubmittedWorkDone();
+    const relit = relight.buffers?.("splat", { frame: null, mesh })
+      .atheneaRelit as GPUBuffer;
+    const got = new Float32Array(await read(relit));
+    MATERIALS.forEach((_, i) => {
+      expect(got[20 * i + 3]).toBe(-2);
+      // Nothing for the draw to shade per pixel.
+      expect([...got.slice(20 * i + 16, 20 * i + 20)]).toEqual([0, 0, 0, 0]);
+    });
+    host.detach();
+    splats.dispose();
+    pool.gpuBuffer.destroy();
+  }, 120_000);
+
   it("keeps the view-independent terms until the sky moves, and draws the relit light", async () => {
     // One large splat facing the camera: at the centre pixel its alpha is
     // its opacity, so the pixel is its relit colour times that.
@@ -811,12 +936,12 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
       const want =
         0.9 *
         Math.min(Math.max(-Math.log(Math.max(ratio, 1e-4)) / 6.2831853, 0), 1);
-      expect(got.slice(8 * i, 8 * i + 3)).toEqual(new Float32Array(3));
-      expect(Math.abs(got[8 * i + 3] - want)).toBeLessThan(2e-3);
+      expect(got.slice(20 * i, 20 * i + 3)).toEqual(new Float32Array(3));
+      expect(Math.abs(got[20 * i + 3] - want)).toBeLessThan(2e-3);
     }
     // All open: nothing taken; all closed: as dark as the layer gets.
     expect(got[3]).toBeLessThan(1e-3);
-    expect(got[8 + 3]).toBeCloseTo(0.9, 2);
+    expect(got[20 + 3]).toBeCloseTo(0.9, 2);
     host.detach();
     splats.dispose();
   }, 120_000);

@@ -26,9 +26,18 @@ export const atheneaAdapterRelight = {
   kRelightLit: 8,
   kRelightIndirect: 16,
   kRelightCache: 32,
+  kRelightSlope: 64,
   kRelightGroup: 256,
-  kRelightStride: 2,
+  kRelightStride: 5,
+  kRelightPixel: 2,
+  kRelightKeepAll: -2,
   kCatcherDepth: 6.2831853,
+} as const;
+
+/** slang/athenea_adapter/relight_colour.slang */
+export const atheneaAdapterRelightColour = {
+  kStride: 5,
+  kPixel: 2,
 } as const;
 
 /** slang/core/attrib.slang */

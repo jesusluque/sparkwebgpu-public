@@ -121,7 +121,7 @@ page 0   header, 160 bytes
           32 restPerColour 36 shWords  40 transferCount 44 shadowWords
           48 pbrWords      52 lobesWords 56 transferWords 60 sectionCount
           64 boundsLo[3]   76 extent   80 boundsMin[3]  92 boundsMax[3]
-         104 blockCount (levels + chunks)   108 0
+         104 blockCount (levels + chunks)   108 curvatureWords (0, 2)
          112 sectionTable (u64)  120 blockIndex  128 starts  136 dataStart
 @160     section table, 32 bytes each:
            id (fourcc), tier, encoding (0: v2 words), compression
@@ -141,6 +141,7 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 | S0p | `SHRS` | 1 | 4 · shWords | rest harmonics |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
 | S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
+| S3c | `CURV` | 3 | 8 | the curvature: athenea's shape operator, three f16 (sparkwebGPU's) |
 | S1 | `TXDI` | 3 | 4 · ⌈direct / 2⌉ | the transfer's direct half (9 or 16 values; zonal: all 10) |
 | S2 | `TXIN` | 3 | 4 · (2 · direct − ⌈direct / 2⌉) | through the indirect half |
 | S2f | `TXFD` | 3 | the rest | the reflected field |
@@ -148,11 +149,31 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 A section is left out when it would be empty. Data tier 1 (the splats as
 captured) is `CORE + SHRS`, tier 2 adds the material, tier 3 the relight
 streams. The order makes each thing a reader may want one contiguous run:
-the material alone; the shadow bits with any prefix of the transfer that is
+the material alone; the shadow bits and the curvature with any prefix of the transfer that is
 a layout of its own (`transfer_layout.slang`: 16 direct values, 64 with the
 indirect half, 112 with the field; 9, 36, 84 at degree 2). For
 `every_stream.athc` (SH3, TX transfer of 112 values, 16×16 shadow bits,
 material): tier 1 is 128 bytes a splat, tier 2 152, tier 3 408.
+
+### The curvature (`CURV`)
+
+athenea keeps a per-splat curvature in USD only
+(`primvars:athenea:splat:curvature`, 3 floats: the 2×2 symmetric shape
+operator in the splat's first two axes, `xx xy yy`, in 1/metres, measured on
+the mesh's normal). Its raster reads it for the per-pixel slope of a
+reflection, the sharp coat and polish, and the far face of a solid glass
+(`lensExit`). sparkwebGPU keeps it in a section of its own, tier 3, right
+after `SHAD` (it is read with the relight streams: `Want` brings it
+whenever it brings the shadow bits), as three f16 in two words (the last
+half 0). Header word 108 is its words a splat (0 or 2). In memory and in
+ATHV pages it is the v2 extra header's sixth word (padding, 0, in every file
+athenea writes); a v2 file never carries it (`--v2` and `athc-convert --v2`
+drop it, and a v2 written from a cloud with it is the file without it). A
+merged group's curvature is the opacity-weighted mean of its splats', as
+the transfer is merged: the mean of the half traces, which is what a lens
+reads, is exact; the anisotropic part is in each splat's own frame and only
+indicative. It decodes to the attribute `curvature` (f16 × 3) and pages in
+the `relight` group.
 
 Files written before the three tiers (`TXIN` holding the field, `SHAD` and
 `MATL` after it, all tier 2: the first pawn conversions) are still read and
@@ -233,7 +254,8 @@ cargo run --release -p build-lod --bin usd-athc -- cloud.usdc --list   # attribu
 | `metallic`, `roughness`, `transmission` | pbr |
 | `transferDirect` (16), `transferIndirect` (48), `transferReflected` (48) | transfer, 112 f16 in that order (`transfer_layout.slang`) |
 | `shadowBits` (int, 8 a splat) | shadowBits |
-| `cryptoObject`, `cryptoManifest`, `curvature`, `ior`, `relight` | no room in a `.athc`: `--json` reports the constants |
+| `curvature` (3 a splat) | `CURV`, three f16 (v3 only; `--no-curvature` leaves it out) |
+| `cryptoObject`, `cryptoManifest`, `ior`, `relight` | no room in a `.athc`: `--json` reports the constants |
 
 A reduced transfer keeps a layout athenea reads: 64 is the direct and
 indirect halves without the reflected field, 16 the direct half alone, 84

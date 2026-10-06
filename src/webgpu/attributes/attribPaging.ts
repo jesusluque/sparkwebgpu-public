@@ -12,7 +12,8 @@
 //             capacity, interleaved as before
 //   material  normalOct, emission, pbr, lobes (.athc v3 section MATL,
 //             data tier 2): cheap, full capacity when the budget allows
-//   relight   shadowBits and transfer (SHAD, TXDI/TXIN/TXFD, data tier 3):
+//   relight   shadowBits, curvature and transfer (SHAD, CURV, TXDI/TXIN/TXFD,
+//             data tier 3):
 //             the expensive ones, with as many pages as the rest of the
 //             budget holds; device tier 2 and up
 //
@@ -53,7 +54,7 @@ export const STREAM_GROUPS: readonly StreamGroupSpec[] = [
   },
   {
     name: "relight",
-    attributes: ["shadowBits", "transfer"],
+    attributes: ["shadowBits", "curvature", "transfer"],
     dataTier: 3,
     minTier: 2,
   },

@@ -36,6 +36,7 @@
     //   ?base=<dir>       where the pawn's files are (default ./pawn/): the
     //                     .athc clouds of usd-athc, pawn.json and hdri/
     //   ?transfer=t16|t64|t84|full   which transfer the clouds carry (t64)
+    //   ?topTransfer=full|t64...     the glass head's (default full: its lens needs the field)
     //   ?hdri=<name>      the dome (default autoshop_01_2k.hdr, the bake's)
     //   ?top=0            the body alone   ?gui=0   ?view=agx|aces2|standard
     import * as THREE from "three/webgpu";
@@ -54,6 +55,11 @@
     const base = params.get("base") ?? "./pawn/";
     const transfer = params.get("transfer") ?? "t64";
     const suffix = transfer === "full" ? "full-gz" : `${transfer}-gz`;
+    // The glass head is a lens only with its transfer's reflected field
+    // (splat_relight: the sharp sky where the field reads open): full by
+    // default, whatever the body carries.
+    const topTransfer = params.get("topTransfer") ?? (params.has("transfer") ? transfer : "full");
+    const topSuffix = topTransfer === "full" ? "full-gz" : `${topTransfer}-gz`;
     const status = document.getElementById("status");
     window.__athenea = { loaded: false, error: null };
 
@@ -115,7 +121,7 @@
     scene.add(spark);
     const body = new SplatMesh({ url: `${base}body-${suffix}.athc`, extSplats: true });
     scene.add(body);
-    const top = params.get("top") === "0" ? null : new SplatMesh({ url: `${base}top-${suffix}.athc`, extSplats: true });
+    const top = params.get("top") === "0" ? null : new SplatMesh({ url: `${base}top-${topSuffix}.athc`, extSplats: true });
     if (top) scene.add(top);
 
     const relight = atheneaRelightPlugin();

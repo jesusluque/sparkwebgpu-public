@@ -46,6 +46,10 @@ pub enum SectionId {
     Material,
     /// The open-direction bits.
     Shadow,
+    /// sparkwebGPU's curvature (athenea's shape operator, three f16 in two
+    /// words): read with the relight streams, so it sits right after the
+    /// shadow bits.
+    Curvature,
     /// The transfer's first ceil(direct / 2) words.
     TransferDirect,
     /// The transfer's words through the indirect half (2 * direct words).
@@ -63,15 +67,17 @@ impl SectionId {
             Self::TransferIndirect => b"TXIN",
             Self::TransferField => b"TXFD",
             Self::Shadow => b"SHAD",
+            Self::Curvature => b"CURV",
             Self::Material => b"MATL",
         })
     }
 
-    pub const ALL: [SectionId; 7] = [
+    pub const ALL: [SectionId; 8] = [
         Self::Core,
         Self::Sh,
         Self::Material,
         Self::Shadow,
+        Self::Curvature,
         Self::TransferDirect,
         Self::TransferIndirect,
         Self::TransferField,
@@ -87,6 +93,7 @@ impl SectionId {
             Self::Sh => "SHRS",
             Self::Material => "MATL",
             Self::Shadow => "SHAD",
+            Self::Curvature => "CURV",
             Self::TransferDirect => "TXDI",
             Self::TransferIndirect => "TXIN",
             Self::TransferField => "TXFD",
@@ -174,7 +181,7 @@ impl Want {
         match id {
             SectionId::Core | SectionId::Sh => true,
             SectionId::Material => self.material,
-            SectionId::Shadow => self.transfer_values > 0,
+            SectionId::Shadow | SectionId::Curvature => self.transfer_values > 0,
             SectionId::TransferDirect => words > 0,
             SectionId::TransferIndirect => words > direct,
             SectionId::TransferField => words > indirect,
@@ -211,6 +218,7 @@ pub fn reduced_headers(h: &AthcHeader, x: &ExtraHeader, want: Want) -> (AthcHead
         x.transfer_count = 0;
         x.transfer_words = 0;
         x.shadow_words = 0;
+        x.curvature_words = 0;
     } else {
         x.transfer_count = values;
         x.transfer_words = values.div_ceil(2);
@@ -264,6 +272,7 @@ pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Sec
         (SectionId::Sh, h.sh_words),
         (SectionId::Material, material),
         (SectionId::Shadow, x.shadow_words),
+        (SectionId::Curvature, x.curvature_words),
         (SectionId::TransferDirect, direct),
         (SectionId::TransferIndirect, indirect - direct),
         (SectionId::TransferField, words - indirect),
@@ -309,6 +318,7 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
             put_words(&mut out, &columns(&block.transfer, block.n, w, from, from + s.words as usize));
         }
         SectionId::Shadow => put_words(&mut out, &block.shadow_bits),
+        SectionId::Curvature => put_words(&mut out, &block.curvature),
         SectionId::Material => {
             for v in [&block.normals, &block.emission, &block.pbr, &block.lobes] {
                 put_words(&mut out, v);
@@ -464,8 +474,23 @@ pub fn write_v3(file: &AthcFile, compression: u32) -> Result<Vec<u8>> {
 /// `write_v3`, or with `legacy` the layout before the three tiers
 /// (`legacy_sections_of`), as files written then are (for tests).
 pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Vec<u8>> {
-    // The v2 writer settles flags, counts and the extra header.
-    let v2 = AthcFile::read(&file.write()?)?;
+    // The v2 writer settles flags, counts and the extra header; the
+    // curvature (no v2 holds it) comes back from the cloud as it was.
+    let mut v2 = AthcFile::read(&file.write()?)?;
+    if file.has_curvature() {
+        let per = |b: &AthcBlock| b.curvature.len().checked_div(b.n).unwrap_or(0);
+        if file.chunks.iter().chain(file.levels.iter().map(|(_, b)| b)).any(|b| per(b) != 2) {
+            bail!(".athc v3: curvature must be two words for every element of every block");
+        }
+        v2.extra.curvature_words = 2;
+        for (to, from) in v2.chunks.iter_mut().zip(&file.chunks) {
+            to.curvature = from.curvature.clone();
+        }
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.curvature = from.curvature.clone();
+        }
+    }
+    let v2 = v2;
     let (h, x) = (v2.header, v2.extra);
     let sections =
         if legacy { legacy_sections_of(&h, &x, compression) } else { sections_of(&h, &x, compression) };
@@ -526,7 +551,7 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
     for f in h.bounds_lo.iter().chain([h.extent].iter()).chain(&h.bounds_min).chain(&h.bounds_max) {
         out.extend_from_slice(&f.to_le_bytes());
     }
-    put_words(&mut out, &[blocks.len() as u32, 0]);
+    put_words(&mut out, &[blocks.len() as u32, x.curvature_words]);
     for v in [section_table, block_index, starts, data_start] {
         out.extend_from_slice(&v.to_le_bytes());
     }
@@ -594,7 +619,11 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
         pbr_words: w(12)?,
         lobes_words: w(13)?,
         transfer_words: w(14)?,
+        curvature_words: u32_at(bytes, 108)?,
     };
+    if extra.curvature_words != 0 && extra.curvature_words != 2 {
+        bail!(".athc v3: curvature of {} words a splat", extra.curvature_words);
+    }
     let section_count = w(15)? as usize;
     let block_count = u32_at(bytes, 104)? as usize;
     let section_table = u64_at(bytes, 112)? as usize;
@@ -679,6 +708,7 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
                 parts.push((s.words as usize, v))
             }
             SectionId::Shadow => block.shadow_bits = v,
+            SectionId::Curvature => block.curvature = v,
             SectionId::Material => {
                 let mut at = 0;
                 let mut take = |on: bool, per: u32| -> Vec<u32> {
@@ -824,7 +854,11 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
     want.check(&x)?;
     let layout = V3Layout { header: h, extra: x, sections, ..Default::default() };
     let mut block = block_from_sections(&layout, n, &raw)?;
-    let (rh, rx) = reduced_headers(&h, &x, want);
+    let (rh, mut rx) = reduced_headers(&h, &x, want);
+    // A page whose sections leave the curvature out reads without it.
+    if block.curvature.is_empty() {
+        rx.curvature_words = 0;
+    }
     // The transfer as the form kept: the prefix of each row.
     if rx.transfer_words > 0 {
         let have = block.transfer.len() / n.max(1);
@@ -838,6 +872,7 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
     } else {
         block.transfer.clear();
         block.shadow_bits.clear();
+        block.curvature.clear();
     }
     if !want.material {
         block.normals.clear();

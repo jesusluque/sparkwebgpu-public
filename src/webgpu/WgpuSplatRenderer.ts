@@ -327,6 +327,12 @@ export class WgpuSplatRenderer {
   onSortDeferred: (() => void) | null = null;
 
   private capacity = 0;
+  /**
+   * The size in pixels of the last target drawn (null before the first
+   * draw): what a pre-pass that projects per splat (the athenea relight's
+   * per-pixel slope) takes the frame to be.
+   */
+  lastDrawSize: { width: number; height: number } | null = null;
   private accumBytes = 0;
   private accumulator: GPUBuffer | null = null;
   private metric: GPUBuffer | null = null;
@@ -1461,6 +1467,7 @@ export class WgpuSplatRenderer {
     height: number,
     linear: boolean,
   ) {
+    this.lastDrawSize = { width, height };
     const view = camera.matrixWorldInverse;
     const viewQuat = new THREE.Quaternion().setFromRotationMatrix(view);
     // World = stored + origin, so the origin moves into the translation.

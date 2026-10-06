@@ -28,7 +28,7 @@ export const pluginSlang: Record<string, { module: string; colour: string | null
   "athenea.relight": {
     "module": "athenea_adapter.relight_colour",
     "colour": "AtheneaRelightColour",
-    "blend": null
+    "blend": "AtheneaRelightBlend"
   }
 };
 
@@ -72,7 +72,7 @@ export const presets = [
       "athenea.relight"
     ],
     "colour": "athenea.relight",
-    "blend": null
+    "blend": "athenea.relight"
   }
 ] as const;
 
@@ -106,6 +106,14 @@ export const blendVariants: Record<string, KernelVariant> = {
       "draw/splat_draw": (await import("./variants/example-fade/draw/splat_draw")).default,
       "draw/splat_attrib_draw": (await import("./variants/example-fade/draw/splat_attrib_draw")).default,
       "tiles/tile_raster": (await import("./variants/example-fade/tiles/tile_raster")).default,
+    }),
+  },
+  "athenea.relight": {
+    plugins: ["athenea.relight"],
+    load: async () => ({
+      "draw/splat_draw": (await import("./variants/athenea-relight/draw/splat_draw")).default,
+      "draw/splat_attrib_draw": (await import("./variants/athenea-relight/draw/splat_attrib_draw")).default,
+      "tiles/tile_raster": (await import("./variants/athenea-relight/tiles/tile_raster")).default,
     }),
   },
 };

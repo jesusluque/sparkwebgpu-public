@@ -1184,15 +1184,16 @@ describe.skipIf(!wideDevice || !available)(
       streamsAgree(cloud, ref, n);
       if (curvatureScale !== 1) {
         // A crease: the same shape operator, sharper, in both clouds.
+        // The attribute is (xx, xy, yy, the merged normals' variance): the
+        // shape operator scales, the variance stays; athenea's has three.
         const k = new Float32Array(3 * n);
-        for (let i = 0; i < n; i++)
-          k.set(
-            cloud.pool
-              .getAttribute("curvature", i)
-              .map((v) => v * curvatureScale),
-            3 * i,
-          );
-        cloud.pool.setAttribute("curvature", k, "f16", 3);
+        const w = new Float32Array(4 * n);
+        for (let i = 0; i < n; i++) {
+          const c = cloud.pool.getAttribute("curvature", i);
+          for (let j = 0; j < 3; j++) k[3 * i + j] = c[j] * curvatureScale;
+          w.set([k[3 * i], k[3 * i + 1], k[3 * i + 2], c[3] ?? 0], 4 * i);
+        }
+        cloud.pool.setAttribute("curvature", w, "f16", 4);
         const f = new Float32Array(ref.words.buffer);
         for (let i = 0; i < 3 * n; i++) f[ref.at.curvature + i] = k[i];
         d.queue.writeBuffer(ref.native, 0, ref.words);

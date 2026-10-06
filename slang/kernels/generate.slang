@@ -20,6 +20,13 @@ import core.ext;
 import core.sh;
 import core.dyno_hooks;
 import core.cov;
+import plugins.splat_colour;
+
+// The colour plugins of this build (slang/plugins/splat_colour.slang): a
+// preset defines SPLAT_COLOUR before including this file.
+#ifndef SPLAT_COLOUR
+#define SPLAT_COLOUR DefaultSplatColour
+#endif
 
 static const uint GEN_SRC_EXT = 1u;      // source is ext (else packed)
 static const uint GEN_OUT_EXT = 2u;      // accumulator is ext (else packed)
@@ -136,7 +143,8 @@ void generate(uint3 tid: SV_DispatchThreadID) {
     CovSplat c;
     c.flags = 0u;
     if (isActive(s.flags)) {
-        s.rgba.rgb += shColor(index, s.center);
+        SplatColourInput colourIn = { s, index, shColor(index, s.center), params.viewObject.xyz };
+        s.rgba = applySplatColour<SPLAT_COLOUR>(s.rgba, colourIn);
         s = dynoObjectModifier(s);
 
         if (cov && hasFlag(GEN_COV_TRANSFORM)) {

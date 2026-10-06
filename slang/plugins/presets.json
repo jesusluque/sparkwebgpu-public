@@ -1,0 +1,15 @@
+{
+  "//": "Plugin Slang and the presets tools/slang-build compiles. Each plugin names its module and the ISplatColour and/or IBlendTerm struct it adds; each preset is an ordered plugin set. The default preset (no plugins) is the kernels under kernels/, draw/ and tiles/ themselves. src/webgpu/plugins/PluginHost.ts picks a variant per active plugin set.",
+  "plugins": {
+    "example.tint": {
+      "module": "plugins.examples.tint",
+      "colour": "TintColour"
+    },
+    "example.fade": { "module": "plugins.examples.fade", "blend": "FadeBlend" }
+  },
+  "presets": [
+    { "name": "tint", "plugins": ["example.tint"] },
+    { "name": "fade", "plugins": ["example.fade"] },
+    { "name": "tint-fade", "plugins": ["example.tint", "example.fade"] }
+  ]
+}

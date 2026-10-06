@@ -7,6 +7,13 @@
 
 import core.math;
 __exported import draw.splat_shape;
+__exported import plugins.blend_term;
+
+// The blend plugins of this build (slang/plugins/blend_term.slang): a preset
+// defines SPLAT_BLEND before including this file (or splat_attrib_draw).
+#ifndef SPLAT_BLEND
+#define SPLAT_BLEND DefaultBlendTerm
+#endif
 
 StructuredBuffer<uint> ordering;
 
@@ -80,7 +87,8 @@ SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
     return o;
 }
 
-float4 computeSplatFragment(SplatVertex v) {
+// `v.position` is the fragment's SV_Position. B: the blend plugins.
+float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     float4 rgba = v.rgba;
     float z2 = dot(v.splatUv, v.splatUv);
     if (z2 > v.adjustedStdDev * v.adjustedStdDev) {
@@ -90,6 +98,8 @@ float4 computeSplatFragment(SplatVertex v) {
     if (rgba.a < params.minAlpha) {
         discard;
     }
+    BlendInput blendIn = { v.splatIndex, v.splatUv, v.position };
+    rgba = applyBlendTerm<B>(rgba, blendIn);
     if (hasFlag(DRAW_ENCODE_LINEAR)) {
         rgba.rgb = srgbToLinear(rgba.rgb);
     }
@@ -109,5 +119,5 @@ float4 splatFragment(VertexOut v) : SV_Target {
     if (hasFlag(DRAW_DISK_CLIP) && params.diskCenter.w != 0.0 && diskClipped(v.viewRay, v.viewDepth)) {
         discard;
     }
-    return computeSplatFragment({ v.position, v.rgba, v.splatUv, v.adjustedStdDev, v.splatIndex });
+    return computeSplatFragment<SPLAT_BLEND>({ v.position, v.rgba, v.splatUv, v.adjustedStdDev, v.splatIndex });
 }

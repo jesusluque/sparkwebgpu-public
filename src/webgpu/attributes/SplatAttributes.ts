@@ -297,10 +297,12 @@ export class SplatAttributes implements SplatRendererStage {
     ];
     while (targets.length > 1 && !targets[targets.length - 1]) targets.pop();
 
-    const key = JSON.stringify([targets, context.depthStencil]);
+    // A blend-plugin variant when the frame has one (PluginHost).
+    const module = context.plugin?.attribDraw ?? attribDrawModule;
+    const key = JSON.stringify([module.name, targets, context.depthStencil]);
     let pipeline = this.pipelines.get(key);
     if (!pipeline) {
-      pipeline = createReflectedRenderPipeline(this.device, attribDrawModule, {
+      pipeline = createReflectedRenderPipeline(this.device, module, {
         vertex: "splatAttribVertex",
         fragment: "splatAttribFragment",
         targets,
@@ -348,6 +350,7 @@ export class SplatAttributes implements SplatRendererStage {
     return {
       pipeline,
       buffers: {
+        ...context.plugin?.buffers,
         attribs: this.drawPool ?? this.emptyPool,
         attribParams: this.uniform,
       },

@@ -15,6 +15,10 @@ import core.ext;
 import core.attrib;
 import draw.splat_draw;
 
+#ifndef SPLAT_BLEND
+#define SPLAT_BLEND DefaultBlendTerm
+#endif
+
 static const uint ATTRIB_SLOTS = 4u;
 
 // Colour modes.
@@ -184,7 +188,7 @@ AttribFragmentOut splatAttribFragment(AttribVertexOut v) {
     base.adjustedStdDev = v.adjustedStdDev;
     base.splatIndex = v.splatIndex;
     AttribFragmentOut o;
-    o.color = computeSplatFragment(base);
+    o.color = computeSplatFragment<SPLAT_BLEND>(base);
     // Premultiplied or not, the colour's alpha is the splat's coverage here.
     float alpha = o.color.a;
     uint id = v.splatIndex + 1u;

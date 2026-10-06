@@ -25,6 +25,13 @@
 
 import core.math;
 import draw.splat_shape;
+import plugins.blend_term;
+
+// The blend plugins of this build (slang/plugins/blend_term.slang), as in
+// the quad draw: a preset defines SPLAT_BLEND before including this file.
+#ifndef SPLAT_BLEND
+#define SPLAT_BLEND DefaultBlendTerm
+#endif
 
 static const uint TILE_SIZE = 16;
 static const uint TILE_THREADS = TILE_SIZE * TILE_SIZE;
@@ -323,7 +330,11 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                 if (c.w > sceneDepth || (disk && diskClipped(viewRay, sViewDepth[j]))) {
                     continue;
                 }
-                float3 rgb = c.rgb * alpha;
+                // Colours here are already linear when DRAW_ENCODE_LINEAR.
+                BlendInput blendIn = { ordering[sortedVals[end - 1u - j]], uv, float4(p, c.w, 1.0) };
+                float4 blended = applyBlendTerm<SPLAT_BLEND>(float4(c.rgb, alpha), blendIn);
+                alpha = blended.a;
+                float3 rgb = blended.rgb * alpha;
                 if (clampColor) {
                     rgb = min(rgb, float3(1.0));
                 }

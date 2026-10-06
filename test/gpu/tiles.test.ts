@@ -197,6 +197,22 @@ describe.skipIf(!device)("TileRasterizer", () => {
     canvas.destroy();
   });
 
+  it("projectOnce: the projector's quads draw the vertex projection's image", async () => {
+    for (const format of ["bgra8unorm", "rgba16float"] as const) {
+      const color = texture(format);
+      const vertex = await renderWith({ projectOnce: false }, color);
+      const once = await renderWith({ projectOnce: true }, color);
+      const { mean, max } = compare(vertex, once);
+      if (process.env.TILES_LOG)
+        console.log("projectOnce", format, mean * 255, max * 255);
+      // The same maths in a compute stage: bit-identical on Dawn/Metal;
+      // elsewhere at most an ulp's rounding.
+      expect(max).toBeLessThan(format === "bgra8unorm" ? 1.5 / 255 : 1e-3);
+      expect(mean).toBeLessThan(0.01 / 255);
+      color.destroy();
+    }
+  });
+
   it("auto: times both paths and draws the same image", async () => {
     const canvas = texture("bgra8unorm");
     const hw = await renderWith({ rasterizer: "hardware" }, canvas);

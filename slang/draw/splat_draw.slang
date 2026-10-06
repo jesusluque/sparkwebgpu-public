@@ -17,6 +17,19 @@ __exported import plugins.blend_term;
 
 StructuredBuffer<uint> ordering;
 
+// The projector (projectSplats, a compute pass after the sort): each sorted
+// slot's footprint, computed once instead of in each of the quad's four
+// vertices, in draw order, PROJECTED_WORDS uint4 a slot:
+//   [0] clip centre (f32 x4)   [1] rgba (f32 x4)
+//   [2] axis1.xy, axis2.xy (f32, scaled pixels)
+//   [3] adjustedStdDev (f32), splat index, 1 when drawn (else 0), 0
+static const uint PROJECTED_WORDS = 4u;
+static const uint PROJECT_WG = 256u;
+static const uint PROJECT_ROUNDS = 4u; // slots a thread: PROJECT_WG x this = the sort's TILE
+StructuredBuffer<uint> sortCount;          // the sort's drawArgs: [1] the active count
+RWStructuredBuffer<uint4> projectedOut;
+StructuredBuffer<uint4> projected;
+
 struct VertexOut {
     float4 position : SV_Position;
     float4 rgba : COLOR0;
@@ -79,11 +92,67 @@ SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
         return o;
     }
 
+    o.position = quadCorner(corner, s.clipCenter, s.axis1, s.axis2);
+    return o;
+}
+
+// A quad corner's clip position from the footprint.
+float4 quadCorner(float2 corner, float4 clipCenter, float2 axis1, float2 axis2) {
     float2 scaledRenderSize = float2(params.renderWidth, params.renderHeight) * params.focalAdjustment;
-    float2 pixelOffset = corner.x * s.axis1 + corner.y * s.axis2;
+    float2 pixelOffset = corner.x * axis1 + corner.y * axis2;
     float2 ndcOffset = (2.0 / scaledRenderSize) * pixelOffset;
-    float2 ndc = s.clipCenter.xy / s.clipCenter.w + ndcOffset;
-    o.position = float4(ndc * s.clipCenter.w, s.clipCenter.zw);
+    float2 ndc = clipCenter.xy / clipCenter.w + ndcOffset;
+    return float4(ndc * clipCenter.w, clipCenter.zw);
+}
+
+// The projector: projectSplat once per sorted slot (not 2DGS: flat splats
+// keep the vertex path), dispatched with the sort's radix dispatch args
+// (a workgroup per TILE active slots).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void projectSplats(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
+    uint count = sortCount[1];
+    for (uint r = 0u; r < PROJECT_ROUNDS; r++) {
+        uint slot = (gid.x * PROJECT_ROUNDS + r) * PROJECT_WG + lid.x;
+        if (slot >= count) {
+            return;
+        }
+        uint splatIndex = ordering[slot];
+        SplatShape s;
+        bool drawn = splatIndex != 0xffffffffu && projectSplat(splatIndex, s) && !s.flat;
+        uint o = PROJECTED_WORDS * slot;
+        if (!drawn) {
+            projectedOut[o + 3u] = uint4(0u);
+            continue;
+        }
+        projectedOut[o] = asuint(s.clipCenter);
+        projectedOut[o + 1u] = asuint(s.rgba);
+        projectedOut[o + 2u] = asuint(float4(s.axis1, s.axis2));
+        projectedOut[o + 3u] = uint4(asuint(s.adjustedStdDev), splatIndex, 1u, 0u);
+    }
+}
+
+// computeSplatVertex from the projector's record of slot `instanceId`.
+SplatVertex projectedSplatVertex(uint vertexId, uint instanceId) {
+    SplatVertex o;
+    o.position = float4(0.0, 0.0, 2.0, 1.0);
+    o.rgba = float4(0.0);
+    o.splatUv = float2(0.0);
+    o.adjustedStdDev = 0.0;
+    o.splatIndex = 0u;
+    uint b = PROJECTED_WORDS * instanceId;
+    uint4 e = projected[b + 3u];
+    if (e.z == 0u) {
+        return o;
+    }
+    float2 corner = CORNERS[vertexId & 3u];
+    float4 axes = asfloat(projected[b + 2u]);
+    float adjustedStdDev = asfloat(e.x);
+    o.rgba = asfloat(projected[b + 1u]);
+    o.splatUv = corner * adjustedStdDev;
+    o.adjustedStdDev = adjustedStdDev;
+    o.splatIndex = e.y;
+    o.position = quadCorner(corner, asfloat(projected[b]), axes.xy, axes.zw);
     return o;
 }
 
@@ -109,6 +178,14 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
 [shader("vertex")]
 VertexOut splatVertex(uint vertexId: SV_VertexID, uint instanceId: SV_InstanceID) {
     SplatVertex s = computeSplatVertex(vertexId, instanceId);
+    float2 ndc = s.position.xy / s.position.w;
+    float3 viewRay = float3(ndc.x / params.proj0.x, ndc.y / params.proj1.y, -1.0);
+    return { s.position, s.rgba, s.splatUv, s.adjustedStdDev, s.splatIndex, viewRay, s.position.w };
+}
+
+[shader("vertex")]
+VertexOut splatVertexProjected(uint vertexId: SV_VertexID, uint instanceId: SV_InstanceID) {
+    SplatVertex s = projectedSplatVertex(vertexId, instanceId);
     float2 ndc = s.position.xy / s.position.w;
     float3 viewRay = float3(ndc.x / params.proj0.x, ndc.y / params.proj1.y, -1.0);
     return { s.position, s.rgba, s.splatUv, s.adjustedStdDev, s.splatIndex, viewRay, s.position.w };

@@ -36,6 +36,7 @@ import {
 } from "./WgpuSplatRenderer";
 import type { WgpuDyno } from "./dyno/DynoKernels";
 import { splatGeneratorDyno, splatMeshDyno } from "./dyno/adapters";
+import { depthTestAttachment } from "./renderPipeline";
 import {
   type OpenPass,
   type ThreeWebGPURenderer,
@@ -254,15 +255,9 @@ export class SparkWebGPU {
     const layer = composite.beginLayer(
       encoder,
       color,
-      depth
-        ? {
-            view: depth.view,
-            depthReadOnly: true,
-            ...(target.depthFormat?.includes("stencil")
-              ? { stencilReadOnly: true }
-              : {}),
-          }
-        : undefined,
+      depth ? depthTestAttachment(depth.view, target.depthFormat) : undefined,
+      undefined,
+      toneMapping,
     );
     const viewport = rc.viewport ? rc.viewportValue : null;
     if (viewport) {
@@ -281,7 +276,6 @@ export class SparkWebGPU {
       color,
       { view: attachment.view, resolveTarget: attachment.resolveTarget },
       viewport,
-      toneMapping,
     );
     open.resume();
   }
@@ -333,13 +327,7 @@ export class SparkWebGPU {
         { view: color.createView(), loadOp: "load", storeOp: "store" },
       ],
       depthStencilAttachment: depth
-        ? {
-            view: depth.createView(),
-            depthReadOnly: true,
-            ...(depthFormat?.includes("stencil")
-              ? { stencilReadOnly: true }
-              : {}),
-          }
+        ? depthTestAttachment(depth.createView(), depthFormat)
         : undefined,
     });
     if (viewport) {

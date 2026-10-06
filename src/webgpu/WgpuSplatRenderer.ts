@@ -57,6 +57,7 @@ import {
   type ReflectedRenderPipeline,
   createBindGroups,
   createReflectedRenderPipeline,
+  depthTestAttachment,
 } from "./renderPipeline";
 import {
   type ThreeWebGPURenderer,
@@ -1266,15 +1267,7 @@ export class WgpuSplatRenderer {
       ...variant?.buffers,
     });
     const depthAttachment: GPURenderPassDepthStencilAttachment | undefined =
-      depthView
-        ? {
-            view: depthView,
-            depthReadOnly: true,
-            ...(depthFormat?.includes("stencil")
-              ? { stencilReadOnly: true }
-              : {}),
-          }
-        : undefined;
+      depthView ? depthTestAttachment(depthView, depthFormat) : undefined;
     const pass = layer
       ? this.srgbComposite.beginLayer(
           encoder,

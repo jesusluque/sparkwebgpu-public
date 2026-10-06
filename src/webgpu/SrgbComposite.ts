@@ -1,17 +1,22 @@
 // Splats blended in sRGB space over a linear target, as WebGL Spark blends
 // them on the canvas. Hardware blending works on the stored (linear) values,
-// so the splats first accumulate in a layer of their own, cleared to (0, 0,
-// 0, 1): premultiplied sRGB colour L and, in alpha, the transmittance T left
-// by all of them. Blending back to front over a background B gives
-// L + T * B in sRGB, so a full-screen pass composites
-//   linear(L + T * srgb(dst))
-// over a copy of the target. srgb() and linear() are three's own transfer
-// functions; pixels no splat covers are left as they were.
+// so the splats blend in a layer of their own: an 8-bit copy of the target
+// as WebGL's canvas would hold it, q(srgb(dst)), with the transmittance T
+// left by the splats in alpha (cleared to 1). Each blend then rounds as
+// WebGL's does. A layer that starts empty and holds L and T apart instead
+// is biased: T stalls at a few levels behind dense splats (T(1 - a) rounds
+// back to T), and the background shows through them. A full-screen pass
+// writes back
+//   linear(layer + T * (srgb(dst) - q(srgb(dst))))
+// over a copy of the target: the term in T restores what quantisation
+// (and clamping, for HDR) took from the background where it still shows.
+// srgb() and linear() are three's own transfer functions; pixels no splat
+// covers are left as they were.
 //
 // With tone mapping, three tone-maps the target in its output pass, after
 // everything is blended, where WebGL Spark blends untone-mapped splats over
-// the tone-mapped picture. So the layer is composited over the picture as
-// it will show, srgb(T(dst)), and written back as T's inverse
+// the tone-mapped picture. So the layer starts from the picture as it will
+// show, srgb(T(dst)), and is written back as T's inverse
 // (toneMapping.ts), which the output pass maps to the composited colour.
 // Transparent objects drawn after the splats then still blend over them,
 // in three's linear space. Colours T never produces (AgX and ACES desaturate
@@ -41,19 +46,36 @@ fn toLinear(c: vec3f) -> vec3f {
   return select(pow(c * 0.9478672986 + 0.0521327014, vec3f(2.4)), c * 0.0773993808, c <= vec3f(0.04045));
 }
 
+// The background as shown, in sRGB: clamped as the display (and WebGL's
+// canvas, before splats blend over it) clamps it, or an HDR sky shows
+// through the splats' transmittance brighter than white.
+fn background(dst: vec4f) -> vec3f {
+  return toSrgb(saturate(toneMap(max(dst.rgb, vec3f(0.0)), params.x)));
+}
+// The layer's 8-bit unorm rounding of c.
+fn quantize(c: vec3f) -> vec3f {
+  return round(saturate(c) * 255.0) / 255.0;
+}
+
+@fragment
+fn initMain(@builtin(position) p: vec4f${multisampled ? ", @builtin(sample_index) s: u32" : ""}) -> @location(0) vec4f {
+  let dst = textureLoad(dstTex, vec2i(p.xy), ${multisampled ? "s" : "0"});
+  return vec4f(background(dst), 1.0);
+}
+
 @fragment
 fn fragmentMain(@builtin(position) p: vec4f${multisampled ? ", @builtin(sample_index) s: u32" : ""}) -> @location(0) vec4f {
   let xy = vec2i(p.xy);
   let dst = textureLoad(dstTex, xy, ${multisampled ? "s" : "0"});
   let layer = textureLoad(layerTex, xy, ${multisampled ? "s" : "0"});
   let t = layer.a;
-  if (t == 1.0 && all(layer.rgb == vec3f(0.0))) {
+  let bg = background(dst);
+  let q = quantize(bg);
+  if (t == 1.0 && all(layer.rgb == q)) {
     return dst;
   }
-  let exposure = params.x;
-  let shown = toneMap(max(dst.rgb, vec3f(0.0)), exposure);
-  let rgb = layer.rgb + t * toSrgb(shown);
-  return vec4f(inverseToneMap(toLinear(rgb), exposure), 1.0 - t + t * dst.a);
+  let rgb = layer.rgb + t * (bg - q);
+  return vec4f(inverseToneMap(toLinear(rgb), params.x), 1.0 - t + t * dst.a);
 }
 `;
 
@@ -85,6 +107,11 @@ export class SrgbComposite {
   private pipelines = new Map<string, GPURenderPipeline>();
   private scratch: Scratch | null = null;
   private readonly params: GPUBuffer;
+  // The layer's, from beginLayer.
+  private toneMapping: CompositeToneMapping = {
+    toneMapping: THREE.NoToneMapping,
+    exposure: 1,
+  };
 
   constructor(readonly device: GPUDevice) {
     this.params = device.createBuffer({
@@ -94,24 +121,62 @@ export class SrgbComposite {
     });
   }
 
-  /** A layer for `color` (the target's attachment texture), cleared. */
+  /**
+   * A layer for `color` (the target's attachment texture), holding its
+   * picture as shown under three's `toneMapping` when its output pass
+   * tone-maps `color`. `composite` must follow before `color` changes.
+   */
   beginLayer(
     encoder: GPUCommandEncoder,
     color: GPUTexture,
     depth: GPURenderPassDepthStencilAttachment | undefined,
     timestampWrites?: GPURenderPassTimestampWrites,
+    toneMapping: CompositeToneMapping = {
+      toneMapping: THREE.NoToneMapping,
+      exposure: 1,
+    },
   ): GPURenderPassEncoder {
-    const { layer } = this.ensureScratch(color);
+    const { layer, copy } = this.ensureScratch(color);
+    this.toneMapping = toneMapping;
+    encoder.copyTextureToTexture({ texture: color }, { texture: copy }, [
+      color.width,
+      color.height,
+    ]);
+    this.device.queue.writeBuffer(
+      this.params,
+      0,
+      new Float32Array([toneMapping.exposure, 0, 0, 0]),
+    );
+    const init = this.pipeline(
+      "initMain",
+      SRGB_LAYER_FORMAT,
+      color.sampleCount,
+      toneMapping.toneMapping,
+    );
+    const pass = encoder.beginRenderPass({
+      label: "splat layer background",
+      colorAttachments: [
+        { view: layer.createView(), loadOp: "clear", storeOp: "store" },
+      ],
+    });
+    pass.setPipeline(init);
+    pass.setBindGroup(
+      0,
+      this.device.createBindGroup({
+        layout: init.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: copy.createView() },
+          { binding: 2, resource: { buffer: this.params } },
+        ],
+      }),
+    );
+    pass.draw(3);
+    pass.end();
     return encoder.beginRenderPass({
       label: "splat layer",
       timestampWrites,
       colorAttachments: [
-        {
-          view: layer.createView(),
-          loadOp: "clear",
-          storeOp: "store",
-          clearValue: [0, 0, 0, 1],
-        },
+        { view: layer.createView(), loadOp: "load", storeOp: "store" },
       ],
       depthStencilAttachment: depth,
     });
@@ -119,33 +184,20 @@ export class SrgbComposite {
 
   /**
    * Composites the layer over `color`, through `view` (its attachment view,
-   * which may resolve), within `viewport` when given, under three's
-   * `toneMapping` when its output pass tone-maps `color`.
+   * which may resolve), within `viewport` when given.
    */
   composite(
     encoder: GPUCommandEncoder,
     color: GPUTexture,
     attachment: Pick<GPURenderPassColorAttachment, "view" | "resolveTarget">,
     viewport?: { x: number; y: number; z: number; w: number } | null,
-    toneMapping: CompositeToneMapping = {
-      toneMapping: THREE.NoToneMapping,
-      exposure: 1,
-    },
   ) {
     const { layer, copy } = this.ensureScratch(color);
-    encoder.copyTextureToTexture({ texture: color }, { texture: copy }, [
-      color.width,
-      color.height,
-    ]);
     const pipeline = this.pipeline(
+      "fragmentMain",
       color.format,
       color.sampleCount,
-      toneMapping.toneMapping,
-    );
-    this.device.queue.writeBuffer(
-      this.params,
-      0,
-      new Float32Array([toneMapping.exposure, 0, 0, 0]),
+      this.toneMapping.toneMapping,
     );
     const pass = encoder.beginRenderPass({
       label: "splat layer composite",
@@ -204,11 +256,12 @@ export class SrgbComposite {
   }
 
   private pipeline(
+    entryPoint: "initMain" | "fragmentMain",
     format: GPUTextureFormat,
     sampleCount: number,
     toneMapping: number,
   ) {
-    const key = `${format}/${sampleCount}/${toneMapping}`;
+    const key = `${entryPoint}/${format}/${sampleCount}/${toneMapping}`;
     let pipeline = this.pipelines.get(key);
     if (!pipeline) {
       const module = this.device.createShaderModule({
@@ -218,7 +271,7 @@ export class SrgbComposite {
         label: "splat layer composite",
         layout: "auto",
         vertex: { module, entryPoint: "fullscreenVertex" },
-        fragment: { module, entryPoint: "fragmentMain", targets: [{ format }] },
+        fragment: { module, entryPoint, targets: [{ format }] },
         multisample: { count: sampleCount },
       });
       this.pipelines.set(key, pipeline);

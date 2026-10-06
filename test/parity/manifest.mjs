@@ -219,17 +219,13 @@ export const cases = [
   ...ex("streaming-lod", [{ readme: 0.67, settle: PAGED }]),
   ...ex("depth-of-field", [{ readme: 0.97 }]),
   ...ex("on-demand", [{ readme: 0.7, hide: ["#stats"], settle: PAGED }]),
-  ...ex("splat-shader-effects", [{ readme: 0.46 }]),
+  // README said 0.46 before this suite existed; the suite measures 0.72 on
+  // every build back to 3c6f02a, so the 0.46 was measured another way.
+  ...ex("splat-shader-effects", [{ readme: 0.72, max: { mean: 0.84 } }]),
   ...ex("procedural-splats", [
     { note: "README: random stars differ (drawn in different orders)" },
   ]),
-  ...ex("sogs", [
-    {
-      readme: 0.97,
-      known:
-        "2.07 since at least 5ea8794: the tower's thin cables fade out and the tower tints blue over SkyMesh, while compare:sutro (the same splats over black) is 0.59",
-    },
-  ]),
+  ...ex("sogs", [{ readme: 0.97 }]),
   ...ex("debug-color", [{ readme: 0.13 }]),
   ...ex("lod-on-demand", [{ readme: 0.23 }]),
   ...ex("particle-animation", [
@@ -503,6 +499,8 @@ export const cases = [
       readme: 0.33,
       routes: [newportalRoute],
       settle: PAGED,
+      // The substitute .rad around the camera: the view is mostly the
+      // portal disk onto its dark interior, on WebGL as well.
       note: "README's 0.33 is with a non-paged scene; this streams a paged one",
     },
   ]),
@@ -604,7 +602,7 @@ const PCT = {
   "depth-of-field": 0.5,
   "splat-shader-effects": 1.33,
   "procedural-splats": 11.29,
-  sogs: 5.53,
+  sogs: 1.5,
   "debug-color": 0.5,
   "lod-on-demand": 0.5,
   "particle-animation": 2.31,

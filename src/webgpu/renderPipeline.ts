@@ -17,6 +17,26 @@ fn fullscreenVertex(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
 }
 `;
 
+/**
+ * A depth attachment to test against without writing it (the splat
+ * pipelines don't write depth). Loaded and stored rather than
+ * `depthReadOnly`: Safari 26 doesn't test against a read-only attachment,
+ * and splats then cover three's opaque objects.
+ */
+export function depthTestAttachment(
+  view: GPURenderPassDepthStencilAttachment["view"],
+  format: GPUTextureFormat | null | undefined,
+): GPURenderPassDepthStencilAttachment {
+  return {
+    view,
+    depthLoadOp: "load",
+    depthStoreOp: "store",
+    ...(format?.includes("stencil")
+      ? { stencilLoadOp: "load", stencilStoreOp: "store" }
+      : {}),
+  };
+}
+
 export interface RenderPipelineOptions {
   vertex: string;
   fragment: string;

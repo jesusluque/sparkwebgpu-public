@@ -1,9 +1,15 @@
-// SrgbComposite: an empty splat layer (L = 0, T = 1) leaves a linear target
-// as it was, through three's sRGB transfer functions and back.
+// SrgbComposite: an empty splat layer leaves a linear target as it was,
+// through three's sRGB transfer functions and back; splats blend over the
+// background as shown.
 
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
-import { SrgbComposite } from "../../src/webgpu/SrgbComposite";
+import {
+  SRGB_LAYER_BLEND,
+  SRGB_LAYER_FORMAT,
+  SrgbComposite,
+} from "../../src/webgpu/SrgbComposite";
+import { FULLSCREEN_TRIANGLE_WGSL } from "../../src/webgpu/renderPipeline";
 import { device } from "./device";
 
 const srgb = (c: number) =>
@@ -51,11 +57,40 @@ describe.skipIf(!device)("SrgbComposite", () => {
     composite.dispose();
   });
 
-  // Under three's tone mapping T, a splat layer (L, t) composites over the
-  // picture as shown, srgb(T(dst)), and the value written back tone-maps to
-  // linear(L + t * srgb(T(dst))). Uncovered pixels keep their HDR value.
-  it("composites in display space under tone mapping", async () => {
-    const reinhard = (c: number) => (2 * c) / (2 * c + 1); // exposure 2
+  // A splat of premultiplied colour `rgba` over the whole layer, blended as
+  // the splat pipelines blend into it.
+  const drawSplat = (pass: GPURenderPassEncoder, rgba: number[]) => {
+    const module = d.createShaderModule({
+      code: `${FULLSCREEN_TRIANGLE_WGSL}
+@fragment fn splat() -> @location(0) vec4f { return vec4f(${rgba.join(", ")}); }`,
+    });
+    pass.setPipeline(
+      d.createRenderPipeline({
+        layout: "auto",
+        vertex: { module, entryPoint: "fullscreenVertex" },
+        fragment: {
+          module,
+          entryPoint: "splat",
+          targets: [{ format: SRGB_LAYER_FORMAT, blend: SRGB_LAYER_BLEND }],
+        },
+      }),
+    );
+    pass.draw(3);
+  };
+  const half = (v: number) => {
+    const f = new Float32Array([v]);
+    const x = new Uint32Array(f.buffer)[0];
+    return (
+      ((x >> 16) & 0x8000) |
+      ((((x >> 23) & 0xff) - 112) << 10) |
+      ((x >> 13) & 0x3ff)
+    );
+  };
+  const fromHalf = (h: number) =>
+    (h & 0x8000 ? -1 : 1) *
+    2 ** (((h >> 10) & 0x1f) - 15) *
+    (1 + (h & 0x3ff) / 1024);
+  const halfTarget = (dst: number) => {
     const color = d.createTexture({
       size: [2, 1],
       format: "rgba16float",
@@ -64,87 +99,77 @@ describe.skipIf(!device)("SrgbComposite", () => {
         GPUTextureUsage.COPY_SRC |
         GPUTextureUsage.COPY_DST,
     });
-    const readPixels = async () => {
-      const read = d.createBuffer({
-        size: 256,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      const enc = d.createCommandEncoder();
-      enc.copyTextureToBuffer({ texture: color }, { buffer: read }, [2, 1]);
-      d.queue.submit([enc.finish()]);
-      await read.mapAsync(GPUMapMode.READ);
-      const px = Array.from(
-        new Uint16Array(read.getMappedRange().slice(0, 16)),
-      );
-      read.unmap();
-      read.destroy();
-      return px;
-    };
-    const dst = 3.0;
-    const half = (v: number) => {
-      const f = new Float32Array([v]);
-      const x = new Uint32Array(f.buffer)[0];
-      return (
-        ((x >> 16) & 0x8000) |
-        ((((x >> 23) & 0xff) - 112) << 10) |
-        ((x >> 13) & 0x3ff)
-      );
-    };
     d.queue.writeTexture(
       { texture: color },
       new Uint16Array([dst, dst, dst, 1, dst, dst, dst, 1].map(half)),
       { bytesPerRow: 16 },
       [2, 1],
     );
-    const composite = new SrgbComposite(d);
+    return color;
+  };
+  const readHalf = async (color: GPUTexture) => {
+    const read = d.createBuffer({
+      size: 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = d.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: color }, { buffer: read }, [2, 1]);
+    d.queue.submit([enc.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const px = Array.from(new Uint16Array(read.getMappedRange().slice(0, 16)));
+    read.unmap();
+    read.destroy();
+    return px.map(fromHalf);
+  };
+
+  // Under three's tone mapping T, a splat (premultiplied colour c, alpha a)
+  // blends over the picture as shown, srgb(T(dst)), and the value written
+  // back tone-maps to linear(c + (1 - a) * srgb(T(dst))). Uncovered pixels
+  // keep their HDR value.
+  it("composites in display space under tone mapping", async () => {
+    const reinhard = (c: number) => (2 * c) / (2 * c + 1); // exposure 2
+    const dst = 3.0;
     const toneMapping = {
       toneMapping: THREE.ReinhardToneMapping,
       exposure: 2,
     };
-    // Pixels of an empty layer keep their HDR value...
+    const composite = new SrgbComposite(d);
+    const color = halfTarget(dst);
     const e1 = d.createCommandEncoder();
-    composite.beginLayer(e1, color, undefined).end();
-    composite.composite(
-      e1,
-      color,
-      { view: color.createView() },
-      null,
-      toneMapping,
-    );
-    // ...and under a splat of sRGB colour 0.6 at alpha 0.5 (premultiplied),
-    // filling the layer, they show the blend.
-    const layer = (composite as unknown as { scratch: { layer: GPUTexture } })
-      .scratch.layer;
-    e1.beginRenderPass({
-      colorAttachments: [
-        {
-          view: layer.createView(),
-          loadOp: "clear",
-          storeOp: "store",
-          clearValue: [77 / 255, 77 / 255, 77 / 255, 128 / 255],
-        },
-      ],
-    }).end();
+    composite.beginLayer(e1, color, undefined, undefined, toneMapping).end();
+    composite.composite(e1, color, { view: color.createView() });
     d.queue.submit([e1.finish()]);
-    const before = await readPixels();
+    expect((await readHalf(color))[0]).toBe(dst);
+
     const e2 = d.createCommandEncoder();
-    composite.composite(
+    const pass = composite.beginLayer(
       e2,
       color,
-      { view: color.createView() },
-      null,
+      undefined,
+      undefined,
       toneMapping,
     );
+    drawSplat(pass, [0.3, 0.3, 0.3, 0.5]);
+    pass.end();
+    composite.composite(e2, color, { view: color.createView() });
     d.queue.submit([e2.finish()]);
-    const px = await readPixels();
-    const fromHalf = (h: number) =>
-      (h & 0x8000 ? -1 : 1) *
-      2 ** (((h >> 10) & 0x1f) - 15) *
-      (1 + (h & 0x3ff) / 1024);
-    const t = 128 / 255; // the layer's alpha is the transmittance
-    const shown = linear(77 / 255 + t * srgb(reinhard(dst)));
-    expect(fromHalf(before[0])).toBe(dst);
-    expect(reinhard(fromHalf(px[0]))).toBeCloseTo(shown, 3);
+    const shown = linear(0.3 + 0.5 * srgb(reinhard(dst)));
+    expect(reinhard((await readHalf(color))[0])).toBeCloseTo(shown, 2);
+    composite.dispose();
+  });
+
+  // WebGL's canvas holds the background clamped when splats blend over it:
+  // an HDR sky must not show through them brighter than white.
+  it("blends over an HDR background clamped, as shown", async () => {
+    const composite = new SrgbComposite(d);
+    const color = halfTarget(4.0);
+    const encoder = d.createCommandEncoder();
+    const pass = composite.beginLayer(encoder, color, undefined);
+    drawSplat(pass, [0, 0, 0, 0.5]);
+    pass.end();
+    composite.composite(encoder, color, { view: color.createView() });
+    d.queue.submit([encoder.finish()]);
+    expect((await readHalf(color))[0]).toBeCloseTo(linear(0.5), 2);
     composite.dispose();
   });
 

@@ -56,8 +56,8 @@ things:
   linear half-float target and then converts it to the canvas. WebGL Spark
   blends splats in sRGB space on its canvas. So where the SparkRenderer comes
   in three's transparent order, `SparkWebGPU` ends three's pass, draws the
-  splats into an 8-bit layer of their own (premultiplied sRGB colour and
-  transmittance), composites that over the target in sRGB
+  splats over an 8-bit sRGB copy of the target, clamped as the canvas
+  shows it (transmittance in alpha), writes that back to the target
   (`src/webgpu/SrgbComposite.ts`) and resumes three's pass, as three's own
   `copyFramebufferToTexture` does. Transparent objects sorted after the
   splats (by `renderOrder` or depth) draw over them, as on WebGL.
@@ -214,13 +214,13 @@ WGSL (src/dyno/wgsl/glslToWgsl.ts).
 | streaming-lod.html | adapter storage limits | 0.82 (fully streamed) |
 | depth-of-field.html | – | 0.97 |
 | on-demand.html | `await renderer.init()`, adapter storage limits | 0.74 (fully streamed) |
-| splat-shader-effects.html | – (GLSL dyno translated) | 0.72 |
+| splat-shader-effects.html | – (GLSL dyno translated) | 0.72 (the suite measures 0.72 on every build back to 3c6f02a) |
 | procedural-splats.html | – | random stars differ |
 | sogs.html | `SkyMesh` for `Sky` | 0.97 |
 | debug-color.html, lod-on-demand.html | – | 0.13, 0.23 |
 | particle-animation.html | – | 3.09 (time-driven noise) |
 | glsl.html | opaque clear color | 0.14 |
-| dynamic-lighting.html (lighting on, debug SDFs) | – | 0.22, 0.23 |
+| dynamic-lighting.html (lighting on, debug SDFs) | – | 0.22, 0.23 (Safari 0.21, 0.22) |
 | mobile-joystick.html (still, after look + walk) | opaque clear color | 0.36, 0.38 |
 | multiple-viewpoints.html (still, turning) | the screens' map and UVs (three, see above) | 0.02, 0.05 |
 | interactive-deform.html (still, drag, bounce, rotate) | main.js inlined | 0.08, 0.10, 0.09, 0.12 |
@@ -240,7 +240,7 @@ in-pass paths, and `&msaa=1` for antialiasing.
 | splat-painter.html (paint, erase, undo strokes) | `spark.getRgba` for `RgbaArray.render` | 0.57; exported SPZ: same splats, 88 bytes of 40 MB differ |
 | render-cube-depth.html (depth on) | clip z mapped to WebGL's for the dyno, TSL depth material, linear output + `rawColor` in depth mode | 1.05 off, 6.01 on (low packed-depth bits); cube readback means within 0.3/255 |
 | portal.html | no fragmentShader (built-in disk clip) | 0.32 (local assets substituted) |
-| newportal.html | adapter storage limits | 0.33 with a non-paged scene; paged LoD streams differently |
+| newportal.html | adapter storage limits | 0.33 with a non-paged scene; 0.00 on the suite's substitute .rad, which shows mostly the dark portal disk on both |
 | splat-portal.html (+ splat-portal/main.js) | TSL portal material | 0.58 |
 | editor.html (normal colour, clip, grid) | – | 0.01 empty, 0.46 with a file, 0.30 with debug options |
 

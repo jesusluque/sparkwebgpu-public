@@ -42,6 +42,9 @@ pub enum SectionId {
     Core,
     /// The rest harmonics, `shWords` words.
     Sh,
+    /// sparkwebGPU's skin (`athc_skin`): influences then weight gradients,
+    /// what a skeleton needs to carry the splats -- geometry, so tier 1.
+    Skin,
     /// normals, emission, pbr, lobes: those the flags say, in that order.
     Material,
     /// The open-direction bits.
@@ -63,6 +66,7 @@ impl SectionId {
         u32::from_le_bytes(*match self {
             Self::Core => b"CORE",
             Self::Sh => b"SHRS",
+            Self::Skin => b"SKIN",
             Self::TransferDirect => b"TXDI",
             Self::TransferIndirect => b"TXIN",
             Self::TransferField => b"TXFD",
@@ -72,9 +76,10 @@ impl SectionId {
         })
     }
 
-    pub const ALL: [SectionId; 8] = [
+    pub const ALL: [SectionId; 9] = [
         Self::Core,
         Self::Sh,
+        Self::Skin,
         Self::Material,
         Self::Shadow,
         Self::Curvature,
@@ -91,6 +96,7 @@ impl SectionId {
         match self {
             Self::Core => "CORE",
             Self::Sh => "SHRS",
+            Self::Skin => "SKIN",
             Self::Material => "MATL",
             Self::Shadow => "SHAD",
             Self::Curvature => "CURV",
@@ -104,7 +110,7 @@ impl SectionId {
     /// materials, 3 relit (shadow bits and transfer).
     pub fn tier(self) -> u32 {
         match self {
-            Self::Core | Self::Sh => 1,
+            Self::Core | Self::Sh | Self::Skin => 1,
             Self::Material => 2,
             _ => 3,
         }
@@ -179,7 +185,7 @@ impl Want {
         let [direct, indirect, _] = transfer_split_words(x.transfer_count);
         let words = self.transfer_values.div_ceil(2);
         match id {
-            SectionId::Core | SectionId::Sh => true,
+            SectionId::Core | SectionId::Sh | SectionId::Skin => true,
             SectionId::Material => self.material,
             SectionId::Shadow | SectionId::Curvature => self.transfer_values > 0,
             SectionId::TransferDirect => words > 0,
@@ -270,6 +276,7 @@ pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Sec
     [
         (SectionId::Core, 9),
         (SectionId::Sh, h.sh_words),
+        (SectionId::Skin, x.skin_words()),
         (SectionId::Material, material),
         (SectionId::Shadow, x.shadow_words),
         (SectionId::Curvature, x.curvature_words),
@@ -319,6 +326,7 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
         }
         SectionId::Shadow => put_words(&mut out, &block.shadow_bits),
         SectionId::Curvature => put_words(&mut out, &block.curvature),
+        SectionId::Skin => put_words(&mut out, &block.skin),
         SectionId::Material => {
             for v in [&block.normals, &block.emission, &block.pbr, &block.lobes] {
                 put_words(&mut out, v);
@@ -464,6 +472,8 @@ pub struct V3Layout {
     pub sections: Vec<Section>,
     pub blocks: Vec<BlockEntry>,
     pub starts_offset: u64,
+    /// Where the skeleton (`athc_skin::AthcSkeleton`, an ATSK blob) sits; 0: none.
+    pub skeleton_offset: u64,
 }
 
 /// v2 (in memory) to v3 bytes.
@@ -471,9 +481,29 @@ pub fn write_v3(file: &AthcFile, compression: u32) -> Result<Vec<u8>> {
     write_v3_as(file, compression, false)
 }
 
+/// `write_v3` of a skinned cloud: its blocks carry the skin stream
+/// (`AthcBlock::skin`, the layout `skeleton` says) and the skeleton goes
+/// between the starts and the first block.
+pub fn write_v3_skinned(
+    file: &AthcFile,
+    compression: u32,
+    skeleton: Option<&crate::athc_skin::AthcSkeleton>,
+) -> Result<Vec<u8>> {
+    write_v3_full(file, compression, false, skeleton)
+}
+
 /// `write_v3`, or with `legacy` the layout before the three tiers
 /// (`legacy_sections_of`), as files written then are (for tests).
 pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Vec<u8>> {
+    write_v3_full(file, compression, legacy, None)
+}
+
+fn write_v3_full(
+    file: &AthcFile,
+    compression: u32,
+    legacy: bool,
+    skeleton: Option<&crate::athc_skin::AthcSkeleton>,
+) -> Result<Vec<u8>> {
     // The v2 writer settles flags, counts and the extra header; the
     // curvature (no v2 holds it) comes back from the cloud as it was.
     let mut v2 = AthcFile::read(&file.write()?)?;
@@ -488,6 +518,23 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
         }
         for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
             to.curvature = from.curvature.clone();
+        }
+    }
+    // So does the skin (athc_skin), with the layout the skeleton says.
+    if file.has_skin() || skeleton.is_some() {
+        let s = skeleton.ok_or_else(|| anyhow!(".athc v3: a skin stream needs its skeleton"))?;
+        s.check()?;
+        let words = (s.influences + s.gradient_words) as usize;
+        if file.chunks.iter().chain(file.levels.iter().map(|(_, b)| b)).any(|b| b.skin.len() != b.n * words) {
+            bail!(".athc v3: the skin must be {words} words for every element of every block");
+        }
+        v2.extra.skin_influences = s.influences;
+        v2.extra.skin_gradient_words = s.gradient_words;
+        for (to, from) in v2.chunks.iter_mut().zip(&file.chunks) {
+            to.skin = from.skin.clone();
+        }
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.skin = from.skin.clone();
         }
     }
     // So do merged opacities past 0.99 (athc::coverage_ratios), which the
@@ -514,7 +561,13 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
     let block_index = section_table + (SECTION_ENTRY_BYTES * sections.len()) as u64;
     let entry = BLOCK_ENTRY_HEAD + BLOCK_ENTRY_PER_SECTION * sections.len();
     let starts = aligned(block_index + (entry * blocks.len()) as u64);
-    let data_start = aligned(starts + 4 * v2.starts.len() as u64);
+    let blob = skeleton.map(|s| s.to_bytes()).unwrap_or_default();
+    let skeleton_offset = if blob.is_empty() { 0 } else { (starts + 4 * v2.starts.len() as u64).div_ceil(16) * 16 };
+    let data_start = aligned(if blob.is_empty() {
+        starts + 4 * v2.starts.len() as u64
+    } else {
+        skeleton_offset + blob.len() as u64
+    });
 
     let mut data = Vec::new();
     let mut entries = Vec::new();
@@ -565,6 +618,8 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
     for v in [section_table, block_index, starts, data_start] {
         out.extend_from_slice(&v.to_le_bytes());
     }
+    put_words(&mut out, &[x.skin_influences, x.skin_gradient_words]);
+    out.extend_from_slice(&skeleton_offset.to_le_bytes());
     out.resize(V3_HEADER_BYTES, 0);
     for s in &sections {
         put_words(&mut out, &[s.id.code(), s.tier, s.encoding, s.compression, s.words, 0, 0, 0]);
@@ -581,6 +636,10 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
     }
     out.resize(starts as usize, 0);
     put_words(&mut out, &v2.starts);
+    if !blob.is_empty() {
+        out.resize(skeleton_offset as usize, 0);
+        out.extend_from_slice(&blob);
+    }
     out.resize(data_start as usize, 0);
     out.extend_from_slice(&data);
     debug_assert_eq!(out.len() as u64 % PAGE, 0);
@@ -630,7 +689,15 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
         lobes_words: w(13)?,
         transfer_words: w(14)?,
         curvature_words: u32_at(bytes, 108)?,
+        skin_influences: u32_at(bytes, 144)?,
+        skin_gradient_words: u32_at(bytes, 148)?,
     };
+    if extra.skin_influences > 16
+        || extra.skin_gradient_words != 0 && extra.skin_gradient_words + 1 != extra.skin_influences
+    {
+        bail!(".athc v3: skin of {} influences and {} gradient words", extra.skin_influences, extra.skin_gradient_words);
+    }
+    let skeleton_offset = u64_at(bytes, 152)?;
     if extra.curvature_words != 0 && extra.curvature_words != 2 {
         bail!(".athc v3: curvature of {} words a splat", extra.curvature_words);
     }
@@ -689,7 +756,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
             spans,
         });
     }
-    Ok(V3Layout { header, extra, sections, blocks, starts_offset })
+    Ok(V3Layout { header, extra, sections, blocks, starts_offset, skeleton_offset })
 }
 
 /// One block's elements from its sections' bytes (`raw[k]`: section k,
@@ -719,6 +786,7 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
             }
             SectionId::Shadow => block.shadow_bits = v,
             SectionId::Curvature => block.curvature = v,
+            SectionId::Skin => block.skin = v,
             SectionId::Material => {
                 let mut at = 0;
                 let mut take = |on: bool, per: u32| -> Vec<u32> {
@@ -941,6 +1009,22 @@ pub fn tables_bytes(bytes: &[u8]) -> Result<u64> {
         bail!("not an .athc v3 (no ATH3 magic)");
     }
     u64_at(bytes, 136)
+}
+
+/// The skeleton of a skinned v3 file (`bytes` through its tables suffice:
+/// `tables_bytes`), or None.
+pub fn read_v3_skeleton(bytes: &[u8]) -> Result<Option<crate::athc_skin::AthcSkeleton>> {
+    if u32_at(bytes, 0)? != ATH3_MAGIC {
+        return Ok(None);
+    }
+    let at = u64_at(bytes, 152)? as usize;
+    if at == 0 {
+        return Ok(None);
+    }
+    let blob = bytes.get(at..).ok_or_else(|| anyhow!(".athc v3: the skeleton is past the end"))?;
+    let n = crate::athc_skin::AthcSkeleton::blob_bytes(blob)?;
+    let blob = blob.get(..n).ok_or_else(|| anyhow!(".athc v3: the skeleton is past the end"))?;
+    Ok(Some(crate::athc_skin::AthcSkeleton::from_bytes(blob)?))
 }
 
 /// v3 bytes (the whole file) back to the v2 cloud.

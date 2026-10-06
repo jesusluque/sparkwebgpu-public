@@ -11,6 +11,8 @@ describes what the WebGPU path reads (version 1 and 2, written by athenea's
 | v1/v2 reader and writer, LoD tree, ATHV pages | `rust/spark-lib/src/athc.rs` |
 | v3 reader and writer, gzip | `rust/spark-lib/src/athc_v3.rs` |
 | Converter CLI | `rust/build-lod/src/bin/athc-convert.rs` |
+| athenea's stream packing and LoD build, on the CPU | `rust/spark-lib/src/athc_build.rs` |
+| USD (`.usdc`) TX cloud to `.athc` | `rust/build-lod/src/bin/usd-athc.rs` |
 | Paging from the browser | `src/athc.ts`, `src/PagedSplats.ts` |
 | athenea's decoders over the attribute pool | `slang/athenea_adapter/athc.slang` |
 | athenea-web `scene.json` | `src/webgpu/athenea/sceneJson.ts` |
@@ -159,6 +161,39 @@ cargo run -p build-lod --bin athc-convert -- in.athc --info             # sectio
 
 The WASM decoder reads a v3 file whole (`new SplatMesh({ url })`) as it reads
 a v2 one.
+
+### From USD: athenea's relightable clouds
+
+athenea writes a cloud with a transfer only as a USD stage (its `.athc`
+writer refuses `--transfer`). `usd-athc` reads the
+`ParticleField3DGaussianSplat` from the `.usdc` (the `openusd` crate),
+packs it as athenea's `scene/streams` + `splat_decode` do, builds the levels
+as `LodBuilder` does (`athc_build.rs`; on `two_cards.athc` it gives athenea's
+groups, cells and order, each merged Gaussian within f32 rounding) and writes
+v3, or v2 with `--v2`.
+
+```sh
+cargo run --release -p build-lod --bin usd-athc -- M_Pawn_Body_W.usdc body.athc --gzip --json body.json
+#   --transfer full|112|84|64|36|16|9|none   which of the transfer's values to keep
+#   --no-shadow --no-material --no-normals --max-sh N --chunk N --prim /World/Splats
+cargo run --release -p build-lod --bin usd-athc -- cloud.usdc --list   # attributes, types, lengths
+```
+
+| USD attribute (`primvars:athenea:splat:` for the athenea ones) | `.athc` |
+|---|---|
+| `positions`, `opacities` (linear) | positions; opacity under 1/255 or a non-finite record is dropped, as athenea's validate does |
+| `orientations` (quatf, w first), `scales` (linear) | shape: smallest three, f16 ln scales |
+| `radiance:sphericalHarmonicsCoefficients` (DC first), `…Degree` | base colour 0.5 + SH0 · dc, rest harmonics |
+| `linear` | flag bit 1 |
+| `normal` | normals |
+| `metallic`, `roughness`, `transmission` | pbr |
+| `transferDirect` (16), `transferIndirect` (48), `transferReflected` (48) | transfer, 112 f16 in that order (`transfer_layout.slang`) |
+| `shadowBits` (int, 8 a splat) | shadowBits |
+| `cryptoObject`, `cryptoManifest`, `curvature`, `ior`, `relight` | no room in a `.athc`: `--json` reports the constants |
+
+A reduced transfer keeps a layout athenea reads: 64 is the direct and
+indirect halves without the reflected field, 16 the direct half alone, 84
+and 36 the same truncated to degree 2 (the first coefficients of each half).
 
 ### Not yet
 

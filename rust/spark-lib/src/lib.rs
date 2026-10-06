@@ -28,6 +28,8 @@ pub mod rad;
 pub mod athc;
 #[cfg(feature = "athc")]
 pub mod athc_v3;
+#[cfg(feature = "athc")]
+pub mod athc_build;
 pub mod decoder;
 pub mod splat_encode;
 pub mod ordering;

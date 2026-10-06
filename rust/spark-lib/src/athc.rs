@@ -1167,7 +1167,11 @@ impl<T: SplatReceiver> AthcDecoder<T> {
     }
 
     fn finish_file(&mut self) -> Result<()> {
-        let file = AthcFile::read(&self.buffer)?;
+        let file = if u32_at(&self.buffer, 0) == crate::athc_v3::ATH3_MAGIC {
+            crate::athc_v3::read_v3(&self.buffer)?
+        } else {
+            AthcFile::read(&self.buffer)?
+        };
         let (h, x) = (file.header, file.extra);
         let tree = VirtualTree::of_file(&file, false)?;
         let merged = merged_block(&file, &tree);
@@ -1235,9 +1239,9 @@ impl<T: SplatReceiver> ChunkReceiver for AthcDecoder<T> {
             bail!(".athc shorter than its magic");
         }
         let result = match u32_at(&self.buffer, 0) {
-            ATHC_MAGIC => self.finish_file(),
+            ATHC_MAGIC | crate::athc_v3::ATH3_MAGIC => self.finish_file(),
             ATHV_MAGIC => self.finish_page(),
-            _ => Err(anyhow!("neither an .athc nor an ATHV page")),
+            _ => Err(anyhow!("neither an .athc (v1, v2, v3) nor an ATHV page")),
         };
         self.buffer = Vec::new();
         result
@@ -1583,6 +1587,15 @@ mod tests {
             std::fs::write(path, &bytes).unwrap();
         }
         assert!(std::fs::read(path).unwrap() == bytes, "stale fixture: ATHC_WRITE_FIXTURES=1 cargo test");
+    }
+
+    #[test]
+    fn v3_decodes_as_v2() {
+        let v3 = crate::athc_v3::write_v3(&AthcFile::read(TWO_CARDS).unwrap(), crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let (a, b) = (decode(TWO_CARDS), decode(&v3));
+        assert_eq!(a.center, b.center);
+        assert_eq!(a.child_start, b.child_start);
+        assert_eq!(a.attribs, b.attribs);
     }
 
     #[test]

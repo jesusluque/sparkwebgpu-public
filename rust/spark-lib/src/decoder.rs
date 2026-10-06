@@ -15,6 +15,8 @@ use crate::ply::{PLY_MAGIC, PlyDecoder};
 use crate::rad::{RAD_CHUNK_MAGIC, RAD_MAGIC, RadDecoder};
 #[cfg(feature = "athc")]
 use crate::athc::{ATHC_MAGIC, ATHV_MAGIC, AthcDecoder};
+#[cfg(feature = "athc")]
+use crate::athc_v3::ATH3_MAGIC;
 #[cfg(feature = "sogs")]
 use crate::sogs::{PK_MAGIC, SogsDecoder};
 #[cfg(feature = "spz")]
@@ -525,7 +527,7 @@ impl<T: SplatReceiver> ChunkReceiver for MultiDecoder<T> {
                     return self.init_file_type(SplatFileType::RAD);
                 }
                 #[cfg(feature = "athc")]
-                (ATHC_MAGIC, _) | (ATHV_MAGIC, _) => {
+                (ATHC_MAGIC, _) | (ATHV_MAGIC, _) | (ATH3_MAGIC, _) => {
                     return self.init_file_type(SplatFileType::ATHC);
                 }
                 _ => {

@@ -26,6 +26,8 @@ pub mod sogs;
 pub mod rad;
 #[cfg(feature = "athc")]
 pub mod athc;
+#[cfg(feature = "athc")]
+pub mod athc_v3;
 pub mod decoder;
 pub mod splat_encode;
 pub mod ordering;

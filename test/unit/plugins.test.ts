@@ -224,8 +224,16 @@ describe("PluginHost per-asset state", () => {
 
 describe("presets", () => {
   it("lists the compiled presets and their variants", () => {
-    expect(presets.map((x) => x.name)).toEqual(["tint", "fade", "tint-fade"]);
-    expect(Object.keys(colourVariants)).toEqual(["example.tint"]);
+    expect(presets.map((x) => x.name)).toEqual([
+      "tint",
+      "fade",
+      "tint-fade",
+      "athenea-raster",
+    ]);
+    expect(Object.keys(colourVariants)).toEqual([
+      "example.tint",
+      "athenea.raster",
+    ]);
     expect(Object.keys(blendVariants)).toEqual(["example.fade"]);
   });
 

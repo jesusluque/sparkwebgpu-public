@@ -5,7 +5,7 @@ import { getSplatFileType, getSplatFileTypeFromPath } from "./SplatLoader";
 import type { SplatSource } from "./SplatMesh";
 import type { SplatPager } from "./SplatPager";
 import { workerPool } from "./SplatWorker";
-import { type AthcPaging, fetchAthcPage, openAthc } from "./athc";
+import { ATHC_FLAGS, type AthcPaging, fetchAthcPage, openAthc } from "./athc";
 import {
   DEFAULT_SPLAT_ENCODING,
   LN_SCALE_MAX,
@@ -42,6 +42,8 @@ export class PagedSplats implements SplatSource {
   fileBytes?: Uint8Array;
   fileType?: SplatFileType;
   athcKeepLinear: boolean;
+  /** Once a .athc is open: its colours are linear light as decoded. */
+  athcStoredLinear?: boolean;
 
   numSh: number;
   maxSh: number;
@@ -120,6 +122,11 @@ export class PagedSplats implements SplatSource {
       withCredentials: this.withCredentials,
       signal: this.abortController.signal,
       keepLinear: this.athcKeepLinear,
+    }).then((paging) => {
+      this.athcStoredLinear =
+        paging.keepLinear &&
+        (paging.layout.header.flags & ATHC_FLAGS.linear) !== 0;
+      return paging;
     });
     return this.athcPromise;
   }

@@ -636,7 +636,8 @@ export class PluginHost {
       if (!steps) {
         steps = p.fx.map((fx, k) => ({
           effect: fx.effect,
-          params: { ...fx.params },
+          // The plugin's own object, so it can change a parameter live.
+          params: fx.params ?? {},
           name: fx.name,
           instance: `${p.id}.${fx.name ?? k}`,
         }));

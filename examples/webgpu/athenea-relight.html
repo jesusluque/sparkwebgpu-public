@@ -124,7 +124,9 @@
     const top = params.get("top") === "0" ? null : new SplatMesh({ url: `${base}top-${topSuffix}.athc`, extSplats: true });
     if (top) scene.add(top);
 
-    const relight = atheneaRelightPlugin();
+    // Per-pixel slope and sharp coat (?detail=1): sharper highlights, but
+    // several times slower at full screen.
+    const relight = atheneaRelightPlugin({ pixelDetail: params.get("detail") === "1" });
     // The glass head's index is the cloud's, not its file's (pawn.json).
     if (top) relight.setIor(top, 1.5);
     const display = atheneaOutputPlugin({ view: params.get("view") ?? "agx", exposure: 0 });
@@ -189,6 +191,10 @@
       gui.add(state, "rotation", -180, 180, 1).name("dome rotation").onChange(applySky);
       gui.add(state, "intensity", 0, 4, 0.05).name("dome intensity").onChange(applySky);
       gui.add(state, "indirect").name("indirect + field").onChange(applySky);
+      gui
+        .add({ detail: relight.options.pixelDetail }, "detail")
+        .name("per-pixel detail (slow)")
+        .onChange((on) => relight.set({ pixelDetail: on }));
       const s = gui.addFolder("analytic sun");
       s.add(state, "sun").onChange(applySky);
       s.add(state, "sunAzimuth", -180, 180, 1).onChange(applySky);

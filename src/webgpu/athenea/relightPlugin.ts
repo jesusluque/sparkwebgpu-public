@@ -99,6 +99,12 @@ export interface AtheneaRelightOptions {
   ior?: number;
   /** Emission times this (default 1). */
   emission?: number;
+  /**
+   * Per-pixel slope and sharp coat/polish (needs the cloud's curvature).
+   * Costly: every covered pixel shades every splat's lobes, about 8x the
+   * frame time on the pawn at full screen (default false).
+   */
+  pixelDetail?: boolean;
 }
 
 type RelightState = Required<Omit<AtheneaRelightOptions, "hdri">> & {
@@ -217,6 +223,7 @@ export function atheneaRelightPlugin(
     litBody: false,
     ior: 0,
     emission: 1,
+    pixelDetail: false,
   };
   const linear = new WeakMap<object, boolean>();
   const iors = new WeakMap<object, number>();
@@ -421,7 +428,8 @@ export function atheneaRelightPlugin(
     // centre in pixels of the last target drawn.
     const size = r.lastDrawSize;
     const p = camera.projectionMatrix.elements;
-    const slopeOn = Boolean(size) && id("curvature") !== ATTRIB_NONE;
+    const slopeOn =
+      options.pixelDetail && Boolean(size) && id("curvature") !== ATTRIB_NONE;
     const toEye = new THREE.Matrix4().multiplyMatrices(
       camera.matrixWorldInverse,
       world,
@@ -700,6 +708,7 @@ export function atheneaRelightPlugin(
       if (o.litBody !== undefined) options.litBody = o.litBody;
       if (o.ior !== undefined) options.ior = o.ior;
       if (o.emission !== undefined) options.emission = o.emission;
+      if (o.pixelDetail !== undefined) options.pixelDetail = o.pixelDetail;
       if (skyChanged && sky) sky.dirty = true;
       lightsDirty = true;
       dirty = true;

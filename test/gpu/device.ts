@@ -22,12 +22,11 @@ async function open(): Promise<GPUDevice | null> {
   try {
     gpu = create([]);
     adapter = await gpu.requestAdapter();
-    // Timestamps where the adapter has them (rasterizer "auto", profile).
-    const requiredFeatures: GPUFeatureName[] = adapter?.features.has(
-      "timestamp-query",
-    )
-      ? ["timestamp-query"]
-      : [];
+    // Timestamps (rasterizer "auto", profile) and subgroups (the sort's
+    // scatter) where the adapter has them.
+    const requiredFeatures = (
+      ["timestamp-query", "subgroups"] as GPUFeatureName[]
+    ).filter((f) => adapter?.features.has(f));
     return adapter ? await adapter.requestDevice({ requiredFeatures }) : null;
   } catch {
     return null;

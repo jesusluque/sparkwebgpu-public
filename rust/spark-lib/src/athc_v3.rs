@@ -228,6 +228,29 @@ pub struct Section {
     pub words: u32,
 }
 
+/// The sections of a file written before the three tiers (the first v3:
+/// `TXIN` holding the field too, then `SHAD` and `MATL`, all tier 2). Still
+/// read, and paged by the browser: a reader takes what a block's table says.
+pub fn legacy_sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Section> {
+    let direct = transfer_direct_values(x.transfer_count).div_ceil(2).min(x.transfer_words);
+    let material = (if h.has(FLAG_NORMALS) { 1 } else { 0 })
+        + (if h.has(FLAG_EMISSION) { 1 } else { 0 })
+        + x.pbr_words
+        + x.lobes_words;
+    [
+        (SectionId::Core, 9, 1),
+        (SectionId::Sh, h.sh_words, 1),
+        (SectionId::TransferDirect, direct, 2),
+        (SectionId::TransferIndirect, x.transfer_words - direct, 2),
+        (SectionId::Shadow, x.shadow_words, 2),
+        (SectionId::Material, material, 2),
+    ]
+    .into_iter()
+    .filter(|&(_, words, _)| words > 0)
+    .map(|(id, words, tier)| Section { id, tier, encoding: ENCODING_V2_WORDS, compression, words })
+    .collect()
+}
+
 /// The sections a cloud with these headers has, in block order.
 pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Section> {
     let [direct, indirect, words] =
@@ -267,7 +290,9 @@ fn columns(v: &[u32], n: usize, per: usize, from: usize, to: usize) -> Vec<u32> 
 }
 
 /// One section of a block, uncompressed: its arrays one after the other.
-fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader) -> Vec<u8> {
+/// `tx_from`: the first transfer word of section `s` (the words of the
+/// transfer sections before it).
+fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(block.n * s.words as usize * 4);
     match s.id {
         SectionId::Core => {
@@ -280,13 +305,8 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader) -> Vec<u8> {
         SectionId::Sh => put_words(&mut out, &block.sh),
         SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {
             let w = x.transfer_words as usize;
-            let [d, i, _] = transfer_split_words(x.transfer_count).map(|v| v as usize);
-            let (from, to) = match s.id {
-                SectionId::TransferDirect => (0, d),
-                SectionId::TransferIndirect => (d, i),
-                _ => (i, w),
-            };
-            put_words(&mut out, &columns(&block.transfer, block.n, w, from, to));
+            let from = tx_from as usize;
+            put_words(&mut out, &columns(&block.transfer, block.n, w, from, from + s.words as usize));
         }
         SectionId::Shadow => put_words(&mut out, &block.shadow_bits),
         SectionId::Material => {
@@ -438,10 +458,17 @@ pub struct V3Layout {
 
 /// v2 (in memory) to v3 bytes.
 pub fn write_v3(file: &AthcFile, compression: u32) -> Result<Vec<u8>> {
+    write_v3_as(file, compression, false)
+}
+
+/// `write_v3`, or with `legacy` the layout before the three tiers
+/// (`legacy_sections_of`), as files written then are (for tests).
+pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Vec<u8>> {
     // The v2 writer settles flags, counts and the extra header.
     let v2 = AthcFile::read(&file.write()?)?;
     let (h, x) = (v2.header, v2.extra);
-    let sections = sections_of(&h, &x, compression);
+    let sections =
+        if legacy { legacy_sections_of(&h, &x, compression) } else { sections_of(&h, &x, compression) };
     let blocks: Vec<(u32, u32, u32, &AthcBlock)> = v2
         .levels
         .iter()
@@ -460,8 +487,12 @@ pub fn write_v3(file: &AthcFile, compression: u32) -> Result<Vec<u8>> {
     for &(kind, level, first, block) in &blocks {
         let mut spans = Vec::new();
         let begin = data.len();
+        let mut tx_from = 0;
         for s in &sections {
-            let raw = section_bytes(block, s, &x);
+            let raw = section_bytes(block, s, &x, tx_from);
+            if s.id.is_transfer() {
+                tx_from += s.words;
+            }
             let stored = if compression == COMPRESSION_GZIP { gzip(&raw) } else { raw.clone() };
             spans.push(SectionSpan { offset: at + (data.len() - begin) as u64, stored: stored.len() as u32, raw: raw.len() as u32 });
             data.extend_from_slice(&stored);
@@ -589,14 +620,14 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
             words: u32_at(bytes, at + 16)?,
         });
     }
-    let expected = sections_of(&header, &extra, COMPRESSION_NONE);
-    if expected.len() != sections.len()
-        || expected.iter().zip(&sections).any(|(e, s)| e.id != s.id || e.words != s.words || e.tier != s.tier)
+    let same = |expected: Vec<Section>| {
+        expected.len() == sections.len()
+            && expected.iter().zip(&sections).all(|(e, s)| e.id == s.id && e.words == s.words && e.tier == s.tier)
+    };
+    if !same(sections_of(&header, &extra, COMPRESSION_NONE))
+        && !same(legacy_sections_of(&header, &extra, COMPRESSION_NONE))
     {
-        bail!(
-            ".athc v3: its sections are not those its header implies (a file written before the three-tier \
-             layout of docs/docs/athc-v3.md: convert it again with athc-convert)"
-        );
+        bail!(".athc v3: its sections are not those its header implies");
     }
     if let Some(s) = sections.iter().find(|s| s.encoding != ENCODING_V2_WORDS || s.compression > COMPRESSION_GZIP) {
         bail!(".athc v3: section {:?} has encoding {} / compression {} this reader does not know", s.id, s.encoding, s.compression);
@@ -741,8 +772,10 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
     let flags = u32_at(b, 152)?;
     let transfer_values = u32_at(b, 156)?;
     let m = u32_at(b, 160)? as usize;
-    let sections = sections_of(&h, &x, COMPRESSION_NONE);
-    let mut raw: Vec<Option<Vec<u8>>> = vec![None; sections.len()];
+    // The page's own sections, words a element from their sizes: either
+    // layout of the transfer's sections (sections_of, legacy_sections_of).
+    let mut sections = Vec::with_capacity(m);
+    let mut raw: Vec<Option<Vec<u8>>> = Vec::with_capacity(m);
     let mut at = 164 + 16 * m;
     let mut present = Vec::new();
     for k in 0..m {
@@ -752,10 +785,16 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
         let stored = u32_at(b, e + 8)? as usize;
         let raw_bytes = u32_at(b, e + 12)? as usize;
         let id = SectionId::from_code(code).ok_or_else(|| anyhow!("ATHV page: unknown section {:#x}", code))?;
-        let slot = sections
-            .iter()
-            .position(|s| s.id == id)
-            .ok_or_else(|| anyhow!("ATHV page: section {} the cloud does not have", id.name()))?;
+        if present.contains(&id) || n == 0 || raw_bytes % (4 * n) != 0 {
+            bail!("ATHV page: section {} twice, or not whole words of {} elements", id.name(), n);
+        }
+        sections.push(Section {
+            id,
+            tier: id.tier(),
+            encoding: ENCODING_V2_WORDS,
+            compression: COMPRESSION_NONE,
+            words: (raw_bytes / (4 * n)) as u32,
+        });
         let data = b.get(at..at + stored).ok_or_else(|| anyhow!("ATHV page shorter than its sections"))?;
         at += stored;
         let bytes = match compression {
@@ -766,7 +805,7 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
         if bytes.len() != raw_bytes {
             bail!("ATHV page: section {} unpacks to {} bytes, not {}", id.name(), bytes.len(), raw_bytes);
         }
-        raw[slot] = Some(bytes);
+        raw.push(Some(bytes));
         present.push(id);
     }
     for id in [SectionId::Core, SectionId::Sh] {
@@ -783,11 +822,6 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
         },
     };
     want.check(&x)?;
-    for id in SectionId::ALL {
-        if want.needs(id, &x) && sections.iter().any(|s| s.id == id) && !present.contains(&id) {
-            bail!("ATHV page keeps a transfer of {} values without its {} section", transfer_values, id.name());
-        }
-    }
     let layout = V3Layout { header: h, extra: x, sections, ..Default::default() };
     let mut block = block_from_sections(&layout, n, &raw)?;
     let (rh, rx) = reduced_headers(&h, &x, want);
@@ -1030,6 +1064,30 @@ mod tests {
             // Without its core it is not a page.
             let page = athv_sections_page(&headers, 0, b.n, 0, 0, &parts(&v3, &layout, b, &[1]));
             assert!(read_sections_page(&page).is_err());
+        }
+    }
+
+    #[test]
+    fn files_of_the_first_layout_still_read_and_page() {
+        let file = AthcFile::read(EVERY).unwrap();
+        let v3 = write_v3_as(&file, COMPRESSION_GZIP, true).unwrap();
+        let layout = parse_v3(&v3).unwrap();
+        use SectionId::*;
+        let ids: Vec<SectionId> = layout.sections.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [Core, Sh, TransferDirect, TransferIndirect, Shadow, Material]);
+        assert!(read_v3(&v3).unwrap().write().unwrap() == EVERY);
+        let headers = layout.v2_headers();
+        let (b, chunk) = (layout.blocks.iter().find(|b| b.kind == 1).unwrap(), &file.chunks[0]);
+        for values in [16, 64, 112] {
+            let want = Want { material: true, transfer_values: values };
+            let picks = wanted_sections(&layout.sections, &layout.extra, want);
+            let page = athv_sections_page(&headers, 0, b.n, 0, values, &parts(&v3, &layout, b, &picks));
+            let (_, x, block, _) = read_sections_page(&page).unwrap();
+            assert_eq!(x.transfer_count, values);
+            let keep = values.div_ceil(2) as usize;
+            let expect: Vec<u32> = (0..chunk.n).flat_map(|e| chunk.transfer[e * 56..e * 56 + keep].to_vec()).collect();
+            assert_eq!(block.transfer, expect);
+            assert_eq!(block.pbr, chunk.pbr);
         }
     }
 

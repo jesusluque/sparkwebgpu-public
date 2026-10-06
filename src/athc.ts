@@ -120,9 +120,18 @@ export type AthcV3Layout = {
   attribSpecs: AthcLayout["attribSpecs"];
   /** The transfer forms it can be kept as (athc_v3.rs transfer_forms). */
   transferForms: number[];
-  /** transfer_split_words: [direct, indirect, words]. */
-  transferSplit: [number, number, number];
 };
+
+/**
+ * The transfer words a splat in TXDI, and through TXIN, as the file's
+ * sections hold them (a file of the first v3 layout keeps the field in TXIN).
+ */
+function transferSplit(layout: AthcV3Layout): [number, number] {
+  const words = (id: AthcSection["id"]) =>
+    layout.sections.find((s) => s.id === id)?.words ?? 0;
+  const direct = words("TXDI");
+  return [direct, direct + words("TXIN")];
+}
 
 export type AnyAthcLayout = AthcLayout | AthcV3Layout;
 
@@ -167,7 +176,7 @@ export function athcNeeds(
   id: AthcSection["id"],
   want: AthcWant,
 ): boolean {
-  const [direct, indirect] = layout.transferSplit;
+  const [direct, indirect] = transferSplit(layout);
   const words = Math.ceil(want.transferValues / 2);
   switch (id) {
     case "CORE":
@@ -746,14 +755,10 @@ async function streamColumns(
   }
   const shad = raw.get("SHAD");
   if (shad) sources.set("shadowBits", [{ data: shad, words: x.shadowWords }]);
-  const [d, i, w] = layout.transferSplit;
-  const tx = [
-    { id: "TXDI", words: d },
-    { id: "TXIN", words: i - d },
-    { id: "TXFD", words: w - i },
-  ]
-    .filter((t) => raw.has(t.id) && t.words > 0)
-    .map((t) => ({ data: raw.get(t.id) as Uint32Array, words: t.words }));
+  // The transfer's sections in file order: direct, then the rest.
+  const tx = layout.sections
+    .filter((s) => /^TX/.test(s.id) && raw.has(s.id))
+    .map((s) => ({ data: raw.get(s.id) as Uint32Array, words: s.words }));
   if (tx.length) sources.set("transfer", tx);
   const pool = new AttribPool(n);
   for (const spec of specs) {

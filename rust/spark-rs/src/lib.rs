@@ -827,8 +827,6 @@ pub fn athc_layout(prefix: Uint8Array, file_bytes: f64) -> Result<JsValue, JsVal
             Vec::new()
         };
         set("transferForms", &serde_wasm_bindgen::to_value(&forms)?)?;
-        let split = spark_lib::athc_v3::transfer_split_words(layout.extra.transfer_count);
-        set("transferSplit", &serde_wasm_bindgen::to_value(&split)?)?;
         return Ok(object);
     }
     let layout = spark_lib::athc::AthcLayout::parse(&bytes, file_bytes as u64)

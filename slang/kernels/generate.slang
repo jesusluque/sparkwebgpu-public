@@ -38,6 +38,8 @@ static const uint GEN_OUT_COV = 512u;    // accumulator holds covariance splats
 static const uint GEN_COV_TRANSFORM = 1024u; // covBasis transforms the CovSplat
                                          // (else the similarity, before it)
 static const uint GEN_CULL = 2048u;      // drop splats the draw would skip
+static const uint GEN_LOD_FADE = 65536u; // lodIndices carry a fade in their top byte (LodFade)
+static const uint GEN_LOD_INDEX_MASK = 0x00FFFFFFu;
 
 struct GenerateParams {
     uint numSplats;   // output splats for this mesh (the LOD count when LOD is on)
@@ -131,6 +133,13 @@ void generate(uint3 tid: SV_DispatchThreadID) {
         return;
     }
     uint index = hasFlag(GEN_USE_LOD) ? lodIndices[i] : i;
+    // A LoD transition's fade (src/webgpu/LodFade.ts): the top byte is how
+    // far the splat is from drawn, 0 opaque, 255 gone; its alpha scales.
+    float4 recolor = params.recolor;
+    if (hasFlag(GEN_LOD_FADE)) {
+        recolor.a *= 1.0 - float(index >> 24u) / 255.0;
+        index &= GEN_LOD_INDEX_MASK;
+    }
 
     Gsplat s;
     s.flags = 0u;
@@ -152,7 +161,7 @@ void generate(uint3 tid: SV_DispatchThreadID) {
             c = dynoCovObjectModifier(gsplatToCovSplat(s));
             float3x3 basis = transpose(float3x3(params.covBasis0.xyz, params.covBasis1.xyz, params.covBasis2.xyz));
             c = transformCovSplat(c, basis, params.translateScale.xyz);
-            c.rgba *= params.recolor;
+            c.rgba *= recolor;
             c = dynoCovWorldModifier(c);
             s.center = c.center;
             s.flags = c.flags;
@@ -161,7 +170,7 @@ void generate(uint3 tid: SV_DispatchThreadID) {
             s.center = quatVec(params.rotate, s.center * scale) + params.translateScale.xyz;
             s.scales *= scale;
             s.quaternion = quatQuat(params.rotate, s.quaternion);
-            s.rgba *= params.recolor;
+            s.rgba *= recolor;
             s = dynoWorldModifier(s);
             if (cov && isActive(s.flags)) {
                 // A Gsplat pipeline into a covariance accumulator.

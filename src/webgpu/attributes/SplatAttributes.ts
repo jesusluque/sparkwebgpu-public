@@ -241,7 +241,10 @@ export class SplatAttributes implements SplatRendererStage {
       const params = UniformWriter.for(gatherModule).setAll({
         numSplats: count,
         outBase: base,
-        flags: mesh.lodIndices ? kernelsAttribGather.GATHER_USE_LOD : 0,
+        flags: mesh.lodIndices
+          ? kernelsAttribGather.GATHER_USE_LOD |
+            (mesh.lodFaded ? kernelsAttribGather.GATHER_LOD_FADE : 0)
+          : 0,
         rotate: [q.x, q.y, q.z, q.w],
       });
       kernel.dispatch(pass, {

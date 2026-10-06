@@ -8,11 +8,12 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-default = ["antisplat", "ksplat", "ply", "rad", "sogs", "spz", "csplat", "gsplat", "tiny_lod", "bhatt_lod"]
+default = ["antisplat", "ksplat", "ply", "rad", "athc", "sogs", "spz", "csplat", "gsplat", "tiny_lod", "bhatt_lod"]
 antisplat = []
 ksplat = []
 ply = []
 rad = ["dep:miniz_oxide"]
+athc = []
 sogs = ["dep:zip", "dep:image"]
 spz = ["dep:miniz_oxide"]
 csplat = []

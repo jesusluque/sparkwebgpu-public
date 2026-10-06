@@ -602,7 +602,10 @@ fn main() -> Result<()> {
     if let Some(r) = thin {
         packed = reduce_thin(&packed, r)?;
     }
-    let file = build_lod(&packed, &options)?;
+    let mut file = build_lod(&packed, &options)?;
+    // v3 keeps the merged levels' whole coverage (athc::coverage_ratios);
+    // a v2 file is written capped at 0.99, as athenea's.
+    spark_lib::athc::uncap_levels(&mut file);
     let build_s = t.elapsed().as_secs_f32() - read_s;
     let compression = if flag("--gzip") {
         COMPRESSION_GZIP

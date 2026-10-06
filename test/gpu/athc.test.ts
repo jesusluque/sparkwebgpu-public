@@ -117,9 +117,22 @@ describe(".athc decode (WASM)", () => {
     expect(splatBase).toBe(65536);
     const m = decode(pages[0]);
     expect(m.numSplats).toBe(merged);
-    expect(Array.from(m.packed.subarray(0, merged * 4))).toEqual(
-      Array.from(whole.packed.subarray(0, merged * 4)),
-    );
+    // The merged nodes as the whole file has them, but for their opacity:
+    // a whole file's levels get their coverage from its splats
+    // (athc.rs coverage_ratios), a v2 page keeps athenea's capped 0.99. The
+    // synthesised root (node 0) merges level 1 by those opacities.
+    const alpha = (w: number) => w >>> 24;
+    for (let k = 1; k < merged; ++k) {
+      const a = m.packed.subarray(k * 4, k * 4 + 4);
+      const b = whole.packed.subarray(k * 4, k * 4 + 4);
+      expect([a[0] & 0xffffff, a[1], a[2], a[3]]).toEqual([
+        b[0] & 0xffffff,
+        b[1],
+        b[2],
+        b[3],
+      ]);
+      expect(alpha(b[0])).toBeGreaterThanOrEqual(alpha(a[0]));
+    }
     const { offset, count } = layout.chunks[0];
     const bytes = count * layout.elementBytes;
     const page = new Uint8Array(160 + bytes);

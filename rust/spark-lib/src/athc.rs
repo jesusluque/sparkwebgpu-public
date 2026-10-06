@@ -569,6 +569,9 @@ impl AthcFile {
         if self.has_curvature() {
             return self.without_curvature().write();
         }
+        if self.over_capped() {
+            return self.capped().write();
+        }
         let first = self.chunks.first().ok_or_else(|| anyhow!("a .athc holds at least one chunk"))?;
         let last_level = &self.levels.last().ok_or_else(|| anyhow!("a .athc holds at least one level"))?.1;
         let mut h = self.header;
@@ -656,6 +659,26 @@ impl AthcFile {
     }
 
     /// The splats of every chunk, as one block.
+    /// Whether a merged opacity is over athenea's 0.99 (`uncap_levels`): a
+    /// level's, or a splat's past 1 (a truncated cloud's splats are merged).
+    pub fn over_capped(&self) -> bool {
+        let over = |b: &AthcBlock, cap: f32| b.positions.chunks_exact(4).any(|p| p[3] > cap);
+        self.levels.iter().any(|(_, b)| over(b, 0.99)) || self.chunks.iter().any(|b| over(b, 1.0))
+    }
+
+    /// Merged opacities at most athenea's 0.99, as a v2 file holds them.
+    pub fn capped(&self) -> Self {
+        let mut out = self.clone();
+        for (b, cap) in out.chunks.iter_mut().map(|b| (b, 1.0)).chain(out.levels.iter_mut().map(|(_, b)| (b, 0.99))) {
+            for p in b.positions.chunks_exact_mut(4) {
+                if p[3] > cap {
+                    p[3] = 0.99;
+                }
+            }
+        }
+        out
+    }
+
     pub fn splats(&self) -> AthcBlock {
         let mut all = AthcBlock::default();
         for c in &self.chunks {
@@ -908,7 +931,8 @@ impl VirtualTree {
 /// The root merged from level 1's groups, as athenea merges a group
 /// (lod_common.slang): weights opacity x the area of the two longest axes,
 /// moments of position and covariance, colours and harmonics by weight,
-/// opacity min(W / own area, 0.99). Everything else is the heaviest group's.
+/// opacity W / own area (athenea caps it at 0.99; see `coverage_ratios`).
+/// Everything else is the heaviest group's.
 pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     let n = level1.n;
     let mut weights = Vec::with_capacity(n);
@@ -972,7 +996,8 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     let scale = values.map(|v| v.max(1e-12).sqrt());
     let mut sorted = scale;
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    let opacity = ((sum_w as f32) / (sorted[0] * sorted[1]).max(1e-20)).min(0.99);
+    // Uncapped: see `coverage_ratios`.
+    let opacity = (sum_w as f32) / (sorted[0] * sorted[1]).max(1e-20);
     let base = base.map(|v| (v / sum_w) as f32);
     let mut root = level1.slice(heaviest, 1);
     root.positions = vec![mu[0] as f32, mu[1] as f32, mu[2] as f32, opacity];
@@ -989,17 +1014,196 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     root
 }
 
-/// The merged nodes in virtual order (root, then every level), one block.
+/// The merged nodes in virtual order (root, then every level), one block,
+/// each widened to tile its cell (`widen_merged`).
 pub fn merged_block(file: &AthcFile, tree: &VirtualTree) -> AthcBlock {
+    let extent = file.header.extent;
     let mut all = if tree.synth_root {
-        merge_root(&file.levels[0].1, file.header.sh_words as usize)
+        let mut root = merge_root(&file.levels[0].1, file.header.sh_words as usize);
+        widen_merged(&mut root, extent);
+        root
     } else {
         AthcBlock::default()
     };
-    for (_, level) in &file.levels {
-        all.append(level);
+    for (level, block) in &file.levels {
+        let mut block = block.clone();
+        widen_merged(&mut block, extent / (1u64 << *level) as f32);
+        all.append(&block);
     }
     all
+}
+
+// --- coverage: merged opacity past athenea's 0.99 ---------------------------
+//
+// athenea gives a group opacity min(W / A, 0.99): W the sum over its splats of
+// opacity x the area of their two longest axes, A its own two-axis area. On a
+// closed shell W / A is 2.5 at the finest level and 10-12 from the third up
+// (the splats overlap several deep), and capping it at 0.99 throws most of the
+// group away: a surface tiled by gaussians of peak 0.99, each its cell wide,
+// is half transparent once a cell is a pixel or less (the antialiasing pays a
+// sub-pixel gaussian back by its mass, 0.99 x 2 pi sigma^2 = 0.52 of its
+// cell). Seen far off, the Corvette's paint let through 12% of what was behind
+// it at 14 m and 26% at 29 m, where its own splats let through 0.04%.
+//
+// So the ratio is kept whole (`coverage_ratios`, `uncap_levels`): a .athc this
+// crate writes as v3 may carry merged opacities above 1, and the decoder turns
+// any opacity above 1 into Spark's LoD opacity (`spark_lod_opacity`), which
+// Spark draws as 1 - (1 - g)^ratio: `ratio` gaussians composited, the way the
+// splats under the group composite. A v2 file is written capped, as athenea's.
+
+/// The two longest of a shape word's three scales, multiplied.
+fn two_axis_area(shape: &[u32]) -> f32 {
+    let mut s = [low_half(shape[1]).exp(), high_half(shape[1]).exp(), low_half(shape[2]).exp()];
+    s.sort_by(|a, b| b.total_cmp(a));
+    s[0] * s[1]
+}
+
+/// Each level's groups' W / A (see above), from the splats up, without
+/// athenea's 0.99: what the group's opacity is before the cap.
+pub fn coverage_ratios(file: &AthcFile) -> Vec<Vec<f32>> {
+    let levels = file.levels.len();
+    let mut weights: Vec<Vec<f64>> = file.levels.iter().map(|(_, b)| vec![0.0; b.n]).collect();
+    if levels == 0 {
+        return Vec::new();
+    }
+    // The finest level: its splats, run after run (chunks are Morton order).
+    let count = file.header.count as usize;
+    let mut g = 0usize;
+    let mut at = 0usize;
+    let finest = &mut weights[levels - 1];
+    for chunk in &file.chunks {
+        for i in 0..chunk.n {
+            while g + 1 < file.starts.len() && file.starts[g + 1] as usize <= at {
+                g += 1;
+            }
+            if g < finest.len() && at < count {
+                let w = chunk.positions[i * 4 + 3].max(0.0) * two_axis_area(&chunk.shape[i * 4..i * 4 + 4]);
+                finest[g] += w as f64;
+            }
+            at += 1;
+        }
+    }
+    // Coarser levels: a group's children are the next level's groups whose
+    // cell code, shifted down three bits, is its own.
+    for l in (0..levels - 1).rev() {
+        let (parents, children) = (&file.levels[l].1.tail, &file.levels[l + 1].1.tail);
+        let mut j = 0;
+        for (i, &code) in parents.iter().enumerate() {
+            let mut w = 0.0;
+            while j < children.len() && children[j] >> 3 == code {
+                w += weights[l + 1][j];
+                j += 1;
+            }
+            weights[l][i] = w;
+        }
+    }
+    file.levels
+        .iter()
+        .zip(&weights)
+        .map(|((_, b), w)| {
+            (0..b.n).map(|i| (w[i] as f32 / two_axis_area(&b.shape[i * 4..i * 4 + 4]).max(1e-30)).max(0.0)).collect()
+        })
+        .collect()
+}
+
+/// Every level's opacities replaced by their uncapped ratio.
+pub fn uncap_levels(file: &mut AthcFile) {
+    let ratios = coverage_ratios(file);
+    for ((_, block), r) in file.levels.iter_mut().zip(ratios) {
+        for (i, o) in r.into_iter().enumerate() {
+            block.positions[i * 4 + 3] = o;
+        }
+    }
+}
+
+/// How far a merged gaussian's two long axes are widened, as a fraction of
+/// its cell's edge added in quadrature (`widen_merged`).
+pub const MERGED_FILL: f32 = 0.35;
+
+/// athenea's merged gaussian is its group's moments: on a flat, evenly
+/// covered cell of edge L its long axes are L / sqrt(12), and a surface tiled
+/// by such gaussians stays open where four cells meet, however opaque each
+/// is (2.45 sigma from every centre). Spark's own merge (gsplat.rs
+/// `new_merged`) widens by half its step; here the two long axes grow by
+/// `MERGED_FILL` x L in quadrature, the thin one is left as it is (a shell
+/// stays a shell), and the opacity is divided by the area gained so the
+/// group keeps its weight -- except that a capped one (athenea's 0.99, a
+/// file whose coverage is not known) stays at least 0.99. Measured on the
+/// Corvette (paint and body, CPU raster of Spark's draw): the light let
+/// through at 58 m goes from 5.2% to 0.6%.
+pub fn widen_merged(block: &mut AthcBlock, edge: f32) {
+    let grow = (MERGED_FILL * edge).powi(2);
+    for i in 0..block.n {
+        let w = &mut block.shape[i * 4..i * 4 + 4];
+        let mut s = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()];
+        let mut order = [0usize, 1, 2];
+        order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+        let before = s[order[0]] * s[order[1]];
+        for &k in &order[..2] {
+            s[k] = (s[k] * s[k] + grow).sqrt();
+        }
+        let after = s[order[0]] * s[order[1]];
+        w[1] = pack_halves(s[0].ln(), s[1].ln());
+        w[2] = pack_halves(s[2].ln(), high_half(w[2]));
+        let o = &mut block.positions[i * 4 + 3];
+        let widened = *o * before / after.max(1e-30);
+        *o = if *o >= 0.98 { widened.max(0.99) } else { widened };
+    }
+}
+
+/// Spark's LoD opacity for an opacity `o` past 1 (tsplat.rs
+/// `encode_lod_opacity`): D = sqrt(1 + e ln o), at most 5, stored as
+/// 1 + (D - 1) / 4, which the draw reads as a gaussian composited `o` times.
+/// At most 1 it is `o` itself.
+pub fn spark_lod_opacity(o: f32) -> f32 {
+    if o.is_nan() || o <= 1.0 {
+        return o;
+    }
+    let d = (1.0 + std::f32::consts::E * o.ln()).sqrt().min(5.0);
+    1.0 + 0.25 * (d - 1.0)
+}
+
+/// The cloud as its levels from the coarsest down to level index `keep`
+/// (0 the coarsest), whose groups become the splats: the full cloud less its
+/// finest detail, each kept group merged as athenea merges (its attributes
+/// too) and with its whole coverage (`uncap_levels`).
+pub fn truncate_levels(file: &AthcFile, keep: usize) -> Result<AthcFile> {
+    if keep == 0 || keep >= file.levels.len() {
+        bail!("keep levels 1 .. {} as merged levels (asked {})", file.levels.len() - 1, keep);
+    }
+    let mut full = file.clone();
+    uncap_levels(&mut full);
+    let mut splats = full.levels[keep].1.clone();
+    // The kept groups are drawn as splats, never through `merged_block`:
+    // widened here, once.
+    widen_merged(&mut splats, full.header.extent / (1u64 << full.levels[keep].0) as f32);
+    let parents = &full.levels[keep - 1].1.tail;
+    let mut starts = Vec::with_capacity(parents.len());
+    let mut j = 0;
+    for &code in parents {
+        starts.push(j as u32);
+        while j < splats.n && splats.tail[j] >> 3 == code {
+            splats.tail[j] = starts.len() as u32 - 1;
+            j += 1;
+        }
+    }
+    if j != splats.n {
+        bail!("level {} has groups without a parent", keep);
+    }
+    let per = file.header.chunk_splats.max(1) as usize;
+    let chunks: Vec<AthcBlock> = (0..splats.n).step_by(per).map(|s| splats.slice(s, per.min(splats.n - s))).collect();
+    let mut out = AthcFile {
+        header: full.header,
+        extra: full.extra,
+        levels: full.levels[..keep].to_vec(),
+        starts,
+        chunks,
+    };
+    out.header.count = splats.n as u32;
+    out.header.chunks = out.chunks.len() as u32;
+    out.header.levels = keep as u32;
+    out.header.finest_groups = out.levels[keep - 1].1.n as u32;
+    Ok(out)
 }
 
 // --- ATHV: one page of a virtual tree --------------------------------------
@@ -1170,7 +1374,8 @@ pub fn emit_block<T: SplatReceiver>(
             let e = done + i;
             let p = &block.positions[e * 4..e * 4 + 4];
             center[i * 3..i * 3 + 3].copy_from_slice(&p[..3]);
-            opacity[i] = p[3];
+            // Past 1 (merged coverage, `coverage_ratios`): Spark's LoD opacity.
+            opacity[i] = spark_lod_opacity(p[3]);
             let s = &block.shape[e * 4..e * 4 + 4];
             quat[i * 4..i * 4 + 4].copy_from_slice(&decode_quaternion(s[0]));
             scale[i * 3] = low_half(s[1]).exp();
@@ -1257,8 +1462,8 @@ pub fn emit_block<T: SplatReceiver>(
 
 fn begin<T: SplatReceiver>(receiver: &mut T, num_splats: usize, h: &AthcHeader, x: &ExtraHeader) -> Result<()> {
     // A LoD tree: receivers mark the encoding lodOpacity, which is what makes
-    // the loader treat the result as LoD splats. athenea's merged opacities
-    // stay at most 0.99, so the extended range goes unused.
+    // the loader treat the result as LoD splats, and keeps opacities up to 2:
+    // merged coverage past 1 (`spark_lod_opacity`).
     receiver.init_splats(&SplatInit { num_splats, max_sh_degree: h.sh_degree(), lod_tree: true })?;
     let specs = attrib_specs(h, x);
     if !specs.is_empty() {
@@ -1300,6 +1505,9 @@ impl<T: SplatReceiver> AthcDecoder<T> {
         };
         drop(bytes);
         let (h, x) = (file.header, file.extra);
+        // The whole file is here, splats too: the merged levels get their
+        // whole coverage, whatever a v2 file capped (`coverage_ratios`).
+        uncap_levels(&mut file);
         let tree = VirtualTree::of_file(&file, false)?;
         let merged = merged_block(&file, &tree);
         begin(&mut self.splats, (tree.merged + h.count) as usize, &h, &x)?;
@@ -1592,6 +1800,80 @@ mod tests {
     }
 
     #[test]
+    fn coverage_past_one_is_sparks_lod_opacity() {
+        assert_eq!(spark_lod_opacity(0.4), 0.4);
+        assert_eq!(spark_lod_opacity(1.0), 1.0);
+        // Spark draws stored s > 1 as D = 4 s - 3 and 1 - (1 - g)^exp((D^2 - 1) / e):
+        // the ratio comes back as the exponent.
+        for o in [1.5f32, 3.0, 12.0, 100.0] {
+            let d = 4.0 * spark_lod_opacity(o) - 3.0;
+            assert!((((d * d - 1.0) / std::f32::consts::E).exp() - o).abs() < 1e-3 * o, "{o}");
+        }
+        assert_eq!(spark_lod_opacity(1e9), 2.0);
+    }
+
+    #[test]
+    fn levels_keep_their_coverage_in_v3_and_cap_it_in_v2() {
+        let mut file = AthcFile::read(TWO_CARDS).unwrap();
+        let capped = file.clone();
+        uncap_levels(&mut file);
+        let ratios = coverage_ratios(&file);
+        // The uncapped ratio is the capped opacity wherever that was under the cap.
+        for ((_, b), r) in capped.levels.iter().zip(&ratios) {
+            for i in 0..b.n {
+                let was = b.positions[i * 4 + 3];
+                if was < 0.98 {
+                    assert!((r[i] - was).abs() < 2e-2 * was.max(0.05), "{} {}", r[i], was);
+                } else {
+                    assert!(r[i] >= 0.98 - 1e-3);
+                }
+            }
+        }
+        assert!(file.over_capped(), "two cards: overlapping splats cover past 1");
+        let v3 = crate::athc_v3::read_v3(&crate::athc_v3::write_v3(&file, crate::athc_v3::COMPRESSION_NONE).unwrap()).unwrap();
+        for ((_, a), (_, b)) in v3.levels.iter().zip(&file.levels) {
+            assert_eq!(a.positions, b.positions);
+        }
+        let v2 = AthcFile::read(&file.write().unwrap()).unwrap();
+        assert!(!v2.over_capped());
+        // Splats as they were (at most 1); only merged opacities are capped.
+        assert_eq!(v2.chunks, file.chunks);
+    }
+
+    #[test]
+    fn truncated_levels_are_a_cloud_of_merged_splats() {
+        let file = AthcFile::read(TWO_CARDS).unwrap();
+        let keep = file.levels.len() - 1;
+        let cut = truncate_levels(&file, keep).unwrap();
+        let kept = &file.levels[keep].1;
+        assert_eq!(cut.header.count as usize, kept.n);
+        assert_eq!(cut.levels.len(), keep);
+        // The levels kept are the file's, with their whole coverage.
+        for ((la, a), (lb, b)) in cut.levels.iter().zip(&file.levels) {
+            assert_eq!((la, &a.shape, &a.tail), (lb, &b.shape, &b.tail));
+        }
+        // Each new splat's tail is its parent group, and starts are where
+        // each parent's run begins.
+        let splats = cut.splats();
+        for g in 0..cut.starts.len() {
+            let end = if g + 1 < cut.starts.len() { cut.starts[g + 1] } else { cut.header.count };
+            assert!(end > cut.starts[g]);
+            assert!(splats.tail[cut.starts[g] as usize..end as usize].iter().all(|&t| t == g as u32));
+        }
+        // Their coverage is kept whole, through v3 and the decoder.
+        let ratios = coverage_ratios(&file);
+        assert!(ratios[keep].iter().any(|&o| o > 1.0));
+        let bytes = crate::athc_v3::write_v3(&cut, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let back = crate::athc_v3::read_v3(&bytes).unwrap();
+        assert_eq!(back.splats().positions, splats.positions);
+        let out = decode(&bytes);
+        let tree = VirtualTree::of_file(&back, false).unwrap();
+        assert_eq!(out.opacity.len(), (tree.merged + cut.header.count) as usize);
+        assert!(out.opacity[tree.merged as usize..].iter().any(|&a| a > 1.0));
+        assert!(out.opacity.iter().all(|&a| a <= 2.0));
+    }
+
+    #[test]
     fn athv_pages_decode_as_the_whole_file() {
         let whole = decode(TWO_CARDS);
         let layout = AthcLayout::parse(TWO_CARDS, TWO_CARDS.len() as u64).unwrap();
@@ -1601,7 +1883,11 @@ mod tests {
         let merged = decode(&pages[0]);
         let m = tree.merged as usize;
         assert_eq!(merged.opacity.len(), m);
-        assert_eq!(merged.center[..], whole.center[..m * 3]);
+        // A synthesised root merges level 1 by opacity: the whole file has
+        // the levels' uncapped coverage (`coverage_ratios`), a page of a v2
+        // file its capped opacities, so the root may sit elsewhere.
+        let from = if tree.synth_root { 3 } else { 0 };
+        assert_eq!(merged.center[from..], whole.center[from..m * 3]);
         assert_eq!(merged.child_count[..], whole.child_count[..m]);
         // Children of the finest groups point at page 1, where the splats are.
         for k in 0..m {

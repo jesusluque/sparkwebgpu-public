@@ -34,6 +34,19 @@ Before generate, a pass of the plugin (`passes`):
 
 generate's colour plugin (`relight_colour.slang`, preset `athenea-relight`) then takes that colour, in linear light, encoded for Spark's draw. Draw into a HalfFloat target and end with `atheneaOutputPlugin`, as with the raster plugin.
 
+### Curvature: the lens, the slope and the sharp lobes
+
+A cloud converted with its curvature (`usd-athc` writes athenea's `primvars:athenea:splat:curvature` as the `.athc` v3 section `CURV`, see [athc v3](athc-v3.md#the-curvature-curv); the attribute `curvature`) is drawn as athenea's raster draws it:
+
+- **A solid glass is a lens.** The mean curvature on the face the eye sees gives `lensExit` the far face of the sphere it stands for: through the pawn's head the room bends twice and turns over, where without it it bends once. This needs the transfer's reflected field (a transfer of 112 values, or 84): where the field reads open the sharp sky along the bent ray stands, elsewhere the field. The pawn pages load the glass head with its full transfer (`?topTransfer=`) for this.
+- **The reflection turns across a splat** (`SplatSlope`): with the frame's projection (the camera and the size of the last target drawn, `WgpuSplatRenderer.lastDrawSize`), the pass finds the normal a pixel right and a pixel down from the shape operator, as `splat_project` does, and `relitSplat` answers either the colour's slope across the footprint or, for a coat under roughness 0.2 and a polish under 0.5 (the glass, the body's glaze), the mirror and its turn. Those records (athenea's `slopes` and `sharpPolish`, and the centre in pixels) go with the splat: generate's colour plugin copies them to the splat's accumulator slot (`SplatColourInput.outIndex`), and the plugin's blend term (`AtheneaRelightBlend`, in the draw and the tile rasteriser) shades each pixel as `splat_blend` does: the slope over the step from the centre, or the first dome's prefiltered sky read again along the mirror this pixel turns to, with the sun through each lobe (`sunReflectPdf`). The colour Spark carries keeps the centre's reading of a sharp lobe (athenea takes it out at the projection) and the blend takes it out, so no colour goes negative in Spark's accumulator.
+
+The first frame has no target size yet and draws without the slope; every later frame has it.
+
+### Paged clouds
+
+A splat whose transfer page a paged pool has not brought (`attribResident`, as `athcTransferResident`) is not relit: it keeps its captured colour (relit alpha -2: generate keeps its rgba) and hands the draw nothing per pixel, until the page arrives. The kept terms skip it too.
+
 The streams are read from the mesh's attribute pool by name (`normalOct`, `pbr`, `lobes`, `emission`, `transfer`, `shadowBits`). athenea's functions index the pool directly: a transfer starts at its attribute's word times two (halves), the cells at the `shadowBits` word. A paged pool (`gpuBuffer`) is bound as it is.
 
 Per transfer, the kernel is athenea's: a TX transfer with cells (`kTransfer` 2: field, cells, sun through the cells, light bounce), the first transfer (1), or none (0: the dome's harmonics and map and the lights alone).
@@ -58,7 +71,8 @@ Per transfer, the kernel is athenea's: a TX transfer with cells (`kTransfer` 2: 
 
 ## Differences from the native raster
 
-- **Per-pixel slope and the sharp coat** need the cloud's curvature, which neither `.athc` v2 nor v3 carries: every lobe is read at the splat's centre (`noSlope`), as athenea draws a cloud without curvature. The same missing curvature is why a glass head bends once rather than as a lens (the pawn's top, ratio 0.917).
+- **Curvature** comes only with a v3 `.athc` that carries `CURV` (`usd-athc` from athenea's USD); a cloud without it reads every lobe at the splat's centre (`noSlope`) and its glass bends once, as athenea draws a cloud without curvature.
+- **Tinted thin glass** (athenea's proposal 075, an RGB transmittance in the blend): not in athenea's Slang at 89a04d9 (a proposal), and no cloud here carries a transmission colour. Spark's hardware blend keeps one transmittance a pixel; an RGB one needs dual-source blending (`dual-source-blending`, Chrome) or the tile rasteriser, a per-splat transmission colour (a `.athc` stream or a table per material) and a mark in the draw's record. The pawn's head is clear solid glass, which 075 leaves as it is.
 - **The colour's harmonics** beyond the constant term are not read (the clouds athenea converts from meshes are degree 0).
 - **Rays**: nothing is traced (no shadow factors, traced reflections or glass exits), as in athenea's raster.
 - **IES profiles**: the lights module's tables are bound but empty; lights are spheres, disks, rects, cylinders and distant lights.

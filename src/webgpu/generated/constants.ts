@@ -28,6 +28,7 @@ export const atheneaAdapterRelight = {
   kRelightCache: 32,
   kRelightGroup: 256,
   kRelightStride: 2,
+  kCatcherDepth: 6.2831853,
 } as const;
 
 /** slang/core/attrib.slang */

@@ -16,6 +16,9 @@
 // times two (halves, low first, as transferAt reads them) and its cells at
 // the shadowBits attribute's word, so athenea indexes the pool directly.
 //
+// A shadow catcher (atheneaRelightCatcher) is drawn black at the opacity
+// splat_project's catcherOpacity gives it.
+//
 // What it does not do here: per-pixel slope and the sharp coat need the
 // cloud's curvature, which a .athc does not carry (noSlope: every lobe is
 // read at the splat's centre); the colour's harmonics beyond the constant
@@ -274,6 +277,92 @@ void relightAt<let kTransfer : int>(uint i) {
         return;
     }
     relit[i * kRelightStride] = asuint(relitColour<kTransfer>(i));
+}
+
+/// splat_project's catcherOpacity (a shadow catcher, athenea mesh2splat
+/// --shadow-catcher): what the object took of the light reaching a ground
+/// gaussian, as the opacity that takes as much out of what is drawn behind
+/// it. Over the cells of its open directions, the sky's radiance from the
+/// harmonics times the cosine and the cell's solid angle, with the object
+/// (the open cells) and without it (every cell above the surface), and the
+/// sun through the same bits on the first side alone.
+static const float kCatcherDepth = 6.2831853;
+
+float catcherOpacity(uint i, float3x3 r, float3 scale, float opacity) {
+    const uint words = shadowWords();
+    if (words < 8u) {
+        return 0.0;
+    }
+    const uint dome = firstDome();
+    if (dome == kEnvNone) {
+        return 0.0;
+    }
+    const float3 n = relightNormalToWorld(relightParams.row0, relightParams.row1, relightParams.row2,
+                                          storedFacing(r, scale, i));
+    const uint side = splatCellSide(words);
+    const uint base = cellBaseOf(i);
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    float sky[16];
+    [unroll] for (uint k = 0; k < 16u; ++k) {
+        sky[k] = dot(envSh[dome * kEnvCoefficients + k].rgb, luma);
+    }
+    float with = 0.0;
+    float without = 0.0;
+    for (uint cell = 0; cell < side * side; ++cell) {
+        const float2 uv = (float2(float(cell % side), float(cell / side)) + 0.5) / float(side);
+        const float3 d = octDecode(uv);
+        const float cosine = dot(n, d);
+        if (!(cosine > 0.0)) {
+            continue;
+        }
+        float radiance = 0.0;
+        [unroll] for (uint k = 0; k < 16u; ++k) {
+            radiance += sky[k] * envBasisValue(k, d);
+        }
+        const float l1 = abs(d.x) + abs(d.y) + abs(d.z);
+        const float worth = max(radiance, 0.0) * cosine * (4.0 / float(side * side)) * l1 * l1 * l1;
+        without += worth;
+        if (((relightPool[base + (cell >> 5u)] >> (cell & 31u)) & 1u) != 0u) {
+            with += worth;
+        }
+    }
+    const float4 disc = envSun[dome * 2];
+    if (disc.w > 0.0) {
+        const float facing = max(dot(n, disc.xyz), 0.0);
+        const float sun = dot(envSun[dome * 2 + 1].rgb, luma) * facing;
+        const float2 at = octEncode(disc.xyz) * float(side) - 0.5;
+        const float2 lo = floor(at);
+        const float2 f = at - lo;
+        float open = 0.0;
+        float weight = 0.0;
+        [unroll] for (uint k = 0; k < 4; ++k) {
+            const int2 c = clamp(int2(lo) + int2(k & 1, k >> 1), int2(0), int2(int(side) - 1));
+            const float wk = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y);
+            if (wk <= 0.0 || dot(octDecode((float2(c) + 0.5) / float(side)), n) <= 0.0) {
+                continue;
+            }
+            const uint index = uint(c.y) * side + uint(c.x);
+            open += wk * float((relightPool[base + (index >> 5u)] >> (index & 31u)) & 1u);
+            weight += wk;
+        }
+        with += sun * (weight > 0.0 ? open / weight : 1.0);
+        without += sun;
+    }
+    const float ratio = saturate(with / max(without, 1.0e-6));
+    return opacity * saturate(-log(max(ratio, 1.0e-4)) / kCatcherDepth);
+}
+
+/// A shadow catcher's splats: black, as opaque as what the object took.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaRelightCatcher(uint3 tid: SV_DispatchThreadID) {
+    const uint i = tid.x;
+    if (i >= relightParams.count) {
+        return;
+    }
+    const Gsplat g = readSplat(i);
+    const float alpha = isActive(g.flags) ? catcherOpacity(i, splatRotation(g.quaternion), g.scales, g.rgba.a) : 0.0;
+    relit[i * kRelightStride] = asuint(float4(0.0, 0.0, 0.0, alpha));
 }
 
 /// The kept terms (splatTransferViewless), when the sky, the lights, the

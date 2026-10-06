@@ -106,6 +106,12 @@ export interface AtheneaRelightPlugin extends SplatPlugin {
    * does not carry; a glass pawn's head is 1.5), over options.ior.
    */
   setIor(asset: object, ior: number): void;
+  /**
+   * `asset` is a shadow catcher (athenea mesh2splat --shadow-catcher): drawn
+   * black, as opaque as what the object took of the light reaching it
+   * (splat_project's catcherOpacity, through its open-direction cells).
+   */
+  setCatcher(asset: object, catcher: boolean): void;
   /** The prepared dome (after the first frame). */
   readonly sky: AtheneaSky | null;
   /** Dispatches so far. */
@@ -190,6 +196,9 @@ export function atheneaRelightPlugin(
   };
   const linear = new WeakMap<object, boolean>();
   const iors = new WeakMap<object, number>();
+  const catchers = new WeakMap<object, boolean>();
+  const isCatcher = (mesh: WgpuSplatMesh) =>
+    keysOf(mesh).some((k) => catchers.get(k) === true);
   const states = new WeakMap<WgpuSplatMesh, MeshState>();
   const stats = { relit: 0, viewless: 0, skies: 0 };
   let renderer: WgpuSplatRenderer | null = null;
@@ -405,6 +414,17 @@ export function atheneaRelightPlugin(
       identity(mesh.lodIndices),
       storedLinear,
     ].join("|");
+    if (isCatcher(mesh)) {
+      if (state.relitKey === placed) return;
+      r.registry.get(relightModule, "atheneaRelightCatcher").dispatch(pass, {
+        grid: [source.count],
+        buffers,
+        uniforms: params.data,
+      });
+      state.relitKey = placed;
+      stats.relit += 1;
+      return;
+    }
     const kept = kTransfer >= 2 && envLights > 0;
     if (kept && state.viewlessKey !== placed) {
       r.registry.get(relightModule, "atheneaRelightViewless").dispatch(pass, {
@@ -551,6 +571,10 @@ export function atheneaRelightPlugin(
       dirty = true;
     },
     storedLinearOf: lookupLinear,
+    setCatcher(asset, catcher) {
+      catchers.set(asset, catcher);
+      dirty = true;
+    },
     setIor(asset, ior) {
       iors.set(asset, ior);
       dirty = true;

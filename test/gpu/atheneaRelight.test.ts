@@ -666,4 +666,158 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     host.detach();
     splats.dispose();
   }, 120_000);
+  it("draws a shadow catcher as athenea's catcherOpacity", async () => {
+    // Ground splats facing +Y, each with its own open cells.
+    const M = 6;
+    const ga = new Uint32Array(M * 4);
+    const gb = new Uint32Array(M * 4);
+    const q = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(1, 0, 0),
+      -Math.PI / 2,
+    );
+    const ground: number[] = [];
+    const r2 = random(11);
+    for (let i = 0; i < M; i++) {
+      encodeExtSplat(
+        [ga, gb],
+        i,
+        i * 0.3,
+        -1,
+        0,
+        0.2,
+        0.2,
+        0.01,
+        q.x,
+        q.y,
+        q.z,
+        q.w,
+        0.9,
+        0.5,
+        0.5,
+        0.5,
+      );
+      for (let w = 0; w < CELLS; w++) {
+        ground.push(
+          i === 0 ? 0xffffffff : i === 1 ? 0 : (r2() * 4294967296) >>> 0,
+        );
+      }
+    }
+    const catcher = GpuSplatSource.fromExt(d, ga, gb, M);
+    catcher.setAttribute("transfer", new Array(M * 16).fill(0), "f16", 16);
+    catcher.setAttribute("shadowBits", ground, "u32", CELLS);
+    const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+      depthTest: false,
+      alwaysGenerate: true,
+    });
+    const mesh = splats.add(catcher);
+    const host = new PluginHost({ capabilities: splats.capabilities, tier: 2 });
+    const relight = atheneaRelightPlugin({
+      hdri: sky(256, 128),
+      rotation: 0.3,
+    });
+    relight.setCatcher(mesh, true);
+    host.register(relight).attach(splats);
+    await host.ready();
+    splats.render(camera, target);
+    await d.queue.onSubmittedWorkDone();
+    const relit = relight.buffers?.("splat", { frame: null, mesh })
+      .atheneaRelit as GPUBuffer;
+    const got = new Float32Array(await read(relit));
+    const { sh, sun: disc } = await (relight.sky as AtheneaSky).read();
+    // splat_project's catcherOpacity, in JS.
+    const octDecode = (u: number, v: number) => {
+      const fx = u * 2 - 1;
+      const fy = v * 2 - 1;
+      const n = new THREE.Vector3(fx, fy, 1 - Math.abs(fx) - Math.abs(fy));
+      const t = Math.min(Math.max(-n.z, 0), 1);
+      n.x += n.x >= 0 ? -t : t;
+      n.y += n.y >= 0 ? -t : t;
+      return n.normalize();
+    };
+    const octEncode = (n: THREE.Vector3) => {
+      const l1 = Math.abs(n.x) + Math.abs(n.y) + Math.abs(n.z);
+      let p = [n.x / l1, n.y / l1];
+      if (n.z / l1 < 0)
+        p = [
+          (1 - Math.abs(p[1])) * (p[0] >= 0 ? 1 : -1),
+          (1 - Math.abs(p[0])) * (p[1] >= 0 ? 1 : -1),
+        ];
+      return p.map((c) => c * 0.5 + 0.5);
+    };
+    const Y16 = (k: number, v: THREE.Vector3) => {
+      const { x, y, z } = v;
+      const c = [
+        -0.5900435899266435 * y * (3 * x * x - y * y),
+        2.890611442640554 * x * y * z,
+        -0.4570457994644658 * y * (4 * z * z - x * x - y * y),
+        0.3731763325901154 * z * (2 * z * z - 3 * x * x - 3 * y * y),
+        -0.4570457994644658 * x * (4 * z * z - x * x - y * y),
+        1.445305721320277 * z * (x * x - y * y),
+        -0.5900435899266435 * x * (x * x - 3 * y * y),
+      ];
+      return k < 9 ? Y(k, v) : c[k - 9];
+    };
+    const luma = (r: number, g: number, b: number) =>
+      0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const skyL = Array.from({ length: 16 }, (_, k) =>
+      luma(sh[4 * k], sh[4 * k + 1], sh[4 * k + 2]),
+    );
+    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+    const side = 16;
+    for (let i = 0; i < M; i++) {
+      const bit = (cell: number) =>
+        (ground[i * CELLS + (cell >> 5)] >>> (cell & 31)) & 1;
+      let withO = 0;
+      let without = 0;
+      for (let cell = 0; cell < side * side; cell++) {
+        const dir = octDecode(
+          ((cell % side) + 0.5) / side,
+          (Math.floor(cell / side) + 0.5) / side,
+        );
+        const cosine = n.dot(dir);
+        if (!(cosine > 0)) continue;
+        let radiance = 0;
+        for (let k = 0; k < 16; k++) radiance += skyL[k] * Y16(k, dir);
+        const l1 = Math.abs(dir.x) + Math.abs(dir.y) + Math.abs(dir.z);
+        const worth =
+          Math.max(radiance, 0) * cosine * (4 / (side * side)) * l1 ** 3;
+        without += worth;
+        if (bit(cell)) withO += worth;
+      }
+      if (disc[3] > 0) {
+        const s = new THREE.Vector3(disc[0], disc[1], disc[2]);
+        const sunL = luma(disc[4], disc[5], disc[6]) * Math.max(n.dot(s), 0);
+        const at = octEncode(s).map((c) => c * side - 0.5);
+        const lo = at.map(Math.floor);
+        const f = [at[0] - lo[0], at[1] - lo[1]];
+        let open = 0;
+        let weight = 0;
+        for (let k = 0; k < 4; k++) {
+          const cx = Math.min(Math.max(lo[0] + (k & 1), 0), side - 1);
+          const cy = Math.min(Math.max(lo[1] + (k >> 1), 0), side - 1);
+          const wk = (k & 1 ? f[0] : 1 - f[0]) * (k >> 1 ? f[1] : 1 - f[1]);
+          if (
+            wk <= 0 ||
+            octDecode((cx + 0.5) / side, (cy + 0.5) / side).dot(n) <= 0
+          )
+            continue;
+          open += wk * bit(cy * side + cx);
+          weight += wk;
+        }
+        withO += sunL * (weight > 0 ? open / weight : 1);
+        without += sunL;
+      }
+      const ratio = Math.min(Math.max(withO / Math.max(without, 1e-6), 0), 1);
+      const want =
+        0.9 *
+        Math.min(Math.max(-Math.log(Math.max(ratio, 1e-4)) / 6.2831853, 0), 1);
+      expect(got.slice(8 * i, 8 * i + 3)).toEqual(new Float32Array(3));
+      expect(Math.abs(got[8 * i + 3] - want)).toBeLessThan(2e-3);
+    }
+    // All open: nothing taken; all closed: as dark as the layer gets.
+    expect(got[3]).toBeLessThan(1e-3);
+    expect(got[8 + 3]).toBeCloseTo(0.9, 2);
+    host.detach();
+    splats.dispose();
+  }, 120_000);
 });

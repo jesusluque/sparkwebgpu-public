@@ -22,7 +22,7 @@ struct AthcTestParams {
 
 StructuredBuffer<uint> pool;
 // Per splat: normal (3), emission (3), pbr (4), lobes (13), transfer[0],
-// transfer[last], shadow word 0, 0: 28 floats.
+// transfer[last], shadow word 0, transfer resident (1/0), 0: 28 floats.
 RWStructuredBuffer<float> decoded;
 ConstantBuffer<AthcTestParams> params;
 
@@ -73,6 +73,6 @@ void athcDecode(uint3 tid: SV_DispatchThreadID) {
     decoded[o + 23u] = athcTransfer(pool, ids, i, 0u);
     decoded[o + 24u] = athcTransfer(pool, ids, i, params.transferCount > 0u ? params.transferCount - 1u : 0u);
     decoded[o + 25u] = asfloat(athcShadowWord(pool, ids, i, 0u));
-    decoded[o + 26u] = 0.0;
+    decoded[o + 26u] = athcTransferResident(pool, ids, i) ? 1.0 : 0.0;
     decoded[o + 27u] = 0.0;
 }

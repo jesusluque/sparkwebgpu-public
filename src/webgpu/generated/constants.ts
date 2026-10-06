@@ -17,6 +17,8 @@ export const coreAttrib = {
   ATTRIB_U32: 6,
   ATTRIB_NONE: 4294967295,
   ATTRIB_DIRECTION: 1,
+  ATTRIB_PAGED: 2,
+  ATTRIB_PAGE_SHIFT: 16,
 } as const;
 
 /** slang/core/math.slang */

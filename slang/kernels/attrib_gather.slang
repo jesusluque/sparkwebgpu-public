@@ -52,7 +52,14 @@ void gatherAttribs(uint3 tid: SV_DispatchThreadID) {
         AttribDesc src = attribDesc(srcAttribs, s);
         bool turn = (src.flags & ATTRIB_DIRECTION) != 0u;
         if (src.format == dst.format && src.components == dst.components && !turn) {
+            // A paged attribute not resident: zeros, as readAttrib gives.
             uint srcBase = attribBase(srcAttribs, src, index);
+            if (srcBase == ATTRIB_NONE) {
+                for (uint w = 0u; w < words; w++) {
+                    drawAttribs[dstBase + w] = 0u;
+                }
+                continue;
+            }
             for (uint w = 0u; w < words; w++) {
                 drawAttribs[dstBase + w] = srcAttribs[srcBase + w];
             }

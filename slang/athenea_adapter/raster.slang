@@ -79,7 +79,7 @@ public SplatOverride atheneaOverrideFor(uint2 groups, out float opacity) {
 /// none (no override applies).
 public uint2 atheneaGroups(uint index) {
     const uint id = atheneaRaster.groupId;
-    if (id == ATTRIB_NONE) {
+    if (id == ATTRIB_NONE || !attribResident(atheneaPool, id, index)) {
         return uint2(0xFFFFFFFFu);
     }
     return uint2(readAttribU(atheneaPool, id, index, 0u), readAttribU(atheneaPool, id, index, 1u));

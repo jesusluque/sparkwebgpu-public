@@ -787,3 +787,47 @@ pub fn decode_rad_header(bytes: Uint8Array) -> Result<JsValue, JsValue> {
     }
 }
 stub_fn!(feature = "rad", decode_rad_header);
+
+/// The bytes of a .athc that `athc_layout` needs (through its tables), from
+/// at least its first page; throws when `bytes` is not a .athc header.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athc_prefix_bytes(bytes: Uint8Array) -> Result<f64, JsValue> {
+    spark_lib::athc::AthcLayout::prefix_bytes(&bytes.to_vec())
+        .map(|n| n as f64)
+        .map_err(|e| JsValue::from(e.to_string()))
+}
+stub_fn!(feature = "athc", athc_prefix_bytes);
+
+/// A .athc's headers and tables (AthcLayout) plus `levelsEnd`, the bytes a
+/// stream reads before any chunk, from the file's first bytes.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athc_layout(prefix: Uint8Array, file_bytes: f64) -> Result<JsValue, JsValue> {
+    let layout = spark_lib::athc::AthcLayout::parse(&prefix.to_vec(), file_bytes as u64)
+        .map_err(|e| JsValue::from(e.to_string()))?;
+    let object = serde_wasm_bindgen::to_value(&layout)?;
+    Reflect::set(&object, &JsValue::from_str("levelsEnd"), &JsValue::from_f64(layout.levels_end() as f64))?;
+    let attribs = spark_lib::athc::attrib_specs(&layout.header, &layout.extra);
+    Reflect::set(&object, &JsValue::from_str("attribSpecs"), &serde_wasm_bindgen::to_value(&attribs)?)?;
+    Ok(object)
+}
+stub_fn!(feature = "athc", athc_layout);
+
+/// The paged virtual tree of a .athc (spark-lib athc::VirtualTree, splats
+/// from the first page boundary after the merged nodes) and its merged
+/// pages as ATHV blobs, from the file's bytes through `levelsEnd`.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athc_merged_pages(prefix: Uint8Array, file_bytes: f64) -> Result<JsValue, JsValue> {
+    let (tree, pages) = spark_lib::athc::athv_merged_pages(&prefix.to_vec(), file_bytes as u64)
+        .map_err(|e| JsValue::from(e.to_string()))?;
+    let object = serde_wasm_bindgen::to_value(&tree)?;
+    let array = Array::new();
+    for page in pages {
+        array.push(&Uint8Array::from(&page[..]));
+    }
+    Reflect::set(&object, &JsValue::from_str("pages"), &array)?;
+    Ok(object)
+}
+stub_fn!(feature = "athc", athc_merged_pages);

@@ -1467,6 +1467,10 @@ mod tests {
     /// A cloud carrying every stream, with athenea's test values
     /// (test_lod.cpp, "a transfer and a material go through ... a .athc").
     fn every_stream() -> AthcFile {
+        every_stream_of(70_000)
+    }
+
+    fn every_stream_of(count: u32) -> AthcFile {
         const ONE: u32 = 0x3C00_3C00; // two halves of 1.0
         const OPEN: u32 = 0xFFFF_FFFF;
         const MATERIAL: u32 = 0x00FF_8040;
@@ -1493,7 +1497,6 @@ mod tests {
             b.tail = tail;
             b
         };
-        let count = 70_000; // two chunks of athenea's default size
         let starts: Vec<u32> = (0..8).map(|g| g * (count / 8)).collect();
         let splat_groups: Vec<u32> = (0..count).map(|s| (s / (count / 8)).min(7)).collect();
         let mut header = AthcHeader {
@@ -1513,7 +1516,10 @@ mod tests {
             extra: ExtraHeader { transfer_count: 112, ..Default::default() },
             levels: vec![(1, block(1, vec![0])), (2, block(8, (0..8).collect()))],
             starts,
-            chunks: vec![all.slice(0, 65536), all.slice(65536, count as usize - 65536)],
+            chunks: (0..count as usize)
+                .step_by(65536)
+                .map(|at| all.slice(at, (count as usize - at).min(65536)))
+                .collect(),
         }
     }
 
@@ -1565,6 +1571,18 @@ mod tests {
         keep.push(&bytes).unwrap();
         keep.finish().unwrap();
         assert_eq!(keep.into_splats().rgb[v * 3], 0.25);
+    }
+
+    /// test/fixtures/athc/every_stream.athc is this cloud of 300 splats:
+    /// the GPU and browser tests read it. ATHC_WRITE_FIXTURES=1 rewrites it.
+    #[test]
+    fn every_stream_fixture_is_current() {
+        let bytes = every_stream_of(300).write().unwrap();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/every_stream.athc");
+        if std::env::var("ATHC_WRITE_FIXTURES").is_ok() {
+            std::fs::write(path, &bytes).unwrap();
+        }
+        assert!(std::fs::read(path).unwrap() == bytes, "stale fixture: ATHC_WRITE_FIXTURES=1 cargo test");
     }
 
     #[test]

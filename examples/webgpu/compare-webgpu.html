@@ -86,13 +86,14 @@
       if (++frames >= 30 && window.__lodState !== undefined || (!lodDriver && frames === 30)) window.__ready = true;
     });
     // Throughput: the normal animation loop for `seconds`, the object turning
-    // every frame; frames counted (run Chrome without vsync to uncap it).
-    window.__fps = (seconds) =>
+    // `spin` radians every frame (0: still, the draw alone); frames counted
+    // (run Chrome without vsync to uncap it).
+    window.__fps = (seconds, spin = 0.01) =>
       new Promise((resolve) => {
         let count = 0;
         const t0 = performance.now();
         renderer.setAnimationLoop(() => {
-          holder.rotation.y += 0.01;
+          holder.rotation.y += spin;
           lodDriver?.update(camera);
           renderer.render(scene, camera);
         splats.render(camera);

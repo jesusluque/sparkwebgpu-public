@@ -95,6 +95,11 @@ export {
   atheneaRasterPlugin,
 } from "./athenea/rasterPlugin";
 export {
+  type AtheneaPick,
+  atheneaGroupOf,
+  pickAtheneaGroup,
+} from "./athenea/pick";
+export {
   type AthcLayout,
   type AthcPaging,
   readAthcLayout,

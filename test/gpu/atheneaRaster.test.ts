@@ -20,9 +20,16 @@ import {
   type WgpuSplatRendererOptions,
 } from "../../src/webgpu/WgpuSplatRenderer";
 import {
+  atheneaGroupOf,
+  pickAtheneaGroup,
+} from "../../src/webgpu/athenea/pick";
+import {
   type AtheneaGroupOverride,
   atheneaRasterPlugin,
 } from "../../src/webgpu/athenea/rasterPlugin";
+import { SplatAttributes } from "../../src/webgpu/attributes/SplatAttributes";
+import { AttribPool } from "../../src/webgpu/attributes/schema";
+import { upload } from "../../src/webgpu/gpuBuffers";
 import { PluginHost } from "../../src/webgpu/plugins";
 import { device } from "./device";
 
@@ -276,5 +283,56 @@ describe.skipIf(!device)("athenea raster plugin", () => {
     expect(worst(got, want)).toBeLessThan(2e-3);
     const plain = athenea(LAYERS, false, [], 2);
     expect(worst(got, plain)).toBeGreaterThan(5e-2);
+  });
+
+  it("picks finest groups through the id target, hidden ranges picked through", async () => {
+    const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+      depthTest: false,
+      alwaysGenerate: true,
+    });
+    const mesh = splats.add(stack(LAYERS));
+    const host = new PluginHost({ capabilities: splats.capabilities });
+    const raster = atheneaRasterPlugin();
+    host.register(raster).attach(splats);
+    await host.ready();
+    const attributes = new SplatAttributes(splats, { targets: { id: true } });
+    const frame = async () => {
+      for (let k = 0; k < 2; k++) {
+        clear();
+        splats.render(camera, target);
+        await d.queue.onSubmittedWorkDone();
+      }
+    };
+    await frame();
+    // The nearest splat covers the centre past pickAlpha (0.45 > 0.3).
+    let hit = await pickAtheneaGroup(attributes, W / 2, H / 2);
+    expect(hit?.mesh).toBe(mesh);
+    expect(hit?.groups).toEqual([0, 1]);
+    // Hide it: the pick goes through to the next group.
+    raster.setOverrides(mesh, [{ groups: hit?.groups ?? [0, 1], opacity: 0 }]);
+    await frame();
+    hit = await pickAtheneaGroup(attributes, W / 2, H / 2);
+    expect(hit?.groups).toEqual([1, 2]);
+    attributes.dispose();
+    host.detach();
+    splats.dispose();
+  });
+
+  it("reads a paged pool's group back from the GPU", async () => {
+    const pool = new AttribPool(5);
+    pool.setAttribute("normalOct", [1, 2, 3, 4, 5], "u32");
+    pool.setAttribute(
+      "athcGroup",
+      [0, 9, 9, 10, 10, 11, 11, 12, 12, 13],
+      "u32",
+      2,
+    );
+    // As PagedAttribPool keeps it: packed on the GPU, columns empty.
+    pool.gpuBuffer = upload(d, pool.pack().words, "paged");
+    for (const c of pool.columns) c.words = new Uint32Array(0);
+    const mesh = { source: { attribs: pool } } as never;
+    expect(await atheneaGroupOf(d, mesh, 3)).toEqual([11, 12]);
+    expect(await atheneaGroupOf(d, mesh, 0)).toEqual([0, 9]);
+    pool.gpuBuffer.destroy();
   });
 });

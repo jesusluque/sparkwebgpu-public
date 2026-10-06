@@ -37,8 +37,8 @@ async function open(): Promise<GPUDevice | null> {
 export const device = await open();
 
 /**
- * A second device on the same adapter with the adapter's storage-buffer
- * count (what splatRequiredLimits asks for), for kernels past the default
+ * A second device with the adapter's storage-buffer count and binding size
+ * (what splatRequiredLimits asks for), for kernels past the default
  * eight (the athenea relight pass binds ten); null where there is none.
  */
 let wideAdapter: GPUAdapter | null = null;
@@ -51,7 +51,12 @@ export const wideDevice: GPUDevice | null = await (async () => {
     if (!wideAdapter || most <= 8) return null;
     return await wideAdapter.requestDevice({
       requiredFeatures: [...device.features] as GPUFeatureName[],
-      requiredLimits: { maxStorageBuffersPerShaderStage: most },
+      requiredLimits: {
+        maxStorageBuffersPerShaderStage: most,
+        maxStorageBufferBindingSize:
+          wideAdapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: wideAdapter.limits.maxBufferSize,
+      },
     });
   } catch {
     return null;

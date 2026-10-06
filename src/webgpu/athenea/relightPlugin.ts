@@ -101,6 +101,11 @@ export interface AtheneaRelightPlugin extends SplatPlugin {
   /** Whether `asset`'s stored colours are linear light (else sRGB-encoded). */
   setStoredLinear(asset: object, linear: boolean): void;
   storedLinearOf(mesh: WgpuSplatMesh): boolean;
+  /**
+   * `asset`'s index of refraction (athenea's per-cloud `ior`, which a .athc
+   * does not carry; a glass pawn's head is 1.5), over options.ior.
+   */
+  setIor(asset: object, ior: number): void;
   /** The prepared dome (after the first frame). */
   readonly sky: AtheneaSky | null;
   /** Dispatches so far. */
@@ -184,6 +189,7 @@ export function atheneaRelightPlugin(
     emission: 1,
   };
   const linear = new WeakMap<object, boolean>();
+  const iors = new WeakMap<object, number>();
   const states = new WeakMap<WgpuSplatMesh, MeshState>();
   const stats = { relit: 0, viewless: 0, skies: 0 };
   let renderer: WgpuSplatRenderer | null = null;
@@ -204,6 +210,14 @@ export function atheneaRelightPlugin(
       if (v !== undefined) return v;
     }
     return pagedStoredLinear(mesh) ?? false;
+  };
+
+  const iorOf = (mesh: WgpuSplatMesh) => {
+    for (const k of keysOf(mesh)) {
+      const v = iors.get(k);
+      if (v !== undefined) return v;
+    }
+    return options.ior;
   };
 
   const records = (): AtheneaLightRecord[] => {
@@ -356,7 +370,7 @@ export function atheneaRelightPlugin(
       shadowBits: id("shadowBits"),
       transferCount,
       shadowWords,
-      ior: options.ior,
+      ior: iorOf(mesh),
       emissionScale: options.emission,
       encoding: source.encoding,
       row0: row(0),
@@ -401,7 +415,7 @@ export function atheneaRelightPlugin(
       state.viewlessKey = placed;
       stats.viewless += 1;
     }
-    const key = `${placed}|${eye.toArray().join()}|${options.ior}|${options.emission}`;
+    const key = `${placed}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
@@ -537,6 +551,10 @@ export function atheneaRelightPlugin(
       dirty = true;
     },
     storedLinearOf: lookupLinear,
+    setIor(asset, ior) {
+      iors.set(asset, ior);
+      dirty = true;
+    },
     ui: [
       {
         id: "intensity",

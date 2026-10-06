@@ -271,6 +271,90 @@ describe.skipIf(!device)("WgpuSplatRenderer features", () => {
     expect(meanDiff(plain, skinned)).toBeLessThan(0.5);
   });
 
+  it("follows the whole Jacobian of a linear blend with weightGradients", async () => {
+    // Bone 1 moves by T; its weight is a ramp in x, w = a x + b. The blend
+    // p + w(p) T is then the affine map A = [I + T (a, 0, 0)^T | b T], so
+    // with the weights' gradients the skinned cloud is the cloud under A
+    // (a shear here); without them its splats only move.
+    const list = grid();
+    const T = [0, 0.5, 0];
+    const a = 0.6;
+    const b = 0.5;
+    const skinned = async (gradients: boolean) => {
+      const skinning = new SplatSkinning({
+        mesh: { numSplats: list.length } as never,
+        numBones: 2,
+        mode: SplatSkinningMode.LINEAR_BLEND,
+        weightGradients: gradients,
+      });
+      list.forEach((g, i) => {
+        const w = a * g.center[0] + b;
+        skinning.setSplatBones(
+          i,
+          new THREE.Vector4(0, 1, 0, 0),
+          new THREE.Vector4(1 - w, w, 0, 0),
+        );
+        if (gradients) {
+          skinning.setSplatWeightGradients(
+            i,
+            new THREE.Vector3(-a, 0, 0),
+            new THREE.Vector3(a, 0, 0),
+            new THREE.Vector3(),
+          );
+        }
+      });
+      skinning.setRestMatrix(0, new THREE.Matrix4());
+      skinning.setRestMatrix(1, new THREE.Matrix4());
+      skinning.setBoneMatrix(
+        1,
+        new THREE.Matrix4().makeTranslation(T[0], T[1], T[2]),
+      );
+      skinning.skinTexture.needsUpdate = true;
+      skinning.boneTexture.needsUpdate = true;
+      skinning.gradientTexture.needsUpdate = true;
+      const modifier = dynoBlock(
+        { covsplat: CovSplat },
+        { covsplat: CovSplat },
+        ({ covsplat }) => ({ covsplat: skinning.modifyCov(covsplat as never) }),
+      );
+      return render(list, { covSplats: true }, undefined, {
+        covObjectModifiers: [modifier],
+      });
+    };
+    // The cloud under A, by hand: centres moved, each covariance sheared
+    // (J = I + T (a, 0, 0)^T mixes x into y: its 2x2 in xy diagonalised).
+    const sheared = list.map((g) => {
+      const [sx, sy, sz] = g.scales;
+      const k = a * T[1];
+      const c00 = sx * sx;
+      const c01 = k * sx * sx;
+      const c11 = k * k * sx * sx + sy * sy;
+      const angle = 0.5 * Math.atan2(2 * c01, c00 - c11);
+      const mean = 0.5 * (c00 + c11);
+      const radius = Math.hypot(0.5 * (c00 - c11), c01);
+      const q = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 0, 1),
+        angle,
+      );
+      const y = g.center[1] + (a * g.center[0] + b) * T[1];
+      return {
+        ...g,
+        center: [g.center[0], y, g.center[2]],
+        scales: [Math.sqrt(mean + radius), Math.sqrt(mean - radius), sz],
+        quat: q.toArray(),
+      };
+    });
+    const affine = await render(sheared, {});
+    const whole = await skinned(true);
+    const blend = await skinned(false);
+    expect(lit(affine)).toBeGreaterThan(W * H * 0.1);
+    // 8-bit weights move a splat by up to |T| / 510.
+    expect(meanDiff(affine, whole)).toBeLessThan(0.3);
+    expect(meanDiff(affine, blend)).toBeGreaterThan(
+      5 * meanDiff(affine, whole),
+    );
+  });
+
   it("draws zero-scale splats as 2D Gaussians with enable2DGS", async () => {
     // Flat in z, seen nearly face-on: the 2D splat covers what the projected
     // 3D one does, without the anti-aliasing blur.

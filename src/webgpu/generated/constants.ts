@@ -64,6 +64,16 @@ export const atheneaAdapterRelightColour = {
   kPixel: 2,
 } as const;
 
+/** slang/athenea_adapter/skin.slang */
+export const atheneaAdapterSkin = {
+  kSkinExt: 1,
+  kSkinJacobian: 2,
+  kSkinNormals: 4,
+  kSkinRest: 8,
+  kSkinDispatchRow: 16776960,
+  kEps: 0.00001,
+} as const;
+
 /** slang/core/attrib.slang */
 export const coreAttrib = {
   ATTRIB_F32: 0,

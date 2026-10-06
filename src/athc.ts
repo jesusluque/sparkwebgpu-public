@@ -18,7 +18,7 @@
 // the pager's (WgpuSplatPager.streamsToFetch); a page that did not fetch a
 // stream group fetches it later on its own (fetchAthcStreams), one Range.
 
-import { athc_layout, athc_prefix_bytes } from "spark-rs";
+import { athc_layout, athc_prefix_bytes, athc_skeleton } from "spark-rs";
 import { workerPool } from "./SplatWorker";
 import * as wasm from "./wasm";
 import type { AttribFormat, AttributeSpec } from "./webgpu/attributes/schema";
@@ -91,7 +91,16 @@ export type AthcLayout = {
 
 /** A v3 section (athc_v3.rs Section). */
 export type AthcSection = {
-  id: "CORE" | "SHRS" | "MATL" | "SHAD" | "CURV" | "TXDI" | "TXIN" | "TXFD";
+  id:
+    | "CORE"
+    | "SHRS"
+    | "SKIN"
+    | "MATL"
+    | "SHAD"
+    | "CURV"
+    | "TXDI"
+    | "TXIN"
+    | "TXFD";
   tier: number;
   encoding: number;
   compression: number;
@@ -188,6 +197,10 @@ export function athcNeeds(
     case "CORE":
     case "SHRS":
       return true;
+    // A skinned cloud's rig (athc_skin.rs): read whole-file only for now;
+    // a paged skinned cloud is drawn in its bind pose.
+    case "SKIN":
+      return false;
     case "MATL":
       return want.material;
     case "SHAD":
@@ -291,6 +304,40 @@ export async function readAthcLayout(
   }
   const layout = athc_layout(prefix, total) as AnyAthcLayout;
   return { layout, prefix: prefix.subarray(0, Math.max(need, 136)) };
+}
+
+/** One animation of a skinned .athc (athc_skin.rs SkinClip). */
+export type AthcSkinClip = {
+  name: string;
+  timeCodesPerSecond: number;
+  /** Time codes of the samples, increasing. */
+  times: Float32Array;
+  /** samples x joints x 16: each joint's transform, USD rows (p' = p M). */
+  xforms: Float32Array;
+};
+
+/**
+ * The skeleton of a skinned .athc v3 (athenea's AtheneaSplatSkinningAPI /
+ * UsdSkel binding as usd-athc writes it; docs/docs/athc-v3.md, SKIN).
+ */
+export type AthcSkeleton = {
+  /** Influences a splat (attribute skinInfluences, u32 each). */
+  influences: number;
+  /** Gradient words a splat (attribute skinGradients), 0 or influences - 1. */
+  gradientWords: number;
+  joints: string[];
+  skeleton: string;
+  /** skel:geomBindTransform, USD rows. */
+  geomBind: Float32Array;
+  clips: AthcSkinClip[];
+};
+
+/** The skeleton of a skinned .athc (null when it has none), from its tables. */
+export async function readAthcSkeleton(
+  options: FetchOptions,
+): Promise<AthcSkeleton | null> {
+  const { prefix } = await readAthcLayout(options);
+  return athc_skeleton(prefix) as AthcSkeleton | null;
 }
 
 /** Merged nodes and the virtual index of the first splat (athc.rs VirtualTree). */

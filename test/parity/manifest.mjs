@@ -600,6 +600,7 @@ export const cases = [
     "dyno",
     [
       ...DYNO.map((scene) => ({ id: scene, query: `?scene=${scene}&t=1` })),
+      { id: "skin-jacobian", query: "?scene=skin&jacobian=1&t=1" },
       { id: "effect-cov", query: "?scene=effect&cov=1&t=1" },
     ],
     {

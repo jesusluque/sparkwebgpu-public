@@ -31,6 +31,8 @@ pub mod athc_v3;
 #[cfg(feature = "athc")]
 pub mod athc_build;
 #[cfg(feature = "athc")]
+pub mod athc_skin;
+#[cfg(feature = "athc")]
 pub mod athl;
 pub mod decoder;
 pub mod splat_encode;

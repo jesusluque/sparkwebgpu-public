@@ -61,6 +61,8 @@ public static const uint kRelightNoCells = 128u;   // debug: the open-direction 
 public static const uint kRelightDebugPlace = 512u;      // debug view: a smooth colour of the place
 public static const uint kRelightDebugNormal = 1024u;    // debug view: the shading normal
 public static const uint kRelightDebugFootprint = 2048u; // debug view: the footprint's spread, the coat roughness
+public static const uint kRelightCullBacks = 4096u;      // opaque splats whose stored face looks away are not drawn
+public static const uint kRelightFootprintPixel = 8192u; // the footprint prefilter knows the frame: its pixel term
 public static const uint kRelightGroup = 256;
 /// Five uint4 a splat in `relit`: the colour (asuint float4: linear rgb,
 /// alpha, -1 to keep the splat's alpha, -2 to keep its whole rgba), the
@@ -101,6 +103,8 @@ public struct AtheneaRelightParams {
     public float4 view2;
     public float4 focal;           ///< pixels: focal x, focal y (negative: rows go down), centre x, centre y
     public float4 viewport;        ///< width, height in pixels
+    public float4 filter;          ///< x: the footprint's clamp (kappa), y: the facing below which a back is
+                                   ///< culled (kRelightCullBacks), z: the pixel filter's variance (px^2)
 };
 
 StructuredBuffer<uint4>              relightSrc;
@@ -331,22 +335,87 @@ bool projectForSlope(Gsplat g, float3x3 r, out float3 tx3, out float3 ty3, out f
 /// paint's coat) is point-sampled once a splat, and where it changes faster
 /// than the splats are spaced the draw shows the splats' layout as a fixed
 /// moire (the light Corvette's 9 mm merged cells: the doors' reflected bands
-/// combed across, 2.5 px apart at 4k). So the lobes are widened by the spread of the
-/// normal over the gaussian, as a mipmap widens a texel's filter (Toksvig):
-/// with the shape operator S in the splat's first two axes, the normal
-/// turns by S e_u per unit along u, and its variance over the gaussian is
-/// su^2 |S e_u|^2 + sv^2 |S e_v|^2; GGX's alpha (roughness^2) grows by
-/// `gain` times its square root in quadrature, at most 1. A splat small
-/// against the curvature (the detailed cloud) keeps its roughness.
-public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain) {
+/// combed across, 2.5 px apart at 4k). So the lobes are filtered over the
+/// spread of the normal, as geometric specular anti-aliasing does over a
+/// pixel (Kaplanyan et al. 2016, Tokuyoshi & Kaplanyan 2019): in slope
+/// space the NDF is convolved with the footprint's slope distribution, and
+/// for GGX/Beckmann that adds twice its variance to alpha^2 (alpha =
+/// roughness^2), clamped by kappa so a crease (a huge |S|) widens to a
+/// rough lobe, not to a diffuse one.
+///
+/// Two footprints, the larger counts: the splat's (`shapeUV`, the shape
+/// operator S in its first two axes: the normal's variance over the
+/// gaussian is su^2 |S e_u|^2 + sv^2 |S e_v|^2) and the pixel's
+/// (`pixelVariance`: the pixel filter's variance times |dn/dx|^2 + |dn/dy|^2,
+/// what a splat smaller than a pixel stands for; 0 when the frame is not
+/// known). `gain` is per standard deviation: sqrt(2) is the filtered GGX's,
+/// 0 none. A splat small against the curvature and the pixel (the detailed
+/// cloud close up) keeps its roughness.
+public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain, float kappa,
+                                float pixelVariance) {
     const float su = scales.x;
     const float sv = scales.y;
-    const float variance = su * su * (shapeUV.x * shapeUV.x + shapeUV.y * shapeUV.y) +
-                           sv * sv * (shapeUV.y * shapeUV.y + shapeUV.z * shapeUV.z);
+    const float splatVariance = su * su * (shapeUV.x * shapeUV.x + shapeUV.y * shapeUV.y) +
+                                sv * sv * (shapeUV.y * shapeUV.y + shapeUV.z * shapeUV.z);
+    const float variance = max(max(splatVariance, pixelVariance), 0.0);
     const float alpha = roughness * roughness;
-    const float add = gain * sqrt(max(variance, 0.0));
-    const float widened = min(sqrt(alpha * alpha + add * add), 1.0);
-    return isfinite(widened) ? max(sqrt(widened), roughness) : roughness;
+    const float add = min(gain * gain * variance, kappa);
+    const float widened = min(alpha * alpha + add, 1.0);
+    const float r = sqrt(sqrt(widened));
+    return isfinite(r) ? max(r, roughness) : roughness;
+}
+
+/// How the normal turns a pixel right and a pixel down (in the cloud's
+/// space, from the shape operator), splat_project's SplatSlope steps:
+/// false where the splat is edge-on to the eye.
+bool normalTurnPerPixel(float3x3 r, float3 shapeUV, float3 cloudNormal, float3 tx3, float3 ty3, out float3 dx,
+                        out float3 dy) {
+    dx = float3(0.0);
+    dy = float3(0.0);
+    const float3 u = float3(r[0][0], r[1][0], r[2][0]);
+    const float3 v = float3(r[0][1], r[1][1], r[2][1]);
+    const float2x2 toPixels = float2x2(dot(tx3, u), dot(tx3, v), dot(ty3, u), dot(ty3, v));
+    const float det = toPixels[0][0] * toPixels[1][1] - toPixels[0][1] * toPixels[1][0];
+    if (!(abs(det) > 1.0e-12)) {
+        return false;
+    }
+    const float2 stepX = float2(toPixels[1][1], -toPixels[1][0]) / det;
+    const float2 stepY = float2(-toPixels[0][1], toPixels[0][0]) / det;
+    const float2x2 shapeOf = float2x2(shapeUV.x, shapeUV.y, shapeUV.y, shapeUV.z);
+    const float3 axis = float3(r[0][2], r[1][2], r[2][2]);
+    const float side = dot(cloudNormal, axis) >= 0.0 ? 1.0 : -1.0;
+    const float2 turnX = mul(shapeOf, stepX) * side;
+    const float2 turnY = mul(shapeOf, stepY) * side;
+    dx = u * turnX.x + v * turnX.y;
+    dy = u * turnY.x + v * turnY.y;
+    return true;
+}
+
+/// THE RUNTIME BACK-FACE REJECT (kRelightCullBacks): a solidified panel is
+/// baked as a shell with two faces (the Corvette's paint: 3 mm, the inner
+/// face dark), and where the splats are as wide as the shell is thick the
+/// centre sort interleaves them, so the inner face shows through the outer
+/// one as a moire (what usd-athc --drop-backs, athc_build::drop_hidden_backs,
+/// removes offline). An opaque splat (no transmission, not a thin sheet)
+/// whose stored face -- the one its transfer was measured for, the mesh's
+/// normal where the cloud keeps it -- looks away from the eye by more than
+/// relightParams.filter.y (a cosine, below 0: some slack for normals that
+/// merged cells over a crease turned) is a back face of a closed surface,
+/// hidden by the front one: it is not drawn (alpha 0; generate's cull then
+/// gives it no sort slot). athenea draws it (its backFacing only bends glass).
+bool culledBack(uint i, Gsplat g, float3x3 r) {
+    if (hasAttr(relightParams.pbr)) {
+        const uint pbr = poolWord(relightParams.pbr, i, 0u);
+        if (pbrTransmission(pbr) > 0.0 || pbrThinWalled(pbr)) {
+            return false;
+        }
+    }
+    const float3 toEye = relightParams.eyeObject.xyz - g.center;
+    const float far = length(toEye);
+    if (!(far > 0.0)) {
+        return false;
+    }
+    return dot(storedFacing(r, g.scales, i), toEye / far) < relightParams.filter.y;
 }
 
 /// What a relit splat shows the eye (splat_project's projectSplat colour
@@ -366,6 +435,9 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
         return float4(0.0, 0.0, 0.0, kRelightKeepAll);
     }
     const float3x3 r = splatRotation(g.quaternion);
+    if (hasFlag(kRelightCullBacks) && culledBack(i, g, r)) {
+        return float4(0.0);
+    }
     const float3 colour = cloudLight(g.rgba.rgb, hasFlag(kRelightLinear));
     const bool hasNormals = hasAttr(relightParams.normalOct);
     const float3 cloudNormal = splatShadingNormal(r, g.scales, g.center, relightParams.eyeObject.xyz, hasNormals,
@@ -395,34 +467,35 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
         const float faces = dot(cloudNormal, axisN) >= 0.0 ? 1.0 : -1.0;
         slope.curvature = faces * 0.5 * (shapeUV.x + shapeUV.z);
     }
-    // Without the per-pixel slope, the splat's one colour stands for its
-    // whole footprint: its lobes widened by how the normal turns over it.
-    if (curved && !hasFlag(kRelightSlope) && relightParams.footprint > 0.0) {
-        const float gain = relightParams.footprint;
-        surface.roughness = footprintRoughness(surface.roughness, shapeUV, g.scales, gain);
-        surface.lobes.coatRoughness = footprintRoughness(surface.lobes.coatRoughness, shapeUV, g.scales, gain);
-    }
+    // The frame's projection, where the pass knows it: the per-pixel slope
+    // (kRelightSlope) and the footprint prefilter's pixel term.
     float3 tx3, ty3;
-    if (curved && hasFlag(kRelightSlope) && shadowWords() >= 8u && transferCount() >= 9u &&
-        projectForSlope(g, r, tx3, ty3, centre, cov)) {
+    const bool projected = curved && (hasFlag(kRelightSlope) || hasFlag(kRelightFootprintPixel)) &&
+                           projectForSlope(g, r, tx3, ty3, centre, cov);
+    float3 dx = float3(0.0);
+    float3 dy = float3(0.0);
+    const bool turns = projected && normalTurnPerPixel(r, shapeUV, cloudNormal, tx3, ty3, dx, dy);
+    // The footprint prefilter: the lobes widened by how the normal turns
+    // over what the splat's one colour stands for. Without the per-pixel
+    // slope that is its gaussian, or the pixel where the splat is smaller;
+    // with it (the draw reads the sharp lobes per pixel) the pixel alone.
+    if (curved && relightParams.footprint > 0.0) {
+        const float gain = relightParams.footprint;
+        const float kappa = relightParams.filter.x;
+        const float pixelVariance = turns ? relightParams.filter.z * (dot(dx, dx) + dot(dy, dy)) : 0.0;
+        const float3 shape = hasFlag(kRelightSlope) ? float3(0.0) : shapeUV;
+        if (!hasFlag(kRelightSlope) || pixelVariance > 0.0) {
+            surface.roughness = footprintRoughness(surface.roughness, shape, g.scales, gain, kappa, pixelVariance);
+            surface.lobes.coatRoughness =
+                footprintRoughness(surface.lobes.coatRoughness, shape, g.scales, gain, kappa, pixelVariance);
+        }
+    }
+    if (turns && hasFlag(kRelightSlope) && shadowWords() >= 8u && transferCount() >= 9u) {
         const float4 w0 = relightParams.row0;
         const float4 w1 = relightParams.row1;
         const float4 w2 = relightParams.row2;
-        const float3 u = float3(r[0][0], r[1][0], r[2][0]);
-        const float3 v = float3(r[0][1], r[1][1], r[2][1]);
-        const float2x2 toPixels = float2x2(dot(tx3, u), dot(tx3, v), dot(ty3, u), dot(ty3, v));
-        const float det = toPixels[0][0] * toPixels[1][1] - toPixels[0][1] * toPixels[1][0];
-        if (abs(det) > 1.0e-12) {
-            const float2 stepX = float2(toPixels[1][1], -toPixels[1][0]) / det;
-            const float2 stepY = float2(-toPixels[0][1], toPixels[0][0]) / det;
-            const float2x2 shapeOf = float2x2(shapeUV.x, shapeUV.y, shapeUV.y, shapeUV.z);
-            const float3 axis = float3(r[0][2], r[1][2], r[2][2]);
-            const float side = dot(cloudNormal, axis) >= 0.0 ? 1.0 : -1.0;
-            const float2 turnX = mul(shapeOf, stepX) * side;
-            const float2 turnY = mul(shapeOf, stepY) * side;
+        {
             const float most = 0.5;
-            const float3 dx = u * turnX.x + v * turnX.y;
-            const float3 dy = u * turnY.x + v * turnY.y;
             const float3 hx = dx * min(1.0, most / max(length(dx), 1.0e-9));
             const float3 hy = dy * min(1.0, most / max(length(dy), 1.0e-9));
             slope.on = true;
@@ -493,7 +566,8 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     } else if (hasFlag(kRelightDebugNormal)) {
         light = 0.02 * (surface.normal * 0.5 + 0.5);
     } else if (hasFlag(kRelightDebugFootprint)) {
-        light = curved ? 0.02 * float3(footprintRoughness(0.0, shapeUV, g.scales, 1.0), surface.lobes.coatRoughness, 0.0)
+        light = curved ? 0.02 * float3(footprintRoughness(0.0, shapeUV, g.scales, 1.0, 1.0, 0.0),
+                                       surface.lobes.coatRoughness, 0.0)
                        : float3(0.0, 0.0, 0.02);
     }
     if (mark > 0.0) {

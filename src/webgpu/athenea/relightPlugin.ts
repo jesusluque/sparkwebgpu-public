@@ -59,14 +59,37 @@ import {
 
 export const ATHENEA_RELIGHT_ID = "athenea.relight";
 /**
- * The footprint prefilter's default gain (AtheneaRelightOptions.footprint;
- * relight.slang footprintRoughness). Measured on the light Corvette's door
- * (golden_gate_hills, the page's camera, a 4k frame's window), against the
- * detailed cloud blurred alike: the 0.7-2 px band from 20.6% of the mean to
- * 5.7% (the detailed cloud 4.1%), the gap to the detailed cloud from 4.7%
- * to 3.9% (0.35: 4.1%, 1: 4.6%, 2: 7.3%); the detailed cloud moves 0.2%.
+ * The footprint prefilter's default gain per standard deviation of the
+ * normal's spread (AtheneaRelightOptions.footprint; relight.slang
+ * footprintRoughness: alpha^2 grows by min(gain^2 variance, clamp)).
+ * Filtered GGX's own gain is sqrt(2) (FOOTPRINT_GAIN_GGX: alpha^2 grows by
+ * twice the slope variance, Kaplanyan et al. 2016) for a colour that stands
+ * for its whole footprint; here the draw blends each pixel from several
+ * overlapping splats shaded at their centres, which already averages much of
+ * the normal's spread, and the residual wants less. Measured on the light
+ * Corvette's door (golden_gate_hills, athenea's camera at 1.5x), 0.7-2 px
+ * band of the upper door at 1080p / the door in a 4k window, and the gap to
+ * the detailed cloud after a 3 px blur: off 43.1% / 20.6% (4.7%); 0.5
+ * 7.4% / 5.7% (4.0%); 1 7.8% / 6.2% (6.7%); sqrt(2) 7.9% / 6.3% (8.2%);
+ * sqrt(2) with kappa 0.18 14.2% / 8.2% (9.8%).
  */
 export const FOOTPRINT_GAIN = 0.5;
+/** Filtered GGX's gain (Kaplanyan et al. 2016, Tokuyoshi & Kaplanyan 2019). */
+export const FOOTPRINT_GAIN_GGX = Math.SQRT2;
+/**
+ * The most the footprint prefilter adds to GGX's alpha^2 by default: 1, no
+ * clamp short of a diffuse lobe. Tokuyoshi & Kaplanyan's kappa
+ * (FOOTPRINT_CLAMP_GGX, 0.18: a crease widens to roughness 0.65 at most)
+ * leaves the light Corvette's merged cells along the door's character line
+ * combed (the band at 14% instead of 7-8%): those cells do stand for normals
+ * spread over a crease.
+ */
+export const FOOTPRINT_CLAMP = 1;
+export const FOOTPRINT_CLAMP_GGX = 0.18;
+/** The pixel filter's variance in px^2 for the prefilter's pixel term. */
+export const FOOTPRINT_PIXEL_VARIANCE = 0.25;
+/** The facing (cosine) below which cullBacks drops an opaque splat. */
+export const CULL_BACKS_FACING = -0.2;
 /** Storage buffers the relight kernel binds. */
 export const RELIGHT_STORAGE_BUFFERS = 10;
 
@@ -123,6 +146,31 @@ export interface AtheneaRelightOptions {
    * (0: off; default FOOTPRINT_GAIN).
    */
   footprint?: number;
+  /**
+   * The most the prefilter adds to alpha^2 (default FOOTPRINT_CLAMP, 1;
+   * FOOTPRINT_CLAMP_GGX is filtered GGX's kappa).
+   */
+  footprintClamp?: number;
+  /**
+   * The prefilter's pixel term (geometric specular AA): once the frame's
+   * size is known, the normal's spread over the pixel filter (variance
+   * FOOTPRINT_PIXEL_VARIANCE px^2) where it is larger than over the splat
+   * (a splat smaller than its pixel), and with pixelDetail the pixel's
+   * alone. Default false: on the light Corvette's door at 1080p it moved
+   * the band from 7.4% to 7.9% and the gap to the detailed cloud at 4k from
+   * 4.0% to 5.0%; the relight also reruns when the camera only turns.
+   */
+  footprintPixel?: boolean;
+  /**
+   * Opaque splats (no transmission, not thin) whose stored normal faces
+   * away from the eye are not drawn: the hidden inner face of a solidified
+   * shell, which the centre sort interleaves with the outer one (the
+   * runtime counterpart of usd-athc --drop-backs). Not athenea's (it draws
+   * them); default false.
+   */
+  cullBacks?: boolean;
+  /** The facing (cosine to the eye) below which cullBacks drops a splat. */
+  cullBacksFacing?: number;
   /** For investigations: the lighting's parts left out, or a debug view. */
   debug?: AtheneaRelightDebug;
   /**
@@ -289,6 +337,10 @@ export function atheneaRelightPlugin(
     emission: 1,
     pixelDetail: false,
     footprint: FOOTPRINT_GAIN,
+    footprintClamp: FOOTPRINT_CLAMP,
+    footprintPixel: false,
+    cullBacks: false,
+    cullBacksFacing: CULL_BACKS_FACING,
     frame: null,
   };
   const linear = new WeakMap<object, boolean>();
@@ -534,6 +586,12 @@ export function atheneaRelightPlugin(
     const p = camera.projectionMatrix.elements;
     const slopeOn =
       options.pixelDetail && Boolean(size) && id("curvature") !== ATTRIB_NONE;
+    // The footprint prefilter's pixel term needs the frame too.
+    const footprintPixelOn =
+      options.footprint > 0 &&
+      options.footprintPixel &&
+      Boolean(size) &&
+      id("curvature") !== ATTRIB_NONE;
     const toEye = new THREE.Matrix4().multiplyMatrices(
       camera.matrixWorldInverse,
       object.matrixWorld,
@@ -566,6 +624,8 @@ export function atheneaRelightPlugin(
       (options.litBody ? C.kRelightLit : 0) |
       (options.indirect ? C.kRelightIndirect : 0) |
       (slopeOn ? C.kRelightSlope : 0) |
+      (footprintPixelOn ? C.kRelightFootprintPixel : 0) |
+      (options.cullBacks ? C.kRelightCullBacks : 0) |
       (options.debug?.noCells ? C.kRelightNoCells : 0) |
       (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
     const e = world.elements;
@@ -595,6 +655,12 @@ export function atheneaRelightPlugin(
       eyeObject: [eyeObject.x, eyeObject.y, eyeObject.z, 1],
       eyeWorld: [eye.x, eye.y, eye.z, 1],
       ...projection,
+      filter: [
+        options.footprintClamp,
+        options.cullBacksFacing,
+        FOOTPRINT_PIXEL_VARIANCE,
+        0,
+      ],
     });
     emptyPool ??= upload(device, new Uint32Array([0, 0, 4, 0]), "relight pool");
     const buffers = {
@@ -609,9 +675,11 @@ export function atheneaRelightPlugin(
       iesRecords: (ies as { records: GPUBuffer }).records,
       iesValues: (ies as { values: GPUBuffer }).values,
     };
+    // The kept terms do not depend on the per-eye options.
+    const eyeFlags = C.kRelightCullBacks | C.kRelightFootprintPixel;
     const placed = [
       lightsVersion,
-      flags,
+      flags & ~eyeFlags,
       options.indirect,
       options.litBody,
       e.join(),
@@ -644,7 +712,7 @@ export function atheneaRelightPlugin(
       state.viewlessKey = placed;
       stats.viewless += 1;
     }
-    const key = `${placed}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${slopeOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
+    const key = `${placed}|${flags & eyeFlags}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
@@ -824,6 +892,13 @@ export function atheneaRelightPlugin(
       if (o.emission !== undefined) options.emission = o.emission;
       if (o.pixelDetail !== undefined) options.pixelDetail = o.pixelDetail;
       if (o.footprint !== undefined) options.footprint = o.footprint;
+      if (o.footprintClamp !== undefined)
+        options.footprintClamp = o.footprintClamp;
+      if (o.footprintPixel !== undefined)
+        options.footprintPixel = o.footprintPixel;
+      if (o.cullBacks !== undefined) options.cullBacks = o.cullBacks;
+      if (o.cullBacksFacing !== undefined)
+        options.cullBacksFacing = o.cullBacksFacing;
       if (o.debug !== undefined) options.debug = { ...o.debug };
       if (o.frame !== undefined) options.frame = o.frame;
       if (skyChanged && sky) sky.dirty = true;

@@ -796,6 +796,76 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     host.detach();
     splats.dispose();
   }, 120_000);
+  it("culls the opaque splats whose stored face looks away (cullBacks)", async () => {
+    const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+      depthTest: false,
+      alwaysGenerate: true,
+    });
+    const src = source();
+    const mesh = splats.add(src, object);
+    const host = new PluginHost({ capabilities: splats.capabilities, tier: 2 });
+    const relight = atheneaRelightPlugin({
+      hdri: sky(256, 128),
+      sun,
+      lights,
+      ior: 1.5,
+      cullBacks: true,
+    });
+    relight.setStoredLinear(mesh, true);
+    host.register(relight).attach(splats);
+    await host.ready();
+    const relit = () =>
+      relight.buffers?.("splat", { frame: null, mesh })
+        .atheneaRelit as GPUBuffer;
+    const stored = new THREE.Vector3(0.3, 0.2, 0.93).normalize();
+    const toObject = object.matrixWorld.clone().invert();
+    let culled = 0;
+    let kept = 0;
+    // From in front and from behind: every splat shows the eye one face.
+    for (const side of [1, -1]) {
+      const eye = new THREE.PerspectiveCamera(50, 1, 0.05, 100);
+      eye.position.set(0.3 * side, 0.8 * side, 4 * side);
+      eye.lookAt(0, 0, 0);
+      eye.updateMatrixWorld();
+      relight.set({ cullBacks: true });
+      splats.render(eye, target);
+      await d.queue.onSubmittedWorkDone();
+      const on = new Float32Array(await read(relit()));
+      relight.set({ cullBacks: false });
+      splats.render(eye, target);
+      await d.queue.onSubmittedWorkDone();
+      const off = new Float32Array(await read(relit()));
+      const eyeObject = eye.position.clone().applyMatrix4(toObject);
+      MATERIALS.forEach((m, i) => {
+        const centre = new THREE.Vector3(
+          (i % 4) * 0.6 - 0.9,
+          Math.floor(i / 4) * 0.6 - 0.6,
+          0,
+        );
+        // The cloud keeps normalOct (word 0, (0, 0, -1), where a material
+        // has none): the stored face, not the disc's axis, decides.
+        const n = m.normal ? stored : new THREE.Vector3(0, 0, -1);
+        const facing = n.dot(eyeObject.clone().sub(centre).normalize());
+        if (Math.abs(facing + 0.2) < 0.02) return;
+        const opaque = m.name !== "glass" && m.name !== "thin sheet";
+        const at = 20 * i;
+        if (opaque && facing < -0.2) {
+          culled += 1;
+          expect([...on.subarray(at, at + 4)]).toEqual([0, 0, 0, 0]);
+        } else {
+          kept += 1;
+          expect([...on.subarray(at, at + 4)]).toEqual([
+            ...off.subarray(at, at + 4),
+          ]);
+        }
+      });
+    }
+    expect(culled).toBeGreaterThanOrEqual(4);
+    expect(kept).toBeGreaterThanOrEqual(10);
+    host.detach();
+    splats.dispose();
+  }, 120_000);
+
   it("draws a shadow catcher as athenea's catcherOpacity", async () => {
     // Ground splats facing +Y, each with its own open cells.
     const M = 6;

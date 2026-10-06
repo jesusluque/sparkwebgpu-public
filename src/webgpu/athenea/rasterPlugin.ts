@@ -174,6 +174,8 @@ export function atheneaRasterPlugin(
 
   const plugin: AtheneaRasterPlugin = {
     id: ATHENEA_RASTER_ID,
+    // Read where a cloud has them: a pager loads them for it.
+    requires: { reads: ["emission", ATHC_GROUP_ATTRIBUTE] },
     slang: {
       module: "athenea_adapter.raster",
       colour: "AtheneaRasterColour",

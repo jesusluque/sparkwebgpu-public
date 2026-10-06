@@ -33,22 +33,35 @@ public struct AthcIds {
 
 public bool athcHas(uint id) { return id != ATTRIB_NONE; }
 
+/// Whether stream `id` of `splat` can be read: the cloud carries it and its
+/// page is resident (a paged stream, src/webgpu/attributes/PagedAttribPool.ts,
+/// may not be). Each reader below falls back as for a cloud without it.
+public bool athcResident(StructuredBuffer<uint> pool, uint id, uint splat) {
+    return athcHas(id) && attribResident(pool, id, splat);
+}
+
+/// Whether `splat`'s transfer (and with it its shadow bits) is resident:
+/// relight it, or else keep its captured colour.
+public bool athcTransferResident(StructuredBuffer<uint> pool, AthcIds ids, uint splat) {
+    return athcResident(pool, ids.transfer, splat);
+}
+
 /// The shading normal in the cloud's space, or `fallback` (the frame's
 /// short axis, say) where the cloud keeps none.
 public float3 athcNormal(StructuredBuffer<uint> pool, AthcIds ids, uint splat, float3 fallback) {
-    return athcHas(ids.normalOct) ? unpackNormal(readAttribU(pool, ids.normalOct, splat, 0u)) : fallback;
+    return athcResident(pool, ids.normalOct, splat) ? unpackNormal(readAttribU(pool, ids.normalOct, splat, 0u)) : fallback;
 }
 
 /// Linear radiance the splat gives off by itself; black where none.
 public float3 athcEmission(StructuredBuffer<uint> pool, AthcIds ids, uint splat) {
-    return athcHas(ids.emission) ? unpackRgb9e5(readAttribU(pool, ids.emission, splat, 0u)) : float3(0.0);
+    return athcResident(pool, ids.emission, splat) ? unpackRgb9e5(readAttribU(pool, ids.emission, splat, 0u)) : float3(0.0);
 }
 
 /// metallic, roughness, transmission, and flags (1 thin-walled, 2 Schlick
 /// metal); a capture's (0, 1, 0, 0) where the cloud carries no material, as
 /// splat_project.slang falls back.
 public float4 athcPbr(StructuredBuffer<uint> pool, AthcIds ids, uint splat) {
-    if (!athcHas(ids.pbr)) {
+    if (!athcResident(pool, ids.pbr, splat)) {
         return float4(0.0, 1.0, 0.0, 0.0);
     }
     const uint w = readAttribU(pool, ids.pbr, splat, 0u);
@@ -58,14 +71,15 @@ public float4 athcPbr(StructuredBuffer<uint> pool, AthcIds ids, uint splat) {
 
 /// The layers over the base, or `plainLobes()` where the cloud names none.
 public SplatLobes athcLobes(StructuredBuffer<uint> pool, AthcIds ids, uint splat) {
-    if (!athcHas(ids.lobes)) {
+    if (!athcResident(pool, ids.lobes, splat)) {
         return plainLobes();
     }
     return unpackLobes(uint3(readAttribU(pool, ids.lobes, splat, 0u), readAttribU(pool, ids.lobes, splat, 1u),
                              readAttribU(pool, ids.lobes, splat, 2u)));
 }
 
-/// Transfer value k (0 .. transferCount - 1), as athenea's halves.
+/// Transfer value k (0 .. transferCount - 1), as athenea's halves; 0 where
+/// the transfer is not resident (check athcTransferResident first).
 public float athcTransfer(StructuredBuffer<uint> pool, AthcIds ids, uint splat, uint k) {
     if (!athcHas(ids.transfer) || k >= ids.transferCount) {
         return 0.0;
@@ -73,8 +87,9 @@ public float athcTransfer(StructuredBuffer<uint> pool, AthcIds ids, uint splat, 
     return f16tof32(readAttribU(pool, ids.transfer, splat, k));
 }
 
-/// Word w of the open-direction bits; all open where the cloud has none.
+/// Word w of the open-direction bits; all open where the cloud has none or
+/// they are not resident.
 public uint athcShadowWord(StructuredBuffer<uint> pool, AthcIds ids, uint splat, uint w) {
-    return athcHas(ids.shadowBits) && w < ids.shadowWords ? readAttribU(pool, ids.shadowBits, splat, w)
-                                                            : 0xFFFFFFFFu;
+    return w < ids.shadowWords && athcResident(pool, ids.shadowBits, splat) ? readAttribU(pool, ids.shadowBits, splat, w)
+                                                                             : 0xFFFFFFFFu;
 }

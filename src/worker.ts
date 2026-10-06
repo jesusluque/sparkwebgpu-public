@@ -19,6 +19,7 @@ import init_wasm, {
   bhatt_lod_extsplats,
   get_lod_tree_level,
   athc_merged_pages,
+  athc3_merged_pages,
 } from "spark-rs";
 import type {
   AttribValues,
@@ -29,6 +30,7 @@ import type {
 
 const rpcHandlers = {
   athcMergedPages,
+  athc3MergedPages,
   sortSplats16,
   sortSplats32,
   loadPackedSplats,
@@ -857,6 +859,22 @@ async function athcMergedPages({
     pages: Uint8Array[];
   } & Record<string, unknown>;
   return { tree, pages };
+}
+
+// A .athc v3's merged pages (src/athc.ts), from its tables and its levels'
+// blocks as kind-2 ATHV pages.
+async function athc3MergedPages({
+  tables,
+  levels,
+}: {
+  tables: Uint8Array;
+  levels: Uint8Array[];
+}) {
+  const { pages, headers, ...tree } = athc3_merged_pages(tables, levels) as {
+    pages: Uint8Array[];
+    headers: Uint8Array;
+  } & Record<string, unknown>;
+  return { tree, pages, headers };
 }
 
 let nextChunkWaiter = (_chunk: Uint8Array) => {};

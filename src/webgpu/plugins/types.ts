@@ -24,6 +24,12 @@ export interface PluginRequirements {
   /** Per-Gaussian attributes the asset must carry, by name. */
   attributes?: readonly string[];
   /**
+   * Attributes it reads where the asset has them, without needing them:
+   * they do not rule the plugin out, but a pager that loads streams on
+   * demand (WgpuSplatPager, .athc v3 sections) loads them for it.
+   */
+  reads?: readonly string[];
+  /**
    * Device features: WebGPU feature names ("shader-f16") or GpuCapabilities
    * flags ("subgroups", "timestampQuery", "gpuSort"...).
    */

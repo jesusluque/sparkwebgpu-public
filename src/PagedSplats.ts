@@ -5,7 +5,21 @@ import { getSplatFileType, getSplatFileTypeFromPath } from "./SplatLoader";
 import type { SplatSource } from "./SplatMesh";
 import type { SplatPager } from "./SplatPager";
 import { workerPool } from "./SplatWorker";
-import { ATHC_FLAGS, type AthcPaging, fetchAthcPage, openAthc } from "./athc";
+import {
+  ATHC_FLAGS,
+  ATHC_PAGE_SPLATS,
+  type AnyAthcLayout,
+  type AthcPaging,
+  athcPageCount,
+  athcSplatBase,
+  athcWantOf,
+  fetchAthc3Page,
+  fetchAthcPage,
+  fetchAthcStreams,
+  isAthcV3,
+  openAthc,
+  readAthcLayout,
+} from "./athc";
 import {
   DEFAULT_SPLAT_ENCODING,
   LN_SCALE_MAX,
@@ -17,6 +31,17 @@ import {
 import * as dyno from "./dyno";
 import { decodeExtSplat, unpackSplat, uploadU32DataTextureRows } from "./utils";
 import * as wasm from "./wasm";
+import { AttribPool, type AttributeSpec } from "./webgpu/attributes/schema";
+
+/**
+ * What a pager that pages attributes by group (WgpuSplatPager) tells the
+ * splats it fetches: the attributes it keeps, and those a page's fetch
+ * should bring with it.
+ */
+interface StreamPager {
+  attributePlan?(): { specs: AttributeSpec[] } | null;
+  streamsToFetch?(splats: PagedSplats, chunk: number): string[];
+}
 
 export interface PagedSplatsOptions {
   pager?: SplatPager;
@@ -32,6 +57,20 @@ export interface PagedSplatsOptions {
    * which blends in linear light (atheneaRasterPlugin, storedLinear).
    */
   athcKeepLinear?: boolean;
+}
+
+/** A decoded page with stream columns fetched beside it (a .athc v3 page). */
+function withStreams<
+  T extends { numSplats: number; extra: { attribs?: object } },
+>(result: T, streams: AttribPool | null): T {
+  if (!streams?.columns.length) return result;
+  const attribs = result.extra.attribs
+    ? AttribPool.from(
+        result.extra.attribs as Parameters<typeof AttribPool.from>[0],
+      )
+    : new AttribPool(result.numSplats);
+  for (const col of streams.columns) attribs.setColumn(col);
+  return { ...result, extra: { ...result.extra, attribs } };
 }
 
 export class PagedSplats implements SplatSource {
@@ -56,6 +95,8 @@ export class PagedSplats implements SplatSource {
   radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
   /** A .athc's virtual tree and merged pages (src/athc.ts). */
   athcPromise?: Promise<AthcPaging>;
+  /** A .athc's headers and tables, read before its merged pages. */
+  athcLayoutPromise?: Promise<{ layout: AnyAthcLayout; prefix: Uint8Array }>;
 
   dynoNumSplats: dyno.DynoInt<"numSplats">;
   dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
@@ -110,24 +151,65 @@ export class PagedSplats implements SplatSource {
       this.radMetaPromise = this.getRadMeta();
     }
     if (this.fileType === SplatFileType.ATHC) {
-      this.athcPromise = this.getAthc();
+      this.athcLayoutPromise = this.getAthcLayout();
     }
   }
 
-  getAthc(): Promise<AthcPaging> {
-    this.athcPromise ??= openAthc({
+  private fetchOptions() {
+    return {
       url: this.rootUrl,
       fileBytes: this.fileBytes,
       requestHeader: this.requestHeader,
       withCredentials: this.withCredentials,
       signal: this.abortController.signal,
-      keepLinear: this.athcKeepLinear,
-    }).then((paging) => {
-      this.athcStoredLinear =
-        paging.keepLinear &&
-        (paging.layout.header.flags & ATHC_FLAGS.linear) !== 0;
-      return paging;
-    });
+    };
+  }
+
+  getAthcLayout() {
+    this.athcLayoutPromise ??= readAthcLayout(this.fetchOptions()).then(
+      (read) => {
+        this.athcStoredLinear =
+          this.athcKeepLinear &&
+          (read.layout.header.flags & ATHC_FLAGS.linear) !== 0;
+        return read;
+      },
+    );
+    return this.athcLayoutPromise;
+  }
+
+  /** The attributes the pager keeps (null: every stream of the file). */
+  private keptSpecs(): AttributeSpec[] | null {
+    return (
+      (this.pager as StreamPager | undefined)?.attributePlan?.()?.specs ?? null
+    );
+  }
+
+  /**
+   * Opens a .athc for paging. A v3 file's levels are read with the streams
+   * the pager keeps: open it once the pager knows them (its schema is set
+   * from getRadMeta, before the first fetch).
+   */
+  getAthc(): Promise<AthcPaging> {
+    this.athcPromise ??= this.getAthcLayout()
+      .then((read) =>
+        openAthc({
+          ...this.fetchOptions(),
+          read,
+          keepLinear: this.athcKeepLinear,
+          want: (layout) => {
+            const kept = this.keptSpecs();
+            return kept
+              ? athcWantOf(layout, kept)
+              : { material: true, transferValues: layout.extra.transferCount };
+          },
+        }),
+      )
+      .then((paging) => {
+        this.athcStoredLinear =
+          paging.keepLinear &&
+          (paging.layout.header.flags & ATHC_FLAGS.linear) !== 0;
+        return paging;
+      });
     return this.athcPromise;
   }
 
@@ -151,12 +233,13 @@ export class PagedSplats implements SplatSource {
     if (this.fileType === SplatFileType.ATHC) {
       // A .athc stands in as a .rad of virtual pages (src/athc.ts): what
       // the WebGPU pager reads of a meta is its attribute schema.
-      this.radMetaPromise = this.getAthc().then(
-        ({ layout, tree, pageCount }) => ({
+      this.radMetaPromise = this.getAthcLayout().then(({ layout }) => {
+        const pageCount = athcPageCount(layout);
+        return {
           meta: {
             version: 0,
             type: "athc",
-            count: tree.splatBase + layout.header.count,
+            count: athcSplatBase(layout).splatBase + layout.header.count,
             lodTree: true,
             chunkSize: 65536,
             chunks: Array.from({ length: pageCount }, () => ({
@@ -166,8 +249,8 @@ export class PagedSplats implements SplatSource {
             attributes: layout.attribSpecs,
           } as RadMeta,
           chunksStart: 0,
-        }),
-      );
+        };
+      });
       return this.radMetaPromise;
     }
 
@@ -220,18 +303,60 @@ export class PagedSplats implements SplatSource {
     return this.rootUrl.replace(/-lod-0\./, `-lod-${chunk}.`);
   }
 
+  /**
+   * The attributes `names` of `chunk` alone, for a pager that pages them by
+   * group (AttribResidency): one Range request of a .athc chunk's streams,
+   * else the chunk fetched and decoded again.
+   */
+  async fetchStreams(
+    chunk: number,
+    names: readonly string[],
+  ): Promise<AttribPool | null> {
+    const specs = (this.keptSpecs() ?? []).filter((s) =>
+      names.includes(s.name),
+    );
+    if (this.fileType === SplatFileType.ATHC) {
+      const paging = await this.getAthc();
+      if (chunk >= paging.tree.splatBase / ATHC_PAGE_SPLATS) {
+        return fetchAthcStreams(paging, chunk, this.fetchOptions(), specs);
+      }
+    }
+    const data = await this.fetchDecodeChunk(chunk);
+    const attribs = data.extra.attribs;
+    return attribs
+      ? AttribPool.from(attribs as Parameters<typeof AttribPool.from>[0])
+      : null;
+  }
+
   async fetchDecodeChunk(chunk: number) {
     let decodeBytes = undefined;
+    let streams: AttribPool | null = null;
 
     if (this.fileType === SplatFileType.ATHC) {
-      // One ATHV page: merged nodes, or an athenea chunk read whole.
-      decodeBytes = await fetchAthcPage(await this.getAthc(), chunk, {
-        url: this.rootUrl,
-        fileBytes: this.fileBytes,
-        requestHeader: this.requestHeader,
-        withCredentials: this.withCredentials,
-        signal: this.abortController.signal,
-      });
+      const paging = await this.getAthc();
+      if (
+        isAthcV3(paging.layout) &&
+        chunk >= paging.tree.splatBase / ATHC_PAGE_SPLATS
+      ) {
+        // The splats and the streams the pager wants with them: one Range.
+        const pager = this.pager as StreamPager | undefined;
+        const names = pager?.streamsToFetch?.(this, chunk);
+        const kept = this.keptSpecs();
+        const specs = kept
+          ? kept.filter((s) => names?.includes(s.name) ?? true)
+          : [];
+        const page = await fetchAthc3Page(
+          paging,
+          chunk,
+          this.fetchOptions(),
+          specs,
+        );
+        decodeBytes = page.page;
+        streams = page.streams;
+      } else {
+        // One ATHV page: merged nodes, or an athenea v2 chunk read whole.
+        decodeBytes = await fetchAthcPage(paging, chunk, this.fetchOptions());
+      }
     } else if (this.fileType === SplatFileType.RAD) {
       const { meta, chunksStart } = await this.getRadMeta();
       if (chunk < 0 || chunk >= meta.chunks.length) {
@@ -347,7 +472,7 @@ export class PagedSplats implements SplatSource {
         this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
         this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
         this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-        return lodSplats;
+        return withStreams(lodSplats, streams);
       }
 
       const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
@@ -378,7 +503,7 @@ export class PagedSplats implements SplatSource {
       this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
       this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
       this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-      return lodSplats;
+      return withStreams(lodSplats, streams);
     });
   }
 

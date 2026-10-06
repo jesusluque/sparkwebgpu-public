@@ -283,8 +283,8 @@ export function getSplatFileType(
   if (magic === 0x30444152) {
     return SplatFileType.RAD;
   }
-  if (magic === 0x43485441) {
-    // "ATHC"
+  if (magic === 0x43485441 || magic === 0x33485441) {
+    // "ATHC", or "ATH3" (version 3, by sections)
     return SplatFileType.ATHC;
   }
   // Unknown file type

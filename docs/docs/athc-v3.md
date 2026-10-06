@@ -14,12 +14,13 @@ describes what the WebGPU path reads (version 1 and 2, written by athenea's
 | athenea's stream packing and LoD build, on the CPU | `rust/spark-lib/src/athc_build.rs` |
 | USD (`.usdc`) TX cloud to `.athc` | `rust/build-lod/src/bin/usd-athc.rs` |
 | Paging from the browser | `src/athc.ts`, `src/PagedSplats.ts` |
+| Streams paged by group, within a budget | `src/webgpu/attributes/attribPaging.ts`, `PagedAttribPool.ts`, `AttribResidency.ts` |
 | athenea's decoders over the attribute pool | `slang/athenea_adapter/athc.slang` |
 | athenea-web `scene.json` | `src/webgpu/athenea/sceneJson.ts` |
 
 ```js
 new SplatMesh({ url: "cloud.athc" });               // whole file, athenea's levels as the LoD tree
-new SplatMesh({ url: "cloud.athc", paged: true });  // one Range request per 65 536-splat chunk
+new SplatMesh({ url: "cloud.athc", paged: true });  // one Range request per 65 536-splat chunk (v3: per chunk and tier)
 ```
 
 ## Version 2 (athenea's)
@@ -138,23 +139,66 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 |---|---|---|---|---|
 | S0 | `CORE` | 1 | 36 | positions, shape, tail (as three arrays) |
 | S0p | `SHRS` | 1 | 4 · shWords | rest harmonics |
-| S1 | `TXDI` | 2 | 4 · ⌈direct / 2⌉ | the transfer's first words: the direct half (9 or 16 values; zonal: all 10) |
-| S2 | `TXIN` | 2 | the rest | indirect half and reflected field |
-| S3 | `SHAD` | 2 | 4 · shadowWords | open-direction bits |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
+| S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
+| S1 | `TXDI` | 3 | 4 · ⌈direct / 2⌉ | the transfer's direct half (9 or 16 values; zonal: all 10) |
+| S2 | `TXIN` | 3 | 4 · (2 · direct − ⌈direct / 2⌉) | through the indirect half |
+| S2f | `TXFD` | 3 | the rest | the reflected field |
 
-A section is left out when it would be empty. Tier 1 (the splats as
-captured) is `CORE + SHRS`; tier 2 (relit) is everything. For
+A section is left out when it would be empty. Data tier 1 (the splats as
+captured) is `CORE + SHRS`, tier 2 adds the material, tier 3 the relight
+streams. The order makes each thing a reader may want one contiguous run:
+the material alone; the shadow bits with any prefix of the transfer that is
+a layout of its own (`transfer_layout.slang`: 16 direct values, 64 with the
+indirect half, 112 with the field; 9, 36, 84 at degree 2). For
 `every_stream.athc` (SH3, TX transfer of 112 values, 16×16 shadow bits,
-material): tier 1 is 128 bytes a splat, tier 2 408.
+material): tier 1 is 128 bytes a splat, tier 2 152, tier 3 408.
+
+Files written before the three tiers (`TXIN` holding the field, `SHAD` and
+`MATL` after it, all tier 2: the first pawn conversions) are still read and
+paged: a reader takes each block's sections from its table. Their material
+is not a prefix of its own, so a page that wants the material and not the
+transfer reads the transfer too; convert them again to page them well.
 
 Compression is per section, gzip (RFC 1952) as `DecompressionStream("gzip")`
 reads it, since HTTP compression does not apply to Range responses.
 
+### Paging it in the browser
+
+`PagedSplats` reads the tables (header through the starts, one Range
+request) and, once the pager knows which attributes it keeps
+(`WgpuSplatPager.attributePlan`, see [attributes](webgpu-attributes.md#paging-by-stream-group)),
+opens the file:
+
+- the **levels**, one Range request per level block, from `CORE` through
+  the last section the kept streams need, sent to the loader worker as
+  kind-2 ATHV pages (`athc_v3.rs athv_sections_page`: the stored sections
+  and a table of them), from which `athc3_merged_pages` builds the merged
+  pages as for v2;
+- each **chunk page**, one Range request from `CORE` through the last
+  section of the streams that page should bring (`streamsToFetch`: the
+  groups held at full capacity, and a paged group while it has a free
+  slot). The splats (`CORE`, `SHRS`) go to the worker as a kind-2 page; the
+  streams are put together on the main thread as attribute columns of
+  their stored words (gunzipped with `DecompressionStream`), with no decode:
+  `MATL`'s arrays, `SHAD`, and the transfer's sections joined per splat and
+  cut to the form kept;
+- an **upgrade** (a page the traversal ranks among a paged group's first
+  `slots` that did not bring the group): one Range request of that group's
+  sections of the chunk (`fetchAthcStreams`).
+
+So a T1 device fetches 128 bytes a splat of every_stream, plus 24 when a
+plugin reads the material; the relight sections only for the pages that
+hold them. v2 files page as before (a chunk read whole), and their upgrades
+read the arrays of the group (one Range request).
+
+The WASM decoder reads a v3 file whole (`new SplatMesh({ url })`) as it reads
+a v2 one.
+
 ### Converter
 
 ```sh
-cargo run -p build-lod --bin athc-convert -- in.athc out.athc [--gzip]  # v1/v2 → v3
+cargo run -p build-lod --bin athc-convert -- in.athc out.athc [--gzip]  # v1/v2 → v3 (test/fixtures/athc/every_stream.v3.athc: --gzip)
 cargo run -p build-lod --bin athc-convert -- in.athc out.athc --v2      # v3 → v2
 cargo run -p build-lod --bin athc-convert -- in.athc --info             # sections, tier sizes
 ```
@@ -197,8 +241,6 @@ and 36 the same truncated to degree 2 (the first coefficients of each half).
 
 ### Not yet
 
-- Paging v3 by tier in the browser: the block index already gives each
-  (block, tier) its range; `src/athc.ts` pages v2 today.
 - 083's quantized S0 (~20 bytes: positions relative to the block's sphere,
   8-bit log scales) and flattened SH0p, and the compressed transfer of 034:
   new `encoding` codes.

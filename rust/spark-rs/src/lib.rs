@@ -793,7 +793,12 @@ stub_fn!(feature = "rad", decode_rad_header);
 #[wasm_bindgen]
 #[cfg(feature = "athc")]
 pub fn athc_prefix_bytes(bytes: Uint8Array) -> Result<f64, JsValue> {
-    spark_lib::athc::AthcLayout::prefix_bytes(&bytes.to_vec())
+    let bytes = bytes.to_vec();
+    if bytes.len() >= 4 && u32::from_le_bytes(bytes[..4].try_into().unwrap()) == spark_lib::athc_v3::ATH3_MAGIC {
+        // Version 3: through the starts (the header, sections and block index).
+        return spark_lib::athc_v3::tables_bytes(&bytes).map(|n| n as f64).map_err(|e| JsValue::from(e.to_string()));
+    }
+    spark_lib::athc::AthcLayout::prefix_bytes(&bytes)
         .map(|n| n as f64)
         .map_err(|e| JsValue::from(e.to_string()))
 }
@@ -804,7 +809,27 @@ stub_fn!(feature = "athc", athc_prefix_bytes);
 #[wasm_bindgen]
 #[cfg(feature = "athc")]
 pub fn athc_layout(prefix: Uint8Array, file_bytes: f64) -> Result<JsValue, JsValue> {
-    let layout = spark_lib::athc::AthcLayout::parse(&prefix.to_vec(), file_bytes as u64)
+    let bytes = prefix.to_vec();
+    if bytes.len() >= 4 && u32::from_le_bytes(bytes[..4].try_into().unwrap()) == spark_lib::athc_v3::ATH3_MAGIC {
+        // Version 3: its sections and block index, the v2 headers an ATHV
+        // page carries, and the attributes as a v2 file of the same cloud.
+        let layout = spark_lib::athc_v3::parse_v3(&bytes).map_err(|e| JsValue::from(e.to_string()))?;
+        let object = serde_wasm_bindgen::to_value(&layout)?;
+        let set = |k: &str, v: &JsValue| Reflect::set(&object, &JsValue::from_str(k), v);
+        set("version", &JsValue::from_f64(3.0))?;
+        set("fileBytes", &JsValue::from_f64(file_bytes))?;
+        set("headers", &Uint8Array::from(&layout.v2_headers()[..]))?;
+        let attribs = spark_lib::athc::attrib_specs(&layout.header, &layout.extra);
+        set("attribSpecs", &serde_wasm_bindgen::to_value(&attribs)?)?;
+        let forms: Vec<u32> = if layout.extra.transfer_words > 0 {
+            spark_lib::athc_v3::transfer_forms(layout.extra.transfer_count)
+        } else {
+            Vec::new()
+        };
+        set("transferForms", &serde_wasm_bindgen::to_value(&forms)?)?;
+        return Ok(object);
+    }
+    let layout = spark_lib::athc::AthcLayout::parse(&bytes, file_bytes as u64)
         .map_err(|e| JsValue::from(e.to_string()))?;
     let object = serde_wasm_bindgen::to_value(&layout)?;
     Reflect::set(&object, &JsValue::from_str("levelsEnd"), &JsValue::from_f64(layout.levels_end() as f64))?;
@@ -831,3 +856,25 @@ pub fn athc_merged_pages(prefix: Uint8Array, file_bytes: f64) -> Result<JsValue,
     Ok(object)
 }
 stub_fn!(feature = "athc", athc_merged_pages);
+
+/// A v3 .athc's paged virtual tree and merged pages, from its tables
+/// (`athc_prefix_bytes`) and its levels' blocks as kind-2 ATHV pages
+/// (spark-lib athc_v3::athv_merged_pages_v3), plus `headers`: the v2 headers
+/// of the streams those pages keep.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athc3_merged_pages(tables: Uint8Array, levels: Array) -> Result<JsValue, JsValue> {
+    let levels: Vec<Vec<u8>> = levels.iter().map(|v| Uint8Array::from(v).to_vec()).collect();
+    let refs: Vec<&[u8]> = levels.iter().map(|v| &v[..]).collect();
+    let (tree, pages, headers) = spark_lib::athc_v3::athv_merged_pages_v3(&tables.to_vec(), &refs)
+        .map_err(|e| JsValue::from(e.to_string()))?;
+    let object = serde_wasm_bindgen::to_value(&tree)?;
+    let array = Array::new();
+    for page in pages {
+        array.push(&Uint8Array::from(&page[..]));
+    }
+    Reflect::set(&object, &JsValue::from_str("pages"), &array)?;
+    Reflect::set(&object, &JsValue::from_str("headers"), &Uint8Array::from(&headers[..]))?;
+    Ok(object)
+}
+stub_fn!(feature = "athc", athc3_merged_pages);

@@ -27,6 +27,7 @@ import {
   type RadAttributeMeta,
   specsFromRadMeta,
 } from "./attributes/PagedAttribPool";
+import type { AttribPagingOptions } from "./attributes/attribPaging";
 import { canvasContext } from "./threeInternals";
 
 type LodSplats = PackedSplats | ExtSplats | PagedSplats;
@@ -53,6 +54,12 @@ export interface WgpuLodOptions {
   maxPagedSplats?: number;
   /** @default 3 */
   numLodFetchers?: number;
+  /**
+   * Paged attributes: the pool's byte budget, pages per stream group,
+   * which streams, the transfer form (attributes/attribPaging.ts). By
+   * default the device tier's budget and the PluginHost's streams.
+   */
+  pagedAttributes?: AttribPagingOptions;
   /** @default true */
   enableLodFetching?: boolean;
   /**
@@ -130,9 +137,15 @@ let nextId = 0;
 
 export class WgpuLod {
   readonly options: Required<
-    Omit<WgpuLodOptions, "lodSplatCount" | "onDirty" | "lodRaycast">
+    Omit<
+      WgpuLodOptions,
+      "lodSplatCount" | "onDirty" | "lodRaycast" | "pagedAttributes"
+    >
   > &
-    Pick<WgpuLodOptions, "lodSplatCount" | "onDirty" | "lodRaycast">;
+    Pick<
+      WgpuLodOptions,
+      "lodSplatCount" | "onDirty" | "lodRaycast" | "pagedAttributes"
+    >;
   readonly meshes: WgpuLodMesh[] = [];
   pager?: WgpuSplatPager;
   /** Time of the last traversal in ms, and the splats it selected. */
@@ -204,7 +217,10 @@ export class WgpuLod {
       const attributes = (meta as { attributes?: RadAttributeMeta[] })
         .attributes;
       if (attributes) {
-        this.ensurePager().setAttribSchema(specsFromRadMeta(attributes));
+        this.ensurePager().setAttribSchema(
+          specsFromRadMeta(attributes),
+          meta.chunks?.length,
+        );
       }
       source = this.ensurePager().source(splats);
     } else {
@@ -334,6 +350,11 @@ export class WgpuLod {
         maxSplats: this.options.maxPagedSplats,
         numFetchers: this.options.numLodFetchers,
         onUpdate: () => this.setDirty(),
+        attributes: this.options.pagedAttributes,
+        attributeDemand: () =>
+          this.renderer.plugins?.plugins.length
+            ? this.renderer.plugins.attributeDemand()
+            : null,
       });
     }
     return this.pager;

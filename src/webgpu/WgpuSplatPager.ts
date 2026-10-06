@@ -15,21 +15,42 @@
 //
 // The core pool (not SH) is also kept on the CPU, in SplatPager's texture
 // data as on WebGL, for SplatMesh.raycast on paged meshes.
+//
+// Attributes are sized per group of streams within a byte budget
+// (attributes/attribPaging.ts): cheap ones at the pool's capacity, the
+// expensive ones (a .athc's transfer) with fewer pages of their own, given
+// to the pages the traversal ranks first (attributes/AttribResidency.ts).
 
 import * as THREE from "three";
 import type { PagedSplats } from "../PagedSplats";
 import { SplatPager, type SplatPagerOptions } from "../SplatPager";
 import { GpuSplatSource } from "./GpuSplatSource";
 import { KernelRegistry } from "./KernelRegistry";
+import { AttribResidency } from "./attributes/AttribResidency";
 import { PagedAttribPool } from "./attributes/PagedAttribPool";
+import {
+  type AttribPagingOptions,
+  type AttribPagingPlan,
+  attribBudget,
+  planAttribPaging,
+} from "./attributes/attribPaging";
 import { AttribPool, type AttributeSpec } from "./attributes/schema";
 import restrideModule from "./generated/kernels/pool_restride";
 import { createStorage } from "./gpuBuffers";
+import { tierOfLimits } from "./plugins/tiers";
 
 const PAGE_SPLATS = 65536;
 
 export interface WgpuSplatPagerOptions
-  extends Omit<SplatPagerOptions, "renderer"> {}
+  extends Omit<SplatPagerOptions, "renderer"> {
+  /** How the attribute pool is sized and which streams it loads. */
+  attributes?: AttribPagingOptions;
+  /**
+   * The streams wanted now (PluginHost.attributeDemand), when
+   * `attributes.attributes` does not say; null for the default.
+   */
+  attributeDemand?: () => readonly string[] | null;
+}
 
 interface Pool {
   wordsPerSplat: number;
@@ -56,7 +77,18 @@ export class WgpuSplatPager extends SplatPager {
    * has some, the data from each chunk's `attrib` properties.
    */
   attribs: PagedAttribPool | null = null;
+  /** Which pages hold the paged attribute groups. */
+  residency: AttribResidency<PagedSplats> | null = null;
   private attribSchema: AttributeSpec[] | null = null;
+  private attribPlan: AttribPagingPlan | null = null;
+  /** Pages of the cloud the schema is from (caps paged groups' slots). */
+  private cloudPages?: number;
+  private readonly attribOptions: AttribPagingOptions;
+  private readonly attributeDemand?: () => readonly string[] | null;
+  /** Splats on each page, as last uploaded. */
+  private pageCounts: number[] = [];
+  /** The tenant each page was last uploaded for (mapped pages wait for theirs). */
+  private uploaded: unknown[] = [];
 
   constructor(device: GPUDevice, options: WgpuSplatPagerOptions) {
     const ext = options.extSplats ?? false;
@@ -81,6 +113,8 @@ export class WgpuSplatPager extends SplatPager {
       );
     }
     this.device = device;
+    this.attribOptions = options.attributes ?? {};
+    this.attributeDemand = options.attributeDemand;
     this.pools = {
       core: { wordsPerSplat: coreWords, buffer: null },
       sh: { wordsPerSplat: 0, buffer: null },
@@ -123,32 +157,129 @@ export class WgpuSplatPager extends SplatPager {
    * The attribute schema of the pool (all paged meshes share it), before
    * the first page arrives; later schemas are ignored.
    */
-  setAttribSchema(specs: AttributeSpec[]) {
-    if (!this.attribSchema && specs.length) this.attribSchema = specs;
+  setAttribSchema(specs: AttributeSpec[], cloudPages?: number) {
+    if (!this.attribSchema && specs.length) {
+      this.attribSchema = specs;
+      this.cloudPages = cloudPages;
+    }
   }
 
-  private uploadAttribs(base: number, count: number, data: unknown) {
+  /**
+   * How the attribute pool is sized for the schema: which streams it
+   * keeps, and the pages of each group (attribPaging.ts). Null before a
+   * schema is known.
+   */
+  attributePlan(): AttribPagingPlan | null {
+    if (this.attribPlan || !this.attribSchema) return this.attribPlan;
+    const o = this.attribOptions;
+    const tier = o.tier ?? tierOfLimits(this.device.limits);
+    const limit = Math.min(
+      this.device.limits.maxStorageBufferBindingSize,
+      this.device.limits.maxBufferSize,
+    );
+    const options = {
+      budget: Math.min(o.budgetBytes ?? attribBudget(this.device, tier), limit),
+      tier,
+      demand: o.attributes ?? this.attributeDemand?.() ?? null,
+      pages: o.pages,
+      transferForm: o.transferForm,
+      cloudPages: this.cloudPages,
+    };
+    let plan = planAttribPaging(this.attribSchema, this.maxPages, options);
+    if (plan.bytes > limit) {
+      console.warn(
+        `WgpuSplatPager: attribute pages as asked need ${plan.bytes} bytes, over the binding size (${limit}); sizing them by the budget`,
+      );
+      plan = planAttribPaging(this.attribSchema, this.maxPages, {
+        ...options,
+        pages: {},
+      });
+    }
+    for (const g of plan.groups) {
+      if (g.paged) {
+        console.info(
+          `WgpuSplatPager: '${g.name}' attributes (${g.specs.map((s) => s.name).join(", ")}) paged in ${g.slots} of ${this.maxPages} pages`,
+        );
+      }
+    }
+    this.attribPlan = plan;
+    return plan;
+  }
+
+  /**
+   * The streams a fetch of `chunk` of `splats` should bring with it (a
+   * .athc v3 reads them in the same Range request): the groups at full
+   * capacity, and paged ones with a slot free.
+   */
+  streamsToFetch(_splats: PagedSplats, _chunk: number): string[] {
+    const plan = this.attributePlan();
+    if (!plan) return [];
+    const free = new Set(this.residency?.streamsWithFreeSlot() ?? []);
+    return plan.groups.flatMap((g) =>
+      g.paged && this.residency && !g.specs.some((s) => free.has(s.name))
+        ? []
+        : g.specs.map((s) => s.name),
+    );
+  }
+
+  /** Every stream the pool keeps (merged .athc pages carry them all). */
+  streamsKept(): string[] {
+    return this.attributePlan()?.specs.map((s) => s.name) ?? [];
+  }
+
+  private ensureAttribs(chunk: AttribPool | null): PagedAttribPool | null {
+    if (this.attribs) return this.attribs;
+    if (!this.attribSchema) {
+      if (!chunk) return null;
+      this.attribSchema = chunk.schema.map((spec) => ({
+        ...spec,
+        toDraw: true,
+      }));
+    }
+    const plan = this.attributePlan();
+    if (!plan?.specs.length) return null;
+    this.attribs = new PagedAttribPool(
+      this.device,
+      plan.specs,
+      this.maxSplats,
+      plan,
+    );
+    if (this.attribs.groups.length) {
+      this.residency = new AttribResidency(this.attribs, {
+        tenant: (page) => this.pageToSplatsChunk[page],
+        count: (page) => this.pageCounts[page] ?? 0,
+        onUpdate: () => this.onUpdate?.(),
+      });
+    }
+    return this.attribs;
+  }
+
+  private uploadAttribs(page: number, count: number, data: unknown) {
     const chunk = data
       ? AttribPool.from(data as Parameters<typeof AttribPool.from>[0])
       : null;
-    if (!this.attribs) {
-      if (!chunk) return;
-      const specs =
-        this.attribSchema ??
-        chunk.schema.map((spec) => ({ ...spec, toDraw: true }));
-      const bytes = PagedAttribPool.bytes(specs, this.maxSplats);
-      const limit = this.device.limits.maxStorageBufferBindingSize;
-      if (bytes > limit) {
-        console.warn(
-          `WgpuSplatPager: attribute pages need ${bytes} bytes, over maxStorageBufferBindingSize (${limit}); not paging attributes`,
-        );
-        this.attribSchema = [];
-        return;
+    const attribs = this.ensureAttribs(chunk);
+    if (!attribs) return;
+    attribs.uploadPage(page * PAGE_SPLATS, count, chunk);
+    this.residency?.onPageUpload(page, count, chunk);
+  }
+
+  /** Ranks the resident pages for the paged attribute groups, after the core fetches. */
+  driveFetchers() {
+    super.driveFetchers();
+    if (!this.residency) return;
+    const order: number[] = [];
+    for (const { splats, chunk } of this.fetchPriority) {
+      const entry = this.getSplatsChunk(splats, chunk);
+      // A page mapped but not yet uploaded brings its own streams.
+      if (
+        entry &&
+        this.uploaded[entry.page] === this.pageToSplatsChunk[entry.page]
+      ) {
+        order.push(entry.page);
       }
-      if (!specs.length) return;
-      this.attribs = new PagedAttribPool(this.device, specs, this.maxSplats);
     }
-    this.attribs.uploadPage(base, count, chunk);
+    this.residency.update(order);
   }
 
   // uint4s per splat for `degree` SH degrees: packed sh1 (padded), sh2, sh3;
@@ -202,10 +333,12 @@ export class WgpuSplatPager extends SplatPager {
     const base = page * PAGE_SPLATS;
     const core = this.pools.core;
     const count = packedArray.length / 4;
+    this.pageCounts[page] = count;
+    this.uploaded[page] = this.pageToSplatsChunk[page];
     this.mirror(this.packedTexture, base, packedArray);
     if (extArray) this.mirror(this.extTexture, base, extArray);
     // Every page, so one without attributes clears the previous tenant's.
-    this.uploadAttribs(base, count, attribs);
+    this.uploadAttribs(page, count, attribs);
     if (extArray) {
       // Ext pages arrive as two arrays; the pool interleaves a and b.
       const words = new Uint32Array(count * 8);
@@ -270,6 +403,7 @@ export class WgpuSplatPager extends SplatPager {
     this.registry?.destroy();
     this.attribs?.destroy();
     this.attribs = null;
+    this.residency = null;
     for (const pool of Object.values(this.pools)) {
       pool.buffer?.destroy();
       pool.buffer = null;

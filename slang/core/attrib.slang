@@ -8,6 +8,17 @@
 // Components are packed little-endian at their format's size, an attribute
 // starting on a word boundary, so a group of four components (comp4) is 1, 2
 // or 4 whole words. Attribute ids are resolved by name on the host.
+//
+// A paged attribute (flags ATTRIB_PAGED; src/webgpu/attributes/
+// PagedAttribPool.ts) is not interleaved: it has its own region of fewer
+// pages than the pool's splats, at offsetWords (from the buffer's start):
+//   [offsetWords ..]                     a page table, one word per page of
+//                                        65 536 splats: its slot, or
+//                                        ATTRIB_NONE when not resident
+//   [offsetWords + pages + (slot * 65536 + splat % 65536) * words ..]
+// where pages = ceil(count / 65536) and words = attribWords(desc). A splat
+// whose page is not resident reads as zeros (readAttrib, readAttribU) and
+// attribResident says so: readers fall back on their own default.
 
 module attrib;
 
@@ -24,6 +35,9 @@ public static const uint ATTRIB_U32 = 6u;
 public static const uint ATTRIB_NONE = 0xffffffffu;
 // Flags: a 3-vector that turns with its object (normals, tangents).
 public static const uint ATTRIB_DIRECTION = 1u;
+// Flags: stored in its own paged region (see above), possibly not resident.
+public static const uint ATTRIB_PAGED = 2u;
+public static const uint ATTRIB_PAGE_SHIFT = 16u;
 
 public struct AttribDesc {
     public uint offsetWords;
@@ -144,8 +158,29 @@ public AttribDesc attribDesc(StructuredBuffer<uint> pool, uint id) {
     return { pool[b], pool[b + 1u], pool[b + 2u], pool[b + 3u] };
 }
 
+// The first word of `splat`'s record of the attribute, or ATTRIB_NONE
+// when it is paged and its page is not resident.
 public uint attribBase(StructuredBuffer<uint> pool, AttribDesc d, uint splat) {
-    return pool[2] + splat * pool[0] + d.offsetWords;
+    if ((d.flags & ATTRIB_PAGED) == 0u) {
+        return pool[2] + splat * pool[0] + d.offsetWords;
+    }
+    uint pages = (pool[3] + (1u << ATTRIB_PAGE_SHIFT) - 1u) >> ATTRIB_PAGE_SHIFT;
+    uint page = splat >> ATTRIB_PAGE_SHIFT;
+    uint slot = page < pages ? pool[d.offsetWords + page] : ATTRIB_NONE;
+    if (slot == ATTRIB_NONE) {
+        return ATTRIB_NONE;
+    }
+    uint local = splat & ((1u << ATTRIB_PAGE_SHIFT) - 1u);
+    return d.offsetWords + pages + ((slot << ATTRIB_PAGE_SHIFT) + local) * attribWords(d);
+}
+
+// Whether attribute `id` of `splat` is there to read: the pool has it and,
+// paged, its page is resident. Not resident reads as zeros.
+public bool attribResident(StructuredBuffer<uint> pool, uint id, uint splat) {
+    if (id >= pool[1]) {
+        return false;
+    }
+    return attribBase(pool, attribDesc(pool, id), splat) != ATTRIB_NONE;
 }
 
 // Components 4 * comp4 .. 4 * comp4 + 3 as floats: normalized formats in
@@ -156,7 +191,11 @@ public float4 readAttrib(StructuredBuffer<uint> pool, uint id, uint splat, uint 
     }
     AttribDesc d = attribDesc(pool, id);
     uint2 span = attribGroupWords(d, comp4);
-    uint base = attribBase(pool, d, splat) + span.x;
+    uint at = attribBase(pool, d, splat);
+    if (at == ATTRIB_NONE) {
+        return float4(0.0);
+    }
+    uint base = at + span.x;
     uint4 w = uint4(0u);
     for (uint k = 0u; k < span.y; k++) {
         w[k] = pool[base + k];
@@ -176,7 +215,11 @@ public uint readAttribU(StructuredBuffer<uint> pool, uint id, uint splat, uint c
     }
     uint size = attribFormatBytes(d.format);
     uint byte = comp * size;
-    uint w = pool[attribBase(pool, d, splat) + byte / 4u] >> ((byte & 3u) * 8u);
+    uint at = attribBase(pool, d, splat);
+    if (at == ATTRIB_NONE) {
+        return 0u;
+    }
+    uint w = pool[at + byte / 4u] >> ((byte & 3u) * 8u);
     return size == 4u ? w : w & ((1u << (8u * size)) - 1u);
 }
 

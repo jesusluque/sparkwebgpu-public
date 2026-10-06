@@ -350,7 +350,7 @@ fn main() -> Result<()> {
             );
         }
         report["sections"] = Json::Object(sections);
-        let tiers: Vec<u64> = [1, 2]
+        let tiers: Vec<u64> = [1, 2, 3]
             .iter()
             .map(|&t| {
                 layout
@@ -360,7 +360,7 @@ fn main() -> Result<()> {
                     .sum()
             })
             .collect();
-        report["tierBytes"] = json!({ "1": tiers[0], "2": tiers[1] });
+        report["tierBytes"] = json!({ "1": tiers[0], "2": tiers[1], "3": tiers[2] });
         // What a whole-file fetch would cost over HTTP compression.
         if compression == COMPRESSION_NONE && flag("--gzip-estimate") {
             report["gzipWhole"] = json!(gzip(&bytes).len());

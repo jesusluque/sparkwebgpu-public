@@ -100,7 +100,7 @@
 
     const paged = params.get("paged") === "1";
     // Paged: a small pool (the relight pass runs a thread a pool slot).
-    const spark = new SparkRenderer({ renderer, ...(paged ? { maxPagedSplats: 16 * 65536, pagedExtSplats: true } : {}) });
+    const spark = new SparkRenderer({ renderer, hdr: true, ...(paged ? { maxPagedSplats: 16 * 65536, pagedExtSplats: true } : {}) });
     scene.add(spark);
     const car = new SplatMesh({ url: `${base}${name}.athc`, extSplats: true, paged });
     scene.add(car);

@@ -34,10 +34,12 @@
     // through athenea's display transform.
     //
     //   ?base=<dir>       where the pawn's files are (default ./pawn/): the
-    //                     .athc clouds of usd-athc, pawn.json and hdri/
+    //                     .athc clouds of usd-athc
+    //   ?hdriBase=<dir>   the full-resolution (4k) HDRIs (default ./hdri-4k/,
+    //                     publish-r2/sparkwebgpu/hdri-4k/ linked or copied here)
     //   ?transfer=t16|t64|t84|full   which transfer the clouds carry (t64)
     //   ?topTransfer=full|t64...     the glass head's (default full: its lens needs the field)
-    //   ?hdri=<name>      the dome (default autoshop_01_2k.hdr, the bake's)
+    //   ?hdri=<name>      the dome (default autoshop_01_4k.hdr, the bake's)
     //   ?top=0            the body alone   ?gui=0   ?view=agx|aces2|standard
     import * as THREE from "three/webgpu";
     import GUI from "lil-gui";
@@ -53,6 +55,7 @@
 
     const params = new URLSearchParams(location.search);
     const base = params.get("base") ?? "./pawn/";
+    const hdriBase = params.get("hdriBase") ?? "./hdri-4k/";
     const transfer = params.get("transfer") ?? "t64";
     const suffix = transfer === "full" ? "full-gz" : `${transfer}-gz`;
     // The glass head is a lens only with its transfer's reflected field
@@ -114,10 +117,13 @@
       new THREE.SphereGeometry(5, 64, 32),
       new THREE.MeshBasicNodeMaterial({ side: THREE.BackSide, depthWrite: false }),
     );
-    backdrop.material.colorNode = skyTexture.sample(skyUv).rgb.mul(intensity);
+    // Linear radiance into the HalfFloat target, held at its largest finite
+    // value (65504: a sun past it would turn to infinity there).
+    backdrop.material.colorNode = TSL.min(skyTexture.sample(skyUv).rgb.mul(intensity), TSL.vec3(65504));
     scene.add(backdrop);
 
-    const spark = new SparkRenderer({ renderer });
+    // Float end to end: relit light past 1 kept and blended in linear light.
+    const spark = new SparkRenderer({ renderer, hdr: true });
     scene.add(spark);
     const body = new SplatMesh({ url: `${base}body-${suffix}.athc`, extSplats: true });
     scene.add(body);
@@ -133,7 +139,7 @@
     let host = null;
 
     const state = {
-      hdri: params.get("hdri") ?? "autoshop_01_2k.hdr",
+      hdri: (params.get("hdri") ?? "autoshop_01_4k.hdr").replace(/_(1k|2k)\.hdr$/, "_4k.hdr"),
       rotation: 0,
       intensity: 1,
       sun: false,
@@ -142,10 +148,11 @@
       sunIntensity: 3,
       indirect: true,
     };
+    // Full resolution only (pawn.json's list names 2k copies).
     let hdris = [state.hdri];
     try {
       const pawn = await (await fetch(`${base}pawn.json`)).json();
-      hdris = pawn.hdri ?? hdris;
+      hdris = [...new Set([state.hdri, ...(pawn.hdri ?? []).map((n) => n.replace(/_(1k|2k)\.hdr$/, "_4k.hdr"))])];
     } catch {
       // pawn.json is optional; the default sky is enough.
     }
@@ -153,10 +160,12 @@
     async function setHdri(name) {
       state.hdri = name;
       status.textContent = `loading ${name}…`;
-      const tex = await hdrLoader.setDataType(THREE.FloatType).loadAsync(`${base}hdri/${name}`);
+      const tex = await hdrLoader.setDataType(THREE.FloatType).loadAsync(`${hdriBase}${name}`);
       const { width, height, data } = tex.image;
       relight.set({ hdri: { width, height, data, channels: 4 } });
       tex.flipY = false;
+      // A 4k float dome is 128 MB as a texture: let the last one go.
+      if (skyTexture.value !== tex) skyTexture.value.dispose();
       skyTexture.value = tex;
       applySky();
     }

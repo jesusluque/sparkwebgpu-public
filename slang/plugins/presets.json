@@ -12,7 +12,8 @@
     },
     "athenea.relight": {
       "module": "athenea_adapter.relight_colour",
-      "colour": "AtheneaRelightColour"
+      "colour": "AtheneaRelightColour",
+      "blend": "AtheneaRelightBlend"
     }
   },
   "presets": [

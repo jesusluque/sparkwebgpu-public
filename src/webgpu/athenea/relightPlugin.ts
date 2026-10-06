@@ -20,6 +20,17 @@
 //     changed: athenea's relitSplat (slang/athenea_adapter/relight.slang).
 // generate's colour plugin (relight_colour.slang) then takes that colour.
 //
+// Where a cloud keeps athenea's curvature (.athc v3 CURV, the attribute
+// `curvature`), the pass also reads a solid glass's far face from it (a
+// lens: lensExit) and, with the last frame's projection, how the surface
+// turns a pixel away (SplatSlope): the reflection's slope across the
+// footprint, or the sharp coat and polish, go to the draw per splat and are
+// shaded per pixel there by the plugin's blend term (AtheneaRelightBlend,
+// athenea's splat_blend), as athenea's raster draws them.
+//
+// A splat whose transfer page a paged pool has not brought keeps its
+// captured colour (athcTransferResident) until the page arrives.
+//
 // The streams are read from the mesh's attribute pool through
 // core/attrib.slang, by name, so a paged pool (gpuBuffer) is bound as it is.
 // The colour leaves in linear light, encoded for Spark's draw like the raster
@@ -143,7 +154,11 @@ const STREAMS = [
   "lobes",
   "transfer",
   "shadowBits",
+  "curvature",
 ] as const;
+
+/** Bytes of the draw's per-slot record (relight_colour.slang atheneaPixel). */
+const PIXEL_RECORD_BYTES = 48;
 
 function keysOf(mesh: WgpuSplatMesh | undefined): object[] {
   if (!mesh) return [];
@@ -168,6 +183,15 @@ function identity(o: object | null | undefined): number {
     identities.set(o, k);
   }
   return k;
+}
+
+/** A zeroed uniform block for the blend term until the first pass fills it. */
+function createUniformBlock(device: GPUDevice): GPUBuffer {
+  return device.createBuffer({
+    label: "relight pixel params",
+    size: 48,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
 }
 
 const vec3 = (v: Vec3): THREE.Vector3 =>
@@ -314,6 +338,41 @@ export function atheneaRelightPlugin(
   };
 
   let emptyPool: GPUBuffer | null = null;
+  /** The draw's records, three uint4 an accumulator slot. */
+  let pixel: GPUBuffer | null = null;
+  /** The first dome's sun and the map's side, for the blend term. */
+  let pixelParams: GPUBuffer | null = null;
+  /** The accumulator's layout the pixel records were written for. */
+  let pixelLayout = "";
+
+  const slotsOf = (r: WgpuSplatRenderer) =>
+    r.meshes.reduce(
+      (n, m) => n + (m.lodIndices ? m.lodIndices.length : m.source.count),
+      0,
+    );
+
+  /** Which mesh holds which accumulator slots, and which are relit. */
+  const layoutOf = (r: WgpuSplatRenderer) =>
+    r.meshes
+      .map(
+        (m) =>
+          `${identity(m)}:${identity(m.lodIndices)}:${m.lodIndices?.length ?? m.source.count}:${!r.plugins || r.plugins.isActive(ATHENEA_RELIGHT_ID, m)}`,
+      )
+      .join();
+
+  const pixelBuffer = (device: GPUDevice, slots: number): GPUBuffer => {
+    const bytes = Math.max(slots, 1) * PIXEL_RECORD_BYTES;
+    if (!pixel || pixel.size < bytes) {
+      pixel?.destroy();
+      pixel = createStorage(
+        device,
+        Math.ceil(bytes * (pixel ? 1.5 : 1)),
+        "relight pixel",
+      );
+      pixelLayout = "";
+    }
+    return pixel;
+  };
 
   const stateOf = (device: GPUDevice, mesh: WgpuSplatMesh): MeshState => {
     const bytes = Math.max(mesh.source.count, 1) * C.kRelightStride * 16;
@@ -357,12 +416,44 @@ export function atheneaRelightPlugin(
     const kTransfer =
       transferCount >= 9 && shadowWords >= 8 ? 2 : transferCount >= 9 ? 1 : 0;
     const storedLinear = lookupLinear(mesh);
+    // The frame's projection, for SplatSlope (splat_project's tx3, ty3):
+    // the cloud's space to the eye's with depth ahead, and the focal and
+    // centre in pixels of the last target drawn.
+    const size = r.lastDrawSize;
+    const p = camera.projectionMatrix.elements;
+    const slopeOn = Boolean(size) && id("curvature") !== ATTRIB_NONE;
+    const toEye = new THREE.Matrix4().multiplyMatrices(
+      camera.matrixWorldInverse,
+      world,
+    ).elements;
+    const eyeRow = (k: number, sign: number) => [
+      sign * toEye[k],
+      sign * toEye[k + 4],
+      sign * toEye[k + 8],
+      sign * toEye[k + 12],
+    ];
+    const w = size?.width ?? 1;
+    const h = size?.height ?? 1;
+    const projection = {
+      view0: eyeRow(0, 1),
+      view1: eyeRow(1, 1),
+      view2: eyeRow(2, -1),
+      // px = w/2 (P00 x / d - P02 + 1), py = h/2 (1 - P11 y / d + P12), d = -z.
+      focal: [
+        (w / 2) * p[0],
+        -(h / 2) * p[5],
+        (w / 2) * (1 - p[8]),
+        (h / 2) * (1 + p[9]),
+      ],
+      viewport: [w, h, 0, 0],
+    };
     let flags =
       (source.format === "ext" ? C.kRelightExt : 0) |
       (source.lodOpacity ? C.kRelightLodOpacity : 0) |
       (storedLinear ? C.kRelightLinear : 0) |
       (options.litBody ? C.kRelightLit : 0) |
-      (options.indirect ? C.kRelightIndirect : 0);
+      (options.indirect ? C.kRelightIndirect : 0) |
+      (slopeOn ? C.kRelightSlope : 0);
     const e = world.elements;
     const row = (k: number) => [e[k], e[k + 4], e[k + 8], e[k + 12]];
     const params = UniformWriter.for(relightModule, "relightParams").setAll({
@@ -381,12 +472,14 @@ export function atheneaRelightPlugin(
       shadowWords,
       ior: iorOf(mesh),
       emissionScale: options.emission,
+      curvature: id("curvature"),
       encoding: source.encoding,
       row0: row(0),
       row1: row(1),
       row2: row(2),
       eyeObject: [eyeObject.x, eyeObject.y, eyeObject.z, 1],
       eyeWorld: [eye.x, eye.y, eye.z, 1],
+      ...projection,
     });
     emptyPool ??= upload(device, new Uint32Array([0, 0, 4, 0]), "relight pool");
     const buffers = {
@@ -435,7 +528,7 @@ export function atheneaRelightPlugin(
       state.viewlessKey = placed;
       stats.viewless += 1;
     }
-    const key = `${placed}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}`;
+    const key = `${placed}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${slopeOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
@@ -457,9 +550,12 @@ export function atheneaRelightPlugin(
   const plugin: AtheneaRelightPlugin = {
     id: ATHENEA_RELIGHT_ID,
     minTier: 2,
+    // A pager brings the streams it reads (WgpuSplatPager.attributePlan).
+    requires: { reads: STREAMS },
     slang: {
       module: "athenea_adapter.relight_colour",
       colour: "AtheneaRelightColour",
+      blend: "AtheneaRelightBlend",
     },
     options,
     stats,
@@ -500,6 +596,23 @@ export function atheneaRelightPlugin(
           }
           const camera = frame.camera;
           camera.updateMatrixWorld();
+          // The blend term's sun (env_sun's two float4) and map side.
+          pixelParams ??= createUniformBlock(device);
+          encoder.copyBufferToBuffer(sky.envSun, 0, pixelParams, 0, 32);
+          device.queue.writeBuffer(
+            pixelParams,
+            32,
+            new Uint32Array([sky.baseSide, 0, 0, 0]),
+          );
+          // Slots a mesh not relit here may now hold kept records of a mesh
+          // that was: cleared when the accumulator's layout changes (onFrame
+          // has asked for the splats to be generated again).
+          const layout = layoutOf(r);
+          const records = pixelBuffer(device, slotsOf(r));
+          if (layout !== pixelLayout) {
+            encoder.clearBuffer(records);
+            pixelLayout = layout;
+          }
           const pass = encoder.beginComputePass({ label: "athenea relight" });
           for (const mesh of meshes) relightMesh(pass, r, mesh, camera);
           pass.end();
@@ -507,8 +620,26 @@ export function atheneaRelightPlugin(
       },
     ],
     buffers(stage, ctx): Record<string, GPUBuffer> {
-      if (stage !== "splat" || !ctx.mesh || !renderer) return {};
-      return { atheneaRelit: stateOf(renderer.device, ctx.mesh).relit };
+      if (!renderer) return {};
+      const records = pixelBuffer(renderer.device, slotsOf(renderer));
+      if (stage === "pixel") {
+        emptyPool ??= upload(
+          renderer.device,
+          new Uint32Array([0, 0, 4, 0]),
+          "relight pool",
+        );
+        pixelParams ??= createUniformBlock(renderer.device);
+        return {
+          atheneaPixel: records,
+          atheneaEnvTexels: sky?.envTexels ?? emptyPool,
+          atheneaPixelParams: pixelParams,
+        };
+      }
+      if (!ctx.mesh) return {};
+      return {
+        atheneaRelit: stateOf(renderer.device, ctx.mesh).relit,
+        atheneaPixelOut: records,
+      };
     },
     attach(r) {
       renderer = r;
@@ -536,10 +667,17 @@ export function atheneaRelightPlugin(
       ies = null;
       emptyPool?.destroy();
       emptyPool = null;
+      pixel?.destroy();
+      pixel = null;
+      pixelParams?.destroy();
+      pixelParams = null;
+      pixelLayout = "";
       renderer = null;
     },
-    onFrame() {
-      const was = dirty;
+    onFrame(frame) {
+      // A new accumulator layout clears the draw's records (the pass), so
+      // the relit meshes' must be written again.
+      const was = dirty || layoutOf(frame.renderer) !== pixelLayout;
       dirty = false;
       return was ? "dirty" : "clean";
     },

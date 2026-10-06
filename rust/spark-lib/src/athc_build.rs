@@ -1044,6 +1044,298 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
     })
 }
 
+/// The grid key of splat `i` for cells of side `cell` from `lo`.
+fn cell_key(b: &AthcBlock, lo: [f32; 3], i: usize, cell: f32) -> u64 {
+    let p = &b.positions[i * 4..i * 4 + 3];
+    let q = |k: usize| (((p[k] - lo[k]) / cell).max(0.0) as u64).min((1 << 21) - 1);
+    (q(0) << 42) | (q(1) << 21) | q(2)
+}
+
+/// The cell side that brings `cloud` down to about `target` splats with
+/// [`reduce_cells`]: the smallest whose groups are at most `target`.
+pub fn cell_for_target(cloud: &PackedCloud, target: usize) -> f32 {
+    let src = &cloud.block;
+    let lo = cloud.bounds_min;
+    let mut extent = 0.0f32;
+    for k in 0..3 {
+        extent = extent.max(cloud.bounds_max[k] - cloud.bounds_min[k]);
+    }
+    let extent = extent.max(1e-6);
+    let groups_at = |cell: f32| -> usize {
+        let mut keys: Vec<u64> = (0..src.n).map(|i| cell_key(src, lo, i, cell)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.len()
+    };
+    let (mut small, mut large) = (extent / (1 << 20) as f32, extent);
+    for _ in 0..24 {
+        let mid = (small * large).sqrt();
+        if groups_at(mid) > target {
+            small = mid;
+        } else {
+            large = mid;
+        }
+    }
+    large
+}
+
+/// A cloud made lighter for the web: the splats are grouped by a grid of
+/// cells of side `cell` (from the cloud's lower bound), and each group is
+/// merged into one Gaussian as a LoD level merges one (athenea's moments; the
+/// material from its first splat, the transfer averaged by opacity, the open
+/// directions by vote). `fill` widens the two long axes of each merged
+/// Gaussian (a level's moments give a patch's spread, about 0.29 of the cell,
+/// which leaves see-through seams when the merged cloud is looked at close
+/// up); its opacity is the merged weight over the widened area, as `finalize`
+/// computes it, at most 0.99. [`cell_for_target`] finds the cell for a count.
+pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedCloud> {
+    let src = &cloud.block;
+    let n = src.n;
+    if !src.emission.is_empty() || !src.lobes.is_empty() {
+        bail!("emission and lobes are not reduced here yet");
+    }
+    if cell.is_nan() || cell <= 0.0 {
+        bail!("the cell must be positive");
+    }
+    let lo = cloud.bounds_min;
+    let key_of = |i: usize, cell: f32| cell_key(src, lo, i, cell);
+    let keys: Vec<u64> = (0..n).map(|i| key_of(i, cell)).collect();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by_key(|&i| keys[i as usize]);
+    let splats = reorder(src, &order);
+    let mut group = Vec::with_capacity(n);
+    let mut starts = Vec::new();
+    for (k, &i) in order.iter().enumerate() {
+        if k == 0 || keys[i as usize] != keys[order[k - 1] as usize] {
+            starts.push(k as u32);
+        }
+        group.push(starts.len() as u32 - 1);
+    }
+    let level = Level {
+        groups: starts.len(),
+        cells: vec![0; starts.len()],
+        group,
+        starts,
+    };
+    let l = MomentLayout {
+        keep: cloud.rest_per_colour as usize,
+        normals: !splats.normals.is_empty(),
+        stride: MOMENTS_HEAD
+            + cloud.rest_per_colour as usize * 3
+            + if splats.normals.is_empty() { 0 } else { 3 },
+    };
+    let sh_words = cloud.sh_words as usize;
+    let moments = leaf_moments(&splats, &level, &l, sh_words);
+    let mut block = finalize(&moments, level.groups, &l, sh_words);
+    if fill != 1.0 {
+        let f = fill.max(1e-3);
+        for g in 0..block.n {
+            let sh = &mut block.shape[g * 4..g * 4 + 4];
+            let ls = [
+                f16_of(sh[1] & 0xffff),
+                f16_of(sh[1] >> 16),
+                f16_of(sh[2] & 0xffff),
+            ];
+            let k = (0..3).min_by(|&a, &b| ls[a].total_cmp(&ls[b])).unwrap();
+            let mut grown = ls;
+            for (a, v) in grown.iter_mut().enumerate() {
+                if a != k {
+                    *v += f.ln();
+                }
+            }
+            let base0 = sh[2] >> 16;
+            sh[1] = pack_halves(half_safe(grown[0]), half_safe(grown[1]));
+            sh[2] = (f16_bits(half_safe(grown[2])) & 0xffff) | (base0 << 16);
+            // finalize clamped at 0.99 before the area grew: the weight
+            // over the widened area.
+            let weight = moments[g * l.stride];
+            let s = grown.map(f32::exp);
+            let smallest = s[0].min(s[1]).min(s[2]);
+            let area = s[0] * s[1] * s[2] / smallest.max(1e-20);
+            block.positions[g * 4 + 3] = (weight / area.max(1e-30)).min(0.99);
+        }
+    }
+    drop(moments);
+    let per = |v: &[u32]| v.len() / n;
+    if !splats.pbr.is_empty() {
+        block.pbr = extras_merge(&splats.pbr, per(&splats.pbr), 0, &level.starts, &splats);
+    }
+    if !splats.transfer.is_empty() {
+        block.transfer = extras_merge(
+            &splats.transfer,
+            per(&splats.transfer),
+            1,
+            &level.starts,
+            &splats,
+        );
+    }
+    if !splats.shadow_bits.is_empty() {
+        block.shadow_bits = extras_merge(
+            &splats.shadow_bits,
+            per(&splats.shadow_bits),
+            2,
+            &level.starts,
+            &splats,
+        );
+    }
+    if !splats.curvature.is_empty() {
+        block.curvature = extras_merge(&splats.curvature, 2, 1, &level.starts, &splats);
+    }
+    Ok(PackedCloud {
+        block,
+        rest_per_colour: cloud.rest_per_colour,
+        sh_words: cloud.sh_words,
+        transfer_count: cloud.transfer_count,
+        linear: cloud.linear,
+        bounds_min: cloud.bounds_min,
+        bounds_max: cloud.bounds_max,
+        dropped: cloud.dropped,
+    })
+}
+
+/// A cloud thinned for the web to about one splat in `ratio`: the splats in
+/// Morton order are cut into runs of about `ratio`, and each run keeps its
+/// most typical splat (its normal nearest the run's mean; its place, turn,
+/// normal and material), its two long axes
+/// grown by the square root of the run's length so the run's area stays
+/// covered, its base colour and transfer averaged over the run by opacity
+/// and its open directions voted (as a LoD level merges them). Unlike
+/// [`reduce_cells`], every kept Gaussian has a real splat's shape on the
+/// surface, so a surface cut by the grid shows no seams or moiré.
+pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
+    let src = &cloud.block;
+    let n = src.n;
+    if !src.emission.is_empty() || !src.lobes.is_empty() {
+        bail!("emission and lobes are not reduced here yet");
+    }
+    if ratio.is_nan() || ratio < 1.0 {
+        bail!("the thinning ratio must be at least 1");
+    }
+    let target = ((n as f64 / ratio as f64).round() as usize).clamp(1, n);
+    let lo = cloud.bounds_min;
+    let mut extent = 0.0f32;
+    for k in 0..3 {
+        extent = extent.max(cloud.bounds_max[k] - cloud.bounds_min[k]);
+    }
+    let e = extent.max(1e-6) * 1.0001;
+    let codes: Vec<u32> = (0..n)
+        .map(|i| {
+            let p = &src.positions[i * 4..i * 4 + 3];
+            morton30([(p[0] - lo[0]) / e, (p[1] - lo[1]) / e, (p[2] - lo[2]) / e])
+        })
+        .collect();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by_key(|&i| codes[i as usize]);
+    let splats = reorder(src, &order);
+    let starts: Vec<u32> = (0..target)
+        .map(|j| (j as u64 * n as u64 / target as u64) as u32)
+        .collect();
+    let end = |j: usize| {
+        if j + 1 < target {
+            starts[j + 1] as usize
+        } else {
+            n
+        }
+    };
+    // Each run's most typical splat: the one whose normal is nearest the
+    // run's mean (a run across a panel's edge keeps a splat of the panel,
+    // not one of the rim folding into the gap); the middle one without normals.
+    let reps: Vec<u32> = (0..target)
+        .map(|j| {
+            let (first, last) = (starts[j] as usize, end(j));
+            if splats.normals.is_empty() {
+                return ((first + last) / 2) as u32;
+            }
+            let normal = |i: usize| crate::athc::unpack_normal(splats.normals[i]);
+            let mut mean = [0.0f32; 3];
+            for i in first..last {
+                let (nv, o) = (normal(i), splats.positions[i * 4 + 3].max(0.0));
+                for k in 0..3 {
+                    mean[k] += o * nv[k];
+                }
+            }
+            (first..last)
+                .max_by(|&a, &b| {
+                    let dot = |i: usize| {
+                        let nv = normal(i);
+                        nv[0] * mean[0] + nv[1] * mean[1] + nv[2] * mean[2]
+                    };
+                    dot(a).total_cmp(&dot(b))
+                })
+                .unwrap() as u32
+        })
+        .collect();
+    let mut block = reorder(&splats, &reps);
+    block.n = target; // reorder keeps a permutation's count
+    for j in 0..target {
+        let (first, last) = (starts[j] as usize, end(j));
+        // The run's base colour, by opacity x area as the moments weigh it.
+        let (mut w, mut c) = (0.0f32, [0.0f32; 3]);
+        for i in first..last {
+            let sh = &splats.shape[i * 4..i * 4 + 4];
+            let sc = [
+                f16_of(sh[1] & 0xffff).exp(),
+                f16_of(sh[1] >> 16).exp(),
+                f16_of(sh[2] & 0xffff).exp(),
+            ];
+            let smallest = sc[0].min(sc[1]).min(sc[2]);
+            let wt =
+                splats.positions[i * 4 + 3].max(0.0) * sc[0] * sc[1] * sc[2] / smallest.max(1e-20);
+            w += wt;
+            c[0] += wt * f16_of(sh[2] >> 16);
+            c[1] += wt * f16_of(sh[3] & 0xffff);
+            c[2] += wt * f16_of(sh[3] >> 16);
+        }
+        let sh = &mut block.shape[j * 4..j * 4 + 4];
+        let ls = [
+            f16_of(sh[1] & 0xffff),
+            f16_of(sh[1] >> 16),
+            f16_of(sh[2] & 0xffff),
+        ];
+        let thin = (0..3).min_by(|&a, &b| ls[a].total_cmp(&ls[b])).unwrap();
+        let grow = 0.5 * ((last - first) as f32).ln();
+        let g = [0, 1, 2].map(|a| if a == thin { ls[a] } else { ls[a] + grow });
+        let base = if w > 0.0 {
+            c.map(|v| v / w)
+        } else {
+            [
+                f16_of(sh[2] >> 16),
+                f16_of(sh[3] & 0xffff),
+                f16_of(sh[3] >> 16),
+            ]
+        };
+        sh[1] = pack_halves(half_safe(g[0]), half_safe(g[1]));
+        sh[2] = pack_halves(half_safe(g[2]), half_safe(base[0]));
+        sh[3] = pack_halves(half_safe(base[1]), half_safe(base[2]));
+    }
+    let per = |v: &[u32]| v.len() / n;
+    if !splats.transfer.is_empty() {
+        block.transfer = extras_merge(&splats.transfer, per(&splats.transfer), 1, &starts, &splats);
+    }
+    if !splats.shadow_bits.is_empty() {
+        block.shadow_bits = extras_merge(
+            &splats.shadow_bits,
+            per(&splats.shadow_bits),
+            2,
+            &starts,
+            &splats,
+        );
+    }
+    if !splats.curvature.is_empty() {
+        block.curvature = extras_merge(&splats.curvature, 2, 1, &starts, &splats);
+    }
+    Ok(PackedCloud {
+        block,
+        rest_per_colour: cloud.rest_per_colour,
+        sh_words: cloud.sh_words,
+        transfer_count: cloud.transfer_count,
+        linear: cloud.linear,
+        bounds_min: cloud.bounds_min,
+        bounds_max: cloud.bounds_max,
+        dropped: cloud.dropped,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,6 +1587,82 @@ mod tests {
             crate::athc_v3::read_v3(&v3).unwrap().write().unwrap(),
             bytes
         );
+    }
+
+    /// The web reductions of usd-athc: counts, grown shapes, streams kept.
+    #[test]
+    fn thins_and_merges_two_cards_for_the_web() {
+        let file = AthcFile::read(TWO_CARDS).unwrap();
+        let h = file.header;
+        let mut splats = file.splats();
+        splats.tail.clear();
+        let cloud = PackedCloud {
+            block: splats,
+            rest_per_colour: h.rest_per_colour,
+            sh_words: h.sh_words,
+            transfer_count: file.extra.transfer_count,
+            linear: h.flags & FLAG_LINEAR != 0,
+            bounds_min: h.bounds_min,
+            bounds_max: h.bounds_max,
+            dropped: 0,
+        };
+        let n = cloud.block.n;
+        let area = |b: &AthcBlock| -> f32 {
+            (0..b.n)
+                .map(|i| {
+                    let sh = &b.shape[i * 4..i * 4 + 4];
+                    let l = [
+                        f16_of(sh[1] & 0xffff),
+                        f16_of(sh[1] >> 16),
+                        f16_of(sh[2] & 0xffff),
+                    ];
+                    l.iter().sum::<f32>() - l.iter().copied().fold(f32::MAX, f32::min)
+                })
+                .map(f32::exp)
+                .sum()
+        };
+
+        let thin = reduce_thin(&cloud, 4.0).unwrap();
+        let t = &thin.block;
+        assert_eq!(t.n, (n as f32 / 4.0).round() as usize);
+        assert_eq!(t.positions.len(), t.n * 4);
+        assert_eq!(t.shape.len(), t.n * 4);
+        for (a, b) in [
+            (&t.normals, &cloud.block.normals),
+            (&t.pbr, &cloud.block.pbr),
+            (&t.sh, &cloud.block.sh),
+        ] {
+            assert_eq!(a.len() * n, b.len() * t.n);
+        }
+        // The kept splats cover about the area the cloud covered.
+        let (before, after) = (area(&cloud.block), area(t));
+        assert!((after / before - 1.0).abs() < 0.5, "{before} -> {after}");
+        // Every kept splat is one of the cloud's, in place.
+        for i in 0..t.n {
+            let p = &t.positions[i * 4..i * 4 + 3];
+            assert!((0..n).any(|j| &cloud.block.positions[j * 4..j * 4 + 3] == p));
+        }
+        assert_eq!(
+            build_lod(&thin, &BuildOptions::default())
+                .unwrap()
+                .header
+                .count as usize,
+            t.n
+        );
+
+        let cell = cell_for_target(&cloud, n / 4);
+        let merged = reduce_cells(&cloud, cell, 1.4).unwrap();
+        assert!(
+            merged.block.n <= n / 4 && merged.block.n > 0,
+            "{}",
+            merged.block.n
+        );
+        assert_eq!(merged.block.shape.len(), merged.block.n * 4);
+        assert!(merged
+            .block
+            .positions
+            .chunks(4)
+            .all(|p| p[3] > 0.0 && p[3] <= 0.99));
     }
 
     #[test]

@@ -104,7 +104,7 @@ describe("GLSL to WGSL", () => {
     );
     expect(code).toContain("clamp(v, vec3f(0.0), vec3f(1.0))");
     expect(code).toContain("step(vec3f(0.5), v)");
-    expect(code).toContain("smoothstep(vec3f(0.0), vec3f(1.0), v)");
+    expect(code).toContain("glsl_smoothstep_vec3f(vec3f(0.0), vec3f(1.0), v)");
     expect(code).toContain("min(v, vec3f(2.0))");
   });
 
@@ -165,6 +165,26 @@ describe("GLSL to WGSL", () => {
         "    s--;",
         "    continuing {",
         "        break if !(s > 5);",
+        "    }",
+        "}",
+      ].join("\n"),
+    );
+  });
+
+  it("turns a comma for-update into a loop's continuing block", () => {
+    expect(stmt("for (int i = 0, j = 4; i < j; i++, j--) {}")).toBe(
+      [
+        "{",
+        "    var i: i32 = 0;",
+        "    var j: i32 = 4;",
+        "    loop {",
+        "        if !(i < j) {",
+        "            break;",
+        "        }",
+        "        continuing {",
+        "            i++;",
+        "            j--;",
+        "        }",
         "    }",
         "}",
       ].join("\n"),

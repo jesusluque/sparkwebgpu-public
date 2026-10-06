@@ -210,6 +210,21 @@ const parity: [string, d.DynoType, () => d.DynoVal<d.DynoType>, number[]][] = [
     [12, 6, 3, 30],
   ],
   [
+    "for with two variables and a comma update",
+    "int",
+    glsl("int", {
+      statements: `
+        int n = 0;
+        for (int a = 0, b = 10; a < b; a++, b--) {
+          if (a == 1) continue;
+          n++;
+        }
+        $value = n;
+      `,
+    }),
+    [4],
+  ],
+  [
     "structs, arrays, const arrays indexed at run time",
     "vec4",
     glsl(
@@ -249,6 +264,15 @@ const parity: [string, d.DynoType, () => d.DynoVal<d.DynoType>, number[]][] = [
       `,
     }),
     [Math.atan2(1, -1), 0.5, smooth(0, 1, 0.4), 2.3],
+  ],
+  [
+    "smoothstep with edge0 > edge1, as GLSL computes it",
+    "vec2",
+    glsl("vec2", {
+      statements:
+        "$value = smoothstep(vec2(1.0, -1.0), vec2(0.0, -2.0), vec2(0.25, -1.5));",
+    }),
+    [smooth(1, 0, 0.25), smooth(-1, -2, -1.5)],
   ],
   [
     "bit casts and bit counts",
@@ -384,6 +408,34 @@ const parity: [string, d.DynoType, () => d.DynoVal<d.DynoType>, number[]][] = [
       { u: d.dynoUsampler2D(uTex), b: d.dynoSampler2D(bTex) } as never,
     ),
     [108, 0.5, 4, 3],
+  ],
+  [
+    "struct uniforms: fields, bools, textures",
+    "vec4",
+    glsl(
+      "vec4",
+      {
+        statements: `
+          uvec4 t = texelFetch($s.tex, ivec2(0, 0), 0);
+          $value = vec4($s.offset * $s.scale, float(t.y) + float($s.flag) + float($s.count));
+        `,
+      },
+      {
+        // Registered with registerWgslStruct in dynoCases.ts.
+        s: new d.DynoUniform({
+          key: "s",
+          type: { type: "TestStruct" },
+          value: {
+            scale: 2,
+            offset: [1, 2, 3],
+            flag: true,
+            tex: uTex,
+            count: 7,
+          },
+        }),
+      } as never,
+    ),
+    [2, 4, 6, 3 + 1 + 7],
   ],
 ];
 

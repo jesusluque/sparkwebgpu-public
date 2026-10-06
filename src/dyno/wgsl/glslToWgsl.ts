@@ -1250,8 +1250,19 @@ export class GlslTranslator {
         want(3);
         const [a, b, x] = floats();
         const t = [x, a, b].find((v) => !isScalar(v.ty))?.ty ?? x.ty;
+        // GLSL's formula, which code relies on for edge0 > edge1 (where
+        // WGSL implementations may differ).
+        const w = this.wgslTy(t);
+        const fn = this.helper(`glsl_smoothstep_${w}`, () =>
+          [
+            `fn glsl_smoothstep_${w}(e0: ${w}, e1: ${w}, x: ${w}) -> ${w} {`,
+            `    let t = clamp((x - e0) / (e1 - e0), ${w}(0.0), ${w}(1.0));`,
+            "    return t * t * (3.0 - 2.0 * t);",
+            "}",
+          ].join("\n"),
+        );
         return call(
-          "smoothstep",
+          fn,
           [a, b, x].map((v) => this.splat(v, t, pos)),
           t,
         );
@@ -1817,15 +1828,29 @@ export class GlslTranslator {
             else pre.push(...lines);
           }
           const test = s.test ? this.condition(s.test) : "";
-          let update = "";
-          if (s.update) {
-            const lines = this.exprStatement(s.update);
-            if (lines.length !== 1)
-              this.error("this for-loop update is not supported", s.update.pos);
-            update = lines[0].replace(/;$/, "");
-          }
+          const update = s.update ? this.exprStatement(s.update) : [];
           const body = this.body(s.body, { ...ctx, loop: ctx.loop + 1 });
-          const loop = [`for (${init}; ${test}; ${update}) {`, ...body, "}"];
+          // WGSL's for takes one update statement; a loop's continuing
+          // block (where continue goes) takes any.
+          const loop =
+            update.length > 1
+              ? [
+                  "loop {",
+                  ...(test
+                    ? [`    if !(${test}) {`, "        break;", "    }"]
+                    : []),
+                  ...body,
+                  "    continuing {",
+                  ...update.map((l) => `        ${l}`),
+                  "    }",
+                  "}",
+                ]
+              : [
+                  `for (${init}; ${test}; ${(update[0] ?? "").replace(/;$/, "")}) {`,
+                  ...body,
+                  "}",
+                ];
+          if (update.length > 1 && init) pre.push(`${init};`);
           return pre.length
             ? ["{", ...[...pre, ...loop].map((l) => `    ${l}`), "}"]
             : loop;

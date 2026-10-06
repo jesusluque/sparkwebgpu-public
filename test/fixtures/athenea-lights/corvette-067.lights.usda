@@ -1,0 +1,94 @@
+#usda 1.0
+(
+    doc = "Corvette C7 light sidecar (proposals 066/067). Draft: namespaced attributes until AtheneaLightGroupAPI exists."
+    subLayers = [@./corvette_c7.usda@]
+)
+
+over "Corvette"
+{
+    over "Looks"
+    {
+        # The exporter dropped the emission (strength 0 in Blender). Unit "on" emission here; w_k scales it at run time.
+        over "Light" {
+            over "OpenPBR" {
+                float inputs:emission_luminance = 1000      # nits when the group is on (to calibrate, 063)
+                color3f inputs:emission_color = (1, 1, 1)
+            }
+        }
+        over "Light_Rear" {
+            over "OpenPBR" {
+                float inputs:emission_luminance = 500       # white; the red comes from the Glass_Red lenses
+                color3f inputs:emission_color = (1, 1, 1)
+            }
+        }
+        over "Light_Rear_Red" {
+            over "OpenPBR" {
+                float inputs:emission_luminance = 800       # the red light-guide tube
+                color3f inputs:emission_color = (0.381, 0.003, 0)
+            }
+        }
+    }
+
+    def Scope "LightGroups"
+    {
+        # One prim per group, named as the Cycles Light Group in Blender (script in this proposal).
+        def Scope "cruce" {
+            rel athenea:lightGroup:members = [</Corvette/Main_Lens_Reflecotr>]
+            token athenea:lightGroup:function = "lowBeam"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:riseSeconds = 0.15
+            float athenea:lightGroup:temperatureK = 5500
+            bool athenea:lightGroup:initialOn = false
+        }
+        def Scope "largas" {
+            rel athenea:lightGroup:members = [</Corvette/Mini_Lens_Reflectors>]     # verify in Blender: high beam or LED signature
+            token athenea:lightGroup:function = "highBeam"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:riseSeconds = 0.15
+            bool athenea:lightGroup:initialOn = false
+        }
+        def Scope "drl" {
+            rel athenea:lightGroup:members = [</Corvette/Headlights_Housing>]       # verify: may include side markers
+            token athenea:lightGroup:function = "daytimeRunning"
+            token athenea:lightGroup:technology = "led"
+            bool athenea:lightGroup:initialOn = false
+        }
+        def Scope "pilotos" {
+            rel athenea:lightGroup:members = [</Corvette/Rear_Light_Relfectors>, </Corvette/Rear_Light_Relfectors_001>]
+            token athenea:lightGroup:function = "tail"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:brakeScale = 4         # brake shares the lamp at a higher intensity (rule below)
+            bool athenea:lightGroup:initialOn = false
+        }
+        def Scope "tubo_trasero" {
+            rel athenea:lightGroup:members = [</Corvette/Rear_Light_Tube>]
+            token athenea:lightGroup:function = "tail"
+            token athenea:lightGroup:technology = "lightGuide"
+            bool athenea:lightGroup:initialOn = false
+        }
+        # No amber emitter exists in the asset: indicators need a source added behind F#1 first.
+    }
+
+    def Scope "LightStates"
+    {
+        def Scope "aparcado"        { dictionary athenea:lightState:targets = {} }
+        def Scope "diurno"          { dictionary athenea:lightState:targets = { double drl = 1 } }
+        def Scope "noche_ciudad"    { dictionary athenea:lightState:targets = { double cruce = 1  double pilotos = 1  double tubo_trasero = 1 } }
+        def Scope "noche_carretera" { dictionary athenea:lightState:targets = { double cruce = 1  double largas = 1  double pilotos = 1  double tubo_trasero = 1 } }
+        def Scope "frenando"        { dictionary athenea:lightState:targets = { double pilotos = 4  double tubo_trasero = 1 } }
+    }
+
+    def Scope "LightRules"
+    {
+        def Scope "drl_off_with_low_beam" {      # UN R48 6.19.7, as quoted by a search (062)
+            token athenea:lightRule:when = "cruce"
+            token athenea:lightRule:target = "drl"
+            double athenea:lightRule:scale = 0
+        }
+        def Scope "high_needs_low" {
+            token athenea:lightRule:when = "!cruce"
+            token athenea:lightRule:target = "largas"
+            double athenea:lightRule:scale = 0
+        }
+    }
+}

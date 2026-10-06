@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • athenea light groups (WebGPU)</title>
+  <style>
+    body { margin: 0; background-color: black; }
+    canvas { display: block; touch-action: none; }
+    .overlay { position: fixed; margin: 12px; bottom: 0; color: white; font-family: sans-serif; font-size: 13px; white-space: pre; }
+    .groups span { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border: 1px solid #888; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "@sparkjsdev/spark/webgpu": "../../dist/spark.webgpu.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
+      }
+    }
+  </script>
+  <div class="overlay"><div class="groups" id="groups"></div><p id="status">loading…</p></div>
+  <canvas id="canvas" tabindex="0" style="outline: none;"></canvas>
+  <script type="module">
+    // athenea's light groups (plan-athenea.md phase 6; proposals 066, 067,
+    // 076): a car's lamps over its relit cloud, switched by named states,
+    // rules and a sequence from its .lights.usda, lit from its .lights.athl
+    // (per group: emitter polygons, a lens profile, sparse baked layers).
+    // Changing a state changes only the groups' weights w_k.
+    //
+    // The asset is synthetic (rust/build-lod athenea-lights): athenea has
+    // not baked a car's groups yet (proposal 069); docs/docs/athl.md says
+    // what the real Corvette needs.
+    //
+    //   ?base=<dir>&name=<name>   the three files (default ./athenea-lights/car)
+    //   ?state=<state>            start in a state   ?play=<sequence>
+    //   ?paged=1                  page the cloud, and the .athl's layers with it
+    //   ?gui=0                    ?view=agx|aces2|standard
+    import * as THREE from "three/webgpu";
+    import GUI from "lil-gui";
+    import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
+    import {
+      splatRequiredLimits,
+      fx,
+      plugins,
+      atheneaRelightPlugin,
+      atheneaLightsPlugin,
+      atheneaOutputPlugin,
+      athcCloudHash,
+      athlPagerChunks,
+      decodeAthl,
+      openAthl,
+      urlRange,
+      lightGroupSwatch,
+    } from "@sparkjsdev/spark/webgpu";
+
+    const params = new URLSearchParams(location.search);
+    const base = params.get("base") ?? "./athenea-lights/";
+    const name = params.get("name") ?? "car";
+    const status = document.getElementById("status");
+    const groupsDiv = document.getElementById("groups");
+    window.__athenea = { loaded: false, error: null };
+
+    const adapter = await navigator.gpu?.requestAdapter();
+    const renderer = new THREE.WebGPURenderer({
+      canvas: document.getElementById("canvas"),
+      requiredLimits: adapter ? splatRequiredLimits(adapter) : {},
+    });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    await renderer.init();
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0.004, 0.005, 0.009);
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 100);
+    camera.position.set(3.6, 1.7, 5.2);
+    camera.lookAt(0, 0.6, 1.5);
+
+    const target = new THREE.RenderTarget(1, 1, {
+      type: THREE.HalfFloatType,
+      depthTexture: new THREE.DepthTexture(1, 1),
+    });
+    const output = new THREE.QuadMesh(new THREE.MeshBasicNodeMaterial({ colorNode: THREE.TSL.texture(target.texture) }));
+    const chain = new fx.FxChain(renderer.backend.device);
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+      target.setSize(size.x, size.y);
+    }
+    resize();
+    addEventListener("resize", resize);
+
+    const paged = params.get("paged") === "1";
+    // Paged: a small pool (the relight pass runs a thread a pool slot).
+    const spark = new SparkRenderer({ renderer, ...(paged ? { maxPagedSplats: 16 * 65536, pagedExtSplats: true } : {}) });
+    scene.add(spark);
+    const car = new SplatMesh({ url: `${base}${name}.athc`, extSplats: true, paged });
+    scene.add(car);
+
+    // A dim night dome: the cloud's base light (TX would go here; this
+    // synthetic cloud has normals and colours only).
+    const relight = atheneaRelightPlugin({ colour: [0.035, 0.04, 0.06], intensity: 1 });
+    const lights = atheneaLightsPlugin();
+    const display = atheneaOutputPlugin({ view: params.get("view") ?? "agx", exposure: 0 });
+    let host = null;
+
+    try {
+      const athlUrl = `${base}${name}.lights.athl`;
+      const [head, usda] = await Promise.all([
+        urlRange(`${base}${name}.athc`)(0, 4096),
+        fetch(`${base}${name}.lights.usda`).then((r) => r.text()),
+      ]);
+      lights.setSidecar(usda);
+      const cloudHash = athcCloudHash(head);
+      if (paged) {
+        // Each page's layers by range as the cloud's page comes in.
+        const none = new Uint32Array(256).fill(0xffffffff);
+        lights.setLights(car, await openAthl(urlRange(athlUrl)), {
+          cloudHash,
+          pageChunks: () => {
+            const pager = spark.webgpu?.lod?.pager;
+            return pager && car.paged ? athlPagerChunks(pager, car.paged) : none;
+          },
+        });
+      } else {
+        const athl = await (await fetch(athlUrl)).arrayBuffer();
+        lights.setLights(car, await decodeAthl(new Uint8Array(athl)), { cloudHash });
+      }
+      await car.initialized;
+      await spark.webgpuReady;
+      if (params.get("state")) lights.setLightState(params.get("state"));
+      else lights.setLightState("noche_ciudad");
+      if (params.get("play")) lights.playSequence(params.get("play"));
+      window.__athenea.loaded = true;
+    } catch (error) {
+      window.__athenea.error = String(error);
+      status.textContent = `error: ${error}`;
+      console.error(error);
+    }
+
+    if (params.get("gui") !== "0") {
+      const gui = new GUI({ title: "athenea light groups" });
+      const add = (folder, c) => {
+        const v = { [c.label]: c.get?.() };
+        if (c.type === "select") return folder.add(v, c.label, c.options).onChange(c.set);
+        if (c.type === "boolean") return folder.add(v, c.label).onChange(c.set);
+        if (c.type === "action") return folder.add({ [c.label]: () => c.set() }, c.label);
+        return folder.add(v, c.label, c.min, c.max, c.step).onChange(c.set);
+      };
+      const g = gui.addFolder("lights");
+      for (const c of lights.ui) add(g, c);
+      const o = gui.addFolder("output");
+      for (const c of display.ui) add(o, c);
+      const d = gui.addFolder("dome");
+      add(d, relight.ui[0]);
+    }
+    Object.assign(window.__athenea, { relight, lights, display, car, spark, camera });
+
+    const controls = new SparkControls({ canvas: renderer.domElement });
+    controls.fpsMovement.moveSpeed = 1;
+    let frames = 0;
+    let last = performance.now();
+    renderer.setAnimationLoop(() => {
+      controls.update(camera);
+      renderer.setRenderTarget(target);
+      renderer.render(scene, camera);
+      const splats = spark.webgpu?.splats;
+      if (!host && splats && window.__athenea.loaded) {
+        host = new plugins.PluginHost({ capabilities: splats.capabilities });
+        host.register(relight).register(lights).register(display).attach(splats);
+        host.applyFx(chain);
+        window.__athenea.host = host;
+        const why = host.resolve(splats.meshes[0]).inactive;
+        if (why.length) status.textContent = `inactive: ${why.map((r) => `${r.id} ${r.reason} ${r.detail ?? ""}`).join(", ")}`;
+      }
+      chain.applyToRenderTarget(renderer, target);
+      renderer.setRenderTarget(null);
+      output.render(renderer);
+      window.__sparkFrames = (window.__sparkFrames ?? 0) + 1;
+      frames++;
+      const now = performance.now();
+      if (now - last > 250 && window.__athenea.loaded) {
+        const fps = (frames * 1000) / (now - last);
+        groupsDiv.innerHTML = lights.lightGroups
+          .map((g) => `<div><span style="background:${lightGroupSwatch(g)};opacity:${Math.min(1, 0.15 + g.level)}"></span>${g.name} ${g.level.toFixed(2)} → ${g.target}</div>`)
+          .join("");
+        const r = lights.rig;
+        status.textContent = `state ${r?.currentState ?? "-"}${r?.playing ? ` · playing ${r.playing}` : ""} · w changes ${lights.stats.changes} · ${fps.toFixed(0)} fps`;
+        frames = 0;
+        last = now;
+        if (host && window.__sparkFrames > 30) window.__ready = true;
+      }
+    });
+  </script>
+</body>
+</html>

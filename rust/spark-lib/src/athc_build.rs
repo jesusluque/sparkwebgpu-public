@@ -55,6 +55,16 @@ pub struct CloudStreams {
     pub metallic: Vec<f32>,
     pub roughness: Vec<f32>,
     pub transmission: Vec<f32>,
+    /// `thinWalled` (int[]): a thin wall, carried on the pbr word (bit 24);
+    /// read only beside the material, as `GpuClouds` reads it
+    pub thin_walled: Vec<u32>,
+    /// `schlickMetal` (int[]): a Schlick metal (OpenPBR, glTF), pbr bit 25
+    pub schlick_metal: Vec<u32>,
+    /// The layers over the base (`packing.slang` `SplatLobes`), one array
+    /// each, empty where the stage does not carry it: `specularWeight`,
+    /// `specularColor` (3), `specularIor`, `coatWeight`, `coatRoughness`,
+    /// `coatIor`, `sheenColor` (3), `sheenRoughness`, `coatDarkening`.
+    pub lobes: LobeStreams,
     /// `transferDirect`: 9 or 16 a splat
     pub transfer_direct: Vec<f32>,
     /// `transferIndirect`: 3 x the direct count a splat, rgb a coefficient
@@ -66,6 +76,182 @@ pub struct CloudStreams {
     /// `curvature`: 3 a splat, the shape operator in the splat's first two
     /// axes (xx, xy, yy), on the mesh's normal (sparkwebGPU's `CURV`)
     pub curvature: Vec<f32>,
+}
+
+/// The layers' arrays (`GpuClouds.cpp` `lobeArrays`, in its order).
+#[derive(Clone, Debug, Default)]
+pub struct LobeStreams {
+    pub specular_weight: Vec<f32>,
+    pub specular_colour: Vec<f32>,
+    pub specular_ior: Vec<f32>,
+    pub coat_weight: Vec<f32>,
+    pub coat_roughness: Vec<f32>,
+    pub coat_ior: Vec<f32>,
+    pub sheen_colour: Vec<f32>,
+    pub sheen_roughness: Vec<f32>,
+    pub coat_darkening: Vec<f32>,
+}
+
+/// A splat's layers, as `packing.slang`'s `SplatLobes` holds them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplatLobes {
+    pub specular_weight: f32,
+    pub specular_colour: [f32; 3],
+    pub specular_ior: f32,
+    pub coat_weight: f32,
+    pub coat_roughness: f32,
+    pub coat_ior: f32,
+    pub coat_darkening: f32,
+    pub sheen_colour: [f32; 3],
+    pub sheen_roughness: f32,
+}
+
+impl SplatLobes {
+    /// `plainLobes()`: what a gaussian without layers reflects with, and what
+    /// `streams.slang` writes for an array the stage does not carry.
+    pub const PLAIN: SplatLobes = SplatLobes {
+        specular_weight: 1.0,
+        specular_colour: [1.0; 3],
+        specular_ior: 1.5,
+        coat_weight: 0.0,
+        coat_roughness: 0.0,
+        coat_ior: 1.5,
+        coat_darkening: 0.0,
+        sheen_colour: [0.0; 3],
+        sheen_roughness: 0.0,
+    };
+}
+
+/// `lobeByte`
+fn lobe_byte(v: f32) -> u32 {
+    (saturate(v) * 255.0 + 0.5) as u32
+}
+/// `iorByte`: `1 + byte / 128`
+fn ior_byte(ior: f32) -> u32 {
+    ((ior - 1.0) * 128.0 + 0.5).clamp(0.0, 255.0) as u32
+}
+/// `coatByte`: `1 + bits / 64` in seven bits, darkening in the eighth
+fn coat_byte(ior: f32, darkening: f32) -> u32 {
+    (((ior - 1.0) * 64.0 + 0.5).clamp(0.0, 127.0) as u32) | if darkening >= 0.5 { 128 } else { 0 }
+}
+
+/// `packing.slang` `packLobes` (txf 89a04d9): (specular colour, weight),
+/// (coat weight, roughness, coat index and darkening, specular index),
+/// (sheen colour, roughness), a byte each.
+pub fn pack_lobes(l: &SplatLobes) -> [u32; 3] {
+    let w0 = lobe_byte(l.specular_colour[0])
+        | (lobe_byte(l.specular_colour[1]) << 8)
+        | (lobe_byte(l.specular_colour[2]) << 16)
+        | (lobe_byte(l.specular_weight) << 24);
+    let w1 = lobe_byte(l.coat_weight)
+        | (lobe_byte(l.coat_roughness) << 8)
+        | (coat_byte(l.coat_ior, l.coat_darkening) << 16)
+        | (ior_byte(l.specular_ior) << 24);
+    let w2 = lobe_byte(l.sheen_colour[0])
+        | (lobe_byte(l.sheen_colour[1]) << 8)
+        | (lobe_byte(l.sheen_colour[2]) << 16)
+        | (lobe_byte(l.sheen_roughness) << 24);
+    [w0, w1, w2]
+}
+
+/// `packing.slang` `unpackLobes`.
+pub fn unpack_lobes(w: [u32; 3]) -> SplatLobes {
+    let b = |word: u32, at: u32| ((word >> (at * 8)) & 0xff) as f32 / 255.0;
+    SplatLobes {
+        specular_colour: [b(w[0], 0), b(w[0], 1), b(w[0], 2)],
+        specular_weight: b(w[0], 3),
+        coat_weight: b(w[1], 0),
+        coat_roughness: b(w[1], 1),
+        coat_ior: 1.0 + ((w[1] >> 16) & 0x7f) as f32 / 64.0,
+        coat_darkening: if (w[1] >> 23) & 1 != 0 { 1.0 } else { 0.0 },
+        specular_ior: 1.0 + (w[1] >> 24) as f32 / 128.0,
+        sheen_colour: [b(w[2], 0), b(w[2], 1), b(w[2], 2)],
+        sheen_roughness: b(w[2], 3),
+    }
+}
+
+impl LobeStreams {
+    /// Whether an array holds a value (or a colour) for each of `n` splats:
+    /// `GpuClouds.cpp`'s `whole` (a shorter array is no array).
+    fn whole(v: &[f32], n: usize, per: usize) -> bool {
+        !v.is_empty() && v.len() >= n * per
+    }
+    fn arrays(&self) -> [(&Vec<f32>, usize); 9] {
+        [
+            (&self.specular_weight, 1),
+            (&self.specular_colour, 3),
+            (&self.specular_ior, 1),
+            (&self.coat_weight, 1),
+            (&self.coat_roughness, 1),
+            (&self.coat_ior, 1),
+            (&self.sheen_colour, 3),
+            (&self.sheen_roughness, 1),
+            (&self.coat_darkening, 1),
+        ]
+    }
+    fn arrays_mut(&mut self) -> [(&mut Vec<f32>, usize, f32); 9] {
+        [
+            (&mut self.specular_weight, 1, 1.0),
+            (&mut self.specular_colour, 3, 1.0),
+            (&mut self.specular_ior, 1, 1.5),
+            (&mut self.coat_weight, 1, 0.0),
+            (&mut self.coat_roughness, 1, 0.0),
+            (&mut self.coat_ior, 1, 1.5),
+            (&mut self.sheen_colour, 3, 0.0),
+            (&mut self.sheen_roughness, 1, 0.0),
+            (&mut self.coat_darkening, 1, 0.0),
+        ]
+    }
+    /// The cloud carries layers where any one array is whole (`haveLobes`).
+    pub fn present(&self, n: usize) -> bool {
+        self.arrays().iter().any(|(v, per)| Self::whole(v, n, *per))
+    }
+    /// Splat `i`'s record (`streams.slang`): each array where it is whole,
+    /// `plainLobes`' value where it is not.
+    pub fn at(&self, n: usize, i: usize) -> SplatLobes {
+        let one = |v: &Vec<f32>, d: f32| if Self::whole(v, n, 1) { v[i] } else { d };
+        let three = |v: &Vec<f32>, d: f32| {
+            if Self::whole(v, n, 3) {
+                [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]
+            } else {
+                [d; 3]
+            }
+        };
+        SplatLobes {
+            specular_weight: one(&self.specular_weight, 1.0),
+            specular_colour: three(&self.specular_colour, 1.0),
+            specular_ior: one(&self.specular_ior, 1.5),
+            coat_weight: one(&self.coat_weight, 0.0),
+            coat_roughness: one(&self.coat_roughness, 0.0),
+            coat_ior: one(&self.coat_ior, 1.5),
+            sheen_colour: three(&self.sheen_colour, 0.0),
+            sheen_roughness: one(&self.sheen_roughness, 0.0),
+            coat_darkening: one(&self.coat_darkening, 0.0),
+        }
+    }
+    /// `other`'s `m` splats after this cloud's `n`: an array one cloud
+    /// carries and the other does not is filled with `plainLobes`' value, as
+    /// athenea reads a missing array.
+    pub fn append(&mut self, n: usize, mut other: LobeStreams, m: usize) {
+        let theirs = other.arrays_mut();
+        for ((mine, per, d), (them, _, _)) in self.arrays_mut().into_iter().zip(theirs) {
+            let a = Self::whole(mine, n, per);
+            let b = Self::whole(them, m, per);
+            if !a && !b {
+                mine.clear();
+                continue;
+            }
+            mine.truncate(if a { n * per } else { 0 });
+            if !a {
+                mine.resize(n * per, d);
+            }
+            if b {
+                mine.extend_from_slice(&them[..m * per]);
+            } else {
+                mine.resize((n + m) * per, d);
+            }
+        }
+    }
 }
 
 /// Which of a transfer's values are kept (`transfer_layout.slang`: the count
@@ -160,7 +346,8 @@ fn saturate(v: f32) -> f32 {
     v.clamp(0.0, 1.0)
 }
 
-/// `packPbr` (splat_encoding.slang), with no thin wall or Schlick mark.
+/// `packPbr` (splat_encoding.slang): a thin wall rides on the transmission
+/// two higher, a Schlick metal four higher (`streams.slang`).
 pub fn pack_pbr(metallic: f32, roughness: f32, transmission: f32) -> u32 {
     let schlick = transmission >= 4.0 - 0.5;
     let rest = if schlick {
@@ -282,6 +469,11 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
     let sh_words = if keep == 0 { 1 } else { (keep * 3).div_ceil(2) };
     let pbr = o.material
         && !(s.metallic.is_empty() && s.roughness.is_empty() && s.transmission.is_empty());
+    // The marks and the layers, only beside the material: athenea's
+    // `writeAthc` keeps lobes only where it keeps pbr.
+    let thin = pbr && !s.thin_walled.is_empty() && s.thin_walled.len() >= n;
+    let schlick = pbr && !s.schlick_metal.is_empty() && s.schlick_metal.len() >= n;
+    let lobes = pbr && s.lobes.present(n);
     let normals = o.normals && !s.normals.is_empty();
     let curvature = o.curvature && !s.curvature.is_empty();
     let (transfer_count, direct, indirect, field) = transfer_layout(s, o.transfer)?;
@@ -392,7 +584,12 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
             } else {
                 s.transmission[i]
             };
-            b.pbr.push(pack_pbr(m, r, t));
+            let mark = (if thin && s.thin_walled[i] != 0 { 2.0 } else { 0.0 })
+                + (if schlick && s.schlick_metal[i] != 0 { 4.0 } else { 0.0 });
+            b.pbr.push(pack_pbr(m, r, t + mark));
+        }
+        if lobes {
+            b.lobes.extend_from_slice(&pack_lobes(&s.lobes.at(n, i)));
         }
         if normals {
             let mut nv = [s.normals[i * 3], s.normals[i * 3 + 1], s.normals[i * 3 + 2]];
@@ -891,8 +1088,11 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
     if n == 0 {
         bail!("an empty cloud has no levels of detail");
     }
-    if !src.emission.is_empty() || !src.lobes.is_empty() {
-        bail!("emission and lobes are not built here yet");
+    if !src.emission.is_empty() {
+        bail!("emission is not built here yet");
+    }
+    if !src.lobes.is_empty() && src.pbr.is_empty() {
+        bail!("lobes without the material: a .athc keeps them only beside pbr");
     }
     let lo = cloud.bounds_min;
     let mut extent = 0.0f32;
@@ -954,6 +1154,11 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
         if !splats.pbr.is_empty() {
             block.pbr = extras_merge(&splats.pbr, per(&splats.pbr), 0, &level.starts, &splats);
         }
+        // The layers as the material: a cell takes its first gaussian's
+        // (`Lod.cpp` `extrasOf`: lobes, 3 words, mode 0).
+        if !splats.lobes.is_empty() {
+            block.lobes = extras_merge(&splats.lobes, 3, 0, &level.starts, &splats);
+        }
         if !splats.transfer.is_empty() {
             block.transfer = extras_merge(
                 &splats.transfer,
@@ -995,6 +1200,7 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
     let mut extra = ExtraHeader::default();
     if !whole.pbr.is_empty() {
         extra.pbr_words = 1;
+        extra.lobes_words = if whole.lobes.is_empty() { 0 } else { 3 };
     }
     if !whole.transfer.is_empty() {
         extra.transfer_count = cloud.transfer_count;
@@ -1091,8 +1297,8 @@ pub fn cell_for_target(cloud: &PackedCloud, target: usize) -> f32 {
 pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedCloud> {
     let src = &cloud.block;
     let n = src.n;
-    if !src.emission.is_empty() || !src.lobes.is_empty() {
-        bail!("emission and lobes are not reduced here yet");
+    if !src.emission.is_empty() {
+        bail!("emission is not reduced here yet");
     }
     if cell.is_nan() || cell <= 0.0 {
         bail!("the cell must be positive");
@@ -1160,6 +1366,9 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
     if !splats.pbr.is_empty() {
         block.pbr = extras_merge(&splats.pbr, per(&splats.pbr), 0, &level.starts, &splats);
     }
+    if !splats.lobes.is_empty() {
+        block.lobes = extras_merge(&splats.lobes, 3, 0, &level.starts, &splats);
+    }
     if !splats.transfer.is_empty() {
         block.transfer = extras_merge(
             &splats.transfer,
@@ -1205,8 +1414,8 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
 pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
     let src = &cloud.block;
     let n = src.n;
-    if !src.emission.is_empty() || !src.lobes.is_empty() {
-        bail!("emission and lobes are not reduced here yet");
+    if !src.emission.is_empty() {
+        bail!("emission is not reduced here yet");
     }
     if ratio.is_nan() || ratio < 1.0 {
         bail!("the thinning ratio must be at least 1");
@@ -1916,5 +2125,289 @@ mod tests {
             .find(|s| s.name == crate::athc::CURVATURE_ATTRIBUTE)
             .unwrap();
         assert_eq!((c.format.as_str(), c.components), ("f16", 3));
+    }
+
+    /// The Corvette paint's layers (athenea-renders/tx/clouds/
+    /// Car_Paint_Main_tx_m3.usdc, its most common material): a Schlick
+    /// metal under a clear coat that darkens what is under it.
+    fn paint_lobes(coat: f32) -> SplatLobes {
+        SplatLobes {
+            specular_weight: 1.0,
+            specular_colour: [1.0; 3],
+            specular_ior: 1.5,
+            coat_weight: coat,
+            coat_roughness: 0.046_975_244,
+            coat_ior: 1.45,
+            coat_darkening: 1.0,
+            sheen_colour: [0.0; 3],
+            sheen_roughness: 0.5,
+        }
+    }
+
+    /// `packLobes` on values read from athenea's clouds, against the words
+    /// worked out by hand from packing.slang (txf 89a04d9):
+    ///   lobeByte(v) = uint(saturate(v) * 255 + 0.5)
+    ///   iorByte(i) = uint(clamp((i - 1) * 128 + 0.5, 0, 255))
+    ///   coatByte(i, d) = uint(clamp((i - 1) * 64 + 0.5, 0, 127)) | (d >= 0.5 ? 128 : 0)
+    #[test]
+    fn packs_lobes_as_athenea_does() {
+        // Paint: colour ff ff ff, weight ff; coat ff, roughness
+        // 0.046975 * 255 + 0.5 = 12.48 -> 0c, coat index 0.45 * 64 + 0.5 =
+        // 29.3 -> 1d | 80 = 9d, specular index 0.5 * 128 + 0.5 -> 40; sheen
+        // 0, roughness 0.5 * 255 + 0.5 = 128 -> 80.
+        assert_eq!(pack_lobes(&paint_lobes(1.0)), [0xffff_ffff, 0x409d_0cff, 0x8000_0000]);
+        // paint/s75/lambert.usdc: specular weight 0, coat weight 0, its
+        // roughness 0.12821592 -> 33.19 -> 21.
+        let lambert = SplatLobes {
+            specular_weight: 0.0,
+            coat_weight: 0.0,
+            coat_roughness: 0.128_215_92,
+            ..paint_lobes(0.0)
+        };
+        assert_eq!(pack_lobes(&lambert), [0x00ff_ffff, 0x409d_2100, 0x8000_0000]);
+        // plainLobes packs to what unpacks to it exactly.
+        assert_eq!(pack_lobes(&SplatLobes::PLAIN), [0xffff_ffff, 0x4020_0000, 0]);
+        assert_eq!(unpack_lobes(pack_lobes(&SplatLobes::PLAIN)), SplatLobes::PLAIN);
+        // The edges: indices clamp (3.5 -> 127 in the coat's seven bits,
+        // 0.8 -> 0), a darkening under 0.5 sets no bit, values clamp to 0..1.
+        let edge = SplatLobes {
+            specular_weight: -0.2,
+            specular_colour: [0.2, 0.4, 0.6],    // 51.5 -> 51, 102.5 -> 102, 153.5 -> 153
+            specular_ior: 2.2,                   // 154.1 -> 154 = 9a
+            coat_weight: 1.7,
+            coat_roughness: 0.5,                 // 128
+            coat_ior: 3.5,
+            coat_darkening: 0.49,
+            sheen_colour: [0.0, 0.002, 0.998],   // 0, 1.01 -> 1, 254.99 -> 254
+            sheen_roughness: 1.2,
+        };
+        assert_eq!(pack_lobes(&edge), [0x0099_6633, 0x9a7f_80ff, 0xfffe_0100]);
+        let ior0 = SplatLobes { specular_ior: 0.8, ..edge };
+        assert_eq!(pack_lobes(&ior0)[1] >> 24, 0);
+    }
+
+    /// The Schlick and thin marks on the pbr word (`streams.slang`: + 4,
+    /// + 2 on the transmission, `packPbr` takes them back off as bits).
+    #[test]
+    fn packs_the_schlick_and_thin_marks() {
+        // lambert.usdc: metallic 0, roughness 0.34377518 -> 88 = 58, Schlick.
+        assert_eq!(pack_pbr(0.0, 0.343_775_18, 4.0), 0x0200_5800);
+        // The paint: metallic 1, roughness 0.3421304 -> 87.74 -> 87 = 57.
+        assert_eq!(pack_pbr(1.0, 0.342_130_4, 4.0), 0x0200_57ff);
+        assert_eq!(pack_pbr(0.0, 0.05, 2.0 + 1.0), 0x01ff_0d00);
+        assert_eq!(pack_pbr(0.0, 0.05, 4.0 + 2.0 + 0.5), 0x0380_0d00);
+    }
+
+    fn with_lobes(n: usize) -> CloudStreams {
+        let mut s = synthetic(n);
+        s.schlick_metal = (0..n).map(|i| (i % 2) as u32).collect();
+        s.thin_walled = (0..n).map(|i| (i % 5 == 0) as u32).collect();
+        // Each splat's material its own: the roughness and the coat's
+        // roughness name the splat, so a pairing that moves shows.
+        s.roughness = (0..n).map(|i| (i % 251) as f32 / 255.0).collect();
+        s.lobes.coat_weight = (0..n).map(|i| (i % 3) as f32 * 0.5).collect();
+        s.lobes.coat_roughness = (0..n).map(|i| (i % 251) as f32 / 255.0).collect();
+        s.lobes.coat_darkening = vec![1.0; n];
+        s.lobes.sheen_colour = (0..n).flat_map(|i| [0.1, 0.2, (i % 7) as f32 / 7.0]).collect();
+        s
+    }
+
+    /// `streams.slang` writes `plainLobes`' value for an array the stage
+    /// does not carry; lobes and marks only beside the material.
+    #[test]
+    fn packs_lobes_and_marks_from_the_streams() {
+        let s = with_lobes(300);
+        let p = pack_streams(&s, &BuildOptions::default()).unwrap();
+        assert_eq!(p.block.lobes.len(), p.block.n * 3);
+        // Splat 0 survives: transmission 1 (even), thin, not Schlick.
+        let l = unpack_lobes([p.block.lobes[0], p.block.lobes[1], p.block.lobes[2]]);
+        assert_eq!((l.specular_weight, l.specular_colour, l.specular_ior), (1.0, [1.0; 3], 1.5));
+        assert_eq!((l.coat_weight, l.coat_roughness, l.coat_ior, l.coat_darkening), (0.0, 0.0, 1.5, 1.0));
+        assert_eq!(p.block.pbr[0], 0x01ff_0000);
+        // Splat 1: Schlick, coat 0.5 (127.5 + 0.5 -> 128), roughness 1/255.
+        assert_eq!(p.block.pbr[1], 0x0200_0100);
+        // Sheen (0.1, 0.2, 1/7): 26, 51, 36.
+        assert_eq!(p.block.lobes[3..6], [0xffff_ffff, 0x40a0_0180, 0x0024_331a]);
+        let none = pack_streams(&s, &BuildOptions { material: false, ..Default::default() }).unwrap();
+        assert!(none.block.lobes.is_empty() && none.block.pbr.is_empty());
+        let mut bare = s.clone();
+        bare.lobes = LobeStreams::default();
+        assert!(pack_streams(&bare, &BuildOptions::default()).unwrap().block.lobes.is_empty());
+        // A shorter array is no array (`whole`): the rest still are.
+        let mut short = s.clone();
+        short.lobes.coat_weight.pop();
+        let q = pack_streams(&short, &BuildOptions::default()).unwrap();
+        assert_eq!(unpack_lobes([q.block.lobes[3], q.block.lobes[4], q.block.lobes[5]]).coat_weight, 0.0);
+    }
+
+    /// Every (pbr, lobes) pair a cloud holds is one of `source`'s.
+    fn pairs_kept(b: &AthcBlock, source: &AthcBlock) {
+        let set: std::collections::HashSet<(u32, [u32; 3])> = (0..source.n)
+            .map(|i| (source.pbr[i], [source.lobes[i * 3], source.lobes[i * 3 + 1], source.lobes[i * 3 + 2]]))
+            .collect();
+        assert_eq!(b.lobes.len(), b.n * 3);
+        assert_eq!(b.pbr.len(), b.n);
+        for i in 0..b.n {
+            let pair = (b.pbr[i], [b.lobes[i * 3], b.lobes[i * 3 + 1], b.lobes[i * 3 + 2]]);
+            assert!(set.contains(&pair), "splat {i}: {pair:x?} is no source splat's material");
+        }
+    }
+
+    /// The layers go with the material through the levels (`Lod.cpp`: a
+    /// group takes its first gaussian's pbr and lobes alike), the files
+    /// (v2, v3) and the web reductions.
+    #[test]
+    fn carries_lobes_with_the_material_everywhere() {
+        let s = with_lobes(5000);
+        let o = BuildOptions { chunk_splats: 1024, ..Default::default() };
+        let p = pack_streams(&s, &o).unwrap();
+        let f = build_lod(&p, &o).unwrap();
+        assert_eq!(f.extra.lobes_words, 3);
+        assert!(f.header.flags & FLAG_MATERIAL != 0);
+        for (_, b) in &f.levels {
+            pairs_kept(b, &p.block);
+        }
+        // A level's group: its first splat's words, as pbr's.
+        let splats = f.splats();
+        pairs_kept(&splats, &p.block);
+        let bytes = f.write().unwrap();
+        let back = AthcFile::read(&bytes).unwrap();
+        assert_eq!(back.extra.lobes_words, 3);
+        assert_eq!(back.levels, f.levels);
+        assert_eq!(back.chunks, f.chunks);
+        let v3 = crate::athc_v3::write_v3(&back, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let again = crate::athc_v3::read_v3(&v3).unwrap();
+        assert_eq!(again.write().unwrap(), bytes);
+
+        let thin = reduce_thin(&p, 4.0).unwrap();
+        pairs_kept(&thin.block, &p.block);
+        let cells = reduce_cells(&p, cell_for_target(&p, 800), 1.0).unwrap();
+        pairs_kept(&cells.block, &p.block);
+        for r in [&thin, &cells] {
+            let g = build_lod(r, &o).unwrap();
+            assert_eq!(g.extra.lobes_words, 3);
+            for (_, b) in &g.levels {
+                pairs_kept(b, &p.block);
+            }
+        }
+    }
+
+    #[test]
+    fn drops_backs_with_their_lobes() {
+        // The shells of drops_the_hidden_back_of_a_shell, each face its own
+        // coat: what stays keeps its own.
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let mut face = |x0: f32, z: f32, up: bool, open: u32, coat: f32| {
+            for a in 0..10 {
+                for b in 0..10 {
+                    s.positions.extend_from_slice(&[x0 + a as f32 * 0.002, b as f32 * 0.002, z]);
+                    s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                    s.scales.extend_from_slice(&[0.002, 0.002, 0.0002]);
+                    s.opacities.push(1.0);
+                    s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+                    s.normals.extend_from_slice(&[0.0, 0.0, if up { 1.0 } else { -1.0 }]);
+                    s.transfer_direct.extend((0..16).map(|_| 0.1));
+                    s.shadow_bits.extend((0..8).map(|w| if w < open { u32::MAX } else { 0 }));
+                    s.metallic.push(1.0);
+                    s.lobes.coat_weight.push(coat);
+                    s.count += 1;
+                }
+            }
+        };
+        face(0.0, 0.003, true, 3, 1.0);
+        face(0.0, 0.0, false, 0, 0.25);
+        face(2.0, 0.0, true, 0, 0.5);
+        let o = BuildOptions { transfer: TransferKeep::Count(16), ..Default::default() };
+        let cloud = pack_streams(&s, &o).unwrap();
+        let (kept, dropped) = drop_hidden_backs(&cloud, 0.008).unwrap();
+        assert_eq!(dropped, 100);
+        pairs_kept(&kept.block, &cloud.block);
+        let coats: Vec<u32> = (0..kept.block.n).map(|i| kept.block.lobes[i * 3 + 1] & 0xff).collect();
+        assert!(coats.iter().all(|&c| c == 255 || c == 128));
+        assert!(build_lod(&kept, &o).unwrap().extra.lobes_words == 3);
+    }
+
+    #[test]
+    fn appends_lobes_with_athenea_defaults() {
+        let mut a = LobeStreams { coat_weight: vec![1.0, 1.0], ..Default::default() };
+        let b = LobeStreams { sheen_colour: vec![0.5; 3], ..Default::default() };
+        a.append(2, b, 1);
+        assert_eq!(a.coat_weight, [1.0, 1.0, 0.0]);
+        assert_eq!(a.sheen_colour, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5]);
+        assert!(a.specular_weight.is_empty());
+        assert!(a.present(3));
+        assert_eq!(a.at(3, 2).coat_weight, 0.0);
+        assert_eq!(a.at(3, 2).sheen_colour, [0.5; 3]);
+    }
+
+    /// test/fixtures/athc/lobes_sphere.athc, for test/gpu/athcLobes.test.ts:
+    /// a ball of 1200 splats of the Corvette's paint (a Schlick metal under
+    /// a darkening clear coat), coated where x > 0 and bare where not, with
+    /// a direct transfer (16) and every way out open. UPDATE_FIXTURES=1
+    /// writes it; otherwise the committed one must be what this builds.
+    #[test]
+    fn writes_the_lobes_sphere_fixture() {
+        let n = 1200;
+        let mut s = CloudStreams { coefficients: 1, linear: true, count: n, ..Default::default() };
+        let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
+        let y = |k: usize, v: [f32; 3]| -> f32 {
+            let [x, y, z] = v;
+            match k {
+                0 => 0.282_094_8,
+                1 => -0.488_602_5 * y,
+                2 => 0.488_602_5 * z,
+                3 => -0.488_602_5 * x,
+                4 => 1.092_548_4 * x * y,
+                5 => -1.092_548_4 * y * z,
+                6 => 0.315_391_57 * (2.0 * z * z - x * x - y * y),
+                7 => -1.092_548_4 * x * z,
+                8 => 0.546_274_2 * (x * x - y * y),
+                _ => 0.0,
+            }
+        };
+        let band = [1.0, 2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 0.25, 0.25, 0.25, 0.25, 0.25];
+        for i in 0..n {
+            let yy = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+            let r = (1.0 - yy * yy).sqrt();
+            let t = golden * i as f32;
+            let nv = [r * t.cos(), yy, r * t.sin()];
+            s.positions.extend(nv.map(|c| 0.5 * c));
+            s.normals.extend_from_slice(&nv);
+            // The quaternion turning z onto the normal (xyzw).
+            let (ax, ay, az) = (-nv[1], nv[0], 0.0f32);
+            let w = 1.0 + nv[2];
+            let q = if w < 1e-6 { [1.0, 0.0, 0.0, 0.0] } else { normalize4([ax, ay, az, w]) };
+            s.rotations.extend_from_slice(&q);
+            s.scales.extend_from_slice(&[0.04, 0.04, 0.004]);
+            s.opacities.push(0.9);
+            s.sh.extend([0.05f32, 0.06, 0.05].map(|c| (c - 0.5) / SH0));
+            s.metallic.push(1.0);
+            s.roughness.push(0.342_130_4);
+            s.transmission.push(0.0);
+            s.schlick_metal.push(1);
+            let l = paint_lobes(if nv[0] > 0.0 { 1.0 } else { 0.0 });
+            s.lobes.specular_weight.push(l.specular_weight);
+            s.lobes.specular_colour.extend_from_slice(&l.specular_colour);
+            s.lobes.specular_ior.push(l.specular_ior);
+            s.lobes.coat_weight.push(l.coat_weight);
+            s.lobes.coat_roughness.push(l.coat_roughness);
+            s.lobes.coat_ior.push(l.coat_ior);
+            s.lobes.sheen_colour.extend_from_slice(&l.sheen_colour);
+            s.lobes.sheen_roughness.push(l.sheen_roughness);
+            s.lobes.coat_darkening.push(l.coat_darkening);
+            s.transfer_direct.extend((0..16).map(|k| if k < 9 { 0.9 * band[k] * y(k, nv) } else { 0.0 }));
+            s.shadow_bits.extend([u32::MAX; 8]);
+        }
+        let o = BuildOptions { transfer: TransferKeep::Count(16), curvature: false, ..Default::default() };
+        let p = pack_streams(&s, &o).unwrap();
+        assert_eq!(p.block.n, n);
+        let f = build_lod(&p, &o).unwrap();
+        assert_eq!(f.extra.lobes_words, 3);
+        let bytes = crate::athc_v3::write_v3(&f, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/lobes_sphere.athc");
+        if std::env::var("UPDATE_FIXTURES").is_ok() {
+            std::fs::write(path, &bytes).unwrap();
+        }
+        assert_eq!(std::fs::read(path).unwrap(), bytes, "UPDATE_FIXTURES=1 rewrites {path}");
     }
 }

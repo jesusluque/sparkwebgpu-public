@@ -48,6 +48,12 @@
 //! primvars:athenea:splat:normal (normal3f[])  normals (octahedral), flag bit 0
 //! primvars:athenea:splat:metallic, roughness,
 //!   transmission (float[])                    pbr, flag bit 4
+//! primvars:athenea:splat:thinWalled,
+//!   schlickMetal (int[])                      pbr bits 24, 25
+//! primvars:athenea:splat:specularWeight, specularColor, specularIor,
+//!   coatWeight, coatRoughness, coatIor, sheenColor, sheenRoughness,
+//!   coatDarkening (float[], color3f[])        lobes (3 words, packing.slang
+//!                                             packLobes), beside pbr
 //! primvars:athenea:splat:transferDirect (float[], 16 a splat), transferIndirect
 //!   (48), transferReflected (48)              transfer, 112 f16, flag bit 5
 //! primvars:athenea:splat:shadowBits (int[], 8 a splat)   shadowBits
@@ -64,7 +70,7 @@ use openusd::sdf::{self, AbstractData, Value};
 use serde_json::{json, Value as Json};
 use spark_lib::athc_build::{
     build_lod, cell_for_target, drop_hidden_backs, pack_streams, reduce_cells, reduce_thin, BuildOptions,
-    CloudStreams, TransferKeep,
+    CloudStreams, LobeStreams, TransferKeep,
 };
 use spark_lib::athc_v3::{gzip, parse_v3, write_v3, COMPRESSION_GZIP, COMPRESSION_NONE};
 
@@ -250,6 +256,19 @@ impl Prim {
             metallic: self.floats(&["athenea:splat:metallic"])?,
             roughness: self.floats(&["athenea:splat:roughness"])?,
             transmission: self.floats(&["athenea:splat:transmission"])?,
+            thin_walled: self.ints("athenea:splat:thinWalled")?,
+            schlick_metal: self.ints("athenea:splat:schlickMetal")?,
+            lobes: LobeStreams {
+                specular_weight: self.floats(&["athenea:splat:specularWeight"])?,
+                specular_colour: self.floats(&["athenea:splat:specularColor"])?,
+                specular_ior: self.floats(&["athenea:splat:specularIor"])?,
+                coat_weight: self.floats(&["athenea:splat:coatWeight"])?,
+                coat_roughness: self.floats(&["athenea:splat:coatRoughness"])?,
+                coat_ior: self.floats(&["athenea:splat:coatIor"])?,
+                sheen_colour: self.floats(&["athenea:splat:sheenColor"])?,
+                sheen_roughness: self.floats(&["athenea:splat:sheenRoughness"])?,
+                coat_darkening: self.floats(&["athenea:splat:coatDarkening"])?,
+            },
             transfer_direct: self.floats(&["athenea:splat:transferDirect"])?,
             transfer_indirect: self.floats(&["athenea:splat:transferIndirect"])?,
             transfer_reflected: self.floats(&["athenea:splat:transferReflected"])?,
@@ -272,8 +291,6 @@ impl Prim {
             }
         }
         for name in [
-            "athenea:splat:specularWeight",
-            "athenea:splat:coatWeight",
             "athenea:splat:emission",
             "athenea:splat:transferZonal",
         ] {
@@ -333,6 +350,23 @@ fn append(a: &mut CloudStreams, b: CloudStreams) -> Result<()> {
         shadow_bits,
         curvature
     );
+    // Per-splat marks and layers default where one cloud does not carry
+    // them, as athenea reads a missing array (0, and `plainLobes`).
+    for (mine, theirs) in [
+        (&mut a.thin_walled, b.thin_walled),
+        (&mut a.schlick_metal, b.schlick_metal),
+    ] {
+        if mine.is_empty() && theirs.is_empty() {
+            continue;
+        }
+        mine.resize(a.count, 0);
+        if theirs.is_empty() {
+            mine.resize(a.count + b.count, 0);
+        } else {
+            mine.extend_from_slice(&theirs[..b.count]);
+        }
+    }
+    a.lobes.append(a.count, b.lobes, b.count);
     a.count += b.count;
     Ok(())
 }
@@ -485,6 +519,44 @@ fn main() -> Result<()> {
     if let Some(c) = arg(&args, "--chunk") {
         options.chunk_splats = c.parse().context("--chunk")?;
     }
+    if flag("--material-stats") {
+        // The distinct materials a cloud carries: its raw values and the
+        // words they pack to, with how many splats have each.
+        let n = streams.count;
+        let mut seen: BTreeMap<(u32, [u32; 3]), (usize, String)> = BTreeMap::new();
+        for i in 0..n {
+            let at = |v: &Vec<f32>, d: f32| v.get(i).copied().unwrap_or(d);
+            let mark = |v: &Vec<u32>, m: f32| if v.get(i).is_some_and(|&b| b != 0) { m } else { 0.0 };
+            let pbr = spark_lib::athc_build::pack_pbr(
+                at(&streams.metallic, 0.0),
+                at(&streams.roughness, 1.0),
+                at(&streams.transmission, 0.0)
+                    + mark(&streams.thin_walled, 2.0)
+                    + mark(&streams.schlick_metal, 4.0),
+            );
+            let l = streams.lobes.at(n, i);
+            let w = spark_lib::athc_build::pack_lobes(&l);
+            let e = seen.entry((pbr, w)).or_insert_with(|| {
+                (
+                    0,
+                    format!(
+                        "metallic {} roughness {} transmission {} | {l:?}",
+                        at(&streams.metallic, 0.0),
+                        at(&streams.roughness, 1.0),
+                        at(&streams.transmission, 0.0)
+                    ),
+                )
+            });
+            e.0 += 1;
+        }
+        let mut rows: Vec<_> = seen.into_iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1 .0));
+        for ((pbr, w), (c, raw)) in rows.iter().take(12) {
+            println!("{c:>9}  pbr {pbr:08x} lobes {:08x} {:08x} {:08x}  first: {raw}", w[0], w[1], w[2]);
+        }
+        println!("{} distinct (pbr, lobes) words", rows.len());
+        return Ok(());
+    }
     let mut packed = pack_streams(&streams, &options)?;
     let source_splats = streams.count;
     drop(streams);
@@ -555,6 +627,7 @@ fn main() -> Result<()> {
         "transferCount": file.extra.transfer_count,
         "shadowWords": file.extra.shadow_words,
         "curvature": file.has_curvature() && !flag("--v2"),
+        "lobesWords": file.extra.lobes_words,
         "boundsMin": h.bounds_min,
         "boundsMax": h.bounds_max,
         "constants": constants,

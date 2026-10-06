@@ -109,10 +109,11 @@ Proposal 083: inside every block, the data a tier needs is a **prefix**, so
 each (block, tier) is **one HTTP Range request**, and a reader that moves up a
 tier fetches only the sections after the prefix it has.
 
-Version 3 rearranges a v2 file; it does not change a value. Every section is
-encoding 0 (v2's words), so `v2 → v3 → v2` is the same file byte for byte
-(tested on both fixtures, with and without compression). The encodings and
-the per-section compression are where 083's smaller sections fit later.
+Version 3 rearranges a v2 file; it does not change a value. A section is
+encoding 0 (v2's words) or one of two lossless rearrangements of them
+(below), so `v2 → v3 → v2` is the same file byte for byte (tested on both
+fixtures, with and without compression, in every encoding). The encodings
+and the per-section compression are where 083's smaller sections fit.
 
 ```text
 page 0   header, 160 bytes
@@ -124,8 +125,9 @@ page 0   header, 160 bytes
          104 blockCount (levels + chunks)   108 curvatureWords (0, 2)
          112 sectionTable (u64)  120 blockIndex  128 starts  136 dataStart
 @160     section table, 32 bytes each:
-           id (fourcc), tier, encoding (0: v2 words), compression
-           (0 none, 1 gzip), words a element, 3 x 0
+           id (fourcc), tier, encoding (0 v2 words, 1 byte planes,
+           2 delta planes), compression (0 none, 1 gzip), words a
+           element, 3 x 0
          block index, (32 + 16 × sectionCount) bytes each:
            kind (0 level, 1 chunk), level (1.. or 0), first element, n,
            bounding sphere of the centres (x, y, z, r),
@@ -155,6 +157,41 @@ indirect half, 112 with the field; 9, 36, 84 at degree 2). For
 `every_stream.athc` (SH3, TX transfer of 112 values, 16×16 shadow bits,
 material): tier 1 is 128 bytes a splat, tier 2 152, tier 3 408.
 
+### Encodings: byte planes before the gzip
+
+A browser has gzip and nothing better (`DecompressionStream`: no zstd, brotli
+only in some engines), so the lever is what gzip is given. Encoding 1 stores
+each array of a section (CORE: positions, shape, tail; MATL: each stream it
+holds; the rest: one array) transposed by bytes: byte 0 of every element,
+then byte 1, and so on (`athc_v3.rs encode_section`). The high byte of an
+f16 (sign, exponent, two bits of mantissa) or of an f32 barely changes from
+a splat to the next in Morton order, and now sits in runs gzip finds; the
+low, noisy bytes no longer break them. Encoding 2 does the same with each
+16-bit lane replaced by its difference from the previous element's
+(wrapping). Both are undone after the gunzip: in WASM for whole files and
+for the pages the loader worker decodes (`CORE`, `SHRS`, the levels), on
+the main thread for the streams a chunk page puts together (`src/athc.ts
+decodeAthcSection`). In an ATHV kind-2 page an entry's compression word
+carries the encoding in its high 16 bits. Readers before these encodings
+refuse such a file (`parse_v3`), as they should.
+
+`athc-convert --gzip --planes` (`write_v3_smallest`) writes every section in
+whichever encoding stores it smallest over the whole file (the shadow bits,
+random bits, stay 0; so do transfers whose low bits are noise either way).
+Measured on the published clouds (gzip, MB):
+
+| Cloud | Total | CORE | MATL | CURV | TXDI | TXIN |
+|---|---|---|---|---|---|---|
+| Corvette light (v3-light, 7 files) | 68.1 → 60.9 (−10.6 %) | −16 % | −15 % | −18 % | −5 % | |
+| Corvette HD (v2-hd, 7 files) | 288.7 → 248.6 (−13.9 %) | −18 % | −19 % | 0 | −13 % | |
+| its paint (1.92M splats) | 125.5 → 97.2 (−23 %) | −23 % | −28 % | 0 | −26 % | |
+| pawn body t16 | 45.3 → 34.4 (−24 %) | −24 % | −21 % | | −28 % | |
+| pawn top t16 | 44.1 → 29.5 (−33 %) | −31 % | −32 % | | −38 % | |
+| pawn body t64 | 102.8 → 85.3 (−17 %) | −24 % | −21 % | 0 | −27 % | −12 % |
+
+The Corvette's trim and wheels (athenea's whole-car bake) keep their
+transfer as it is. The shadow bits never gain.
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only
@@ -164,8 +201,13 @@ the mesh's normal). Its raster reads it for the per-pixel slope of a
 reflection, the sharp coat and polish, and the far face of a solid glass
 (`lensExit`). sparkwebGPU keeps it in a section of its own, tier 3, right
 after `SHAD` (it is read with the relight streams: `Want` brings it
-whenever it brings the shadow bits), as three f16 in two words (the last
-half 0). Header word 108 is its words a splat (0 or 2). In memory and in
+whenever it brings the shadow bits), as three f16 in two words. The
+fourth half is 0 for a splat and, for a merged group written by
+sparkwebGPU (`athc.rs store_normal_variance`, `truncate_creases`), the
+variance of its splats' normals (1 − |opacity×area-weighted mean normal|²,
+LEAN's second moment), which the relight's footprint prefilter widens the
+lobes by where it exceeds what the curvature implies
+(`relight.slang footprintRoughness`); the attribute is four halves. Header word 108 is its words a splat (0 or 2). In memory and in
 ATHV pages it is the v2 extra header's sixth word (padding, 0, in every file
 athenea writes); a v2 file never carries it (`--v2` and `athc-convert --v2`
 drop it, and a v2 written from a cloud with it is the file without it). A
@@ -221,7 +263,12 @@ a v2 one.
 ```sh
 cargo run -p build-lod --bin athc-convert -- in.athc out.athc [--gzip]  # v1/v2 → v3 (test/fixtures/athc/every_stream.v3.athc: --gzip)
 cargo run -p build-lod --bin athc-convert -- in.athc out.athc --v2      # v3 → v2
-cargo run -p build-lod --bin athc-convert -- in.athc --info             # sections, tier sizes
+cargo run -p build-lod --bin athc-convert -- in.athc --info             # sections, encodings, stored bytes, tier sizes
+cargo run -p build-lod --bin athc-convert -- in.athc out.athc --gzip --planes   # each section in its smallest encoding
+# a light cloud cut from a detailed one, keeping finer groups (down to the
+# splats) where the normals spread (athc::truncate_creases):
+cargo run -p build-lod --bin athc-convert -- hd.athc light.athc --gzip --planes --keep-splats 200000 --creases 0.03 --crease-depth 1
+#   --rebuild-frame SEED: build the levels again in an octree frame turned and shifted by SEED
 ```
 
 The WASM decoder reads a v3 file whole (`new SplatMesh({ url })`) as it reads
@@ -264,6 +311,6 @@ and 36 the same truncated to degree 2 (the first coefficients of each half).
 ### Not yet
 
 - 083's quantized S0 (~20 bytes: positions relative to the block's sphere,
-  8-bit log scales) and flattened SH0p, and the compressed transfer of 034:
-  new `encoding` codes.
+  8-bit log scales) and flattened SH0p, and the compressed (lossy) transfer
+  of 034: new `encoding` codes.
 - The light-group sidecar `.athl` (066, 069): its own file.

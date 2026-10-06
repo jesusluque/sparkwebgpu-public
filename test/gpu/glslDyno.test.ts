@@ -116,6 +116,18 @@ const parity: [string, d.DynoType, () => d.DynoVal<d.DynoType>, number[]][] = [
     [0.5, 0.5, -1],
   ],
   [
+    // An ulp the other way would change any fract(sin(dot(p, k)) * 43758.)
+    // hash (Safari's own dot rounds 21593.359375 here).
+    "dot rounds as GLSL's does on Metal: a forward fma chain",
+    "float",
+    glsl(
+      "float",
+      { statements: "$value = dot($p, vec3(127.1, 311.7, 74.7)) - 21593.0;" },
+      { p: d.dynoVec3(new THREE.Vector3(42.1, 41.9, 42.6)) },
+    ),
+    [0.361328125],
+  ],
+  [
     "?:, int to float, compound assignment, ++, <<=",
     "vec2",
     glsl(

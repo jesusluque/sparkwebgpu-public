@@ -120,6 +120,21 @@ describe("GLSL to WGSL", () => {
     expect(globals).toContain("fn glsl_mod_f32(x: f32, y: f32) -> f32");
   });
 
+  it("spells out dot() as Metal's fma chain, so hashes round the same", () => {
+    const { code, globals } = statements(
+      "vec3 p; vec4 q; float x; float a = dot(p, vec3(127.1, 311.7, 74.7)) + dot(q, q) + dot(x, 2.0);",
+    );
+    expect(code).toContain(
+      "glsl_dot_vec3f(p, vec3f(127.1, 311.7, 74.7)) + glsl_dot_vec4f(q, q) + x * 2.0",
+    );
+    expect(globals).toContain(
+      "return fma(a.z, b.z, fma(a.y, b.y, a.x * b.x));",
+    );
+    expect(globals).toContain(
+      "return fma(a.w, b.w, fma(a.z, b.z, fma(a.y, b.y, a.x * b.x)));",
+    );
+  });
+
   it("compares vectors as GLSL does", () => {
     expect(stmt("vec2 a, b; bool e = a == b; bool n = a != b;")).toContain(
       "var e: bool = all(a == b);\nvar n: bool = any(a != b);",

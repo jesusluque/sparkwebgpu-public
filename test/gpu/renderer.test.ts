@@ -2,7 +2,7 @@
 // it the device and an offscreen "canvas" texture.
 
 import * as THREE from "three";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { encodeExtSplat } from "../../src/utils";
 import {
   GpuSplatSource,
@@ -182,6 +182,22 @@ describe.skipIf(!device)("WgpuSplatRenderer", () => {
       camera.updateMatrixWorld();
       splats.render(camera);
       expect(splats.stats.generated).toBe(2);
+
+      // minSortIntervalMs: a moved camera regenerates but draws the last
+      // order; the next still frame sorts.
+      // biome-ignore lint/suspicious/noExplicitAny: counting a private call
+      const sorts = vi.spyOn(splats as any, "encodeSort");
+      let deferred = 0;
+      splats.onSortDeferred = () => deferred++;
+      splats.options.minSortIntervalMs = 1e9;
+      camera.position.x += 0.1;
+      camera.updateMatrixWorld();
+      splats.render(camera);
+      expect([splats.stats.generated, sorts.mock.calls.length]).toEqual([3, 0]);
+      expect([splats.sortStale, deferred]).toEqual([true, 1]);
+      splats.render(camera);
+      expect([splats.stats.generated, sorts.mock.calls.length]).toEqual([3, 1]);
+      expect(splats.sortStale).toBe(false);
       splats.dispose();
     },
   );

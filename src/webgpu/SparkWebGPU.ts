@@ -416,6 +416,7 @@ export class SparkWebGPU {
         >[0],
         { depthTest: spark.material.depthTest },
       );
+      this.splats.onSortDeferred = () => spark.setDirty();
       this.lod = new WgpuLod(this.splats, {
         pagedExtSplats: spark.pagedExtSplats,
         maxPagedSplats: spark.maxPagedSplats,
@@ -446,6 +447,7 @@ export class SparkWebGPU {
     o.focalDistance = spark.focalDistance;
     o.apertureAngle = spark.apertureAngle;
     o.sortRadial = spark.sortRadial;
+    o.minSortIntervalMs = spark.minSortIntervalMs;
     o.lodInflate = spark.lodInflate;
     o.depthTest = spark.material.depthTest;
     const l = (this.lod as WgpuLod).options;

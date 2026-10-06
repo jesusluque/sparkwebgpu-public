@@ -152,6 +152,14 @@ export interface WgpuSplatRendererOptions {
    * Turn on (or call markDirty()) for splats animated on the GPU.
    */
   alwaysGenerate?: boolean;
+  /**
+   * GPU sort: while only the camera and mesh transforms move, re-sort at
+   * most every this many ms and draw the last order in between, as
+   * SparkRenderer draws its last worker sort (same option name). A frame
+   * where nothing moved sorts a stale order (see sortStale). Default 0:
+   * every regenerated frame is sorted.
+   */
+  minSortIntervalMs?: number;
   maxStdDev?: number;
   minPixelRadius?: number;
   maxPixelRadius?: number;
@@ -305,6 +313,11 @@ export class WgpuSplatRenderer {
    * next draws (default draw and attribute variants).
    */
   diskClip: SplatDiskClip | null = null;
+  /**
+   * Called when a render defers its sort (minSortIntervalMs), so on-demand
+   * apps render once more after motion stops and get the exact order.
+   */
+  onSortDeferred: (() => void) | null = null;
 
   private capacity = 0;
   private accumBytes = 0;
@@ -314,6 +327,12 @@ export class WgpuSplatRenderer {
   private sorter: GpuSorter;
   // What the last generate saw; an identical frame skips generate and sort.
   private lastSignature: number[] = [];
+  // The signature without camera and mesh transforms, and whether only
+  // those moved in the last change (minSortIntervalMs).
+  private lastStructure: number[] = [];
+  private posesOnly = false;
+  private lastSortTime = Number.NEGATIVE_INFINITY;
+  private stale = false;
   private dirty = true;
   private drawUniform: GPUBuffer;
   private pipelines = new Map<string, ReflectedRenderPipeline>();
@@ -358,6 +377,7 @@ export class WgpuSplatRenderer {
       sort: "gpu",
       sortBits: 32,
       alwaysGenerate: false,
+      minSortIntervalMs: 0,
       maxStdDev: Math.sqrt(8),
       minPixelRadius: 0,
       maxPixelRadius: 512,
@@ -534,10 +554,18 @@ export class WgpuSplatRenderer {
     this.dirty = true;
   }
 
+  /**
+   * Whether the last render drew an order sorted for an earlier pose
+   * (minSortIntervalMs): render again once nothing moves to sort it.
+   */
+  get sortStale(): boolean {
+    return this.stale;
+  }
+
   // True when the camera, a mesh transform or colour, the mesh set or the
   // sort settings changed since the last generate.
   private changedSince(camera: THREE.Camera, total: number): boolean {
-    const sig: number[] = [
+    const structure: number[] = [
       total,
       this.mappingVersion,
       this.options.sortBits,
@@ -549,26 +577,57 @@ export class WgpuSplatRenderer {
       this.options.covSplats ? 1 : 0,
       // A stage added later (attributes) has gathered nothing yet.
       this.stages.length,
+    ];
+    const sig: number[] = [
       ...camera.matrixWorld.elements,
       ...camera.projectionMatrix.elements,
     ];
     for (const m of this.meshes) {
       m.object.updateMatrixWorld();
-      sig.push(
-        ...m.object.matrixWorld.elements,
-        ...m.recolor.toArray(),
-        m.source.version,
-      );
+      sig.push(...m.object.matrixWorld.elements);
+      structure.push(...m.recolor.toArray(), m.source.version);
     }
-    const same =
+    const equal = (a: number[], b: number[]) =>
+      a.length === b.length && a.every((v, i) => v === b[i]);
+    const sameStructure =
       !this.dirty &&
       !this.dynoDirty &&
       !this.options.alwaysGenerate &&
-      sig.length === this.lastSignature.length &&
-      sig.every((v, i) => v === this.lastSignature[i]);
+      equal(structure, this.lastStructure);
+    const same = sameStructure && equal(sig, this.lastSignature);
+    this.posesOnly = sameStructure;
+    this.lastStructure = structure;
     this.lastSignature = sig;
     this.dirty = false;
     return !same;
+  }
+
+  // The GPU-sort frame before the draw: generate on any change, and sort
+  // unless only poses moved within minSortIntervalMs of the last sort. An
+  // unchanged frame sorts a stale order: its metric is still current.
+  private generateAndSort(
+    encoder: GPUCommandEncoder,
+    camera: THREE.Camera,
+    total: number,
+    cameraPos: THREE.Vector3,
+    cameraDir: THREE.Vector3,
+  ) {
+    const changed = this.changedSince(camera, total);
+    if (changed) {
+      this.generateAll(encoder, camera, cameraPos, cameraDir);
+      this.stats.generated += 1;
+    }
+    const now = performance.now();
+    const deferred =
+      changed &&
+      this.posesOnly &&
+      now - this.lastSortTime < this.options.minSortIntervalMs;
+    if ((changed || this.stale) && !deferred) {
+      this.encodeSort(encoder, total);
+      this.lastSortTime = now;
+    }
+    this.stale = deferred;
+    if (deferred) this.onSortDeferred?.();
   }
 
   /**
@@ -680,11 +739,7 @@ export class WgpuSplatRenderer {
 
     const encoder = this.device.createCommandEncoder({ label: "splats" });
     if (this.options.sort === "gpu") {
-      if (this.changedSince(camera, total)) {
-        this.generateAll(encoder, camera, cameraPos, cameraDir);
-        this.encodeSort(encoder, total);
-        this.stats.generated += 1;
-      }
+      this.generateAndSort(encoder, camera, total, cameraPos, cameraDir);
       this.draw(encoder, camera, target, total);
       this.submit(encoder);
       return;
@@ -719,11 +774,7 @@ export class WgpuSplatRenderer {
     const gpu = this.options.sort === "gpu";
     let readback: GPUBuffer | null = null;
     if (gpu) {
-      if (this.changedSince(camera, total)) {
-        this.generateAll(encoder, camera, cameraPos, cameraDir);
-        this.encodeSort(encoder, total);
-        this.stats.generated += 1;
-      }
+      this.generateAndSort(encoder, camera, total, cameraPos, cameraDir);
     } else {
       this.generateAll(encoder, camera, cameraPos, cameraDir);
       readback = this.sortPending ? null : this.copyMetric(encoder, total);

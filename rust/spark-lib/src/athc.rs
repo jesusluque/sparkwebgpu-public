@@ -1221,53 +1221,38 @@ pub fn emit_block<T: SplatReceiver>(
         });
         done += count;
     }
-    // The extras, as attributes: words as they are, the transfer as halves.
+    // The extras, as attributes: words as they are, the transfer and the
+    // curvature as halves (set_attrib_words: a WASM receiver keeps them packed).
     let mut k = 0;
-    let words = |v: &[u32]| -> Vec<f64> { v.iter().map(|&w| w as f64).collect() };
-    for (on, values) in [
-        (h.has(FLAG_NORMALS), &block.normals),
-        (h.has(FLAG_EMISSION), &block.emission),
-        (x.pbr_words > 0, &block.pbr),
-        (x.lobes_words > 0, &block.lobes),
+    for (on, values, per) in [
+        (h.has(FLAG_NORMALS), &block.normals, 1),
+        (h.has(FLAG_EMISSION), &block.emission, 1),
+        (x.pbr_words > 0, &block.pbr, 1),
+        (x.lobes_words > 0, &block.lobes, x.lobes_words as usize),
     ] {
         if on {
-            receiver.set_attrib(k, base, block.n, &words(values));
+            receiver.set_attrib_words(k, base, block.n, values, per, false);
             k += 1;
         }
     }
     if x.transfer_words > 0 {
-        let tc = x.transfer_count as usize;
-        let tw = x.transfer_words as usize;
-        let mut values = vec![0.0f64; block.n * tc];
-        for i in 0..block.n {
-            for c in 0..tc {
-                let word = block.transfer[i * tw + c / 2];
-                values[i * tc + c] = if c % 2 == 0 { low_half(word) } else { high_half(word) } as f64;
-            }
-        }
-        receiver.set_attrib(k, base, block.n, &values);
+        receiver.set_attrib_words(k, base, block.n, &block.transfer, x.transfer_count as usize, true);
         k += 1;
     }
     if x.shadow_words > 0 {
-        receiver.set_attrib(k, base, block.n, &words(&block.shadow_bits));
+        receiver.set_attrib_words(k, base, block.n, &block.shadow_bits, x.shadow_words as usize, false);
         k += 1;
     }
     if x.curvature_words > 0 {
-        let values: Vec<f64> = (0..block.n)
-            .flat_map(|i| {
-                let w = &block.curvature[i * 2..i * 2 + 2];
-                [low_half(w[0]) as f64, high_half(w[0]) as f64, low_half(w[1]) as f64]
-            })
-            .collect();
-        receiver.set_attrib(k, base, block.n, &values);
+        receiver.set_attrib_words(k, base, block.n, &block.curvature, 3, true);
         k += 1;
     }
     // GROUP_ATTRIBUTE: given for merged nodes; a splat's tail is its group.
-    let ranges: Vec<f64> = match groups {
-        Some(g) => g.iter().map(|&w| w as f64).collect(),
-        None => block.tail.iter().flat_map(|&g| [g as f64, (g as f64) + 1.0]).collect(),
+    let ranges: Vec<u32> = match groups {
+        Some(g) => g.to_vec(),
+        None => block.tail.iter().flat_map(|&g| [g, g + 1]).collect(),
     };
-    receiver.set_attrib(k, base, block.n, &ranges);
+    receiver.set_attrib_words(k, base, block.n, &ranges, 2, false);
 }
 
 fn begin<T: SplatReceiver>(receiver: &mut T, num_splats: usize, h: &AthcHeader, x: &ExtraHeader) -> Result<()> {
@@ -1303,11 +1288,17 @@ impl<T: SplatReceiver> AthcDecoder<T> {
     }
 
     fn finish_file(&mut self) -> Result<()> {
-        let file = if u32_at(&self.buffer, 0) == crate::athc_v3::ATH3_MAGIC {
-            crate::athc_v3::read_v3(&self.buffer)?
+        // The file's bytes go as soon as they are read, and each chunk once
+        // it is handed over: a whole file with a full transfer (the
+        // Corvette's paint, 1.9M splats, 112 halves each) is most of a
+        // wasm32 heap, read and decoded side by side.
+        let bytes = std::mem::take(&mut self.buffer);
+        let mut file = if u32_at(&bytes, 0) == crate::athc_v3::ATH3_MAGIC {
+            crate::athc_v3::read_v3(&bytes)?
         } else {
-            AthcFile::read(&self.buffer)?
+            AthcFile::read(&bytes)?
         };
+        drop(bytes);
         let (h, x) = (file.header, file.extra);
         let tree = VirtualTree::of_file(&file, false)?;
         let merged = merged_block(&file, &tree);
@@ -1323,9 +1314,11 @@ impl<T: SplatReceiver> AthcDecoder<T> {
             true,
             self.options,
         );
+        drop(merged);
+        file.levels = Vec::new();
         let mut at = tree.splat_base as usize;
-        for chunk in &file.chunks {
-            emit_block(&mut self.splats, at, chunk, &h, &x, None, None, true, self.options);
+        for chunk in std::mem::take(&mut file.chunks) {
+            emit_block(&mut self.splats, at, &chunk, &h, &x, None, None, true, self.options);
             at += chunk.n;
         }
         self.tree = Some(tree);

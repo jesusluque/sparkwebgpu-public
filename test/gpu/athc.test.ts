@@ -51,7 +51,7 @@ type Decoded = {
     lnScaleMax: number;
   };
   attribSpecs?: AttribValues["specs"];
-  attribColumns?: Float64Array[];
+  attribColumns?: AttribValues["values"];
   fileType: string;
 };
 

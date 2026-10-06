@@ -63,6 +63,13 @@ export interface AtheneaSkyOptions {
   exposure?: number;
   /** Turns the dome about +Y, radians. Default 0. */
   rotation?: number;
+  /**
+   * The world to the frame the sky is prepared in (a rotation), after the
+   * turn about +Y: athenea's stage, where a cloud's transfer and cells were
+   * baked, when the page has turned that stage (the relight plugin's
+   * `frame`). Default none: the world itself.
+   */
+  frame?: THREE.Matrix4 | null;
 }
 
 /** Environment::baseSideFor: a map texel as wide as a lat-long texel. */
@@ -124,6 +131,7 @@ export class AtheneaSky {
     intensity: 1,
     exposure: 0,
     rotation: 0,
+    frame: null,
   };
 
   /** kEnvCoefficients float4: the sky's harmonics (rgb), its sun taken out. */
@@ -157,12 +165,16 @@ export class AtheneaSky {
     if (options.intensity !== undefined) o.intensity = options.intensity;
     if (options.exposure !== undefined) o.exposure = options.exposure;
     if (options.rotation !== undefined) o.rotation = options.rotation;
+    if (options.frame !== undefined) o.frame = options.frame?.clone() ?? null;
     this.dirty = true;
   }
 
-  /** Light to world: the dome turned about +Y. */
+  /** Light to world: the dome turned about +Y (then into `frame`). */
   get matrix(): THREE.Matrix4 {
-    return new THREE.Matrix4().makeRotationY(this.options.rotation);
+    const turn = new THREE.Matrix4().makeRotationY(this.options.rotation);
+    return this.options.frame
+      ? this.options.frame.clone().multiply(turn)
+      : turn;
   }
 
   /** The dome as a LightRecord (for a lights buffer beside it). */

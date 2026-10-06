@@ -31,7 +31,7 @@ import {
   packLightRecords,
 } from "../../src/webgpu/athenea/lights";
 import { atheneaRelightPlugin } from "../../src/webgpu/athenea/relightPlugin";
-import { AttribPool } from "../../src/webgpu/attributes/schema";
+import { AttribPool, attribWords } from "../../src/webgpu/attributes/schema";
 import refModule from "../../src/webgpu/generated/tests/athenea_relight";
 import {
   createReadback,
@@ -73,7 +73,7 @@ type Decoded = {
     lnScaleMax: number;
   };
   attribSpecs?: AttribValues["specs"];
-  attribColumns?: Float64Array[];
+  attribColumns?: AttribValues["values"];
 };
 
 function decode(bytes: Uint8Array): Decoded {
@@ -98,7 +98,13 @@ function finest(dec: Decoded) {
   const merged = dec.numSplats - count;
   const specs = dec.attribSpecs ?? [];
   const values = (dec.attribColumns ?? []).map((col, k) =>
-    col.slice(merged * specs[k].components),
+    // A .athc's streams come as their packed words (spec.packed).
+    col.slice(
+      merged *
+        (specs[k].packed
+          ? attribWords(specs[k] as never)
+          : specs[k].components),
+    ),
   );
   const pool = AttribPool.fromValues({ count, specs, values });
   const a = new Uint32Array(count * 4);

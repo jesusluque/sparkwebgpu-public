@@ -105,10 +105,22 @@ export interface AtheneaRelightOptions {
    * frame time on the pawn at full screen (default false).
    */
   pixelDetail?: boolean;
+  /**
+   * athenea's stage: the object whose space the clouds were baked in, where
+   * the page has placed or turned it (the Corvette's Z-up stage under a car
+   * turned to three's Y-up). A TX transfer, its cells and its reflected
+   * field are directions of the bake's world, and athenea reads them with
+   * world directions, so the relighting runs in this object's frame: the
+   * clouds placed in it, the dome, the sun and the lights taken into it.
+   * Default none: three's world is the stage (a rigid frame; its scale is
+   * not undone for the lights).
+   */
+  frame?: THREE.Object3D | null;
 }
 
-type RelightState = Required<Omit<AtheneaRelightOptions, "hdri">> & {
+type RelightState = Required<Omit<AtheneaRelightOptions, "hdri" | "frame">> & {
   hdri: SkyImage | null;
+  frame: THREE.Object3D | null;
 };
 
 export interface AtheneaRelightPlugin extends SplatPlugin {
@@ -234,6 +246,7 @@ export function atheneaRelightPlugin(
     ior: 0,
     emission: 1,
     pixelDetail: false,
+    frame: null,
   };
   const linear = new WeakMap<object, boolean>();
   const iors = new WeakMap<object, number>();
@@ -253,6 +266,31 @@ export function atheneaRelightPlugin(
   let lightsVersion = 0;
   let lightsDirty = true;
   let dirty = true;
+  /** Three's world to athenea's stage (options.frame's inverse), and its turn. */
+  let toStage = new THREE.Matrix4();
+  let stageTurn = new THREE.Matrix4();
+  let stageKey = "";
+  /** Brings the stage up to date: a moved frame prepares the sky again. */
+  const updateStage = () => {
+    const f = options.frame;
+    if (f) {
+      f.updateWorldMatrix(true, false);
+      toStage = f.matrixWorld.clone().invert();
+    } else {
+      toStage = new THREE.Matrix4();
+    }
+    const q = new THREE.Quaternion();
+    toStage.decompose(new THREE.Vector3(), q, new THREE.Vector3());
+    stageTurn = new THREE.Matrix4().makeRotationFromQuaternion(q);
+    const key = toStage.elements.map((v) => v.toPrecision(7)).join();
+    if (key !== stageKey) {
+      stageKey = key;
+      if (sky) {
+        sky.set({ frame: f ? stageTurn : null });
+      }
+      lightsDirty = true;
+    }
+  };
 
   const lookupLinear = (mesh: WgpuSplatMesh) => {
     for (const k of keysOf(mesh)) {
@@ -282,10 +320,19 @@ export function atheneaRelightPlugin(
         colour: (s.colour ?? [1, 1, 1]).map(
           (c) => c * (s.intensity ?? 1),
         ) as Rgb,
-        matrix: distantMatrix(vec3(s.direction)),
+        matrix: distantMatrix(vec3(s.direction).applyMatrix4(stageTurn)),
       });
     }
-    out.push(...options.lights);
+    for (const l of options.lights) {
+      out.push(
+        options.frame
+          ? {
+              ...l,
+              matrix: toStage.clone().multiply(l.matrix ?? new THREE.Matrix4()),
+            }
+          : l,
+      );
+    }
     return out;
   };
 
@@ -418,11 +465,15 @@ export function atheneaRelightPlugin(
     const state = stateOf(device, mesh);
     const { source, object } = mesh;
     object.updateMatrixWorld();
-    const world = object.matrixWorld;
-    const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
-    const eyeObject = eye
+    // The cloud in athenea's stage (options.frame), and the eye.
+    const world = toStage.clone().multiply(object.matrixWorld);
+    const eyeInWorld = new THREE.Vector3().setFromMatrixPosition(
+      camera.matrixWorld,
+    );
+    const eye = eyeInWorld.clone().applyMatrix4(toStage);
+    const eyeObject = eyeInWorld
       .clone()
-      .applyMatrix4(new THREE.Matrix4().copy(world).invert());
+      .applyMatrix4(new THREE.Matrix4().copy(object.matrixWorld).invert());
     const pool = state.pool;
     const ids = pool?.ids ?? {};
     const id = (name: string) => ids[name] ?? ATTRIB_NONE;
@@ -442,7 +493,7 @@ export function atheneaRelightPlugin(
       options.pixelDetail && Boolean(size) && id("curvature") !== ATTRIB_NONE;
     const toEye = new THREE.Matrix4().multiplyMatrices(
       camera.matrixWorldInverse,
-      world,
+      object.matrixWorld,
     ).elements;
     const eyeRow = (k: number, sign: number) => [
       sign * toEye[k],
@@ -593,7 +644,11 @@ export function atheneaRelightPlugin(
           );
           if (!meshes.length) return;
           const { device } = r;
-          sky ??= new AtheneaSky(device, r.registry);
+          if (!sky) {
+            sky = new AtheneaSky(device, r.registry);
+            stageKey = "";
+          }
+          updateStage();
           if (sky.dirty) {
             sky.set({
               image: options.hdri,
@@ -721,6 +776,7 @@ export function atheneaRelightPlugin(
       if (o.ior !== undefined) options.ior = o.ior;
       if (o.emission !== undefined) options.emission = o.emission;
       if (o.pixelDetail !== undefined) options.pixelDetail = o.pixelDetail;
+      if (o.frame !== undefined) options.frame = o.frame;
       if (skyChanged && sky) sky.dirty = true;
       lightsDirty = true;
       dirty = true;

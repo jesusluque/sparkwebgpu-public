@@ -109,7 +109,7 @@ const wasm = (await import("spark-rs")) as unknown as {
     finish(): {
       numSplats: number;
       attribSpecs: { name: string; format: string; components: number }[];
-      attribColumns: Float64Array[];
+      attribColumns: (Float64Array | Uint32Array)[];
     };
   };
 };

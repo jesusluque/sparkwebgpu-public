@@ -14,7 +14,7 @@
 //!          [--chunk 65536] [--gzip] [--v2] [--json out.json]
 //!          [--add more.usdc]... [--only-prim TEXT]... [--exclude-prim TEXT]...
 //!          [--thin RATIO | --target SPLATS | --cell SIDE [--fill 1.0]]
-//!          [--drop-backs THICKNESS]
+//!          [--drop-backs THICKNESS] [--box x0,y0,z0,x1,y1,z1]
 //! usd-athc in.usdc --list            the prim's attributes, their types and lengths
 //! ```
 //!
@@ -33,7 +33,8 @@
 //! thick (`athc_build::drop_hidden_backs`): mesh2splat bakes both faces of
 //! a solidified panel, and the dark inner one shows through the outer one
 //! in moiré bands wherever the draw's sort interleaves them (LoD levels,
-//! thinned clouds).
+//! thinned clouds). `--box` keeps the splats whose centres lie in that box
+//! (after `--drop-backs`): a small piece of a large bake, for tests.
 //!
 //! USD attribute -> `.athc` array:
 //!
@@ -69,7 +70,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use openusd::sdf::{self, AbstractData, Value};
 use serde_json::{json, Value as Json};
 use spark_lib::athc_build::{
-    build_lod, cell_for_target, drop_hidden_backs, pack_streams, reduce_cells, reduce_thin, BuildOptions,
+    build_lod, cell_for_target, crop_box, drop_hidden_backs, pack_streams, reduce_cells, reduce_thin, BuildOptions,
     CloudStreams, LobeStreams, TransferKeep,
 };
 use spark_lib::athc_v3::{gzip, parse_v3, write_v3, COMPRESSION_GZIP, COMPRESSION_NONE};
@@ -573,6 +574,13 @@ fn main() -> Result<()> {
         let (kept, dropped) = drop_hidden_backs(&packed, t)?;
         packed = kept;
         dropped_backs = Some(dropped);
+    }
+    if let Some(b) = arg(&args, "--box") {
+        let v: Vec<f32> = b.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>().context("--box")?;
+        if v.len() != 6 {
+            bail!("--box takes x0,y0,z0,x1,y1,z1");
+        }
+        packed = crop_box(&packed, [v[0], v[1], v[2]], [v[3], v[4], v[5]]);
     }
     let fill: f32 = arg(&args, "--fill")
         .map_or(Ok(1.0), |f| f.parse())

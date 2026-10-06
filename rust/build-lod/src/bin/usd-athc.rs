@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! usd-athc in.usdc out.athc [--prim /World/Splats] [--transfer full|112|84|64|36|16|9|none]
-//!          [--no-shadow] [--no-material] [--no-normals] [--no-curvature] [--max-sh 0|3|8|15]
+//!          [--no-shadow] [--no-material] [--no-lobes] [--no-normals] [--no-curvature] [--max-sh 0|3|8|15]
 //!          [--chunk 65536] [--gzip] [--v2] [--json out.json]
 //!          [--add more.usdc]... [--only-prim TEXT]... [--exclude-prim TEXT]...
 //!          [--thin RATIO | --target SPLATS | --cell SIDE [--fill 1.0]]
@@ -518,6 +518,10 @@ fn main() -> Result<()> {
     }
     if let Some(c) = arg(&args, "--chunk") {
         options.chunk_splats = c.parse().context("--chunk")?;
+    }
+    if flag("--no-lobes") {
+        // The material's base alone, as before the layers were carried.
+        streams.lobes = LobeStreams::default();
     }
     if flag("--material-stats") {
         // The distinct materials a cloud carries: its raw values and the

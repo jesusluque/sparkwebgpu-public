@@ -37,6 +37,7 @@ export {
 } from "./WgpuCubeMap";
 export { UniformWriter } from "./uniforms";
 export * as fx from "./fx";
+export * as plugins from "./plugins";
 export {
   capabilitiesOf,
   splatRequiredLimits,

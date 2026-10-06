@@ -534,10 +534,15 @@ float catcherOpacity(uint i, float3x3 r, float3 scale, float opacity) {
 }
 
 /// A shadow catcher's splats: black, as opaque as what the object took.
+// A cloud over 65 535 workgroups wide (16 776 960 splats, a 256-page pool)
+// is dispatched as rows of that many threads: the splat is x + y * row.
+public static const uint kRelightDispatchRow = 65535u * 256u;
+uint relightIndex(uint3 tid) { return tid.x + tid.y * kRelightDispatchRow; }
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelightCatcher(uint3 tid: SV_DispatchThreadID) {
-    const uint i = tid.x;
+    const uint i = relightIndex(tid);
     if (i >= relightParams.count) {
         return;
     }
@@ -552,7 +557,7 @@ void atheneaRelightCatcher(uint3 tid: SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelightViewless(uint3 tid: SV_DispatchThreadID) {
-    const uint i = tid.x;
+    const uint i = relightIndex(tid);
     if (i >= relightParams.count) {
         return;
     }
@@ -564,19 +569,19 @@ void atheneaRelightViewless(uint3 tid: SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelight(uint3 tid: SV_DispatchThreadID) {
-    relightAt<2>(tid.x);
+    relightAt<2>(relightIndex(tid));
 }
 
 /// The first transfer (no cells).
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelightFirst(uint3 tid: SV_DispatchThreadID) {
-    relightAt<1>(tid.x);
+    relightAt<1>(relightIndex(tid));
 }
 
 /// No transfer: the lights and the dome's harmonics and map alone.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelightPlain(uint3 tid: SV_DispatchThreadID) {
-    relightAt<0>(tid.x);
+    relightAt<0>(relightIndex(tid));
 }

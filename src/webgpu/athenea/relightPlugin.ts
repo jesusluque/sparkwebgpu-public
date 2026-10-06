@@ -191,6 +191,16 @@ function identity(o: object | null | undefined): number {
   return k;
 }
 
+/**
+ * The relight kernels' grid: one thread a splat, in rows of
+ * kRelightDispatchRow threads once a cloud is wider than one dispatch
+ * dimension allows (65 535 workgroups of 256).
+ */
+export function relightGrid(count: number): [number, number] {
+  const row = C.kRelightDispatchRow;
+  return count <= row ? [count, 1] : [row, Math.ceil(count / row)];
+}
+
 /** A zeroed uniform block for the blend term until the first pass fills it. */
 function createUniformBlock(device: GPUDevice): GPUBuffer {
   return device.createBuffer({
@@ -518,7 +528,7 @@ export function atheneaRelightPlugin(
     if (isCatcher(mesh)) {
       if (state.relitKey === placed) return;
       r.registry.get(relightModule, "atheneaRelightCatcher").dispatch(pass, {
-        grid: [source.count],
+        grid: relightGrid(source.count),
         buffers,
         uniforms: params.data,
       });
@@ -529,7 +539,7 @@ export function atheneaRelightPlugin(
     const kept = kTransfer >= 2 && envLights > 0;
     if (kept && state.viewlessKey !== placed) {
       r.registry.get(relightModule, "atheneaRelightViewless").dispatch(pass, {
-        grid: [source.count],
+        grid: relightGrid(source.count),
         buffers,
         uniforms: params.data,
       });
@@ -547,7 +557,7 @@ export function atheneaRelightPlugin(
           ? "atheneaRelightFirst"
           : "atheneaRelightPlain";
     r.registry.get(relightModule, entry).dispatch(pass, {
-      grid: [source.count],
+      grid: relightGrid(source.count),
       buffers,
       uniforms: params.data,
     });

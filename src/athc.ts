@@ -18,6 +18,8 @@ export const ATHC_MAGIC = 0x43485441; // "ATHC"
 export const ATHV_MAGIC = 0x56485441; // "ATHV"
 export const ATHV_HEAD = 160;
 export const ATHV_SPLATS = 1;
+/** ATHV head decode flags (byte 152): keep a linear cloud's colours linear. */
+export const ATHV_KEEP_LINEAR = 1;
 export const ATHC_PAGE_SPLATS = 65536;
 
 export const ATHC_FLAGS = {
@@ -89,6 +91,12 @@ export type AthcPaging = {
   mergedPages: Uint8Array[];
   /** Virtual pages: merged ones, then one per chunk from splatBase / 65 536. */
   pageCount: number;
+  /**
+   * The pages ask the decoder to keep a linear cloud's colours linear
+   * (ATHV_KEEP_LINEAR) instead of encoding them to sRGB for Spark's blend:
+   * for a renderer that blends in linear light (the athenea raster plugin).
+   */
+  keepLinear: boolean;
 };
 
 type FetchOptions = {
@@ -158,7 +166,9 @@ export async function readAthcLayout(
  * Opens a .athc for paging: its layout, its virtual tree and the ATHV blobs
  * of its merged pages (built in a loader worker from the file's levels).
  */
-export async function openAthc(options: FetchOptions): Promise<AthcPaging> {
+export async function openAthc(
+  options: FetchOptions & { keepLinear?: boolean },
+): Promise<AthcPaging> {
   const { layout, prefix } = await readAthcLayout(options);
   const levels =
     prefix.length >= layout.levelsEnd
@@ -177,17 +187,33 @@ export async function openAthc(options: FetchOptions): Promise<AthcPaging> {
       `.athc: chunks of ${layout.header.chunkSplats} splats; paging needs ${ATHC_PAGE_SPLATS}`,
     );
   }
+  const keepLinear = options.keepLinear ?? false;
+  if (keepLinear) {
+    for (const page of pages) {
+      new DataView(page.buffer, page.byteOffset).setUint32(
+        152,
+        ATHV_KEEP_LINEAR,
+        true,
+      );
+    }
+  }
   return {
     layout,
     tree,
     headers: prefix.slice(0, 136),
     mergedPages: pages,
     pageCount: tree.splatBase / ATHC_PAGE_SPLATS + chunkPages,
+    keepLinear,
   };
 }
 
 /** The ATHV head of a page of `n` splats at virtual index `base`. */
-export function athvHead(headers: Uint8Array, base: number, n: number) {
+export function athvHead(
+  headers: Uint8Array,
+  base: number,
+  n: number,
+  flags = 0,
+) {
   const head = new Uint8Array(ATHV_HEAD);
   const view = new DataView(head.buffer);
   view.setUint32(0, ATHV_MAGIC, true);
@@ -195,6 +221,7 @@ export function athvHead(headers: Uint8Array, base: number, n: number) {
   view.setUint32(8, base, true);
   view.setUint32(12, n, true);
   head.set(headers.subarray(0, 136), 16);
+  view.setUint32(152, flags, true);
   return head;
 }
 
@@ -219,7 +246,14 @@ export async function fetchAthcPage(
   const bytes = count * paging.layout.elementBytes;
   const { data } = await readRange(options, offset, bytes);
   const out = new Uint8Array(ATHV_HEAD + bytes);
-  out.set(athvHead(paging.headers, page * ATHC_PAGE_SPLATS, count));
+  out.set(
+    athvHead(
+      paging.headers,
+      page * ATHC_PAGE_SPLATS,
+      count,
+      paging.keepLinear ? ATHV_KEEP_LINEAR : 0,
+    ),
+  );
   out.set(data, ATHV_HEAD);
   return out;
 }

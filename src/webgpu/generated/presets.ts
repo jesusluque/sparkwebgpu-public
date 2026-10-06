@@ -19,6 +19,11 @@ export const pluginSlang: Record<string, { module: string; colour: string | null
     "module": "plugins.examples.fade",
     "colour": null,
     "blend": "FadeBlend"
+  },
+  "athenea.raster": {
+    "module": "athenea_adapter.raster",
+    "colour": "AtheneaRasterColour",
+    "blend": null
   }
 };
 
@@ -47,6 +52,14 @@ export const presets = [
     ],
     "colour": "example.tint",
     "blend": "example.fade"
+  },
+  {
+    "name": "athenea-raster",
+    "plugins": [
+      "athenea.raster"
+    ],
+    "colour": "athenea.raster",
+    "blend": null
   }
 ] as const;
 
@@ -56,6 +69,12 @@ export const colourVariants: Record<string, KernelVariant> = {
     plugins: ["example.tint"],
     load: async () => ({
       "kernels/generate": (await import("./variants/example-tint/kernels/generate")).default,
+    }),
+  },
+  "athenea.raster": {
+    plugins: ["athenea.raster"],
+    load: async () => ({
+      "kernels/generate": (await import("./variants/athenea-raster/kernels/generate")).default,
     }),
   },
 };

@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import * as THREE from "three";
 import { describe, expect, it, vi } from "vitest";
 import {
+  ATHV_KEEP_LINEAR,
   athvHead,
   unpackAthcLobes,
   unpackAthcNormal,
@@ -93,7 +94,16 @@ describe(".athc decode (WASM)", () => {
     // Root: three children from 1 (level 1's groups).
     expect(d.lodTree?.[2]).toBe(3);
     expect(d.lodTree?.[3]).toBe(1);
-    expect(d.attribSpecs?.map((s) => s.name)).toEqual(["normalOct"]);
+    expect(d.attribSpecs?.map((s) => s.name)).toEqual([
+      "normalOct",
+      "athcGroup",
+    ]);
+    // athcGroup: the root covers every finest group, a splat its own.
+    const pool = attribs(d);
+    expect(pool.getAttribute("athcGroup", 0)).toEqual([0, 527]);
+    const last = d.numSplats - 1;
+    const [lo, hi] = pool.getAttribute("athcGroup", last);
+    expect(hi - lo).toBe(1);
   });
 
   it("decodes paged ATHV pages as the whole file", () => {
@@ -125,6 +135,23 @@ describe(".athc decode (WASM)", () => {
     );
   });
 
+  it("keeps a linear cloud's colours linear when the ATHV head asks", () => {
+    const layout = wasm.athc_layout(EVERY, EVERY.length);
+    expect(layout.header.flags & 2).toBe(2);
+    const { offset, count } = layout.chunks[0];
+    const bytes = count * layout.elementBytes;
+    const page = (flags: number) => {
+      const out = new Uint8Array(160 + bytes);
+      out.set(athvHead(EVERY.subarray(0, 136), 65536, count, flags));
+      out.set(EVERY.subarray(offset, offset + bytes), 160);
+      return out;
+    };
+    // every_stream's splats are 0.25, 0.5, 1 linear: red as a byte.
+    const red = (d: Decoded) => d.packed[0] & 0xff;
+    expect(red(decode(page(0)))).toBe(Math.round(0.5371 * 255));
+    expect(red(decode(page(ATHV_KEEP_LINEAR)))).toBe(Math.round(0.25 * 255));
+  });
+
   it("carries every stream athenea's test writes", () => {
     const d = decode(EVERY);
     expect(d.attribSpecs?.map((s) => [s.name, s.format, s.components])).toEqual(
@@ -135,6 +162,7 @@ describe(".athc decode (WASM)", () => {
         ["lobes", "u32", 3],
         ["transfer", "f16", 112],
         ["shadowBits", "u32", 8],
+        ["athcGroup", "u32", 2],
       ],
     );
     const pool = attribs(d);

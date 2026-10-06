@@ -74,6 +74,32 @@ export {
   pickAtheneaFile,
 } from "./athenea/sceneJson";
 export {
+  ATHENEA_DISPLAYS,
+  ATHENEA_VIEWS,
+  AtheneaDisplay,
+  type AtheneaDisplayEncoding,
+  type AtheneaView,
+  prepareAces2,
+} from "./athenea/AtheneaDisplay";
+export {
+  ATHC_GROUP_ATTRIBUTE,
+  ATHENEA_OUTPUT_ID,
+  ATHENEA_RASTER_ID,
+  MAX_ATHENEA_OVERRIDES,
+  type AtheneaGroupOverride,
+  type AtheneaOutputOptions,
+  type AtheneaOutputPlugin,
+  type AtheneaRasterOptions,
+  type AtheneaRasterPlugin,
+  atheneaOutputPlugin,
+  atheneaRasterPlugin,
+} from "./athenea/rasterPlugin";
+export {
+  type AtheneaPick,
+  atheneaGroupOf,
+  pickAtheneaGroup,
+} from "./athenea/pick";
+export {
   type AthcLayout,
   type AthcPaging,
   readAthcLayout,

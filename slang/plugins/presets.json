@@ -5,11 +5,16 @@
       "module": "plugins.examples.tint",
       "colour": "TintColour"
     },
-    "example.fade": { "module": "plugins.examples.fade", "blend": "FadeBlend" }
+    "example.fade": { "module": "plugins.examples.fade", "blend": "FadeBlend" },
+    "athenea.raster": {
+      "module": "athenea_adapter.raster",
+      "colour": "AtheneaRasterColour"
+    }
   },
   "presets": [
     { "name": "tint", "plugins": ["example.tint"] },
     { "name": "fade", "plugins": ["example.fade"] },
-    { "name": "tint-fade", "plugins": ["example.tint", "example.fade"] }
+    { "name": "tint-fade", "plugins": ["example.tint", "example.fade"] },
+    { "name": "athenea-raster", "plugins": ["athenea.raster"] }
   ]
 }

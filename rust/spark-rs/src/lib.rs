@@ -839,6 +839,75 @@ pub fn athc_layout(prefix: Uint8Array, file_bytes: f64) -> Result<JsValue, JsVal
 }
 stub_fn!(feature = "athc", athc_layout);
 
+/// The bytes of a .athl through its section table, from at least its
+/// first 128 bytes (docs/docs/athl.md).
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athl_prefix_bytes(bytes: Uint8Array) -> Result<f64, JsValue> {
+    spark_lib::athl::AthlHeader::prefix_bytes(&bytes.to_vec())
+        .map(|n| n as f64)
+        .map_err(|e| JsValue::from(e.to_string()))
+}
+stub_fn!(feature = "athc", athl_prefix_bytes);
+
+/// A .athl's header and section table, from its prefix: where each
+/// group's layers for each page are, for Range requests.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athl_header(prefix: Uint8Array) -> Result<JsValue, JsValue> {
+    let h = spark_lib::athl::AthlHeader::parse(&prefix.to_vec()).map_err(|e| JsValue::from(e.to_string()))?;
+    Ok(serde_wasm_bindgen::to_value(&h)?)
+}
+stub_fn!(feature = "athc", athl_header);
+
+#[cfg(feature = "athc")]
+fn athl_layer_object(l: &spark_lib::athl::AthlLayer) -> Result<JsValue, JsValue> {
+    let object = serde_wasm_bindgen::to_value(l)?;
+    Reflect::set(&object, &JsValue::from_str("blocks"), &Uint16Array::from(&l.blocks[..]))?;
+    Reflect::set(&object, &JsValue::from_str("data"), &Uint16Array::from(&l.data[..]))?;
+    Ok(object)
+}
+
+/// One LAYR section of a .athl (the bytes a Range request of it returns):
+/// { group, kind, chunk, components, blocks: Uint16Array, data: Uint16Array }.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn decode_athl_layer(section: Uint8Array) -> Result<JsValue, JsValue> {
+    let l = spark_lib::athl::AthlLayer::read(&section.to_vec()).map_err(|e| JsValue::from(e.to_string()))?;
+    athl_layer_object(&l)
+}
+stub_fn!(feature = "athc", decode_athl_layer);
+
+/// A whole .athl: { header, groups, polygons, profiles (texels as a
+/// Uint16Array of f16 bits), layers (as decode_athl_layer) }.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn decode_athl(bytes: Uint8Array) -> Result<JsValue, JsValue> {
+    let bytes = bytes.to_vec();
+    let header = spark_lib::athl::AthlHeader::parse(&bytes).map_err(|e| JsValue::from(e.to_string()))?;
+    let file = spark_lib::athl::AthlFile::read(&bytes).map_err(|e| JsValue::from(e.to_string()))?;
+    spark_lib::athl::validate(&file).map_err(|e| JsValue::from(e.to_string()))?;
+    let object = js_sys::Object::new();
+    let set = |k: &str, v: &JsValue| Reflect::set(&object, &JsValue::from_str(k), v);
+    set("header", &serde_wasm_bindgen::to_value(&header)?)?;
+    set("groups", &serde_wasm_bindgen::to_value(&file.groups)?)?;
+    set("polygons", &serde_wasm_bindgen::to_value(&file.polygons)?)?;
+    let profiles = Array::new();
+    for p in &file.profiles {
+        let o = serde_wasm_bindgen::to_value(p)?;
+        Reflect::set(&o, &JsValue::from_str("texels"), &Uint16Array::from(&p.texels[..]))?;
+        profiles.push(&o);
+    }
+    set("profiles", &profiles)?;
+    let layers = Array::new();
+    for l in &file.layers {
+        layers.push(&athl_layer_object(l)?);
+    }
+    set("layers", &layers)?;
+    Ok(JsValue::from(object))
+}
+stub_fn!(feature = "athc", decode_athl);
+
 /// The paged virtual tree of a .athc (spark-lib athc::VirtualTree, splats
 /// from the first page boundary after the merged nodes) and its merged
 /// pages as ATHV blobs, from the file's bytes through `levelsEnd`.

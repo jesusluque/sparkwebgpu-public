@@ -21,6 +21,14 @@ relight.setCatcher(ground, true);                                     // a shado
 
 `examples/webgpu/athenea-relight.html` shows the OpenChessSet pawn (`?base=` where its files are) under the HDRIs of its `pawn.json`, with the dome switchable and turnable, an analytic sun and athenea's display transform.
 
+`examples/webgpu/athenea-corvette.html` (and the public `examples/webgpu-site/corvette.html`, both built by `examples/webgpu-site/corvette.js` from a `corvette.json`) shows athenea's Corvette, light: athenea's per-material TX bakes for the paint, wheels, metal, chrome and two glasses, the rest of the car from its whole-car TX bake, and its shadow catcher, thinned by `usd-athc --thin` to about 1.1M splats and a direct-only transfer (t16), about 70 MB. The stage is Z-up: the clouds are kept as baked and the page turns the car; each glass cloud gets its index with `setIor`, the catcher `setCatcher`. A web set like it:
+
+```sh
+usd-athc Car_Paint_Main_tx.usdc body-t16-gz.athc --add Rim_Paint_tx.usdc::Wiper_2 \
+  --transfer 16 --thin 10 --no-curvature --gzip      # one splat in 10, grown to its run's area
+usd-athc corvette_tx.usdc trim-t16-gz.athc --exclude-prim Car_Paint_Main ... --thin 20 --transfer 16 --gzip
+```
+
 ## What runs, and when
 
 Before generate, a pass of the plugin (`passes`):

@@ -138,6 +138,18 @@ export class SplatWorkerPool {
     });
   }
 
+  /**
+   * Terminates the idle workers, giving back their WebAssembly memory (it
+   * never shrinks while a worker lives): after a big load on a device with
+   * little memory. New loads start fresh workers as needed.
+   */
+  trim() {
+    for (const worker of this.freelist.splice(0)) {
+      worker.dispose();
+      this.numWorkers -= 1;
+    }
+  }
+
   freeWorker(worker: SplatWorker) {
     if (this.numWorkers > this.maxWorkers) {
       // Worker no longer needed

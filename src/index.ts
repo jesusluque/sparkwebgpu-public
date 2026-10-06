@@ -5,6 +5,7 @@ export {
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 
 export * as dyno from "./dyno";
+export { workerPool, SplatWorkerPool } from "./SplatWorker";
 
 export { RgbaArray, readRgbaArray } from "./RgbaArray";
 

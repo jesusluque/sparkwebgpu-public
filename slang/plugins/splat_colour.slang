@@ -25,6 +25,12 @@ public struct SplatColourInput {
     public float3 sh;
     /** Camera position in object space. */
     public float3 viewObject;
+    /**
+     * The accumulator slot the splat is written to (what the draw's
+     * BlendInput.splatIndex names): where a colour plugin leaves per-splat
+     * data for its blend term.
+     */
+    public uint outIndex;
 };
 
 public interface ISplatColour {

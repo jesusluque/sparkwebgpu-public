@@ -143,7 +143,7 @@ void generate(uint3 tid: SV_DispatchThreadID) {
     CovSplat c;
     c.flags = 0u;
     if (isActive(s.flags)) {
-        SplatColourInput colourIn = { s, index, shColor(index, s.center), params.viewObject.xyz };
+        SplatColourInput colourIn = { s, index, shColor(index, s.center), params.viewObject.xyz, params.outBase + i };
         s.rgba = applySplatColour<SPLAT_COLOUR>(s.rgba, colourIn);
         s = dynoObjectModifier(s);
 

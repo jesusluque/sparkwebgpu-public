@@ -23,9 +23,12 @@ function metrics(n: number, seed: number, sparse = false) {
   return m;
 }
 
-describe.skipIf(!device)("GpuSorter", () => {
+// The plain scatter, and the subgroup one where the device has subgroups.
+const scatters = device?.features.has("subgroups") ? [false, true] : [false];
+
+describe.skipIf(!device).each(scatters)("GpuSorter (subgroups: %s)", (sg) => {
   const registry = new KernelRegistry(device as GPUDevice);
-  const sorter = new GpuSorter(registry);
+  const sorter = new GpuSorter(registry, "sort", sg);
 
   it.each([
     [1, false],

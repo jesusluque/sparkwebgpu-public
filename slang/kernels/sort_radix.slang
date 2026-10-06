@@ -6,7 +6,8 @@
 // Stability inside a block comes from a workgroup scan of the 16 digit
 // counters packed 8 bits each in a uint4 (a block round is 128 threads, so a
 // counter never passes 128). No subgroup operations: it runs everywhere
-// WebGPU does.
+// WebGPU does (kernels/sort_scatter_subgroup.slang replaces radixScatter
+// where the device has subgroups).
 //
 // The keys are the metric's (from generate.slang) inverted float bits, so
 // the largest metric (farthest) comes first. Only active splats (finite

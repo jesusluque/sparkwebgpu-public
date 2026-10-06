@@ -236,7 +236,10 @@ describe("presets", () => {
       "athenea.raster",
       "athenea.relight",
     ]);
-    expect(Object.keys(blendVariants)).toEqual(["example.fade"]);
+    expect(Object.keys(blendVariants)).toEqual([
+      "example.fade",
+      "athenea.relight",
+    ]);
   });
 
   it("picks the exact variant, else the longest inside the list", () => {

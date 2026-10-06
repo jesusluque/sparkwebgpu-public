@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! usd-athc in.usdc out.athc [--prim /World/Splats] [--transfer full|112|84|64|36|16|9|none]
-//!          [--no-shadow] [--no-material] [--no-normals] [--max-sh 0|3|8|15]
+//!          [--no-shadow] [--no-material] [--no-normals] [--no-curvature] [--max-sh 0|3|8|15]
 //!          [--chunk 65536] [--gzip] [--v2] [--json out.json]
 //!          [--add more.usdc]... [--only-prim TEXT]... [--exclude-prim TEXT]...
 //!          [--thin RATIO | --target SPLATS | --cell SIDE [--fill 1.0]]
@@ -45,7 +45,9 @@
 //! primvars:athenea:splat:transferDirect (float[], 16 a splat), transferIndirect
 //!   (48), transferReflected (48)              transfer, 112 f16, flag bit 5
 //! primvars:athenea:splat:shadowBits (int[], 8 a splat)   shadowBits
-//! cryptoObject, cryptoManifest, curvature, ior, relight   not in a .athc:
+//! primvars:athenea:splat:curvature (float[], 3 a splat)  curvature, 3 f16
+//!                                             (v3 section CURV; not in a v2)
+//! cryptoObject, cryptoManifest, ior, relight  not in a .athc:
 //!                                             reported in --json
 //! ```
 
@@ -246,6 +248,7 @@ impl Prim {
             transfer_indirect: self.floats(&["athenea:splat:transferIndirect"])?,
             transfer_reflected: self.floats(&["athenea:splat:transferReflected"])?,
             shadow_bits: self.ints("athenea:splat:shadowBits")?,
+            curvature: self.floats(&["athenea:splat:curvature"])?,
         })
     }
 
@@ -321,7 +324,8 @@ fn append(a: &mut CloudStreams, b: CloudStreams) -> Result<()> {
         transfer_direct,
         transfer_indirect,
         transfer_reflected,
-        shadow_bits
+        shadow_bits,
+        curvature
     );
     a.count += b.count;
     Ok(())
@@ -404,7 +408,7 @@ fn main() -> Result<()> {
         }
     }
     let Some(input) = paths.first() else {
-        bail!("usage: usd-athc in.usdc out.athc [--prim P] [--transfer full|112|84|64|36|16|9|none] [--no-shadow] [--no-material] [--no-normals] [--max-sh N] [--chunk N] [--gzip] [--v2] [--json out.json] | usd-athc in.usdc --list");
+        bail!("usage: usd-athc in.usdc out.athc [--prim P] [--transfer full|112|84|64|36|16|9|none] [--no-shadow] [--no-material] [--no-normals] [--no-curvature] [--max-sh N] [--chunk N] [--gzip] [--v2] [--json out.json] | usd-athc in.usdc --list");
     };
     let prim_path = arg(&args, "--prim").unwrap_or("/World/Splats");
     let t = std::time::Instant::now();
@@ -465,6 +469,7 @@ fn main() -> Result<()> {
         shadow_bits: !flag("--no-shadow"),
         material: !flag("--no-material"),
         normals: !flag("--no-normals"),
+        curvature: !flag("--no-curvature"),
         ..Default::default()
     };
     if let Some(m) = arg(&args, "--max-sh") {
@@ -530,6 +535,7 @@ fn main() -> Result<()> {
         "shDegree": h.sh_degree(),
         "transferCount": file.extra.transfer_count,
         "shadowWords": file.extra.shadow_words,
+        "curvature": file.has_curvature() && !flag("--v2"),
         "boundsMin": h.bounds_min,
         "boundsMax": h.bounds_max,
         "constants": constants,

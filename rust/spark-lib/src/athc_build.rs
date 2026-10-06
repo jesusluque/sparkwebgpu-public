@@ -63,6 +63,9 @@ pub struct CloudStreams {
     pub transfer_reflected: Vec<f32>,
     /// `shadowBits`: 2, 8 or 32 words a splat
     pub shadow_bits: Vec<u32>,
+    /// `curvature`: 3 a splat, the shape operator in the splat's first two
+    /// axes (xx, xy, yy), on the mesh's normal (sparkwebGPU's `CURV`)
+    pub curvature: Vec<f32>,
 }
 
 /// Which of a transfer's values are kept (`transfer_layout.slang`: the count
@@ -88,6 +91,8 @@ pub struct BuildOptions {
     pub shadow_bits: bool,
     pub normals: bool,
     pub material: bool,
+    /// Keep the curvature (a v3 section of its own; a v2 file drops it).
+    pub curvature: bool,
 }
 
 impl Default for BuildOptions {
@@ -101,6 +106,7 @@ impl Default for BuildOptions {
             shadow_bits: true,
             normals: true,
             material: true,
+            curvature: true,
         }
     }
 }
@@ -257,6 +263,7 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
     need("scales", &s.scales, 3)?;
     need("opacities", &s.opacities, 1)?;
     need("normals", &s.normals, 3)?;
+    need("curvature", &s.curvature, 3)?;
     if s.positions.is_empty() {
         bail!("no positions");
     }
@@ -276,6 +283,7 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
     let pbr = o.material
         && !(s.metallic.is_empty() && s.roughness.is_empty() && s.transmission.is_empty());
     let normals = o.normals && !s.normals.is_empty();
+    let curvature = o.curvature && !s.curvature.is_empty();
     let (transfer_count, direct, indirect, field) = transfer_layout(s, o.transfer)?;
     let transfer_words = transfer_count.div_ceil(2) as usize;
     let shadow_words = if transfer_count > 0 && o.shadow_bits && !s.shadow_bits.is_empty() {
@@ -416,6 +424,14 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
             b.shadow_bits
                 .extend_from_slice(&s.shadow_bits[i * shadow_words..(i + 1) * shadow_words]);
         }
+        if curvature {
+            let k = &s.curvature[i * 3..i * 3 + 3];
+            let safe = |v: f32| if v.is_finite() { half_safe(v) } else { 0.0 };
+            b.curvature.extend_from_slice(&[
+                pack_halves(safe(k[0]), safe(k[1])),
+                pack_halves(safe(k[2]), 0.0),
+            ]);
+        }
     }
     if b.n == 0 {
         bail!("no splat survives validation");
@@ -495,6 +511,7 @@ fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         lobes: pick(&b.lobes),
         transfer: pick(&b.transfer),
         shadow_bits: pick(&b.shadow_bits),
+        curvature: pick(&b.curvature),
     }
 }
 
@@ -955,6 +972,12 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
                 &splats,
             );
         }
+        // The curvature merged as the transfer is, by opacity: the mean of
+        // the shape operators' half traces (what a lens reads) is exact,
+        // the rest is each splat's own frame and only indicative.
+        if !splats.curvature.is_empty() {
+            block.curvature = extras_merge(&splats.curvature, 2, 1, &level.starts, &splats);
+        }
         block.tail = level.cells.clone();
         stored.push((r, block));
         fine_moments = moments;
@@ -977,6 +1000,9 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
         extra.transfer_count = cloud.transfer_count;
         extra.transfer_words = cloud.transfer_count.div_ceil(2);
         extra.shadow_words = (whole.shadow_bits.len() / n) as u32;
+    }
+    if !whole.curvature.is_empty() {
+        extra.curvature_words = 2;
     }
     let flags = (if whole.normals.is_empty() {
         0
@@ -1152,6 +1178,9 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
             &splats,
         );
     }
+    if !splats.curvature.is_empty() {
+        block.curvature = extras_merge(&splats.curvature, 2, 1, &level.starts, &splats);
+    }
     Ok(PackedCloud {
         block,
         rest_per_colour: cloud.rest_per_colour,
@@ -1291,6 +1320,9 @@ pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
             &starts,
             &splats,
         );
+    }
+    if !splats.curvature.is_empty() {
+        block.curvature = extras_merge(&splats.curvature, 2, 1, &starts, &splats);
     }
     Ok(PackedCloud {
         block,
@@ -1631,5 +1663,112 @@ mod tests {
             .positions
             .chunks(4)
             .all(|p| p[3] > 0.0 && p[3] <= 0.99));
+    }
+
+    #[test]
+    fn carries_the_curvature_in_v3_and_drops_it_from_v2() {
+        let mut s = synthetic(3000);
+        for i in 0..s.count {
+            // A ball of radius 1/(10 + i % 7), a little anisotropic.
+            let k = 10.0 + (i % 7) as f32;
+            s.curvature.extend_from_slice(&[k, 0.25, k + 0.5]);
+        }
+        let o = BuildOptions {
+            chunk_splats: 1024,
+            ..Default::default()
+        };
+        let p = pack_streams(&s, &o).unwrap();
+        assert_eq!(p.block.curvature.len(), p.block.n * 2);
+        assert_eq!(f16_of(p.block.curvature[0] & 0xffff), 10.0);
+        assert_eq!(f16_of(p.block.curvature[1] >> 16), 0.0);
+        let f = build_lod(&p, &o).unwrap();
+        assert_eq!(f.extra.curvature_words, 2);
+        assert!(f.has_curvature());
+        for (_, b) in &f.levels {
+            assert_eq!(b.curvature.len(), b.n * 2);
+            // A merged group's mean curvature is a mean of 10 .. 16.5.
+            for w in b.curvature.chunks(2) {
+                let h = 0.5 * (f16_of(w[0] & 0xffff) + f16_of(w[1] & 0xffff));
+                assert!((10.0..=16.6).contains(&h), "{h}");
+            }
+        }
+        // v2 leaves it out: the same file as the cloud without it.
+        let plain = f.without_curvature();
+        let v2 = f.write().unwrap();
+        assert_eq!(v2, plain.write().unwrap());
+        assert_eq!(AthcFile::read(&v2).unwrap().extra.curvature_words, 0);
+        // v3 keeps it, in CURV right after the shadow bits.
+        let v3 = crate::athc_v3::write_v3(&f, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let layout = crate::athc_v3::parse_v3(&v3).unwrap();
+        assert_eq!(layout.extra.curvature_words, 2);
+        let ids: Vec<&str> = layout.sections.iter().map(|s| s.id.name()).collect();
+        assert_eq!(
+            ids,
+            ["CORE", "SHRS", "MATL", "SHAD", "CURV", "TXDI", "TXIN", "TXFD"]
+        );
+        let back = crate::athc_v3::read_v3(&v3).unwrap();
+        assert_eq!(
+            (back.levels.clone(), back.chunks.clone()),
+            (f.levels.clone(), f.chunks.clone())
+        );
+        // A v3 without it is the file it was.
+        let v3_plain = crate::athc_v3::write_v3(&plain, crate::athc_v3::COMPRESSION_NONE).unwrap();
+        assert_eq!(
+            crate::athc_v3::read_v3(&v3_plain).unwrap().write().unwrap(),
+            v2
+        );
+        // A page of a chunk's sections keeps it with the relight streams.
+        use crate::athc_v3::{athv_sections_page, read_sections_page, wanted_sections, Want};
+        let v3u = crate::athc_v3::write_v3(&f, crate::athc_v3::COMPRESSION_NONE).unwrap();
+        let lu = crate::athc_v3::parse_v3(&v3u).unwrap();
+        let chunk = lu.blocks.iter().find(|b| b.kind == 1).unwrap();
+        for (want, kept) in [
+            (
+                Want {
+                    material: true,
+                    transfer_values: 0,
+                },
+                false,
+            ),
+            (Want::all(&lu.extra), true),
+        ] {
+            let picks = wanted_sections(&lu.sections, &lu.extra, want);
+            let parts: Vec<_> = picks
+                .iter()
+                .map(|&k| {
+                    let span = chunk.spans[k];
+                    (
+                        &lu.sections[k],
+                        &v3u[span.offset as usize..(span.offset + span.stored as u64) as usize],
+                        span.raw,
+                    )
+                })
+                .collect();
+            let page = athv_sections_page(
+                &lu.v2_headers(),
+                0,
+                chunk.n,
+                0,
+                want.transfer_values,
+                &parts,
+            );
+            let (_, x, block, _) = read_sections_page(&page).unwrap();
+            assert_eq!(x.curvature_words, if kept { 2 } else { 0 });
+            assert_eq!(
+                block.curvature,
+                if kept {
+                    f.chunks[0].curvature.clone()
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+        // Decoded, it is an attribute of three halves.
+        let specs = crate::athc::attrib_specs(&layout.header, &layout.extra);
+        let c = specs
+            .iter()
+            .find(|s| s.name == crate::athc::CURVATURE_ATTRIBUTE)
+            .unwrap();
+        assert_eq!((c.format.as_str(), c.components), ("f16", 3));
     }
 }

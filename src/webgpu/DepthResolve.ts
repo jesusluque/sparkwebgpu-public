@@ -49,7 +49,11 @@ export class DepthResolve {
       label: "resolved depth",
       size: [source.width, source.height],
       format: RESOLVED_DEPTH_FORMAT,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      // Sampled too: the tile rasterizer reads the depth it tests against.
+      usage:
+        GPUTextureUsage.RENDER_ATTACHMENT |
+        GPUTextureUsage.COPY_SRC |
+        GPUTextureUsage.TEXTURE_BINDING,
     });
     this.texture = texture;
     const bindGroup = device.createBindGroup({

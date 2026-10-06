@@ -29,8 +29,23 @@ struct SortParams {
     uint count;     // keys to sort
     uint shift;     // digit position for this pass: 0, 4, ..., 28
     uint numBlocks; // ceil(count / TILE)
+    uint keyMode;   // compactKeys: KEY_FLOAT or KEY_DEPTH
+    float keyLo;    // KEY_DEPTH: the metric at the near plane
+    float keyScale; // KEY_DEPTH: DEPTH_KEYS / (far - near metric)
     uint pad0;
+    uint pad1;
 };
+
+// compactKeys' key of a metric. KEY_FLOAT: its inverted float bits (any
+// metric). KEY_DEPTH: where every active metric lies in [keyLo, keyLo +
+// DEPTH_KEYS / keyScale] (generate's cull keeps the view depth between the
+// near and far planes), its place in that range on DEPTH_BITS bits, in the
+// key's top bits: a uniform step over the range instead of the float's
+// relative one, so DEPTH_BITS sort as finely as more float bits.
+static const uint KEY_FLOAT = 0u;
+static const uint KEY_DEPTH = 1u;
+static const uint DEPTH_BITS = 24u;
+static const float DEPTH_KEYS = 16777215.0; // 2^24 - 1
 
 struct ScanParams {
     uint count; // elements of `scanData` at this level
@@ -64,6 +79,11 @@ bool isActiveMetric(float m) {
 }
 
 uint metricKey(float m) {
+    if (params.keyMode == KEY_DEPTH) {
+        // Farthest first: the far end of the range is key 0.
+        float t = clamp((m - params.keyLo) * params.keyScale, 0.0, DEPTH_KEYS);
+        return (uint(DEPTH_KEYS) - uint(t)) << (32u - DEPTH_BITS);
+    }
     return min(~asuint(max(m, 0.0)), 0xfffffffeu);
 }
 

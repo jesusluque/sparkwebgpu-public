@@ -59,9 +59,14 @@ public struct AtheneaRelightColour : ISplatColour {
         const float4 c = asfloat(atheneaRelit[at]);
         const uint o = 3u * i.outIndex;
         const bool keepAll = c.a < -1.5;
-        atheneaPixelOut[o] = keepAll ? uint4(0u) : atheneaRelit[at + kPixel];
-        atheneaPixelOut[o + 1u] = keepAll ? uint4(0u) : atheneaRelit[at + kPixel + 1u];
-        atheneaPixelOut[o + 2u] = keepAll ? uint4(0u) : atheneaRelit[at + kPixel + 2u];
+        // The draw reads the slope and polish records only under the
+        // centre's mark (AtheneaRelightBlend): copied only then.
+        const uint4 head = keepAll ? uint4(0u) : atheneaRelit[at + kPixel + 2u];
+        atheneaPixelOut[o + 2u] = head;
+        if (highHalf(head.w) > 0.5) {
+            atheneaPixelOut[o] = atheneaRelit[at + kPixel];
+            atheneaPixelOut[o + 1u] = atheneaRelit[at + kPixel + 1u];
+        }
         if (keepAll) {
             return rgba;
         }

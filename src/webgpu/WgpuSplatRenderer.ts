@@ -27,8 +27,9 @@ import {
   DrawTimer,
   type RasterPath,
 } from "./AutoRasterizer";
+import { DepthResolve } from "./DepthResolve";
 import { GpuProfiler } from "./GpuProfiler";
-import { GpuSorter } from "./GpuSorter";
+import { GpuSorter, type SortDepthRange } from "./GpuSorter";
 import { GpuSplatSource } from "./GpuSplatSource";
 import type { KernelModule } from "./KernelModule";
 import { KernelRegistry } from "./KernelRegistry";
@@ -45,7 +46,11 @@ import {
   DynoKernels,
   type WgpuDyno,
 } from "./dyno/DynoKernels";
-import { drawSplatShape, kernelsGenerate } from "./generated/constants";
+import {
+  drawSplatDraw,
+  drawSplatShape,
+  kernelsGenerate,
+} from "./generated/constants";
 import drawModule from "./generated/draw/splat_draw";
 import generateModule from "./generated/kernels/generate";
 import {
@@ -70,6 +75,9 @@ import {
 } from "./threeInternals";
 import type { WebGPURendererLike } from "./threeRenderer";
 import { UniformWriter } from "./uniforms";
+
+// The projector's record of a sorted slot (splat_draw.slang).
+const PROJECTED_BYTES = 16 * drawSplatDraw.PROJECTED_WORDS;
 
 const {
   GEN_SRC_EXT,
@@ -150,6 +158,17 @@ export interface WgpuSplatRendererOptions {
    */
   sortBits?: 16 | 24 | 32;
   /**
+   * GPU sort with the cull on and a perspective camera: key the metrics by
+   * their place between the camera's planes on 24 bits (6 radix passes, not
+   * 8), instead of their float bits (sortBits), while that step is at most
+   * 2.5e-4 of a unit (a range under ~4.2k units: with the default radial
+   * metric, a far plane of ~2k at a 60 degree field). The step is uniform:
+   * finer than 24 float bits beyond a few units, and the order differs
+   * from the 32-bit one only between splats closer than that.
+   * Default true.
+   */
+  depthKeys?: boolean;
+  /**
    * Regenerate and re-sort every frame even when nothing moved. Off by
    * default: like SparkRenderer, an unchanged frame redraws the last order.
    * Turn on (or call markDirty()) for splats animated on the GPU.
@@ -184,6 +203,18 @@ export interface WgpuSplatRendererOptions {
    * Splits the sort into a pass per stage, so it costs a little.
    */
   profile?: boolean;
+  /**
+   * Project each sorted splat once, in a compute pass after the sort
+   * (draw/splat_draw.slang projectSplats), and have the quads' vertices read
+   * that record, instead of projecting it in each of its four vertices.
+   * Same image. Applies to the GPU sort's quad draw (not 2DGS, attribute
+   * draw stages or the tile rasterizer) while the records (64 B a splat)
+   * fit one storage binding. Default false: on an Apple GPU (Chrome) the
+   * draw took as long either way (the quads' raster, not their vertex
+   * shading, is what costs; docs/docs/webgpu-performance-audit.md), and the
+   * records take 64 B a splat.
+   */
+  projectOnce?: boolean;
   /**
    * Accumulator format between generate and draw. "ext" (32 B a splat):
    * float centers and colours. "packed" (16 B, as SparkRenderer's default):
@@ -357,13 +388,22 @@ export class WgpuSplatRenderer {
   private stale = false;
   private dirty = true;
   private drawUniform: GPUBuffer;
+  /** Single-sample copies of multisampled targets' depth (render()). */
+  private depthResolve?: DepthResolve;
+  /** The projector's records (projectOnce), PROJECTED_BYTES a slot. */
+  private projected: GPUBuffer | null = null;
   private pipelines = new Map<string, ReflectedRenderPipeline>();
   private emptyBuffer: GPUBuffer;
   private dynoKernels: DynoKernels;
   private profiler: GpuProfiler | null = null;
   // The accumulator as the last generate wrote it: packed centers are
   // relative to `origin` (the camera then).
-  private written = { packed: false, origin: new THREE.Vector3() };
+  private written: {
+    packed: boolean;
+    origin: THREE.Vector3;
+    /** The range the generated metrics lie in (depthKeys), or null. */
+    depth: SortDepthRange | null;
+  } = { packed: false, origin: new THREE.Vector3(), depth: null };
   private lastTime = performance.now() / 1000;
   private dynoDirty = false;
   private bakePipeline?: GPUComputePipeline;
@@ -400,6 +440,7 @@ export class WgpuSplatRenderer {
       sortRadial: true,
       sort: "gpu",
       sortBits: 32,
+      depthKeys: true,
       alwaysGenerate: false,
       minSortIntervalMs: 0,
       maxStdDev: Math.sqrt(8),
@@ -415,6 +456,7 @@ export class WgpuSplatRenderer {
       apertureAngle: 0,
       lodInflate: false,
       profile: false,
+      projectOnce: false,
       accumulator: "auto",
       cull: true,
       covSplats: false,
@@ -614,6 +656,7 @@ export class WgpuSplatRenderer {
       total,
       this.mappingVersion,
       this.options.sortBits,
+      this.options.depthKeys ? 1 : 0,
       this.options.sortRadial ? 1 : 0,
       this.packedFor(total) ? 1 : 0,
       this.options.cull ? 1 : 0,
@@ -707,16 +750,36 @@ export class WgpuSplatRenderer {
       : undefined;
   }
 
+  /**
+   * Timestamp writes for a plugin's own pass, timed into stats.gpuMs under
+   * `label` with options.profile; undefined otherwise.
+   */
+  passTimestampWrites(
+    label: string,
+  ):
+    | (GPUComputePassTimestampWrites & GPURenderPassTimestampWrites)
+    | undefined {
+    return this.timestampWrites(label);
+  }
+
   // The GPU sort of this frame's metric, a pass per stage when profiling.
   private encodeSort(encoder: GPUCommandEncoder, total: number) {
     const metric = this.metric as GPUBuffer;
     const bits = this.options.sortBits;
+    const depth = this.written.depth;
     if (this.options.profile && this.profiler) {
-      this.sorter.encodeProfiled(encoder, this.profiler, metric, total, bits);
+      this.sorter.encodeProfiled(
+        encoder,
+        this.profiler,
+        metric,
+        total,
+        bits,
+        depth,
+      );
       return;
     }
     const pass = encoder.beginComputePass({ label: "sort" });
-    this.sorter.encode(pass, metric, total, bits);
+    this.sorter.encode(pass, metric, total, bits, depth);
     pass.end();
   }
 
@@ -820,8 +883,20 @@ export class WgpuSplatRenderer {
     this.plugins?.encodePasses(encoder);
     const gpu = this.options.sort === "gpu";
     let readback: GPUBuffer | null = null;
+    let projected: GPUBuffer | null = null;
     if (gpu) {
       this.generateAndSort(encoder, camera, total, cameraPos, cameraDir);
+      if (this.projects(total)) {
+        // The draw params now, so the projector (submitted with the sort,
+        // before the caller's pass) projects for this target.
+        const drawParams = this.writeDrawParams(
+          camera,
+          target.width,
+          target.height,
+          target.linear && !target.layer,
+        );
+        projected = this.encodeProject(encoder, total, drawParams);
+      }
     } else {
       this.generateAll(encoder, camera, cameraPos, cameraDir);
       readback = this.sortPending ? null : this.copyMetric(encoder, total);
@@ -845,8 +920,10 @@ export class WgpuSplatRenderer {
     const depthFormat = this.options.depthTest ? target.depthFormat : null;
     const pixel = this.plugins?.pixelKernels(this.device) ?? null;
     const module = pixel?.draw ?? drawModule;
+    const vertex = projected ? "splatVertexProjected" : "splatVertex";
     const key = [
       module.name,
+      vertex,
       target.format,
       target.depthFormat,
       depthFormat ? "test" : "",
@@ -860,7 +937,7 @@ export class WgpuSplatRenderer {
       const { colorTarget } = this.pipelineStates(target.format, null);
       if (target.layer) colorTarget.blend = SRGB_LAYER_BLEND;
       rp = createReflectedRenderPipeline(this.device, module, {
-        vertex: "splatVertex",
+        vertex,
         fragment: "splatFragment",
         targets: [
           colorTarget,
@@ -885,6 +962,7 @@ export class WgpuSplatRenderer {
     }
     const groups = createBindGroups(this.device, rp, {
       ordering: gpu ? this.sorter.ordering : (this.ordering as GPUBuffer),
+      ...(projected ? { projected } : {}),
       splats: this.accumulator as GPUBuffer,
       params: this.drawUniform,
       ...pixel?.buffers,
@@ -951,11 +1029,9 @@ export class WgpuSplatRenderer {
         "WgpuSplatRenderer: render the scene into the target first",
       );
     }
-    if ((target.samples ?? 0) > 1) {
-      throw new Error(
-        "WgpuSplatRenderer: multisampled targets are not supported yet",
-      );
-    }
+    // A multisampled target (samples > 1): three resolves its colour into
+    // target.texture's single-sample texture at the end of its pass, which
+    // is what `color` is; its depth stays multisampled, resolved in draw().
     const depth = target.depthTexture
       ? (gpuTexture(renderer, target.depthTexture) ?? null)
       : null;
@@ -1002,6 +1078,7 @@ export class WgpuSplatRenderer {
       this.options.cull && this.options.sort === "gpu"
         ? this.cullParams(camera)
         : undefined;
+    this.written.depth = cull ? this.depthRange(camera) : null;
     const packed = this.packedFor(
       this.meshes.reduce((n, m) => n + this.meshCount(m), 0),
     );
@@ -1201,6 +1278,26 @@ export class WgpuSplatRenderer {
     countBuffer.destroy();
   }
 
+  // The range of the metrics generate's cull lets through for `camera`
+  // (depthKeys): the view depth between the planes, + 100 along the view
+  // axis; radially, up to the far plane's corners past clipXY.
+  private depthRange(camera: THREE.Camera): SortDepthRange | null {
+    const cam = camera as THREE.PerspectiveCamera;
+    if (!this.options.depthKeys || !cam.isPerspectiveCamera) return null;
+    const { near, far } = cam;
+    const p = cam.projectionMatrix.elements;
+    if (!(near > 0 && far > near && p[0] && p[5])) return null;
+    let range: SortDepthRange;
+    if (this.options.sortRadial) {
+      const x = (this.options.clipXY + Math.abs(p[8])) / Math.abs(p[0]);
+      const y = (this.options.clipXY + Math.abs(p[9])) / Math.abs(p[5]);
+      range = { lo: near, hi: far * Math.sqrt(1 + x * x + y * y) };
+    } else {
+      range = { lo: near + 100, hi: far + 100 };
+    }
+    return (range.hi - range.lo) / 2 ** 24 <= 2.5e-4 ? range : null;
+  }
+
   // generate's copy of the draw's early outs (GEN_CULL), for this camera.
   private cullParams(camera: THREE.Camera) {
     const view = camera.matrixWorldInverse;
@@ -1262,6 +1359,57 @@ export class WgpuSplatRenderer {
     }
   }
 
+  // Whether this frame's quads read the projector's records (projectOnce):
+  // GPU sort, no 2DGS, while the records fit one binding.
+  private projects(total: number): boolean {
+    return (
+      this.options.projectOnce &&
+      this.options.sort === "gpu" &&
+      !this.options.enable2DGS &&
+      total * PROJECTED_BYTES <= this.device.limits.maxStorageBufferBindingSize
+    );
+  }
+
+  // The projector over the sorted slots, after the sort and with this
+  // frame's draw params (already written), into `encoder`.
+  private encodeProject(
+    encoder: GPUCommandEncoder,
+    total: number,
+    drawParams: ArrayBuffer,
+  ): GPUBuffer {
+    const bytes = Math.max(total, 1) * PROJECTED_BYTES;
+    if (!this.projected || this.projected.size < bytes) {
+      this.projected?.destroy();
+      this.projected = createStorage(
+        this.device,
+        Math.min(
+          Math.ceil(bytes * (this.projected ? 1.5 : 1)),
+          this.device.limits.maxStorageBufferBindingSize,
+        ),
+        "projected splats",
+      );
+    }
+    const pass = encoder.beginComputePass({
+      label: "project",
+      timestampWrites: this.timestampWrites("project"),
+    });
+    this.registry.get(drawModule, "projectSplats").dispatchIndirect(
+      pass,
+      {
+        buffers: {
+          ordering: this.sorter.ordering,
+          sortCount: this.sorter.drawArgs,
+          projectedOut: this.projected,
+          splats: this.accumulator as GPUBuffer,
+        },
+        uniforms: drawParams,
+      },
+      this.sorter.dispatchArgs,
+    );
+    pass.end();
+    return this.projected;
+  }
+
   private pipelineStates(
     format: GPUTextureFormat,
     depthFormat: GPUTextureFormat | null,
@@ -1287,8 +1435,9 @@ export class WgpuSplatRenderer {
     depthFormat: GPUTextureFormat | null,
     layer = false,
     module: KernelModule = drawModule,
+    vertex = "splatVertex",
   ) {
-    const key = `${format}/${depthFormat}${layer ? "/layer" : ""}/${module.name}`;
+    const key = `${format}/${depthFormat}${layer ? "/layer" : ""}/${module.name}/${vertex}`;
     let p = this.pipelines.get(key);
     if (!p) {
       const { colorTarget, depthStencil } = this.pipelineStates(
@@ -1297,7 +1446,7 @@ export class WgpuSplatRenderer {
       );
       if (layer) colorTarget.blend = SRGB_LAYER_BLEND;
       p = createReflectedRenderPipeline(this.device, module, {
-        vertex: "splatVertex",
+        vertex,
         fragment: "splatFragment",
         targets: [colorTarget],
         depthStencil,
@@ -1321,7 +1470,13 @@ export class WgpuSplatRenderer {
       return;
     const { color: target, depth, linear } = this.resolveTarget(renderTarget);
     const size = { x: target.width, y: target.height };
-    const depthTexture = this.options.depthTest ? depth : null;
+    let depthTexture = this.options.depthTest ? depth : null;
+    if (depthTexture && depthTexture.sampleCount > 1) {
+      // Splats draw single-sampled over the resolved colour, tested against
+      // a single-sample copy of the multisampled depth.
+      this.depthResolve ??= new DepthResolve(this.device);
+      depthTexture = this.depthResolve.resolve(encoder, depthTexture);
+    }
     const depthView = depthTexture?.createView();
     const depthFormat = depthTexture?.format ?? null;
 
@@ -1367,14 +1522,32 @@ export class WgpuSplatRenderer {
       this.encodeTiles(encoder, target, depthTexture, layer, drawParams, false);
     }
     this.stats.rasterizer = "hardware";
+    const projected =
+      gpu && !variant && this.projects(gpuSorted as number)
+        ? this.encodeProject(encoder, gpuSorted as number, drawParams)
+        : null;
+    const vertex = projected ? "splatVertexProjected" : "splatVertex";
     const timestampWrites = this.timestampWrites("draw") ?? drawEnd;
     const rp =
       variant?.pipeline ??
       (layer
-        ? this.pipeline(SRGB_LAYER_FORMAT, depthFormat, true, pixel?.draw)
-        : this.pipeline(target.format, depthFormat, false, pixel?.draw));
+        ? this.pipeline(
+            SRGB_LAYER_FORMAT,
+            depthFormat,
+            true,
+            pixel?.draw,
+            vertex,
+          )
+        : this.pipeline(
+            target.format,
+            depthFormat,
+            false,
+            pixel?.draw,
+            vertex,
+          ));
     const groups = createBindGroups(this.device, rp, {
       ordering: gpu ? this.sorter.ordering : (this.ordering as GPUBuffer),
+      ...(projected ? { projected } : {}),
       splats: this.accumulator as GPUBuffer,
       params: this.drawUniform,
       ...pixel?.buffers,
@@ -1556,11 +1729,13 @@ export class WgpuSplatRenderer {
     this.accumulator?.destroy();
     this.metric?.destroy();
     this.ordering?.destroy();
+    this.projected?.destroy();
     this.drawUniform.destroy();
     this.emptyBuffer.destroy();
     this.sorter.destroy();
     this.srgb?.dispose();
     this.tiles?.destroy();
+    this.depthResolve?.dispose();
     this.profiler?.destroy();
     this.autoTimer?.destroy();
     this.registry.destroy();

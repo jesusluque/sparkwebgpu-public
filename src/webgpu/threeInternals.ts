@@ -272,6 +272,15 @@ export class OpenPass {
     return (data.msaaTexture ?? data.texture) as GPUTexture;
   }
 
+  /**
+   * The first colour attachment's single-sample texture: with MSAA, the one
+   * three resolves into at the end of its pass.
+   */
+  resolvedColorTexture(): GPUTexture {
+    const textures = this.context.textures as THREE.Texture[];
+    return textureData(this.renderer, textures[0]).texture as GPUTexture;
+  }
+
   /** The depth texture three is drawing with, when it has one. */
   depthTexture(): GPUTexture | null {
     const depth = this.context.depthTexture;

@@ -35,6 +35,7 @@ nav:
   - WebGPU architecture: docs/webgpu-architecture.md
   - WebGPU attributes: docs/webgpu-attributes.md
   - WebGPU effects: docs/webgpu-fx.md
+  - WebGPU performance audit: docs/webgpu-performance-audit.md
   - athenea .athc: docs/athc-v3.md
   - athenea raster: docs/webgpu-athenea-raster.md
   - athenea relight: docs/webgpu-athenea-relight.md

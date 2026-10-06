@@ -1256,6 +1256,222 @@ pub fn truncate_levels(file: &AthcFile, keep: usize) -> Result<AthcFile> {
     Ok(out)
 }
 
+/// Each level's groups' normal moments from the splats up: the weight W
+/// (opacity x area of the two long axes, as athenea's moments weigh) and
+/// the weighted sum of the unit normals, `[W, Sx, Sy, Sz]` (f64). Empty
+/// for a cloud without normals.
+pub fn normal_moments(file: &AthcFile) -> Vec<Vec<[f64; 4]>> {
+    let levels = file.levels.len();
+    if levels == 0 || file.chunks.iter().all(|c| c.normals.is_empty()) {
+        return Vec::new();
+    }
+    let mut m: Vec<Vec<[f64; 4]>> = file.levels.iter().map(|(_, b)| vec![[0.0; 4]; b.n]).collect();
+    let mut g = 0usize;
+    let mut at = 0usize;
+    for chunk in &file.chunks {
+        for i in 0..chunk.n {
+            while g + 1 < file.starts.len() && file.starts[g + 1] as usize <= at {
+                g += 1;
+            }
+            if g < m[levels - 1].len() && !chunk.normals.is_empty() {
+                let w = (chunk.positions[i * 4 + 3].max(0.0) * two_axis_area(&chunk.shape[i * 4..i * 4 + 4])) as f64;
+                let n = unpack_normal(chunk.normals[i]);
+                let e = &mut m[levels - 1][g];
+                e[0] += w;
+                for k in 0..3 {
+                    e[k + 1] += w * n[k] as f64;
+                }
+            }
+            at += 1;
+        }
+    }
+    for l in (0..levels - 1).rev() {
+        let (parents, children) = (&file.levels[l].1.tail, &file.levels[l + 1].1.tail);
+        let mut j = 0;
+        for (i, &code) in parents.iter().enumerate() {
+            let mut e = [0.0f64; 4];
+            while j < children.len() && children[j] >> 3 == code {
+                for k in 0..4 {
+                    e[k] += m[l + 1][j][k];
+                }
+                j += 1;
+            }
+            m[l][i] = e;
+        }
+    }
+    m
+}
+
+/// A group's normal spread from its moments: 1 - |mean normal|, 0 for a
+/// flat group, 1 - cos(phi / 2) for two equal faces phi apart (a 45 degree
+/// crease: 0.076), 1 for two opposite faces.
+pub fn normal_spread(m: &[f64; 4]) -> f32 {
+    if m[0] <= 0.0 {
+        return 0.0;
+    }
+    let len = (m[1] * m[1] + m[2] * m[2] + m[3] * m[3]).sqrt() / m[0];
+    (1.0 - len).clamp(0.0, 1.0) as f32
+}
+
+/// The variance of a group's normals, 1 - |mean normal|^2 (the trace of
+/// their covariance; LEAN's second moment less the mean's square): what a
+/// merged gaussian's lobes are widened by (relight.slang
+/// footprintRoughness), kept in the curvature's fourth half.
+pub fn normal_variance(m: &[f64; 4]) -> f32 {
+    if m[0] <= 0.0 {
+        return 0.0;
+    }
+    let len2 = (m[1] * m[1] + m[2] * m[2] + m[3] * m[3]) / (m[0] * m[0]);
+    (1.0 - len2).clamp(0.0, 1.0) as f32
+}
+
+/// Writes each merged level's normal variance (`normal_variance`) into the
+/// fourth half of its curvature (0 in every file written before; the
+/// splats keep 0: their own spread is the curvature's). A cloud without
+/// curvature or normals is left as it is.
+pub fn store_normal_variance(file: &mut AthcFile) {
+    let m = normal_moments(file);
+    if m.is_empty() {
+        return;
+    }
+    for ((_, b), m) in file.levels.iter_mut().zip(&m) {
+        if b.curvature.len() != 2 * b.n {
+            continue;
+        }
+        for i in 0..b.n {
+            let w = &mut b.curvature[2 * i + 1];
+            *w = pack_halves(low_half(*w), normal_variance(&m[i]));
+        }
+    }
+}
+
+/// What [`truncate_creases`] made of a cloud.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct CreaseCut {
+    /// Elements of the cut from each level kept as merged (index into the
+    /// file's levels, from `keep`), then real splats.
+    pub per_level: Vec<usize>,
+    pub splats: usize,
+}
+
+/// [`truncate_levels`], aware of creases: a group of level `keep` whose
+/// normals spread more than `max_spread` ([`normal_spread`]) is replaced by
+/// its children, recursively, down to the splats themselves, so that a
+/// crease keeps finer (in the end real) splats instead of one merged
+/// gaussian straddling it with the faces' mean normal (the merged cell's
+/// centre off both faces, its normal neither's: the light Corvette's door
+/// sill read as a sawtooth along its crease). Each element keeps its own
+/// level's widening; the merged ones carry their normal variance in the
+/// curvature's fourth half (`store_normal_variance`). `max_spread` >= 1
+/// is `truncate_levels` (plus the variance). `max_depth` bounds how many
+/// levels below `keep` a crease may go (the splats count as one more than
+/// the finest level).
+pub fn truncate_creases(file: &AthcFile, keep: usize, max_spread: f32, max_depth: usize) -> Result<(AthcFile, CreaseCut)> {
+    if keep == 0 || keep >= file.levels.len() {
+        bail!("keep levels 1 .. {} as merged levels (asked {})", file.levels.len() - 1, keep);
+    }
+    let mut full = file.clone();
+    uncap_levels(&mut full);
+    store_normal_variance(&mut full);
+    let moments = normal_moments(&full);
+    let spread = |l: usize, g: usize| moments.get(l).map_or(0.0, |m| normal_spread(&m[g]));
+    let levels = full.levels.len();
+    let finest_level = full.levels[levels - 1].0;
+    let all = full.splats();
+    let count = all.n;
+    // Each level's children ranges in the next (codes are sorted).
+    let child_range = |l: usize, g: usize| -> (usize, usize) {
+        let code = full.levels[l].1.tail[g];
+        let next = &full.levels[l + 1].1.tail;
+        let lo = next.partition_point(|&c| (c >> 3) < code);
+        let hi = next.partition_point(|&c| (c >> 3) <= code);
+        (lo, hi)
+    };
+    // The cut, in Morton order: (level index or usize::MAX for a splat, index).
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = (0..full.levels[keep].1.n).rev().map(|g| (keep, g)).collect();
+    while let Some((l, g)) = stack.pop() {
+        if spread(l, g) <= max_spread || l - keep >= max_depth {
+            cut.push((l, g));
+        } else if l + 1 < levels {
+            let (lo, hi) = child_range(l, g);
+            stack.extend((lo..hi).rev().map(|c| (l + 1, c)));
+        } else {
+            let lo = full.starts[g] as usize;
+            let hi = full.starts.get(g + 1).map_or(count, |&s| s as usize);
+            cut.extend((lo..hi).map(|s| (usize::MAX, s)));
+        }
+    }
+    // Each kept level widened once, as truncate_levels widens its one.
+    let widened: Vec<AthcBlock> = (keep..levels)
+        .map(|l| {
+            let mut b = full.levels[l].1.clone();
+            widen_merged(&mut b, full.header.extent / (1u64 << full.levels[l].0) as f32);
+            b
+        })
+        .collect();
+    let mut stats = CreaseCut { per_level: vec![0; levels - keep], splats: 0 };
+    let mut splats = AthcBlock::default();
+    let mut codes = Vec::with_capacity(cut.len());
+    let parent_level = full.levels[keep - 1].0;
+    // Runs of the same source are appended together.
+    let mut run: Option<(usize, usize, usize)> = None;
+    let flush = |run: Option<(usize, usize, usize)>, splats: &mut AthcBlock| {
+        if let Some((l, lo, hi)) = run {
+            let mut part = if l == usize::MAX { all.slice(lo, hi - lo) } else { widened[l - keep].slice(lo, hi - lo) };
+            part.tail.clear();
+            if l == usize::MAX && part.curvature.is_empty() && !widened[0].curvature.is_empty() {
+                part.curvature = vec![0; 2 * part.n];
+            }
+            splats.append(&part);
+        }
+    };
+    for &(l, i) in &cut {
+        let (code, level) = if l == usize::MAX {
+            (full.levels[levels - 1].1.tail[all.tail[i] as usize], finest_level)
+        } else {
+            (full.levels[l].1.tail[i], full.levels[l].0)
+        };
+        codes.push(code >> (3 * (level - parent_level)));
+        if l == usize::MAX {
+            stats.splats += 1;
+        } else {
+            stats.per_level[l - keep] += 1;
+        }
+        run = match run {
+            Some((rl, lo, hi)) if rl == l && hi == i => Some((rl, lo, hi + 1)),
+            other => {
+                flush(other, &mut splats);
+                Some((l, i, i + 1))
+            }
+        };
+    }
+    flush(run, &mut splats);
+    // Tails: the index of the parent group at level keep - 1.
+    let parents = &full.levels[keep - 1].1.tail;
+    let mut starts = Vec::with_capacity(parents.len());
+    let mut j = 0;
+    splats.tail = vec![0; splats.n];
+    for &code in parents {
+        starts.push(j as u32);
+        while j < splats.n && codes[j] == code {
+            splats.tail[j] = starts.len() as u32 - 1;
+            j += 1;
+        }
+    }
+    if j != splats.n {
+        bail!("the cut has elements without a parent at level {}", keep - 1);
+    }
+    let per = file.header.chunk_splats.max(1) as usize;
+    let chunks: Vec<AthcBlock> = (0..splats.n).step_by(per).map(|s| splats.slice(s, per.min(splats.n - s))).collect();
+    let mut out = AthcFile { header: full.header, extra: full.extra, levels: full.levels[..keep].to_vec(), starts, chunks };
+    out.header.count = splats.n as u32;
+    out.header.chunks = out.chunks.len() as u32;
+    out.header.levels = keep as u32;
+    out.header.finest_groups = out.levels[keep - 1].1.n as u32;
+    Ok((out, stats))
+}
+
 // --- ATHV: one page of a virtual tree --------------------------------------
 
 /// Bytes before an ATHV page's own data.
@@ -1363,7 +1579,7 @@ pub fn attrib_specs(h: &AthcHeader, x: &ExtraHeader) -> Vec<AttribSpec> {
         out.push(spec("shadowBits", "u32", x.shadow_words, LodMerge::First));
     }
     if x.curvature_words > 0 {
-        out.push(spec(CURVATURE_ATTRIBUTE, "f16", 3, LodMerge::WeightedMean));
+        out.push(spec(CURVATURE_ATTRIBUTE, "f16", 4, LodMerge::WeightedMean));
     }
     // The skin as stored (athc_skin): merged nodes carry their own.
     if x.skin_influences > 0 {
@@ -1386,7 +1602,8 @@ pub fn attrib_specs(h: &AthcHeader, x: &ExtraHeader) -> Vec<AttribSpec> {
 pub const GROUP_ATTRIBUTE: &str = "athcGroup";
 
 /// The curvature stream's attribute: athenea's per-splat shape operator in
-/// the splat's first two axes (xx, xy, yy), 1/metres, on the mesh's normal.
+/// the splat's first two axes (xx, xy, yy), 1/metres, on the mesh's normal,
+/// and a merged splat's normal variance (`store_normal_variance`; 0 for a splat).
 pub const CURVATURE_ATTRIBUTE: &str = "curvature";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1506,7 +1723,7 @@ pub fn emit_block<T: SplatReceiver>(
         k += 1;
     }
     if x.curvature_words > 0 {
-        receiver.set_attrib_words(k, base, block.n, &block.curvature, 3, true);
+        receiver.set_attrib_words(k, base, block.n, &block.curvature, 4, true);
         k += 1;
     }
     if x.skin_influences > 0 {
@@ -1553,6 +1770,8 @@ fn begin<T: SplatReceiver>(receiver: &mut T, num_splats: usize, h: &AthcHeader, 
 pub struct AthcDecoder<T: SplatReceiver> {
     splats: T,
     buffer: Vec<u8>,
+    /// The whole file's size was read from its tables and reserved.
+    reserved: bool,
     pub options: DecodeOptions,
     /// Set after finish(): the tree a whole file was decoded with.
     pub tree: Option<VirtualTree>,
@@ -1560,7 +1779,7 @@ pub struct AthcDecoder<T: SplatReceiver> {
 
 impl<T: SplatReceiver> AthcDecoder<T> {
     pub fn new(splats: T) -> Self {
-        Self { splats, buffer: Vec::new(), options: DecodeOptions::default(), tree: None }
+        Self { splats, buffer: Vec::new(), reserved: false, options: DecodeOptions::default(), tree: None }
     }
 
     pub fn into_splats(self) -> T {
@@ -1665,6 +1884,27 @@ impl<T: SplatReceiver> AthcDecoder<T> {
 impl<T: SplatReceiver> ChunkReceiver for AthcDecoder<T> {
     fn push(&mut self, bytes: &[u8]) -> Result<()> {
         self.buffer.extend_from_slice(bytes);
+        // A v3 file says its size in its tables: reserve it once, so the
+        // buffer holds the file and not up to twice it (Vec doubling), and
+        // is not copied as it grows. Its sections are decoded next to it.
+        if !self.reserved && self.buffer.len() >= 144 && u32_at(&self.buffer, 0) == crate::athc_v3::ATH3_MAGIC {
+            match crate::athc_v3::tables_bytes(&self.buffer) {
+                Ok(tables) if self.buffer.len() as u64 >= tables => {
+                    self.reserved = true;
+                    if let Ok(end) = crate::athc_v3::file_bytes(&self.buffer) {
+                        // Files end padded to a whole page.
+                        let want = aligned(end) as usize;
+                        if want > self.buffer.len() && want < (1usize << 31) {
+                            let mut whole = Vec::with_capacity(want);
+                            whole.extend_from_slice(&self.buffer);
+                            self.buffer = whole;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => self.reserved = true,
+            }
+        }
         Ok(())
     }
 
@@ -1946,6 +2186,47 @@ mod tests {
         assert_eq!(out.opacity.len(), (tree.merged + cut.header.count) as usize);
         assert!(out.opacity[tree.merged as usize..].iter().any(|&a| a > 1.0));
         assert!(out.opacity.iter().all(|&a| a <= 2.0));
+    }
+
+    #[test]
+    fn a_crease_aware_cut_keeps_finer_splats_where_normals_spread() {
+        const HOOD: &[u8] = include_bytes!("../../../test/fixtures/athc/hood_t16.athc");
+        let file = crate::athc_v3::read_v3(HOOD).unwrap();
+        let keep = file.levels.len() - 3;
+        let plain = truncate_levels(&file, keep).unwrap();
+        // No bound: the plain cut, plus each merged splat's normal variance.
+        let (same, stats) = truncate_creases(&file, keep, 1.0, usize::MAX).unwrap();
+        assert_eq!((stats.per_level[0], stats.splats), (file.levels[keep].1.n, 0));
+        let (a, b) = (plain.splats(), same.splats());
+        assert_eq!((&a.positions, &a.shape, &a.tail, &a.transfer), (&b.positions, &b.shape, &b.tail, &b.transfer));
+        assert_eq!(plain.starts, same.starts);
+        let moments = normal_moments(&file);
+        for i in 0..b.n {
+            assert_eq!(a.curvature[2 * i], b.curvature[2 * i]);
+            assert_eq!(a.curvature[2 * i + 1] & 0xffff, b.curvature[2 * i + 1] & 0xffff);
+            let v = high_half(b.curvature[2 * i + 1]);
+            assert!((v - normal_variance(&moments[keep][i])).abs() <= 1e-3 * v.max(1e-2), "{i}: {v}");
+        }
+        assert!((0..b.n).any(|i| high_half(b.curvature[2 * i + 1]) > 0.0));
+        // A bound of 0: every group with any spread goes down, to the splats.
+        let (fine, stats) = truncate_creases(&file, keep, 0.0, usize::MAX).unwrap();
+        assert!(stats.splats > 0 && fine.header.count > plain.header.count);
+        let one = truncate_creases(&file, keep, 0.0, 1).unwrap().1;
+        assert_eq!((one.per_level.len(), one.splats), (stats.per_level.len(), 0));
+        assert!(one.per_level[1] > 0);
+        // Still a tree: each parent's run, tails its index; and every splat's
+        // weight is there once (the cut covers the cloud).
+        let splats = fine.splats();
+        for g in 0..fine.starts.len() {
+            let end = if g + 1 < fine.starts.len() { fine.starts[g + 1] } else { fine.header.count };
+            assert!(end > fine.starts[g]);
+            assert!(splats.tail[fine.starts[g] as usize..end as usize].iter().all(|&t| t == g as u32));
+        }
+        let bytes = crate::athc_v3::write_v3(&fine, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let back = crate::athc_v3::read_v3(&bytes).unwrap();
+        assert_eq!(back.splats().positions, splats.positions);
+        let tree = VirtualTree::of_file(&back, false).unwrap();
+        assert_eq!(decode(&bytes).opacity.len(), (tree.merged + fine.header.count) as usize);
     }
 
     #[test]

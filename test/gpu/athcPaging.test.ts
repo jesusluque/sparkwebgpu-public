@@ -121,6 +121,9 @@ const fixture = (name: string) =>
   );
 const V2 = fixture("every_stream.athc");
 const V3 = fixture("every_stream.v3.athc");
+// The same, its sections as byte planes (encoding 1) and delta planes (2).
+const V3_PLANES = fixture("every_stream.planes.athc");
+const V3_DELTA = fixture("every_stream.delta.athc");
 const MERGED = 9;
 const COUNT = 300;
 
@@ -250,6 +253,8 @@ describe.skipIf(!device)("a .athc paged by stream group", () => {
 
   it.each([
     ["v3 (sections, gzip)", V3],
+    ["v3 (byte planes)", V3_PLANES],
+    ["v3 (delta planes)", V3_DELTA],
     ["v2", V2],
   ])(
     "keeps the relight streams of the first-ranked page, %s",

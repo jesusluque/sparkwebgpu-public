@@ -874,6 +874,36 @@ describe.skipIf(!wideDevice)(
       ).toBe(10);
     });
 
+    it("reads the same rig from the byte-plane encoding (athc-convert --gzip --planes)", () => {
+      const planes = new Uint8Array(
+        readFileSync(
+          new URL(
+            "../fixtures/athc/skinned_corner.planes.athc",
+            import.meta.url,
+          ),
+        ),
+      );
+      expect(wasm.athc_skeleton(planes)).toEqual(skeleton);
+      const decoder = wasm.decode_to_extsplats(
+        undefined,
+        "planes.athc",
+        undefined,
+        undefined,
+        undefined,
+      );
+      decoder.push(planes);
+      const a = decoder.finish() as ExtDecoded;
+      const b = decodeCorner();
+      expect(a.numSplats).toBe(b.numSplats);
+      expect(Array.from(a.ext0)).toEqual(Array.from(b.ext0));
+      a.attribSpecs.forEach((spec, k) => {
+        expect(spec.name).toBe(b.attribSpecs[k].name);
+        expect(Array.from(a.attribColumns[k])).toEqual(
+          Array.from(b.attribColumns[k]),
+        );
+      });
+    });
+
     it("shades a cloud its joint turns as the same cloud turned by its transform", async () => {
       // athenea's own check (fe1f6e6, athenea_usd_tests [zonal]): carried by a
       // rotating joint, the cloud shades as the same cloud still under an

@@ -90,6 +90,9 @@ public struct AtheneaRelightParams {
     public float emissionScale;
     public uint  curvature;        ///< the curvature attribute (ATTRIB_NONE: absent)
     public float footprint;        ///< the footprint prefilter's gain (0: none; footprintRoughness)
+    public uint  listCount;        ///< > 0: relight only these splats, the list at listBase (below)
+    public uint  listBase;         ///< uint4 index in `relit` of the list (four splat indices each)
+    public uint  pad0;
     public float4 encoding;        ///< packed src: rgbMin, rgbMax, lnScaleMin, lnScaleMax
     public float4 row0;            ///< object to world, rows of a 3x4
     public float4 row1;
@@ -284,6 +287,13 @@ bool curvatureOf(uint i, out float3 k) {
     return all(isfinite(k));
 }
 
+/// The variance of a merged splat's normals (the curvature's fourth half;
+/// 0 for a splat, or a cloud written without it).
+float normalSpreadOf(uint i) {
+    const uint id = relightParams.curvature;
+    return hasAttr(id) ? f16tof32(readAttribU(relightPool, id, i, 3u)) : 0.0;
+}
+
 /// splat_project's projection of a gaussian, as far as SplatSlope needs it:
 /// the linearisation a pixel right and down is (`tx3`, `ty3`, in the
 /// cloud's space), the centre in pixels and the 2D covariance (a, b, c)
@@ -339,10 +349,20 @@ bool projectForSlope(Gsplat g, float3x3 r, out float3 tx3, out float3 ty3, out f
 /// `gain` times its square root in quadrature, at most 1. A splat small
 /// against the curvature (the detailed cloud) keeps its roughness.
 public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain) {
+    return footprintRoughness(roughness, shapeUV, scales, gain, 0.0);
+}
+
+/// The same, where the cloud also knows the normals' variance over a merged
+/// gaussian (`spread`, LEAN's second moment: .athc's curvature fourth half,
+/// athc.rs store_normal_variance): the larger of the two, so a merged cell
+/// over a crease, whose members' normals the curvature does not see, is
+/// widened by how far they really turn.
+public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain, float spread) {
     const float su = scales.x;
     const float sv = scales.y;
-    const float variance = su * su * (shapeUV.x * shapeUV.x + shapeUV.y * shapeUV.y) +
-                           sv * sv * (shapeUV.y * shapeUV.y + shapeUV.z * shapeUV.z);
+    const float variance = max(su * su * (shapeUV.x * shapeUV.x + shapeUV.y * shapeUV.y) +
+                               sv * sv * (shapeUV.y * shapeUV.y + shapeUV.z * shapeUV.z),
+                               isfinite(spread) ? spread : 0.0);
     const float alpha = roughness * roughness;
     const float add = gain * sqrt(max(variance, 0.0));
     const float widened = min(sqrt(alpha * alpha + add * add), 1.0);
@@ -399,8 +419,9 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     // whole footprint: its lobes widened by how the normal turns over it.
     if (curved && !hasFlag(kRelightSlope) && relightParams.footprint > 0.0) {
         const float gain = relightParams.footprint;
-        surface.roughness = footprintRoughness(surface.roughness, shapeUV, g.scales, gain);
-        surface.lobes.coatRoughness = footprintRoughness(surface.lobes.coatRoughness, shapeUV, g.scales, gain);
+        const float spread = normalSpreadOf(i);
+        surface.roughness = footprintRoughness(surface.roughness, shapeUV, g.scales, gain, spread);
+        surface.lobes.coatRoughness = footprintRoughness(surface.lobes.coatRoughness, shapeUV, g.scales, gain, spread);
     }
     float3 tx3, ty3;
     if (curved && hasFlag(kRelightSlope) && shadowWords() >= 8u && transferCount() >= 9u &&
@@ -493,7 +514,7 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     } else if (hasFlag(kRelightDebugNormal)) {
         light = 0.02 * (surface.normal * 0.5 + 0.5);
     } else if (hasFlag(kRelightDebugFootprint)) {
-        light = curved ? 0.02 * float3(footprintRoughness(0.0, shapeUV, g.scales, 1.0), surface.lobes.coatRoughness, 0.0)
+        light = curved ? 0.02 * float3(footprintRoughness(0.0, shapeUV, g.scales, 1.0, normalSpreadOf(i)), surface.lobes.coatRoughness, 0.0)
                        : float3(0.0, 0.0, 0.02);
     }
     if (mark > 0.0) {
@@ -503,14 +524,32 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     return float4(light, alpha);
 }
 
-void relightAt<let kTransfer : int>(uint i) {
+/// The splat thread t relights: the t-th of the list after the records
+/// (listCount > 0: the splats a LoD cut draws, the host's copy of the
+/// mesh's lodIndices), else splat t; count when there is none.
+uint relightTarget(uint t) {
+    if (relightParams.listCount == 0u) {
+        return t;
+    }
+    if (t >= relightParams.listCount) {
+        return relightParams.count;
+    }
+    return relit[relightParams.listBase + t / 4u][t % 4u];
+}
+
+void relightAt<let kTransfer : int>(uint t) {
+    const uint i = relightTarget(t);
     if (i >= relightParams.count) {
         return;
     }
     RelightPixel pixel;
     relit[i * kRelightStride] = asuint(relitColour<kTransfer>(i, pixel));
-    relit[i * kRelightStride + kRelightPixel] = pixel.slopes;
-    relit[i * kRelightStride + kRelightPixel + 1u] = pixel.polish;
+    // The draw reads the slope and polish records only under a mark in the
+    // centre's (kRelightSlope): without it they are left as they are.
+    if (hasFlag(kRelightSlope)) {
+        relit[i * kRelightStride + kRelightPixel] = pixel.slopes;
+        relit[i * kRelightStride + kRelightPixel + 1u] = pixel.polish;
+    }
     relit[i * kRelightStride + kRelightPixel + 2u] = pixel.centre;
 }
 

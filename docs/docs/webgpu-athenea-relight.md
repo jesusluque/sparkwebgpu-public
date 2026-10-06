@@ -84,6 +84,7 @@ Per transfer, the kernel is athenea's: a TX transfer with cells (`kTransfer` 2: 
 | pawn glass top | 0.917, 0.0866 | 0.710, 0.1604 | 0.775, 0.0598 |
 
   The balls are measured in athenea's box (192 x 192 + 96 + 80 of 384 x 384), the pawn over each material's pixels (validate's measure). athenea's raster is the s95 TX build.
+- **The whole pipeline on athenea's spheres** (usd-athc with lobes and curvature, the WASM decoder, `pixelDetail`): [athenea spheres](athenea-spheres.md). The paint balls are athenea's raster within 0.5% (relMSE under 1e-4), and the TX balls (paint, chrome, rubber, glass) are its relitSplat per splat, per-pixel records included.
 
 ## Differences from the native raster
 

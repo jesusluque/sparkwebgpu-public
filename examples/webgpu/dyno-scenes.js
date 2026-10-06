@@ -9,7 +9,8 @@
 //                   displacing box)
 //   ?scene=snow     generators.snowBox
 //   ?scene=skin     the butterfly flapping by linear-blend SplatSkinning
-//                   (covariance splats)
+//                   (covariance splats); &jacobian=1 also with the weights'
+//                   gradients (weightGradients: the whole Jacobian)
 //   ?scene=rgba     the butterfly recoloured by SplatMesh.splatRgba (an
 //                   RgbaArray of channel-swapped colours)
 //   &cov=1          covariance splats: an ExtSplats mesh with covSplats, and
@@ -25,6 +26,7 @@ export function sceneParams() {
     intensity: Number(params.get("intensity") ?? 0.8),
     time: params.has("t") ? Number(params.get("t")) : null,
     cov: params.get("cov") === "1" || params.get("scene") === "skin",
+    jacobian: params.get("jacobian") === "1",
     size: {
       w: Number(params.get("w") ?? 800),
       h: Number(params.get("h") ?? 600),
@@ -273,7 +275,7 @@ export async function buildScene({ THREE, spark, getAssetFileURL, params }) {
       mesh.splatRgba = new spark.RgbaArray({ array });
     } else if (params.scene === "skin") {
       await mesh.initialized;
-      const skin = skinWings(THREE, spark, mesh);
+      const skin = skinWings(THREE, spark, mesh, params.jacobian);
       mesh.updateGenerator();
       return {
         mesh,
@@ -292,13 +294,15 @@ export async function buildScene({ THREE, spark, getAssetFileURL, params }) {
 
 // Linear-blend skinning: bone 0 the body, bones 1 and 2 the wings, which
 // flap about the body's axis and stretch, blended near the body.
-function skinWings(THREE, spark, mesh) {
+function skinWings(THREE, spark, mesh, jacobian = false) {
   const { SplatSkinning, SplatSkinningMode } = spark;
   const skinning = new SplatSkinning({
     mesh,
     numBones: 3,
     mode: SplatSkinningMode.LINEAR_BLEND,
+    weightGradients: jacobian,
   });
+  const zero = new THREE.Vector3();
   mesh.extSplats.forEachSplat((index, center) => {
     const w = Math.min(1, Math.abs(center.x) / 0.3);
     const wing = center.x < 0 ? 1 : 2;
@@ -307,7 +311,18 @@ function skinWings(THREE, spark, mesh) {
       new THREE.Vector4(0, wing, 0, 0),
       new THREE.Vector4(1 - w, w, 0, 0),
     );
+    if (jacobian) {
+      // d w / d x across the ramp, the body's the opposite.
+      const dw = Math.abs(center.x) < 0.3 ? Math.sign(center.x) / 0.3 : 0;
+      skinning.setSplatWeightGradients(
+        index,
+        new THREE.Vector3(-dw, 0, 0),
+        new THREE.Vector3(dw, 0, 0),
+        zero,
+      );
+    }
   });
+  if (jacobian) skinning.gradientTexture.needsUpdate = true;
   for (let bone = 0; bone < 3; bone++) {
     skinning.setRestMatrix(bone, new THREE.Matrix4());
   }

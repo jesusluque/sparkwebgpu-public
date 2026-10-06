@@ -281,7 +281,10 @@ bool curvatureOf(uint i, out float3 k) {
 
 /// splat_project's projection of a gaussian, as far as SplatSlope needs it:
 /// the linearisation a pixel right and down is (`tx3`, `ty3`, in the
-/// cloud's space), the centre in pixels and the 2D covariance (a, b, c).
+/// cloud's space), the centre in pixels and the 2D covariance (a, b, c)
+/// after splat_project's third of a pixel of dilation, which is what the
+/// slope's fall is held by (without it a footprint of a pixel or two kept
+/// half as much again of a crease's ramp as athenea's).
 bool projectForSlope(Gsplat g, float3x3 r, out float3 tx3, out float3 ty3, out float2 centre, out float3 cov) {
     tx3 = float3(0.0);
     ty3 = float3(0.0);
@@ -313,7 +316,7 @@ bool projectForSlope(Gsplat g, float3x3 r, out float3 tx3, out float3 ty3, out f
     const float3x3 m = float3x3(r[0] * scale, r[1] * scale, r[2] * scale);
     const float3 ax = mul(tx3, m);
     const float3 ay = mul(ty3, m);
-    cov = float3(dot(ax, ax), dot(ax, ay), dot(ay, ay));
+    cov = float3(dot(ax, ax) + 0.3, dot(ax, ay), dot(ay, ay) + 0.3);
     return true;
 }
 

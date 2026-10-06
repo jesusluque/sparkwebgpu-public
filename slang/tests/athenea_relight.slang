@@ -16,6 +16,7 @@ import athenea.splat.splat_relight;
 import athenea.common.packing;
 import athenea.common.color;
 import athenea.scene.splat_encoding;
+import athenea.common.octahedral;
 
 struct RefParams {
     uint count;
@@ -40,14 +41,21 @@ struct RefParams {
 
     float ior;
     float curvature;      ///< every splat's shape operator (k, 0, k) on its third axis (0: none)
-    uint pad1;
-    uint pad2;
+    uint perSplatCurvature; ///< 1: the shape operator (xx, xy, yy) is each splat's, f32 at curvatureAt + i * 3
+    uint curvatureAt;
 
     float4 w0;
     float4 w1;
     float4 w2;
     float4 eyeCloud;
     float4 eyeWorld;
+    // referenceRelightPixel: splat_project's projection (the cloud's space
+    // to the eye's, rows; focal x, y and centre x, y in pixels; width, height).
+    float4 view0;
+    float4 view1;
+    float4 view2;
+    float4 focal;
+    float4 viewport;
 };
 
 StructuredBuffer<uint4>        src;
@@ -62,7 +70,57 @@ ConstantBuffer<RefParams>      params;
 
 static const uint kNone = 0xFFFFFFFFu;
 
+/// splat_project's projection of splat i as far as SplatSlope reads it:
+/// the linearisation a pixel right and down (tx3, ty3), the centre in
+/// pixels and the 2D covariance after its third of a pixel of dilation
+/// (a, b, c: what the slope's fall is held by).
+bool projected(Gsplat g, float3x3 r, out float3 tx3, out float3 ty3, out float2 centre, out float3 abc) {
+    tx3 = float3(0.0);
+    ty3 = float3(0.0);
+    centre = float2(0.0);
+    abc = float3(0.0);
+    const float3x3 wv = float3x3(params.view0.xyz, params.view1.xyz, params.view2.xyz);
+    const float3 t = mul(wv, g.center) + float3(params.view0.w, params.view1.w, params.view2.w);
+    if (!(t.z > 1.0e-6)) {
+        return false;
+    }
+    const float focalX = params.focal.x;
+    const float focalY = params.focal.y;
+    const float centreX = params.focal.z;
+    const float centreY = params.focal.w;
+    const float invZ = 1.0 / t.z;
+    centre = float2(focalX * t.x * invZ + centreX, focalY * t.y * invZ + centreY);
+    const float limLoX = (-0.15 * params.viewport.x - centreX) / focalX;
+    const float limHiX = (1.15 * params.viewport.x - centreX) / focalX;
+    const float limLoY = (-0.15 * params.viewport.y - centreY) / focalY;
+    const float limHiY = (1.15 * params.viewport.y - centreY) / focalY;
+    const float tx = clamp(t.x * invZ, min(limLoX, limHiX), max(limLoX, limHiX)) * t.z;
+    const float ty = clamp(t.y * invZ, min(limLoY, limHiY), max(limLoY, limHiY)) * t.z;
+    const float3 jx = float3(focalX * invZ, 0.0, -focalX * tx * invZ * invZ);
+    const float3 jy = float3(0.0, focalY * invZ, -focalY * ty * invZ * invZ);
+    tx3 = mul(jx, wv);
+    ty3 = mul(jy, wv);
+    const float3x3 m = float3x3(r[0] * g.scales, r[1] * g.scales, r[2] * g.scales);
+    const float3 ax = mul(tx3, m);
+    const float3 ay = mul(ty3, m);
+    abc = float3(dot(ax, ax) + 0.3, dot(ax, ay), dot(ay, ay) + 0.3);
+    return true;
+}
+
 float3 relitToward<let kTransfer : int>(uint i) {
+    uint4 slopes;
+    uint4 polish;
+    float mark;
+    return relitTowardAt<kTransfer>(i, false, slopes, polish, mark);
+}
+
+/// relitToward, and with `pixel` splat_project's records for the blend: the
+/// colour without the centre's sharp reading, `slopes` and `sharpPolish`
+/// (athenea's words), and the mark (0 none, 1 slope, 2 sharp).
+float3 relitTowardAt<let kTransfer : int>(uint i, bool pixel, out uint4 slopesOut, out uint4 polishOut, out float mark) {
+    slopesOut = uint4(0u);
+    polishOut = uint4(0u);
+    mark = 0.0;
     const Gsplat g = readExtSplat(src[2u * i], src[2u * i + 1u], int(i));
     const float3 position = g.center;
     const float3 scale = g.scales;
@@ -114,15 +172,80 @@ float3 relitToward<let kTransfer : int>(uint i) {
     surface.cellBase = params.cellsAt + i * surface.cellWords;
     SplatSlope slope = noSlope();
     // splat_project's mean curvature, on the face the eye sees.
-    if (kTransfer >= 2 && params.curvature != 0.0) {
+    if (kTransfer >= 2 && params.perSplatCurvature != 0) {
+        // athenea's own: curvature[i * 3] and curvature[i * 3 + 2], as float.
+        const float3 axisN = float3(r[0][2], r[1][2], r[2][2]);
+        const float faces = dot(cloudNormal, axisN) >= 0.0 ? 1.0 : -1.0;
+        slope.curvature = faces * 0.5 * (asfloat(native[params.curvatureAt + i * 3]) +
+                                         asfloat(native[params.curvatureAt + i * 3 + 2]));
+    } else if (kTransfer >= 2 && params.curvature != 0.0) {
         const float3 axisN = float3(r[0][2], r[1][2], r[2][2]);
         const float faces = dot(cloudNormal, axisN) >= 0.0 ? 1.0 : -1.0;
         slope.curvature = faces * 0.5 * (params.curvature + params.curvature);
     }
-    return relitSplat<kTransfer>(surface, normalize(params.eyeWorld.xyz - surface.position), lights,
-                                 params.lightCount, 0xFFFFFFFFu, 0xFFFFFFFFu, iesValues, 0u, 0u, envTexels, envSh,
-                                 envOfLight, params.envLights, params.envBaseSide, envSun, native, native,
-                                 params.transferIndirect != 0, slope);
+    // splat_project's SplatSlope: the normal a pixel right and down, from
+    // the shape operator (per-splat curvature only).
+    float3 abc = float3(0.0);
+    if (pixel && kTransfer >= 2 && params.perSplatCurvature != 0 && surface.cellWords >= 8u) {
+        float3 tx3, ty3;
+        float2 centre;
+        if (projected(g, r, tx3, ty3, centre, abc)) {
+            const float3 u = float3(r[0][0], r[1][0], r[2][0]);
+            const float3 v = float3(r[0][1], r[1][1], r[2][1]);
+            const float2x2 toPixels = float2x2(dot(tx3, u), dot(tx3, v), dot(ty3, u), dot(ty3, v));
+            const float det = toPixels[0][0] * toPixels[1][1] - toPixels[0][1] * toPixels[1][0];
+            if (abs(det) > 1.0e-12) {
+                const float2 stepX = float2(toPixels[1][1], -toPixels[1][0]) / det;
+                const float2 stepY = float2(-toPixels[0][1], toPixels[0][0]) / det;
+                const uint k = params.curvatureAt + i * 3;
+                const float3 shapeUV = float3(asfloat(native[k]), asfloat(native[k + 1]), asfloat(native[k + 2]));
+                const float2x2 shapeOf = float2x2(shapeUV.x, shapeUV.y, shapeUV.y, shapeUV.z);
+                const float3 axis = float3(r[0][2], r[1][2], r[2][2]);
+                const float side = dot(cloudNormal, axis) >= 0.0 ? 1.0 : -1.0;
+                const float2 turnX = mul(shapeOf, stepX) * side;
+                const float2 turnY = mul(shapeOf, stepY) * side;
+                const float most = 0.5;
+                const float3 dx = u * turnX.x + v * turnX.y;
+                const float3 dy = u * turnY.x + v * turnY.y;
+                const float3 hx = dx * min(1.0, most / max(length(dx), 1.0e-9));
+                const float3 hy = dy * min(1.0, most / max(length(dy), 1.0e-9));
+                slope.on = true;
+                slope.normalX = relightNormalToWorld(w0, w1, w2, normalize(cloudNormal + hx));
+                slope.normalY = relightNormalToWorld(w0, w1, w2, normalize(cloudNormal + hy));
+            }
+        }
+    }
+    float3 lit = relitSplat<kTransfer>(surface, normalize(params.eyeWorld.xyz - surface.position), lights,
+                                          params.lightCount, 0xFFFFFFFFu, 0xFFFFFFFFu, iesValues, 0u, 0u, envTexels,
+                                          envSh, envOfLight, params.envLights, params.envBaseSide, envSun, native,
+                                          native, params.transferIndirect != 0, slope);
+    if (kTransfer >= 2 && slope.sharpOn) {
+        lit = lit - slope.sharpWeight * slope.sharpSeen - slope.sharpPolish * slope.sharpPolishSeen -
+                 slope.sharpSunCentre;
+        const float2 at = octEncode(slope.sharpMirror);
+        float2 stepX = octEncode(slope.sharpMirrorX) - at;
+        float2 stepY = octEncode(slope.sharpMirrorY) - at;
+        stepX = all(abs(stepX) < 0.25) ? stepX : float2(0.0);
+        stepY = all(abs(stepY) < 0.25) ? stepY : float2(0.0);
+        slopesOut = uint4(packHalves(at.x, at.y), packHalves(stepX.x, stepX.y), packHalves(stepY.x, stepY.y),
+                          packHalves(slope.sharpWeight, slope.sharpRoughness));
+        polishOut = uint4(packHalves(slope.sharpPolish.x, slope.sharpPolish.y),
+                          packHalves(slope.sharpPolish.z, slope.sharpPolishRoughness),
+                          packHalves(slope.sharpSunPolish.x, slope.sharpSunPolish.y),
+                          packHalves(slope.sharpSunPolish.z, slope.sharpSunCoat));
+        mark = 2.0;
+    } else if (kTransfer >= 2 && slope.on) {
+        const float3 fall = 3.0 * sqrt(max(abc.x * slope.slopeX * slope.slopeX +
+                                               2.0 * abc.y * slope.slopeX * slope.slopeY +
+                                               abc.z * slope.slopeY * slope.slopeY,
+                                           float3(0.0)));
+        const float3 keep = min(float3(1.0), max(lit, float3(0.0)) / max(fall, float3(1.0e-9)));
+        const float3 sx = slope.slopeX * keep;
+        const float3 sy = slope.slopeY * keep;
+        slopesOut = uint4(packHalves(sx.x, sx.y), packHalves(sx.z, sy.x), packHalves(sy.y, sy.z), 0u);
+        mark = 1.0;
+    }
+    return lit;
 }
 
 [shader("compute")]
@@ -138,5 +261,23 @@ void referenceRelight(uint3 tid: SV_DispatchThreadID) {
 void referenceRelightPlain(uint3 tid: SV_DispatchThreadID) {
     if (tid.x < params.count) {
         outColour[tid.x] = float4(relitToward<0>(tid.x), 1.0);
+    }
+}
+
+/// splat_project's colour and records for the blend (athenea's raster with
+/// its projection): four float4 a splat -- the colour without the centre's
+/// sharp reading (w: the mark), then asfloat of `slopes`, `sharpPolish`, 0.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void referenceRelightPixel(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x < params.count) {
+        uint4 slopes;
+        uint4 polish;
+        float mark;
+        const float3 c = relitTowardAt<2>(tid.x, true, slopes, polish, mark);
+        outColour[4 * tid.x] = float4(c, mark);
+        outColour[4 * tid.x + 1] = asfloat(slopes);
+        outColour[4 * tid.x + 2] = asfloat(polish);
+        outColour[4 * tid.x + 3] = float4(0.0);
     }
 }

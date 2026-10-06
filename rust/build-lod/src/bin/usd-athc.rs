@@ -420,6 +420,16 @@ fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|s| s.as_str())
 }
 
+/// The layer's `upAxis` metadata (the pseudo-root's), where it says one.
+fn up_axis(data: &dyn AbstractData) -> Option<String> {
+    let root = sdf::path("/").ok()?;
+    match data.try_field(&root, "upAxis").ok()??.into_owned() {
+        Value::Token(t) => Some(t.to_string()),
+        Value::String(t) => Some(t),
+        _ => None,
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
@@ -456,7 +466,11 @@ fn main() -> Result<()> {
     let t = std::time::Instant::now();
     let data = openusd::usdc::read_file(input).with_context(|| format!("reading {input}"))?;
     let prim = Prim::read(data.as_ref(), prim_path)?;
+    let up_axis = up_axis(data.as_ref());
     if flag("--list") {
+        if let Some(up) = &up_axis {
+            println!("upAxis: {up}");
+        }
         for (name, v) in &prim.attributes {
             println!("{name}: {}", kind(v));
         }
@@ -646,6 +660,10 @@ fn main() -> Result<()> {
         "boundsMin": h.bounds_min,
         "boundsMax": h.bounds_max,
         "constants": constants,
+        // The stage's up axis, as the cloud's layer says it: a TX transfer,
+        // its cells and its field are directions of that stage, so a Z-up
+        // cloud is relit in a turned frame (atheneaRelightPlugin `frame`).
+        "upAxis": up_axis,
         "seconds": { "read": read_s, "build": build_s },
     });
     if !flag("--v2") {
@@ -691,6 +709,13 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../test/fixtures/athc/tx_cloud.usdc"
     );
+
+    #[test]
+    fn reports_the_layers_up_axis() {
+        let data = openusd::usdc::read_file(FIXTURE).unwrap();
+        // athenea's export writes the stage's: the fixture's is Y-up.
+        assert_eq!(up_axis(data.as_ref()).as_deref(), Some("Y"));
+    }
 
     #[test]
     fn reads_a_tx_particle_field() {

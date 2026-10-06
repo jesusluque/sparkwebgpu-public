@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import * as THREE from "three";
 import { describe, expect, it, vi } from "vitest";
 import type { PagedSplats } from "../../src/PagedSplats";
-import { setPackedSplat, unpackSplat } from "../../src/utils";
+import { decodeExtSplat, setPackedSplat, unpackSplat } from "../../src/utils";
 import { GpuSplatSource } from "../../src/webgpu/GpuSplatSource";
 import { KernelRegistry } from "../../src/webgpu/KernelRegistry";
 import { WgpuSplatPager } from "../../src/webgpu/WgpuSplatPager";
@@ -19,6 +19,7 @@ const {
   GEN_USE_LOD: USE_LOD,
   GEN_LOD_OPACITY: LOD_OPACITY,
   GEN_OUT_EXT: OUT_EXT,
+  GEN_LOD_FADE: LOD_FADE,
 } = kernelsGenerate;
 
 // test/unit/setup.ts stubs the wasm package; these tests need the real one.
@@ -116,12 +117,20 @@ describe.skipIf(!device)("LoD", () => {
   const d = device as GPUDevice;
   const registry = new KernelRegistry(d);
 
-  async function run(source: GpuSplatSource, indices: Uint32Array) {
+  async function runWords(
+    source: GpuSplatSource,
+    indices: Uint32Array,
+    fade = false,
+  ) {
     const out = storage(indices.length * 32);
     const params = UniformWriter.for(generate).setAll({
       numSplats: indices.length,
       outBase: 0,
-      flags: USE_LOD | OUT_EXT | (source.lodOpacity ? LOD_OPACITY : 0),
+      flags:
+        USE_LOD |
+        OUT_EXT |
+        (source.lodOpacity ? LOD_OPACITY : 0) |
+        (fade ? LOD_FADE : 0),
       numSh: 0,
       srcCount: source.count,
       rotate: [0, 0, 0, 1],
@@ -141,7 +150,11 @@ describe.skipIf(!device)("LoD", () => {
       },
       uniforms: params.data,
     });
-    const words = new Uint32Array(await readBack(out));
+    return new Uint32Array(await readBack(out));
+  }
+
+  async function run(source: GpuSplatSource, indices: Uint32Array) {
+    const words = await runWords(source, indices);
     return Array.from(
       indices,
       (_, i) => new Float32Array(words.buffer, 32 * i, 3),
@@ -191,6 +204,60 @@ describe.skipIf(!device)("LoD", () => {
       lodOpacity: lod.splatEncoding.lodOpacity,
     });
     expectCenters(await run(source, indices), indices);
+    source.destroy();
+  });
+
+  it("fades a LoD transition: the index's top byte scales the alpha", async () => {
+    const { lodId } = wasm.init_lod_tree(
+      lod.numSplats,
+      lod.lodTree.slice(),
+    ) as {
+      lodId: number;
+    };
+    const indices = traverse(lodId, 0);
+    wasm.dispose_lod_tree(lodId);
+    const source = GpuSplatSource.fromPacked(d, lod.packed, lod.numSplats, {
+      lodOpacity: lod.splatEncoding.lodOpacity,
+    });
+    // LodFade's encoding: 0 drawn, 255 gone.
+    const gone = Array.from(indices, (_, i) => (i * 37) % 256);
+    const faded = Uint32Array.from(
+      indices,
+      (index, i) => (index | (gone[i] << 24)) >>> 0,
+    );
+    const plain = await runWords(source, indices);
+    const got = await runWords(source, faded, true);
+    // Without the flag the plain indices give the same splats.
+    const a = [
+      plain.filter((_, k) => k % 8 < 4),
+      plain.filter((_, k) => k % 8 >= 4),
+    ];
+    const b = [
+      got.filter((_, k) => k % 8 < 4),
+      got.filter((_, k) => k % 8 >= 4),
+    ];
+    let checked = 0;
+    indices.forEach((_, i) => {
+      // decodeExtSplat hands back one object it reuses: copy.
+      const pd = decodeExtSplat(a as [Uint32Array, Uint32Array], i);
+      const p = { center: pd.center.clone(), opacity: pd.opacity };
+      const fd = decodeExtSplat(b as [Uint32Array, Uint32Array], i);
+      const f = { center: fd.center.clone(), opacity: fd.opacity };
+      expect(f.center.distanceTo(p.center)).toBeLessThan(1e-6);
+      if (gone[i] === 255) {
+        // Gone: nothing drawn (an inactive splat or alpha 0).
+        expect(f.opacity).toBeLessThan(1e-3);
+        return;
+      }
+      expect(f.opacity).toBeCloseTo(p.opacity * (1 - gone[i] / 255), 2);
+      checked++;
+    });
+    expect(checked).toBeGreaterThan(1000);
+    // Gone == 0 is the plain splat, bit for bit.
+    indices.forEach((_, i) => {
+      if (gone[i] !== 0) return;
+      for (let k = 0; k < 8; k++) expect(got[8 * i + k]).toBe(plain[8 * i + k]);
+    });
     source.destroy();
   });
 

@@ -11,6 +11,7 @@ import core.math;
 import core.attrib;
 
 static const uint GATHER_USE_LOD = 4u; // as GEN_USE_LOD
+static const uint GATHER_LOD_FADE = 65536u; // as GEN_LOD_FADE: the top byte is a fade
 
 struct GatherParams {
     uint numSplats;
@@ -34,6 +35,9 @@ void gatherAttribs(uint3 tid: SV_DispatchThreadID) {
         return;
     }
     uint index = (params.flags & GATHER_USE_LOD) != 0u ? lodIndices[i] : i;
+    if ((params.flags & GATHER_LOD_FADE) != 0u) {
+        index &= 0x00FFFFFFu;
+    }
     bool valid = index < attribSplats(srcAttribs);
     uint o = params.outBase + i;
 

@@ -21,6 +21,7 @@ import { PagedSplats } from "../PagedSplats";
 import { SplatWorker } from "../SplatWorker";
 import { isAndroid, isIos, isMobile, isOculus, isVisionPro } from "../utils";
 import { GpuSplatSource } from "./GpuSplatSource";
+import { LodFade } from "./LodFade";
 import { WgpuSplatPager } from "./WgpuSplatPager";
 import type { WgpuSplatMesh, WgpuSplatRenderer } from "./WgpuSplatRenderer";
 import {
@@ -77,6 +78,14 @@ export interface WgpuLodOptions {
   lodRaycastIntervalMs?: number;
   /** Called when LoD state changed and a new frame should be rendered. */
   onDirty?: () => void;
+  /**
+   * LoD transitions fade instead of popping (LodFade): splats entering the
+   * cut fade in over this many ms while those leaving it stay, then fade
+   * out over as long. Packed/ext LoD splats only (a paged pool may reuse
+   * the slots of splats fading out). 0: off, a hard swap as Spark does.
+   * @default 0
+   */
+  lodFadeMs?: number;
 }
 
 export interface WgpuLodMeshOptions {
@@ -109,6 +118,8 @@ export interface WgpuLodMesh extends WgpuLodMeshOptions {
    * LoD splats (paged: the page pool) of the last raycast traversal.
    */
   raycastIndices?: { numSplats: number; indices: Uint32Array };
+  /** The LoD fade between cuts (WgpuLodOptions.lodFadeMs). */
+  fade?: LodFade;
 }
 
 interface TreeRecord {
@@ -195,6 +206,7 @@ export class WgpuLod {
       enableLodFetching: true,
       lodCleanupTimeoutMs: 3000,
       lodRaycastIntervalMs: 500,
+      lodFadeMs: 0,
       ...options,
     };
   }
@@ -324,6 +336,7 @@ export class WgpuLod {
   // selection, or with LoD off its full-detail splats.
   private applySelection(lodMesh: WgpuLodMesh) {
     const { splats, mesh } = lodMesh;
+    lodMesh.fade?.reset();
     if (!lodMesh.visible) {
       this.renderer.setLodIndices(mesh, NO_SPLATS);
     } else if (!this.lodSplatsOf(lodMesh)) {
@@ -444,6 +457,7 @@ export class WgpuLod {
       (m) => m.visible && m.enableLod && this.lodSplatsOf(m),
     );
     const now = performance.now();
+    this.stepFades(lodMeshes, now);
     for (const m of lodMeshes) {
       m.object.updateMatrixWorld();
       const splats = this.lodSplatsOf(m) as LodSplats;
@@ -485,6 +499,47 @@ export class WgpuLod {
         }
       }
     });
+  }
+
+  /** Whether `m`'s cuts fade (lodFadeMs, and not a paged pool). */
+  private fades(m: WgpuLodMesh): boolean {
+    return this.options.lodFadeMs > 0 && !(m.splats instanceof PagedSplats);
+  }
+
+  /** Draws `m`'s new cut, through its fade when cuts fade. */
+  private drawCut(m: WgpuLodMesh) {
+    if (!this.fades(m)) {
+      m.fade = undefined;
+      this.renderer.setLodIndices(m.mesh, m.lastIndices);
+      return;
+    }
+    m.fade ??= new LodFade(this.options.lodFadeMs);
+    m.fade.durationMs = this.options.lodFadeMs;
+    const { indices, faded } = m.fade.setCut(m.lastIndices, performance.now());
+    this.renderer.setLodIndices(m.mesh, indices, faded);
+  }
+
+  /** A frame of every fade in progress. */
+  private stepFades(lodMeshes: WgpuLodMesh[], now: number) {
+    let stepped = false;
+    for (const m of lodMeshes) {
+      if (!m.fade) continue;
+      if (!this.fades(m)) {
+        m.fade = undefined;
+        this.renderer.setLodIndices(m.mesh, m.lastIndices);
+        stepped = true;
+        continue;
+      }
+      m.fade.durationMs = this.options.lodFadeMs;
+      const frame = m.fade.step(now);
+      if (!frame) continue;
+      this.renderer.setLodIndices(m.mesh, frame.indices, frame.faded);
+      stepped = true;
+    }
+    if (stepped) {
+      this.markRendererDirty();
+      this.setDirty();
+    }
   }
 
   private canvasSize() {
@@ -682,7 +737,7 @@ export class WgpuLod {
         continue;
       }
       m.lastIndices = indices.subarray(0, numSplats);
-      this.renderer.setLodIndices(m.mesh, m.lastIndices);
+      this.drawCut(m);
       // PagedSplats.update's count, for stats (no texture here).
       if (m.splats instanceof PagedSplats) {
         m.splats.numSplats = numSplats;

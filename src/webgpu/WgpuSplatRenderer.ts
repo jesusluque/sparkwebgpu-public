@@ -82,6 +82,7 @@ const {
   GEN_OUT_COV,
   GEN_CULL,
   GEN_COV_TRANSFORM,
+  GEN_LOD_FADE,
 } = kernelsGenerate;
 const {
   DRAW_EXT,
@@ -132,6 +133,11 @@ export interface WgpuSplatMesh {
   /** Source indices to draw, from LOD traversal; all splats when null. */
   lodIndices: Uint32Array | null;
   lodBuffer: GPUBuffer | null;
+  /**
+   * The GPU copy of lodIndices carries a LoD transition's fade in each
+   * index's top byte (LodFade; generate's GEN_LOD_FADE).
+   */
+  lodFaded?: boolean;
   /** Dyno generator and modifiers run in the generate kernel. */
   dyno?: WgpuDyno;
 }
@@ -509,26 +515,31 @@ export class WgpuSplatRenderer {
   }
 
   /** Restricts a mesh to the given source indices (a LOD traversal result). */
-  setLodIndices(mesh: WgpuSplatMesh, indices: Uint32Array | null) {
+  /**
+   * The source indices `mesh` draws (null: all). `faded`, the same indices
+   * with a fade in their top byte (LodFade.encode), is what the GPU reads
+   * instead while a LoD transition fades; `indices` stay the plain ones.
+   */
+  setLodIndices(
+    mesh: WgpuSplatMesh,
+    indices: Uint32Array | null,
+    faded?: Uint32Array,
+  ) {
     mesh.lodIndices = indices;
-    if (
-      indices &&
-      mesh.lodBuffer &&
-      mesh.lodBuffer.size >= indices.byteLength
-    ) {
+    const gpu = indices && faded?.length === indices.length ? faded : indices;
+    mesh.lodFaded = gpu !== indices;
+    if (gpu && mesh.lodBuffer && mesh.lodBuffer.size >= gpu.byteLength) {
       // LOD updates arrive often; reuse the buffer while it is large enough.
       this.device.queue.writeBuffer(
         mesh.lodBuffer,
         0,
-        indices.buffer,
-        indices.byteOffset,
-        indices.byteLength,
+        gpu.buffer,
+        gpu.byteOffset,
+        gpu.byteLength,
       );
     } else {
       mesh.lodBuffer?.destroy();
-      mesh.lodBuffer = indices
-        ? upload(this.device, indices, "lod indices")
-        : null;
+      mesh.lodBuffer = gpu ? upload(this.device, gpu, "lod indices") : null;
     }
     this.mappingVersion += 1;
   }
@@ -1083,6 +1094,7 @@ export class WgpuSplatRenderer {
     let flags = (out.packed ? 0 : GEN_OUT_EXT) | (out.cull ? GEN_CULL : 0);
     if (source.format === "ext") flags |= GEN_SRC_EXT;
     if (out.lod) flags |= GEN_USE_LOD;
+    if (out.lod && mesh.lodFaded) flags |= GEN_LOD_FADE;
     if (source.lodOpacity) flags |= GEN_LOD_OPACITY;
     if (this.options.sortRadial) flags |= GEN_SORT_RADIAL;
     if (dyno && mesh.dyno?.generator) flags |= GEN_DYNO_SOURCE;

@@ -50,6 +50,8 @@ export const atheneaAdapterRelight = {
   kRelightDebugPlace: 512,
   kRelightDebugNormal: 1024,
   kRelightDebugFootprint: 2048,
+  kRelightCullBacks: 4096,
+  kRelightFootprintPixel: 8192,
   kRelightGroup: 256,
   kRelightStride: 5,
   kRelightPixel: 2,
@@ -189,6 +191,7 @@ export const fxTransform = {
 /** slang/kernels/attrib_gather.slang */
 export const kernelsAttribGather = {
   GATHER_USE_LOD: 4,
+  GATHER_LOD_FADE: 65536,
 } as const;
 
 /** slang/kernels/generate.slang */
@@ -202,6 +205,8 @@ export const kernelsGenerate = {
   GEN_OUT_COV: 512,
   GEN_COV_TRANSFORM: 1024,
   GEN_CULL: 2048,
+  GEN_LOD_FADE: 65536,
+  GEN_LOD_INDEX_MASK: 16777215,
 } as const;
 
 /** slang/kernels/sort_radix.slang */

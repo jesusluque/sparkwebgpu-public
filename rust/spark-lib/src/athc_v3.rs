@@ -12,10 +12,12 @@
 
 use anyhow::{anyhow, bail, Result};
 use miniz_oxide::deflate::compress_to_vec;
+use serde::{Serialize, Serializer};
 use miniz_oxide::inflate::decompress_to_vec;
 
 use crate::athc::{
-    aligned, AthcBlock, AthcFile, AthcHeader, ExtraHeader, FLAG_EMISSION, FLAG_NORMALS, PAGE,
+    aligned, AthcBlock, AthcFile, AthcHeader, ExtraHeader, FLAG_EMISSION, FLAG_MATERIAL, FLAG_NORMALS, FLAG_TRANSFER,
+    PAGE,
 };
 
 pub const ATH3_MAGIC: u32 = u32::from_le_bytes(*b"ATH3");
@@ -29,21 +31,27 @@ pub const COMPRESSION_NONE: u32 = 0;
 pub const COMPRESSION_GZIP: u32 = 1;
 pub const ENCODING_V2_WORDS: u32 = 0;
 
-/// Sections, in the order they sit in every block (tier order).
+/// Sections, in the order they sit in every block (tier order). Within the
+/// relight tier the shadow bits come first and the transfer in the order of
+/// its layouts (transfer_layout.slang), so every reduced form a reader may
+/// want (`Want`) is one contiguous run: shadow and the direct half, then
+/// the indirect half, then the reflected field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionId {
     /// positions (f32 x4), shape (u32 x4), tail (u32): 36 bytes.
     Core,
     /// The rest harmonics, `shWords` words.
     Sh,
-    /// The transfer's first ceil(direct / 2) words.
-    TransferDirect,
-    /// The rest of the transfer's words (indirect half, reflected field).
-    TransferIndirect,
-    /// The open-direction bits.
-    Shadow,
     /// normals, emission, pbr, lobes: those the flags say, in that order.
     Material,
+    /// The open-direction bits.
+    Shadow,
+    /// The transfer's first ceil(direct / 2) words.
+    TransferDirect,
+    /// The transfer's words through the indirect half (2 * direct words).
+    TransferIndirect,
+    /// The rest: the reflected field.
+    TransferField,
 }
 
 impl SectionId {
@@ -53,23 +61,56 @@ impl SectionId {
             Self::Sh => b"SHRS",
             Self::TransferDirect => b"TXDI",
             Self::TransferIndirect => b"TXIN",
+            Self::TransferField => b"TXFD",
             Self::Shadow => b"SHAD",
             Self::Material => b"MATL",
         })
     }
 
+    pub const ALL: [SectionId; 7] = [
+        Self::Core,
+        Self::Sh,
+        Self::Material,
+        Self::Shadow,
+        Self::TransferDirect,
+        Self::TransferIndirect,
+        Self::TransferField,
+    ];
+
     pub fn from_code(code: u32) -> Option<Self> {
-        [Self::Core, Self::Sh, Self::TransferDirect, Self::TransferIndirect, Self::Shadow, Self::Material]
-            .into_iter()
-            .find(|s| s.code() == code)
+        Self::ALL.into_iter().find(|s| s.code() == code)
     }
 
-    /// The tier that first needs it: 1 the splats as captured, 2 relit.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Core => "CORE",
+            Self::Sh => "SHRS",
+            Self::Material => "MATL",
+            Self::Shadow => "SHAD",
+            Self::TransferDirect => "TXDI",
+            Self::TransferIndirect => "TXIN",
+            Self::TransferField => "TXFD",
+        }
+    }
+
+    /// The data tier that first needs it: 1 the splats as captured, 2 their
+    /// materials, 3 relit (shadow bits and transfer).
     pub fn tier(self) -> u32 {
         match self {
             Self::Core | Self::Sh => 1,
-            _ => 2,
+            Self::Material => 2,
+            _ => 3,
         }
+    }
+
+    pub fn is_transfer(self) -> bool {
+        matches!(self, Self::TransferDirect | Self::TransferIndirect | Self::TransferField)
+    }
+}
+
+impl Serialize for SectionId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
     }
 }
 
@@ -83,7 +124,102 @@ pub fn transfer_direct_values(count: u32) -> u32 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a transfer of `count` values splits into its three sections, in
+/// words of a splat's row: [0, direct) [direct, indirect) [indirect, words).
+/// A half the layout does not keep is empty.
+pub fn transfer_split_words(count: u32) -> [u32; 3] {
+    let words = count.div_ceil(2);
+    let d = transfer_direct_values(count);
+    let direct = d.div_ceil(2).min(words);
+    let indirect = if count >= 4 * d { (2 * d).min(words) } else { direct };
+    [direct, indirect, words]
+}
+
+/// The shorter transfers a reader may keep of one of `count` values:
+/// prefixes that are layouts of their own (transfer_layout.slang), shortest
+/// first, `count` itself last (a TX transfer of 112: 16 direct, 64 with
+/// the indirect half, 112 with the reflected field).
+pub fn transfer_forms(count: u32) -> Vec<u32> {
+    let d = transfer_direct_values(count);
+    if count == 10 || count == d {
+        return vec![count];
+    }
+    let mut out = vec![d, 4 * d];
+    if count > 4 * d {
+        out.push(count);
+    }
+    out
+}
+
+/// What a reader keeps of a cloud's optional streams: the material streams
+/// (normals, emission, pbr, lobes) or not, and the relight streams (shadow
+/// bits and a transfer of `transfer_values`, one of `transfer_forms`) or not
+/// (0). The splats themselves (`CORE`, `SHRS`) are always kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Want {
+    pub material: bool,
+    pub transfer_values: u32,
+}
+
+impl Want {
+    /// Everything the cloud has.
+    pub fn all(x: &ExtraHeader) -> Self {
+        Self { material: true, transfer_values: x.transfer_count }
+    }
+
+    /// Whether section `id` is needed for this.
+    pub fn needs(&self, id: SectionId, x: &ExtraHeader) -> bool {
+        let [direct, indirect, _] = transfer_split_words(x.transfer_count);
+        let words = self.transfer_values.div_ceil(2);
+        match id {
+            SectionId::Core | SectionId::Sh => true,
+            SectionId::Material => self.material,
+            SectionId::Shadow => self.transfer_values > 0,
+            SectionId::TransferDirect => words > 0,
+            SectionId::TransferIndirect => words > direct,
+            SectionId::TransferField => words > indirect,
+        }
+    }
+
+    /// Checks the transfer form against the cloud's.
+    pub fn check(&self, x: &ExtraHeader) -> Result<()> {
+        if self.transfer_values != 0 && !transfer_forms(x.transfer_count).contains(&self.transfer_values) {
+            bail!(
+                ".athc: a transfer of {} values keeps no form of {} (forms: {:?})",
+                x.transfer_count,
+                self.transfer_values,
+                transfer_forms(x.transfer_count)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The v2 headers of what `want` keeps of a cloud: the streams left out are
+/// gone from the flags and the extra header, the transfer is the form kept.
+pub fn reduced_headers(h: &AthcHeader, x: &ExtraHeader, want: Want) -> (AthcHeader, ExtraHeader) {
+    let mut h = *h;
+    let mut x = *x;
+    if !want.material {
+        h.flags &= !(FLAG_NORMALS | FLAG_EMISSION | FLAG_MATERIAL);
+        x.pbr_words = 0;
+        x.lobes_words = 0;
+    }
+    let values = want.transfer_values.min(x.transfer_count);
+    if values == 0 {
+        h.flags &= !FLAG_TRANSFER;
+        x.transfer_count = 0;
+        x.transfer_words = 0;
+        x.shadow_words = 0;
+    } else {
+        x.transfer_count = values;
+        x.transfer_words = values.div_ceil(2);
+    }
+    h.version = if h.flags != 0 { 2 } else { 1 };
+    (h, x)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Section {
     pub id: SectionId,
     pub tier: u32,
@@ -94,7 +230,8 @@ pub struct Section {
 
 /// The sections a cloud with these headers has, in block order.
 pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Section> {
-    let direct = transfer_direct_values(x.transfer_count).div_ceil(2).min(x.transfer_words);
+    let [direct, indirect, words] =
+        if x.transfer_words > 0 { transfer_split_words(x.transfer_count) } else { [0, 0, 0] };
     let material = (if h.has(FLAG_NORMALS) { 1 } else { 0 })
         + (if h.has(FLAG_EMISSION) { 1 } else { 0 })
         + x.pbr_words
@@ -102,10 +239,11 @@ pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Sec
     [
         (SectionId::Core, 9),
         (SectionId::Sh, h.sh_words),
-        (SectionId::TransferDirect, direct),
-        (SectionId::TransferIndirect, x.transfer_words - direct),
-        (SectionId::Shadow, x.shadow_words),
         (SectionId::Material, material),
+        (SectionId::Shadow, x.shadow_words),
+        (SectionId::TransferDirect, direct),
+        (SectionId::TransferIndirect, indirect - direct),
+        (SectionId::TransferField, words - indirect),
     ]
     .into_iter()
     .filter(|&(_, words)| words > 0)
@@ -140,10 +278,14 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader) -> Vec<u8> {
             put_words(&mut out, &block.tail);
         }
         SectionId::Sh => put_words(&mut out, &block.sh),
-        SectionId::TransferDirect | SectionId::TransferIndirect => {
+        SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {
             let w = x.transfer_words as usize;
-            let d = transfer_direct_values(x.transfer_count).div_ceil(2).min(x.transfer_words) as usize;
-            let (from, to) = if s.id == SectionId::TransferDirect { (0, d) } else { (d, w) };
+            let [d, i, _] = transfer_split_words(x.transfer_count).map(|v| v as usize);
+            let (from, to) = match s.id {
+                SectionId::TransferDirect => (0, d),
+                SectionId::TransferIndirect => (d, i),
+                _ => (i, w),
+            };
             put_words(&mut out, &columns(&block.transfer, block.n, w, from, to));
         }
         SectionId::Shadow => put_words(&mut out, &block.shadow_bits),
@@ -210,14 +352,14 @@ pub fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
 // --- the file ---------------------------------------------------------------
 
 /// Where one section of one block is in the file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SectionSpan {
     pub offset: u64,
     pub stored: u32,
     pub raw: u32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct BlockEntry {
     /// 0 a level's groups, 1 a chunk of splats.
     pub kind: u32,
@@ -244,6 +386,22 @@ impl BlockEntry {
             .unwrap_or(start);
         (start, end - start)
     }
+
+    /// The one byte range holding the sections `picks` (indices into the
+    /// section table): from the first one's start to the last one's end,
+    /// with whatever sits between. Empty when `picks` is.
+    pub fn range_of(&self, picks: &[usize]) -> (u64, u64) {
+        let (Some(&lo), Some(&hi)) = (picks.iter().min(), picks.iter().max()) else {
+            return (self.spans[0].offset, 0);
+        };
+        let start = self.spans[lo].offset;
+        (start, self.spans[hi].offset + self.spans[hi].stored as u64 - start)
+    }
+}
+
+/// The section table's indices `want` needs, in block order.
+pub fn wanted_sections(sections: &[Section], x: &ExtraHeader, want: Want) -> Vec<usize> {
+    sections.iter().enumerate().filter(|(_, s)| want.needs(s.id, x)).map(|(k, _)| k).collect()
 }
 
 fn sphere_of(block: &AthcBlock) -> [f32; 4] {
@@ -268,7 +426,8 @@ fn sphere_of(block: &AthcBlock) -> [f32; 4] {
 }
 
 /// A v3 file's tables (everything but the data).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct V3Layout {
     pub header: AthcHeader,
     pub extra: ExtraHeader,
@@ -432,9 +591,12 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
     }
     let expected = sections_of(&header, &extra, COMPRESSION_NONE);
     if expected.len() != sections.len()
-        || expected.iter().zip(&sections).any(|(e, s)| e.id != s.id || e.words != s.words)
+        || expected.iter().zip(&sections).any(|(e, s)| e.id != s.id || e.words != s.words || e.tier != s.tier)
     {
-        bail!(".athc v3: its sections are not those its header implies");
+        bail!(
+            ".athc v3: its sections are not those its header implies (a file written before the three-tier \
+             layout of docs/docs/athc-v3.md: convert it again with athc-convert)"
+        );
     }
     if let Some(s) = sections.iter().find(|s| s.encoding != ENCODING_V2_WORDS || s.compression > COMPRESSION_GZIP) {
         bail!(".athc v3: section {:?} has encoding {} / compression {} this reader does not know", s.id, s.encoding, s.compression);
@@ -467,8 +629,8 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
     let (h, x) = (&layout.header, &layout.extra);
     let words = |b: &[u8]| -> Vec<u32> { b.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect() };
     let mut block = AthcBlock { n, ..Default::default() };
-    let mut direct = Vec::new();
-    let mut indirect = Vec::new();
+    // The transfer's sections, as rows of their words.
+    let mut parts: Vec<(usize, Vec<u32>)> = Vec::new();
     for (s, bytes) in layout.sections.iter().zip(raw) {
         let Some(bytes) = bytes else { continue };
         if bytes.len() != n * s.words as usize * 4 {
@@ -482,8 +644,9 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
                 block.tail = v[8 * n..9 * n].to_vec();
             }
             SectionId::Sh => block.sh = v,
-            SectionId::TransferDirect => direct = v,
-            SectionId::TransferIndirect => indirect = v,
+            SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {
+                parts.push((s.words as usize, v))
+            }
             SectionId::Shadow => block.shadow_bits = v,
             SectionId::Material => {
                 let mut at = 0;
@@ -502,14 +665,203 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
             }
         }
     }
-    if !direct.is_empty() {
-        let d = direct.len() / n.max(1);
-        let i = indirect.len() / n.max(1);
-        block.transfer = (0..n)
-            .flat_map(|e| direct[e * d..(e + 1) * d].iter().chain(&indirect[e * i..(e + 1) * i]).copied().collect::<Vec<_>>())
-            .collect();
+    // Joined per element; the sections present are a prefix of the three
+    // (`Want`), so the row is a prefix of the transfer's.
+    if !parts.is_empty() {
+        let per: usize = parts.iter().map(|(w, _)| w).sum();
+        let mut transfer = Vec::with_capacity(n * per);
+        for e in 0..n {
+            for (w, v) in &parts {
+                transfer.extend_from_slice(&v[e * w..(e + 1) * w]);
+            }
+        }
+        block.transfer = transfer;
     }
     Ok(block)
+}
+
+// --- ATHV pages of sections: what the browser pages a v3 file with --------
+
+/// An ATHV page (athc.rs `athv_head`) of kind 2: one block's sections as
+/// they are stored, for the decoder to put together.
+///
+/// ```text
+/// 0    "ATHV"   4 kind 2   8 base   12 n
+/// 16   the cloud's v2 FileHeader and ExtraHeader (136 bytes; `V3Layout::v2_headers`)
+/// 152  decode flags (ATHV_KEEP_LINEAR)
+/// 156  transfer values kept (`Want::transfer_values`)
+/// 160  m, then m entries: section code, compression, stored bytes, raw bytes
+///      the m sections' stored bytes, one after the other
+/// ```
+///
+/// Sections may be any of the block's; the decoder keeps what `Want` they
+/// make (material with `MATL`, the relight streams with `SHAD`) and reads the
+/// transfer as the form at 156.
+pub const ATHV_SECTIONS: u32 = 2;
+
+impl V3Layout {
+    /// The 136 bytes of v2 headers (FileHeader, ExtraHeader) of this cloud,
+    /// as an ATHV head carries them. Table offsets are 0: a page has none.
+    pub fn v2_headers(&self) -> Vec<u8> {
+        let mut h = self.header;
+        h.version = if h.flags != 0 { 2 } else { 1 };
+        let mut out = h.to_bytes().to_vec();
+        out.extend_from_slice(&self.extra.to_bytes());
+        out
+    }
+}
+
+/// A kind-2 ATHV page of `n` elements at virtual `base` from stored sections
+/// (`(section, stored bytes, raw bytes)`), as the browser builds one.
+pub fn athv_sections_page(
+    headers: &[u8],
+    base: u32,
+    n: u32,
+    flags: u32,
+    transfer_values: u32,
+    parts: &[(&Section, &[u8], u32)],
+) -> Vec<u8> {
+    let mut out = crate::athc::athv_head(ATHV_SECTIONS, base, n, headers);
+    out[152..156].copy_from_slice(&flags.to_le_bytes());
+    out[156..160].copy_from_slice(&transfer_values.to_le_bytes());
+    put_words(&mut out, &[parts.len() as u32]);
+    for (s, stored, raw) in parts {
+        put_words(&mut out, &[s.id.code(), s.compression, stored.len() as u32, *raw]);
+    }
+    for (_, stored, _) in parts {
+        out.extend_from_slice(stored);
+    }
+    out
+}
+
+/// A kind-2 page's block, with the v2 headers of what it keeps.
+pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBlock, u32)> {
+    let n = u32_at(b, 12)? as usize;
+    let (h, x) = crate::athc::parse_headers(b.get(16..152).ok_or_else(|| anyhow!("ATHV page too short"))?)?;
+    let flags = u32_at(b, 152)?;
+    let transfer_values = u32_at(b, 156)?;
+    let m = u32_at(b, 160)? as usize;
+    let sections = sections_of(&h, &x, COMPRESSION_NONE);
+    let mut raw: Vec<Option<Vec<u8>>> = vec![None; sections.len()];
+    let mut at = 164 + 16 * m;
+    let mut present = Vec::new();
+    for k in 0..m {
+        let e = 164 + 16 * k;
+        let code = u32_at(b, e)?;
+        let compression = u32_at(b, e + 4)?;
+        let stored = u32_at(b, e + 8)? as usize;
+        let raw_bytes = u32_at(b, e + 12)? as usize;
+        let id = SectionId::from_code(code).ok_or_else(|| anyhow!("ATHV page: unknown section {:#x}", code))?;
+        let slot = sections
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| anyhow!("ATHV page: section {} the cloud does not have", id.name()))?;
+        let data = b.get(at..at + stored).ok_or_else(|| anyhow!("ATHV page shorter than its sections"))?;
+        at += stored;
+        let bytes = match compression {
+            COMPRESSION_NONE => data.to_vec(),
+            COMPRESSION_GZIP => gunzip(data)?,
+            c => bail!("ATHV page: compression {}", c),
+        };
+        if bytes.len() != raw_bytes {
+            bail!("ATHV page: section {} unpacks to {} bytes, not {}", id.name(), bytes.len(), raw_bytes);
+        }
+        raw[slot] = Some(bytes);
+        present.push(id);
+    }
+    for id in [SectionId::Core, SectionId::Sh] {
+        if !present.contains(&id) {
+            bail!("ATHV page without its {} section", id.name());
+        }
+    }
+    let want = Want {
+        material: present.contains(&SectionId::Material),
+        transfer_values: if present.contains(&SectionId::Shadow) || x.shadow_words == 0 && present.iter().any(|s| s.is_transfer()) {
+            transfer_values
+        } else {
+            0
+        },
+    };
+    want.check(&x)?;
+    for id in SectionId::ALL {
+        if want.needs(id, &x) && sections.iter().any(|s| s.id == id) && !present.contains(&id) {
+            bail!("ATHV page keeps a transfer of {} values without its {} section", transfer_values, id.name());
+        }
+    }
+    let layout = V3Layout { header: h, extra: x, sections, ..Default::default() };
+    let mut block = block_from_sections(&layout, n, &raw)?;
+    let (rh, rx) = reduced_headers(&h, &x, want);
+    // The transfer as the form kept: the prefix of each row.
+    if rx.transfer_words > 0 {
+        let have = block.transfer.len() / n.max(1);
+        let keep = rx.transfer_words as usize;
+        if have < keep {
+            bail!("ATHV page: transfer rows of {} words for a form of {}", have, keep);
+        }
+        if have != keep {
+            block.transfer = (0..n).flat_map(|e| block.transfer[e * have..e * have + keep].to_vec()).collect();
+        }
+    } else {
+        block.transfer.clear();
+        block.shadow_bits.clear();
+    }
+    if !want.material {
+        block.normals.clear();
+        block.emission.clear();
+        block.pbr.clear();
+        block.lobes.clear();
+    }
+    Ok((rh, rx, block, flags))
+}
+
+/// The paged virtual tree of a v3 cloud and its merged pages (kind 0, as
+/// `athv_merged_pages` makes them for v2), from its tables (through the
+/// starts) and its levels' blocks as kind-2 pages (coarsest first). The
+/// pages carry the v2 headers of what those level pages keep, also returned.
+pub fn athv_merged_pages_v3(
+    tables: &[u8],
+    levels: &[&[u8]],
+) -> Result<(crate::athc::VirtualTree, Vec<Vec<u8>>, Vec<u8>)> {
+    let layout = parse_v3(tables)?;
+    let level_blocks: Vec<&BlockEntry> = layout.blocks.iter().filter(|b| b.kind == 0).collect();
+    if levels.len() != level_blocks.len() {
+        bail!(".athc v3: {} level pages for {} levels", levels.len(), level_blocks.len());
+    }
+    let mut header = None;
+    let mut blocks = Vec::new();
+    for (page, entry) in levels.iter().zip(&level_blocks) {
+        if u32_at(page, 0)? != crate::athc::ATHV_MAGIC || u32_at(page, 4)? != ATHV_SECTIONS {
+            bail!(".athc v3: a level page is not an ATHV page of sections");
+        }
+        let (h, x, block, _) = read_sections_page(page)?;
+        if block.n != entry.n as usize {
+            bail!(".athc v3: level {} page of {} groups, not {}", entry.level, block.n, entry.n);
+        }
+        if header.is_some_and(|hx| hx != (h, x)) {
+            bail!(".athc v3: level pages keep different streams");
+        }
+        header = Some((h, x));
+        blocks.push((entry.level, block));
+    }
+    let (h, x) = header.unwrap_or((layout.header, layout.extra));
+    let at = layout.starts_offset as usize;
+    let starts = (0..layout.header.finest_groups as usize)
+        .map(|g| u32_at(tables, at + 4 * g))
+        .collect::<Result<Vec<_>>>()?;
+    let file = AthcFile { header: h, extra: x, levels: blocks, starts, chunks: Vec::new() };
+    let mut headers = h.to_bytes().to_vec();
+    headers.extend_from_slice(&x.to_bytes());
+    let (tree, pages) = crate::athc::merged_pages_of(&file, &headers)?;
+    Ok((tree, pages, headers))
+}
+
+/// The bytes of a v3 file a pager reads before any block: the header, the
+/// section table, the block index and the starts.
+pub fn tables_bytes(bytes: &[u8]) -> Result<u64> {
+    if u32_at(bytes, 0)? != ATH3_MAGIC {
+        bail!("not an .athc v3 (no ATH3 magic)");
+    }
+    u64_at(bytes, 136)
 }
 
 /// v3 bytes (the whole file) back to the v2 cloud.
@@ -575,16 +927,19 @@ mod tests {
         let layout = parse_v3(&v3).unwrap();
         let ids: Vec<SectionId> = layout.sections.iter().map(|s| s.id).collect();
         use SectionId::*;
-        assert_eq!(ids, [Core, Sh, TransferDirect, TransferIndirect, Shadow, Material]);
-        // 112 values: 16 direct (8 words), then 48 words of indirect and field.
-        assert_eq!(layout.sections.iter().map(|s| s.words).collect::<Vec<_>>(), [9, 23, 8, 48, 8, 6]);
+        assert_eq!(ids, [Core, Sh, Material, Shadow, TransferDirect, TransferIndirect, TransferField]);
+        // 112 values: 16 direct (8 words), 48 indirect (24), 48 of field (24).
+        assert_eq!(layout.sections.iter().map(|s| s.words).collect::<Vec<_>>(), [9, 23, 6, 8, 8, 24, 24]);
+        assert_eq!(layout.sections.iter().map(|s| s.tier).collect::<Vec<_>>(), [1, 1, 2, 3, 3, 3, 3]);
         for b in &layout.blocks {
             assert_eq!(b.spans[0].offset % PAGE, 0, "every block on its own page");
             let (start, len) = b.tier_range(&layout.sections, 1);
             assert_eq!(start, b.spans[0].offset);
             assert_eq!(len, (b.n as u64) * (9 + 23) * 4, "tier 1: core and harmonics only");
-            let (_, all) = b.tier_range(&layout.sections, 2);
-            assert_eq!(all, (b.n as u64) * (9 + 23 + 8 + 48 + 8 + 6) * 4);
+            let (_, material) = b.tier_range(&layout.sections, 2);
+            assert_eq!(material, (b.n as u64) * (9 + 23 + 6) * 4);
+            let (_, all) = b.tier_range(&layout.sections, 3);
+            assert_eq!(all, (b.n as u64) * (9 + 23 + 6 + 8 + 8 + 24 + 24) * 4);
             // A tier-1 reader decodes the block from its prefix alone.
             let prefix = &v3[start as usize..(start + len) as usize];
             let mut raw: Vec<Option<Vec<u8>>> = vec![None; layout.sections.len()];
@@ -597,11 +952,133 @@ mod tests {
             let block = block_from_sections(&layout, b.n as usize, &raw).unwrap();
             assert_eq!(block.positions.len(), 4 * b.n as usize);
             assert!(block.transfer.is_empty() && block.pbr.is_empty());
+            // The relight streams of any form are one range after the material.
+            for form in transfer_forms(112) {
+                let picks = wanted_sections(&layout.sections, &layout.extra, Want { material: false, transfer_values: form });
+                let relight: Vec<usize> = picks.into_iter().filter(|&k| layout.sections[k].tier == 3).collect();
+                let (from, bytes) = b.range_of(&relight);
+                assert_eq!(from, b.spans[3].offset);
+                assert_eq!(bytes, (b.n as u64) * (8 + form.div_ceil(2) as u64) * 4, "form {form}");
+            }
         }
         // Chunks know where they are.
         let chunk = layout.blocks.iter().find(|b| b.kind == 1).unwrap();
         assert!(chunk.sphere[3] > 0.0);
     }
+
+    #[test]
+    fn transfer_forms_are_layout_prefixes() {
+        assert_eq!(transfer_forms(112), [16, 64, 112]);
+        assert_eq!(transfer_forms(84), [9, 36, 84]);
+        assert_eq!(transfer_forms(64), [16, 64]);
+        assert_eq!(transfer_forms(36), [9, 36]);
+        assert_eq!(transfer_forms(16), [16]);
+        assert_eq!(transfer_forms(10), [10]);
+        assert_eq!(transfer_split_words(112), [8, 32, 56]);
+        assert_eq!(transfer_split_words(84), [5, 18, 42]);
+        assert_eq!(transfer_split_words(36), [5, 18, 18]);
+        assert_eq!(transfer_split_words(10), [5, 5, 5]);
+    }
+
+    /// Each stored section of block `b`, as a kind-2 page part.
+    fn parts<'a>(v3: &'a [u8], layout: &'a V3Layout, b: &BlockEntry, picks: &[usize]) -> Vec<(&'a Section, &'a [u8], u32)> {
+        picks
+            .iter()
+            .map(|&k| {
+                let span = b.spans[k];
+                (&layout.sections[k], &v3[span.offset as usize..span.offset as usize + span.stored as usize], span.raw)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_page_of_sections_is_the_chunk_it_keeps() {
+        let file = AthcFile::read(EVERY).unwrap();
+        for compression in [COMPRESSION_NONE, COMPRESSION_GZIP] {
+            let v3 = write_v3(&file, compression).unwrap();
+            let layout = parse_v3(&v3).unwrap();
+            let headers = layout.v2_headers();
+            let (b, chunk) = (layout.blocks.iter().find(|b| b.kind == 1).unwrap(), &file.chunks[0]);
+            for want in [
+                Want::default(),
+                Want { material: true, transfer_values: 0 },
+                Want { material: false, transfer_values: 16 },
+                Want { material: true, transfer_values: 64 },
+                Want::all(&layout.extra),
+            ] {
+                let picks = wanted_sections(&layout.sections, &layout.extra, want);
+                let page = athv_sections_page(&headers, 65536, b.n, 0, want.transfer_values, &parts(&v3, &layout, b, &picks));
+                let (h, x, block, _) = read_sections_page(&page).unwrap();
+                assert_eq!((h, x), reduced_headers(&layout.header, &layout.extra, want), "{want:?}");
+                assert_eq!(block.positions, chunk.positions);
+                assert_eq!(block.sh, chunk.sh);
+                assert_eq!(block.tail, chunk.tail);
+                assert_eq!(!block.pbr.is_empty(), want.material);
+                if want.material {
+                    assert_eq!((&block.normals, &block.lobes), (&chunk.normals, &chunk.lobes));
+                }
+                let keep = want.transfer_values.div_ceil(2) as usize;
+                let tw = layout.extra.transfer_words as usize;
+                let expect: Vec<u32> = (0..chunk.n).flat_map(|e| chunk.transfer[e * tw..e * tw + keep].to_vec()).collect();
+                assert_eq!(block.transfer, expect, "{want:?}");
+                assert_eq!(block.shadow_bits.is_empty(), want.transfer_values == 0);
+                // The decoder's v2 reading of the same block agrees.
+                let mut v2 = Vec::new();
+                block.write(&mut v2);
+                assert_eq!(crate::athc::AthcBlock::read(&v2, block.n, &h, &x).unwrap(), block);
+            }
+            // Without its core it is not a page.
+            let page = athv_sections_page(&headers, 0, b.n, 0, 0, &parts(&v3, &layout, b, &[1]));
+            assert!(read_sections_page(&page).is_err());
+        }
+    }
+
+    #[test]
+    fn merged_pages_from_levels_match_v2() {
+        for v2 in [TWO_CARDS, EVERY] {
+            let file = AthcFile::read(v2).unwrap();
+            let layout2 = crate::athc::AthcLayout::parse(v2, v2.len() as u64).unwrap();
+            let (tree2, pages2) = crate::athc::athv_merged_pages(&v2[..layout2.levels_end() as usize], v2.len() as u64).unwrap();
+            let v3 = write_v3(&file, COMPRESSION_GZIP).unwrap();
+            let layout = parse_v3(&v3).unwrap();
+            let tables = &v3[..tables_bytes(&v3).unwrap() as usize];
+            let headers = layout.v2_headers();
+            let all = Want::all(&layout.extra);
+            let picks = wanted_sections(&layout.sections, &layout.extra, all);
+            let levels: Vec<Vec<u8>> = layout
+                .blocks
+                .iter()
+                .filter(|b| b.kind == 0)
+                .map(|b| athv_sections_page(&headers, 0, b.n, 0, all.transfer_values, &parts(&v3, &layout, b, &picks)))
+                .collect();
+            let refs: Vec<&[u8]> = levels.iter().map(|v| &v[..]).collect();
+            let (tree, pages, _) = athv_merged_pages_v3(tables, &refs).unwrap();
+            assert_eq!((tree.merged, tree.splat_base), (tree2.merged, tree2.splat_base));
+            assert_eq!(pages.len(), pages2.len());
+            for (a, b) in pages.iter().zip(&pages2) {
+                // The same page but for the head's table offsets.
+                assert_eq!(a[..16], b[..16]);
+                assert_eq!(a[ATHV_HEAD_END..], b[ATHV_HEAD_END..]);
+            }
+            // Tier 1 levels: merged pages of the splats alone.
+            let core = Want::default();
+            let picks = wanted_sections(&layout.sections, &layout.extra, core);
+            let levels: Vec<Vec<u8>> = layout
+                .blocks
+                .iter()
+                .filter(|b| b.kind == 0)
+                .map(|b| athv_sections_page(&headers, 0, b.n, 0, 0, &parts(&v3, &layout, b, &picks)))
+                .collect();
+            let refs: Vec<&[u8]> = levels.iter().map(|v| &v[..]).collect();
+            let (_, pages, headers) = athv_merged_pages_v3(tables, &refs).unwrap();
+            let (h, x) = crate::athc::parse_headers(&headers).unwrap();
+            assert_eq!(h.flags & !crate::athc::FLAG_LINEAR, 0);
+            assert_eq!(x, ExtraHeader::default());
+            assert!(pages[0].len() < pages2[0].len() || layout.sections.len() == 2);
+        }
+    }
+
+    const ATHV_HEAD_END: usize = crate::athc::ATHV_HEAD;
 
     #[test]
     fn gzip_is_what_a_browser_reads() {

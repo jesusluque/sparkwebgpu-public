@@ -1,6 +1,6 @@
 //! .athc v2 <-> v3 (rust/spark-lib/src/athc_v3.rs, docs/docs/athc-v3.md).
 //!
-//!   athc-convert in.athc out.athc [--gzip]   v1/v2 to v3 (sections by tier)
+//!   athc-convert in.athc out.athc [--gzip]   v1/v2 to v3 (sections by tier: 1 splats, 2 material, 3 relight)
 //!   athc-convert in.athc out.athc --v2       v3 (or v2) to v2
 //!   athc-convert in.athc --info              headers, sections, tier sizes
 
@@ -41,7 +41,7 @@ fn main() -> Result<()> {
         for s in &layout.sections {
             println!("  section {:?}: tier {}, {} B a splat", s.id, s.tier, 4 * s.words);
         }
-        for tier in [1, 2] {
+        for tier in [1, 2, 3] {
             let bytes: u64 = layout.blocks.iter().map(|b| b.tier_range(&layout.sections, tier).1).sum();
             println!("  tier {tier}: {:.1} MB", bytes as f64 / 1e6);
         }

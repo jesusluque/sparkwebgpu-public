@@ -996,8 +996,15 @@ pub fn athv_merged_pages(prefix: &[u8], file_bytes: u64) -> Result<(VirtualTree,
     let mut at = h.starts as usize;
     let starts = words_of(prefix, &mut at, h.finest_groups as usize);
     let file = AthcFile { header: h, extra: x, levels, starts, chunks: Vec::new() };
-    let tree = VirtualTree::of_file(&file, true)?;
-    let merged = merged_block(&file, &tree);
+    merged_pages_of(&file, prefix)
+}
+
+/// The paged virtual tree of a cloud's levels (`file.chunks` unused) and
+/// its merged pages, their heads carrying `header_page`'s first 136 bytes.
+pub fn merged_pages_of(file: &AthcFile, header_page: &[u8]) -> Result<(VirtualTree, Vec<Vec<u8>>)> {
+    let prefix = header_page;
+    let tree = VirtualTree::of_file(file, true)?;
+    let merged = merged_block(file, &tree);
     let mut pages = Vec::new();
     for p in 0..tree.merged_pages() {
         let base = p * PAGE_SPLATS;
@@ -1260,6 +1267,15 @@ impl<T: SplatReceiver> AthcDecoder<T> {
             bail!("ATHV page shorter than its header");
         }
         let kind = u32_at(b, 4);
+        if kind == crate::athc_v3::ATHV_SECTIONS {
+            // A v3 block's sections (athc_v3::athv_sections_page).
+            let (h, x, block, flags) = crate::athc_v3::read_sections_page(b)?;
+            let mut options = self.options;
+            options.keep_linear |= flags & ATHV_KEEP_LINEAR != 0;
+            begin(&mut self.splats, block.n, &h, &x)?;
+            emit_block(&mut self.splats, 0, &block, &h, &x, None, None, true, options);
+            return self.splats.finish();
+        }
         let base = u32_at(b, 8);
         let n = u32_at(b, 12) as usize;
         let mut page = vec![0u8; HEADER_BYTES + EXTRA_HEADER_BYTES];
@@ -1538,6 +1554,53 @@ mod tests {
         // Group ranges, merged and splats, as the whole file has them.
         assert_eq!(merged.attribs[1][..], whole.attribs[1][..2 * m]);
         assert_eq!(splats.attribs[1][..], whole.attribs[1][2 * m..]);
+    }
+
+    #[test]
+    fn v3_section_pages_decode_as_the_chunk() {
+        use crate::athc_v3::*;
+        let file = every_stream();
+        let bytes = file.write().unwrap();
+        let layout = AthcLayout::parse(&bytes, bytes.len() as u64).unwrap();
+        let (tree, _) = athv_merged_pages(&bytes[..layout.levels_end() as usize], bytes.len() as u64).unwrap();
+        let e = layout.chunks[0];
+        let mut page = athv_head(ATHV_SPLATS, tree.splat_base, e.count, &bytes);
+        page.extend_from_slice(&bytes[e.offset as usize..(e.offset + e.count as u64 * layout.element_bytes) as usize]);
+        let whole = decode(&page);
+        let v3 = write_v3(&file, COMPRESSION_GZIP).unwrap();
+        let l3 = parse_v3(&v3).unwrap();
+        let b = l3.blocks.iter().find(|b| b.kind == 1).unwrap();
+        let section_page = |want: Want, flags: u32| {
+            let picks = wanted_sections(&l3.sections, &l3.extra, want);
+            let parts: Vec<_> = picks
+                .iter()
+                .map(|&k| {
+                    let s = b.spans[k];
+                    (&l3.sections[k], &v3[s.offset as usize..s.offset as usize + s.stored as usize], s.raw)
+                })
+                .collect();
+            athv_sections_page(&l3.v2_headers(), tree.splat_base, b.n, flags, want.transfer_values, &parts)
+        };
+        let all = decode(&section_page(Want::all(&l3.extra), 0));
+        assert_eq!(all.center, whole.center);
+        assert_eq!(all.rgb, whole.rgb);
+        assert_eq!(all.sh1, whole.sh1);
+        assert_eq!(all.specs, whole.specs);
+        assert_eq!(all.attribs, whole.attribs);
+        // The splats alone: the same splats, and only their groups.
+        let core = decode(&section_page(Want::default(), ATHV_KEEP_LINEAR));
+        assert_eq!(core.center, whole.center);
+        assert_eq!(core.specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), [GROUP_ATTRIBUTE]);
+        assert_eq!(core.attribs[0], whole.attribs[6]);
+        assert_eq!(core.rgb[1000 * 3], 0.25, "decode flags kept");
+        // A shorter transfer: its first 64 values.
+        let short = decode(&section_page(Want { material: false, transfer_values: 64 }, 0));
+        let names: Vec<&str> = short.specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["transfer", "shadowBits", GROUP_ATTRIBUTE]);
+        assert_eq!(short.specs[0].components, 64);
+        for i in [0usize, 777] {
+            assert_eq!(short.attribs[0][i * 64..i * 64 + 64], whole.attribs[4][i * 112..i * 112 + 64]);
+        }
     }
 
     #[test]

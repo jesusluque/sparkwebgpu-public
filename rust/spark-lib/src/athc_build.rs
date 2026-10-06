@@ -1990,6 +1990,110 @@ mod tests {
             .all(|p| p[3] > 0.0 && p[3] <= 0.99));
     }
 
+    /// Spark's draw of one gaussian at squared Mahalanobis radius `z2`, for a
+    /// decoded opacity (`spark_lod_opacity`: past 1, a LoD coverage).
+    fn spark_alpha(stored: f32, z2: f32) -> f32 {
+        let g = (-0.5 * z2).exp();
+        if stored <= 1.0 {
+            return stored * g;
+        }
+        let d = (stored * 4.0 - 3.0).min(5.0);
+        let e = ((d * d - 1.0) / std::f32::consts::E).exp();
+        1.0 - (1.0 - g).powf(e)
+    }
+
+    /// A merged level drawn by Spark over the middle of a flat sheet: the
+    /// mean light let through where the cells are pixels wide (each gaussian
+    /// as drawn, composited), and where they are under a pixel (each
+    /// gaussian is its mass there: the antialiasing pays a sub-pixel
+    /// gaussian back by its integral, `paid` x the peak).
+    fn sheet_transmittance(b: &AthcBlock, side: f32, margin: f32) -> (f32, f32) {
+        let mut nodes = Vec::new();
+        for i in 0..b.n {
+            let p = &b.positions[i * 4..i * 4 + 4];
+            let c = cov_of(&b.shape[i * 4..i * 4 + 4]);
+            // In the sheet's plane (z): the 2D covariance and its inverse.
+            let (a, bb, d) = (c[0][0], c[0][1], c[1][1]);
+            let det = a * d - bb * bb;
+            let stored = crate::athc::spark_lod_opacity(p[3]);
+            let mass_peak = if stored <= 1.0 { stored } else { (stored * 4.0 - 3.0).min(5.0) };
+            nodes.push((p[0], p[1], d / det, -bb / det, a / det, stored, mass_peak * 2.0 * std::f32::consts::PI * det.sqrt()));
+        }
+        let (mut t, mut n) = (0.0f64, 0);
+        let steps = 64;
+        for u in 0..steps {
+            for v in 0..steps {
+                let x = margin + (side - 2.0 * margin) * (u as f32 + 0.5) / steps as f32;
+                let y = margin + (side - 2.0 * margin) * (v as f32 + 0.5) / steps as f32;
+                let mut tr = 1.0f32;
+                for &(px, py, ia, ib, ic, stored, _) in &nodes {
+                    let (dx, dy) = (x - px, y - py);
+                    let z2 = ia * dx * dx + 2.0 * ib * dx * dy + ic * dy * dy;
+                    if z2 < 25.0 {
+                        tr *= 1.0 - spark_alpha(stored, z2).min(1.0);
+                    }
+                }
+                t += tr as f64;
+                n += 1;
+            }
+        }
+        let inside = |&&(px, py, ..): &&(f32, f32, f32, f32, f32, f32, f32)| {
+            px > margin && px < side - margin && py > margin && py < side - margin
+        };
+        let mass: f32 = nodes.iter().filter(inside).map(|n| n.6).sum();
+        let tau = mass / (side - 2.0 * margin).powi(2);
+        ((t / n as f64) as f32, (-tau).exp())
+    }
+
+    /// The Corvette, seen far off, let the inside through its paint: a
+    /// closed shell's merged levels at athenea's opacity min(W / A, 0.99)
+    /// and athenea's moment shape leave most of every cell open. As decoded
+    /// (the whole coverage, `athc::uncap_levels`, drawn as Spark's LoD
+    /// opacity, and each cell widened, `athc::widen_merged`) the sheet stays
+    /// shut at every level, whether its cells are pixels wide or under one.
+    #[test]
+    fn merged_levels_keep_a_closed_sheet_closed() {
+        // A 192 mm sheet of the paint's splats: 2.4 mm wide, 0.24 mm thin,
+        // on a 2 mm grid, opaque.
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let (side, step) = (0.192f32, 0.002f32);
+        let k = (side / step) as usize;
+        for a in 0..k {
+            for b in 0..k {
+                let jitter = ((a * 7 + b * 13) % 5) as f32 * 0.0001;
+                s.positions.extend_from_slice(&[(a as f32 + 0.5) * step + jitter, (b as f32 + 0.5) * step, 0.0]);
+                s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                s.scales.extend_from_slice(&[0.0024, 0.0024, 0.00024]);
+                s.opacities.push(1.0);
+                s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+                s.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+                s.count += 1;
+            }
+        }
+        let o = BuildOptions::default();
+        let file = build_lod(&pack_streams(&s, &o).unwrap(), &o).unwrap();
+        let mut uncapped = file.clone();
+        crate::athc::uncap_levels(&mut uncapped);
+        let extent = file.header.extent;
+        let mut worst_before = 0.0f32;
+        for ((level, before), (_, after)) in file.levels.iter().zip(&uncapped.levels) {
+            let edge = extent / (1u64 << *level) as f32;
+            // Cells from 3 to 30 mm: a few splats to a few hundred each.
+            if !(0.003..0.03).contains(&edge) {
+                continue;
+            }
+            let mut after = after.clone();
+            crate::athc::widen_merged(&mut after, edge);
+            let margin = 1.5 * edge;
+            let (t0, s0) = sheet_transmittance(before, side, margin);
+            let (t1, s1) = sheet_transmittance(&after, side, margin);
+            eprintln!("level {level} (cell {:.1} mm): through as athenea capped {t0:.3} (sub-pixel {s0:.3}), decoded {t1:.4} (sub-pixel {s1:.4})", edge * 1e3);
+            worst_before = worst_before.max(t0.max(s0));
+            assert!(t1 < 0.01 && s1 < 0.05, "level {level}: {t1} {s1}");
+        }
+        assert!(worst_before > 0.25, "the capped levels were the bug: {worst_before}");
+    }
+
     #[test]
     fn drops_the_hidden_back_of_a_shell() {
         // Three 3 mm shells on a 2 mm grid: one open outside and closed

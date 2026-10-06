@@ -490,6 +490,16 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
             to.curvature = from.curvature.clone();
         }
     }
+    // So do merged opacities past 0.99 (athc::coverage_ratios), which the
+    // v2 writer caps as athenea's files hold them.
+    if file.over_capped() {
+        for (to, from) in v2.chunks.iter_mut().zip(&file.chunks) {
+            to.positions = from.positions.clone();
+        }
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.positions = from.positions.clone();
+        }
+    }
     let v2 = v2;
     let (h, x) = (v2.header, v2.extra);
     let sections =

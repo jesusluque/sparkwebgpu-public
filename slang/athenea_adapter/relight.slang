@@ -404,7 +404,9 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     // splat_project's thin sheet, with Spark's alpha as the paid opacity.
     float sheetScale = 1.0;
     if (hasPbr && pbrThinWalled(pbr) && pbrTransmission(pbr) > 0.5) {
-        const float alphaOwn = max(g.rgba.a - 1.0 / 255.0, 0.0);
+        // A merged sheet's coverage past 1 (LoD opacity) is drawn as one
+        // sheet: the thin sheet's opacity is at most 1.
+        const float alphaOwn = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
         alpha = max(alphaOwn, 0.1);
         sheetScale = alphaOwn / alpha;
     }
@@ -530,7 +532,11 @@ float catcherOpacity(uint i, float3x3 r, float3 scale, float opacity) {
         without += sun;
     }
     const float ratio = saturate(with / max(without, 1.0e-6));
-    return opacity * saturate(-log(max(ratio, 1.0e-4)) / kCatcherDepth);
+    const float took = saturate(-log(max(ratio, 1.0e-4)) / kCatcherDepth);
+    // A merged gaussian's coverage past 1 (Spark's LoD opacity, 1..2: see
+    // athc.rs coverage_ratios) is not a factor to scale: whole where the
+    // object took everything, else the plain gaussian it was capped to.
+    return opacity > 1.0 ? (took >= 1.0 ? opacity : took) : opacity * took;
 }
 
 /// A shadow catcher's splats: black, as opaque as what the object took.

@@ -1,0 +1,14 @@
+athenea shaders
+Copyright (c) 2026 jesus luque.
+
+The .slang files under this directory are unmodified copies of
+shaders/athenea/ in the athenea repository at commit 89a04d92055965a92f74d44e0b20c78b96606ef4.
+Each keeps its original copyright header. They are vendored into
+sparkwebGPU by their author's decision (plan-athenea.md, section 6,
+2026-10-06) as a read-only dependency; changes belong upstream in
+athenea, adaptations in slang/athenea_adapter/.
+
+athenea's tree at that commit carries no LICENSE file; the plan names
+Apache-2.0 as its intended licence. Until a LICENSE is added upstream
+these files are under their author's copyright, not under Spark's MIT
+licence.

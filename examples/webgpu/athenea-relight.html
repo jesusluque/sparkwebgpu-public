@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • athenea relight (WebGPU)</title>
+  <style>
+    body { margin: 0; background-color: black; }
+    canvas { display: block; touch-action: none; }
+    .overlay { position: fixed; margin: 12px; bottom: 0; color: white; font-family: sans-serif; white-space: pre; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "@sparkjsdev/spark/webgpu": "../../dist/spark.webgpu.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
+      }
+    }
+  </script>
+  <div class="overlay"><p id="status">loading…</p></div>
+  <canvas id="canvas" tabindex="0" style="outline: none;"></canvas>
+  <script type="module">
+    // athenea's relighting (plan-athenea.md, phase 4): the OpenChessSet pawn
+    // as athenea mesh2splat baked it -- a TX transfer a gaussian, its open
+    // directions, its material -- relit by any dome, an analytic sun and its
+    // own bounce, by athenea's splat_relight (atheneaRelightPlugin), shown
+    // through athenea's display transform.
+    //
+    //   ?base=<dir>       where the pawn's files are (default ./pawn/): the
+    //                     .athc clouds of usd-athc, pawn.json and hdri/
+    //   ?transfer=t16|t64|t84|full   which transfer the clouds carry (t64)
+    //   ?hdri=<name>      the dome (default autoshop_01_2k.hdr, the bake's)
+    //   ?top=0            the body alone   ?gui=0   ?view=agx|aces2|standard
+    import * as THREE from "three/webgpu";
+    import GUI from "lil-gui";
+    import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
+    import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
+    import {
+      splatRequiredLimits,
+      fx,
+      plugins,
+      atheneaRelightPlugin,
+      atheneaOutputPlugin,
+    } from "@sparkjsdev/spark/webgpu";
+
+    const params = new URLSearchParams(location.search);
+    const base = params.get("base") ?? "./pawn/";
+    const transfer = params.get("transfer") ?? "t64";
+    const suffix = transfer === "full" ? "full-gz" : `${transfer}-gz`;
+    const status = document.getElementById("status");
+    window.__athenea = { loaded: false, error: null };
+
+    const adapter = await navigator.gpu?.requestAdapter();
+    const renderer = new THREE.WebGPURenderer({
+      canvas: document.getElementById("canvas"),
+      requiredLimits: adapter ? splatRequiredLimits(adapter) : {},
+    });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    await renderer.init();
+
+    const scene = new THREE.Scene();
+    // /World/Cam: 50 mm over a 36 mm aperture, at (0, 0.048, 0.18).
+    const camera = new THREE.PerspectiveCamera(2 * THREE.MathUtils.radToDeg(Math.atan(18 / 50)), innerWidth / innerHeight, 0.01, 10);
+    camera.position.set(0, 0.048, 0.18);
+
+    const target = new THREE.RenderTarget(1, 1, {
+      type: THREE.HalfFloatType,
+      depthTexture: new THREE.DepthTexture(1, 1),
+    });
+    const output = new THREE.QuadMesh(new THREE.MeshBasicNodeMaterial({ colorNode: THREE.TSL.texture(target.texture) }));
+    const chain = new fx.FxChain(renderer.backend.device);
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+      target.setSize(size.x, size.y);
+    }
+    resize();
+    addEventListener("resize", resize);
+
+    // The dome behind the pawn: the image the relighting reads, looked up as
+    // athenea's domeUv looks it up, turned with the dome.
+    const { TSL } = THREE;
+    const hdrLoader = new HDRLoader();
+    const turn = TSL.uniform(new THREE.Vector2(1, 0)); // cos, sin of the rotation
+    const intensity = TSL.uniform(1);
+    const skyTexture = TSL.texture(new THREE.DataTexture(new Float32Array(4), 1, 1, THREE.RGBAFormat, THREE.FloatType));
+    const d = TSL.positionWorld.sub(TSL.cameraPosition).normalize();
+    const local = TSL.vec3(
+      turn.x.mul(d.x).sub(turn.y.mul(d.z)),
+      d.y,
+      turn.y.mul(d.x).add(turn.x.mul(d.z)),
+    );
+    const skyUv = TSL.vec2(
+      TSL.fract(TSL.atan(local.z, local.x).add(Math.PI / 2).div(2 * Math.PI)),
+      TSL.acos(TSL.clamp(local.y, -1, 1)).div(Math.PI),
+    );
+    const backdrop = new THREE.Mesh(
+      new THREE.SphereGeometry(5, 64, 32),
+      new THREE.MeshBasicNodeMaterial({ side: THREE.BackSide, depthWrite: false }),
+    );
+    backdrop.material.colorNode = skyTexture.sample(skyUv).rgb.mul(intensity);
+    scene.add(backdrop);
+
+    const spark = new SparkRenderer({ renderer });
+    scene.add(spark);
+    const body = new SplatMesh({ url: `${base}body-${suffix}.athc`, extSplats: true });
+    scene.add(body);
+    const top = params.get("top") === "0" ? null : new SplatMesh({ url: `${base}top-${suffix}.athc`, extSplats: true });
+    if (top) scene.add(top);
+
+    const relight = atheneaRelightPlugin();
+    // The glass head's index is the cloud's, not its file's (pawn.json).
+    if (top) relight.setIor(top, 1.5);
+    const display = atheneaOutputPlugin({ view: params.get("view") ?? "agx", exposure: 0 });
+    let host = null;
+
+    const state = {
+      hdri: params.get("hdri") ?? "autoshop_01_2k.hdr",
+      rotation: 0,
+      intensity: 1,
+      sun: false,
+      sunAzimuth: 40,
+      sunElevation: 35,
+      sunIntensity: 3,
+      indirect: true,
+    };
+    let hdris = [state.hdri];
+    try {
+      const pawn = await (await fetch(`${base}pawn.json`)).json();
+      hdris = pawn.hdri ?? hdris;
+    } catch {
+      // pawn.json is optional; the default sky is enough.
+    }
+
+    async function setHdri(name) {
+      state.hdri = name;
+      status.textContent = `loading ${name}…`;
+      const tex = await hdrLoader.setDataType(THREE.FloatType).loadAsync(`${base}hdri/${name}`);
+      const { width, height, data } = tex.image;
+      relight.set({ hdri: { width, height, data, channels: 4 } });
+      tex.flipY = false;
+      skyTexture.value = tex;
+      applySky();
+    }
+    function applySky() {
+      relight.set({ rotation: THREE.MathUtils.degToRad(state.rotation), intensity: state.intensity, indirect: state.indirect });
+      const r = THREE.MathUtils.degToRad(state.rotation);
+      turn.value.set(Math.cos(r), Math.sin(r));
+      intensity.value = state.intensity;
+      const az = THREE.MathUtils.degToRad(state.sunAzimuth);
+      const el = THREE.MathUtils.degToRad(state.sunElevation);
+      relight.set({
+        sun: state.sun
+          ? { direction: [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)], intensity: state.sunIntensity }
+          : null,
+      });
+    }
+
+    try {
+      await setHdri(state.hdri);
+      await Promise.all([body.initialized, top?.initialized]);
+      await spark.webgpuReady;
+      window.__athenea.loaded = true;
+    } catch (error) {
+      window.__athenea.error = String(error);
+      status.textContent = `error: ${error} (the pawn's files are not under ${base}?)`;
+      console.error(error);
+    }
+
+    if (params.get("gui") !== "0") {
+      const gui = new GUI({ title: "athenea relight" });
+      gui.add(state, "hdri", hdris).onChange(setHdri);
+      gui.add(state, "rotation", -180, 180, 1).name("dome rotation").onChange(applySky);
+      gui.add(state, "intensity", 0, 4, 0.05).name("dome intensity").onChange(applySky);
+      gui.add(state, "indirect").name("indirect + field").onChange(applySky);
+      const s = gui.addFolder("analytic sun");
+      s.add(state, "sun").onChange(applySky);
+      s.add(state, "sunAzimuth", -180, 180, 1).onChange(applySky);
+      s.add(state, "sunElevation", -10, 90, 1).onChange(applySky);
+      s.add(state, "sunIntensity", 0, 20, 0.1).onChange(applySky);
+      const o = gui.addFolder("output");
+      for (const c of display.ui) {
+        const v = { [c.label]: c.get() };
+        if (c.type === "select") o.add(v, c.label, c.options).onChange(c.set);
+        else o.add(v, c.label, c.min, c.max, c.step).onChange(c.set);
+      }
+    }
+    Object.assign(window.__athenea, { relight, display, body, top, spark, camera, setHdri, state });
+
+    const controls = new SparkControls({ canvas: renderer.domElement });
+    controls.fpsMovement.moveSpeed = 0.1;
+    let frames = 0;
+    let last = performance.now();
+    renderer.setAnimationLoop(() => {
+      controls.update(camera);
+      renderer.setRenderTarget(target);
+      renderer.render(scene, camera);
+      const splats = spark.webgpu?.splats;
+      if (!host && splats) {
+        host = new plugins.PluginHost({ capabilities: splats.capabilities });
+        host.register(relight).register(display).attach(splats);
+        host.applyFx(chain);
+        window.__athenea.host = host;
+        const why = host.resolve(splats.meshes[0]).inactive.find((r) => r.id === relight.id);
+        if (why) status.textContent = `relight inactive: ${why.reason} ${why.detail ?? ""}`;
+      }
+      chain.applyToRenderTarget(renderer, target);
+      renderer.setRenderTarget(null);
+      output.render(renderer);
+      window.__sparkFrames = (window.__sparkFrames ?? 0) + 1;
+      frames++;
+      const now = performance.now();
+      if (now - last > 500 && window.__athenea.loaded) {
+        const fps = (frames * 1000) / (now - last);
+        const st = relight.stats;
+        status.textContent = `${state.hdri} · transfer ${transfer} · relit ${st.relit} · kept ${st.viewless} · skies ${st.skies} · ${fps.toFixed(0)} fps`;
+        frames = 0;
+        last = now;
+        if (host && window.__sparkFrames > 30) window.__ready = true;
+      }
+    });
+  </script>
+</body>
+</html>

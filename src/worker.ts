@@ -18,6 +18,7 @@ import init_wasm, {
   tiny_lod_extsplats,
   bhatt_lod_extsplats,
   get_lod_tree_level,
+  athc_merged_pages,
 } from "spark-rs";
 import type {
   AttribValues,
@@ -27,6 +28,7 @@ import type {
 } from "./defines";
 
 const rpcHandlers = {
+  athcMergedPages,
   sortSplats16,
   sortSplats32,
   loadPackedSplats,
@@ -841,6 +843,20 @@ function getLodTreeLevel({
   level: number;
 }) {
   return get_lod_tree_level(lodId, level) as { indices: Uint32Array };
+}
+
+// A .athc's merged pages (src/athc.ts), from its bytes through its levels.
+async function athcMergedPages({
+  prefix,
+  fileBytes,
+}: {
+  prefix: Uint8Array;
+  fileBytes: number;
+}) {
+  const { pages, ...tree } = athc_merged_pages(prefix, fileBytes) as {
+    pages: Uint8Array[];
+  } & Record<string, unknown>;
+  return { tree, pages };
 }
 
 let nextChunkWaiter = (_chunk: Uint8Array) => {};

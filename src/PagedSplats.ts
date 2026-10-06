@@ -5,6 +5,7 @@ import { getSplatFileType, getSplatFileTypeFromPath } from "./SplatLoader";
 import type { SplatSource } from "./SplatMesh";
 import type { SplatPager } from "./SplatPager";
 import { workerPool } from "./SplatWorker";
+import { type AthcPaging, fetchAthcPage, openAthc } from "./athc";
 import {
   DEFAULT_SPLAT_ENCODING,
   LN_SCALE_MAX,
@@ -44,6 +45,8 @@ export class PagedSplats implements SplatSource {
   numSplats: number;
   splatEncoding?: SplatEncoding;
   radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
+  /** A .athc's virtual tree and merged pages (src/athc.ts). */
+  athcPromise?: Promise<AthcPaging>;
 
   dynoNumSplats: dyno.DynoInt<"numSplats">;
   dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
@@ -96,6 +99,20 @@ export class PagedSplats implements SplatSource {
     if (this.fileType === SplatFileType.RAD) {
       this.radMetaPromise = this.getRadMeta();
     }
+    if (this.fileType === SplatFileType.ATHC) {
+      this.athcPromise = this.getAthc();
+    }
+  }
+
+  getAthc(): Promise<AthcPaging> {
+    this.athcPromise ??= openAthc({
+      url: this.rootUrl,
+      fileBytes: this.fileBytes,
+      requestHeader: this.requestHeader,
+      withCredentials: this.withCredentials,
+      signal: this.abortController.signal,
+    });
+    return this.athcPromise;
   }
 
   dispose() {
@@ -113,6 +130,28 @@ export class PagedSplats implements SplatSource {
 
   getRadMeta(): Promise<{ meta: RadMeta; chunksStart: number }> {
     if (this.radMetaPromise) {
+      return this.radMetaPromise;
+    }
+    if (this.fileType === SplatFileType.ATHC) {
+      // A .athc stands in as a .rad of virtual pages (src/athc.ts): what
+      // the WebGPU pager reads of a meta is its attribute schema.
+      this.radMetaPromise = this.getAthc().then(
+        ({ layout, tree, pageCount }) => ({
+          meta: {
+            version: 0,
+            type: "athc",
+            count: tree.splatBase + layout.header.count,
+            lodTree: true,
+            chunkSize: 65536,
+            chunks: Array.from({ length: pageCount }, () => ({
+              offset: 0,
+              bytes: 0,
+            })),
+            attributes: layout.attribSpecs,
+          } as RadMeta,
+          chunksStart: 0,
+        }),
+      );
       return this.radMetaPromise;
     }
 
@@ -168,7 +207,16 @@ export class PagedSplats implements SplatSource {
   async fetchDecodeChunk(chunk: number) {
     let decodeBytes = undefined;
 
-    if (this.fileType === SplatFileType.RAD) {
+    if (this.fileType === SplatFileType.ATHC) {
+      // One ATHV page: merged nodes, or an athenea chunk read whole.
+      decodeBytes = await fetchAthcPage(await this.getAthc(), chunk, {
+        url: this.rootUrl,
+        fileBytes: this.fileBytes,
+        requestHeader: this.requestHeader,
+        withCredentials: this.withCredentials,
+        signal: this.abortController.signal,
+      });
+    } else if (this.fileType === SplatFileType.RAD) {
       const { meta, chunksStart } = await this.getRadMeta();
       if (chunk < 0 || chunk >= meta.chunks.length) {
         throw new Error(

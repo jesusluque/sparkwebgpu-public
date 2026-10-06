@@ -1,0 +1,69 @@
+{
+  "id": "pawn-hq",
+  "title": "Peón HQ (sin iluminar)",
+  "description": "Peón de ajedrez de athenea, cuerpo y cabeza de vidrio (bake 512+512 a 2048 px). Nube TX anterior a flatten: el SH de grado 0 es el albedo, así que se ve plano y sin iluminar. Escena para medir LOD y rendimiento (propuesta 074, fase 0).",
+  "renderer": "spark",
+  "gaussians": 1875795,
+  "shDegree": 0,
+  "default": "rad",
+  "transform": {
+    "scale": 0.01
+  },
+  "cameras": [
+    {
+      "name": "Referencia",
+      "position": [0, 0.048, 0.18],
+      "target": [0, 0.048, 0],
+      "fov": 39.6
+    }
+  ],
+  "files": [
+    {
+      "format": "tlod",
+      "path": "tlod/lod.json",
+      "transform": {},
+      "note": "Prototipo de LOD propio sobre three.js WebGPU (tools/lod/build_lod.py); presupuesto 450 K por el límite de rendimiento de three",
+      "lod": {
+        "budget": 450000,
+        "cache": 1.6
+      }
+    },
+    {
+      "format": "rad",
+      "path": "pawn-lod.rad",
+      "paged": true,
+      "note": "build-lod --quality --rad-chunked"
+    },
+    {
+      "format": "sog",
+      "path": "pawn.sog"
+    },
+    {
+      "format": "spz",
+      "path": "pawn.spz",
+      "spzVersion": 3
+    },
+    {
+      "format": "ply",
+      "path": "pawn.ply",
+      "note": "PLY INRIA, SH0, en centímetros"
+    }
+  ],
+  "background": {
+    "color": "#202024"
+  },
+  "source": {
+    "kind": "athenea",
+    "title": "athenea-renders/pawn-hq/clouds/{M_Pawn_Body_W,M_Pawn_Top_W}.usdc",
+    "mesh": "athenea-bench/scenes/pawn_mesh.usda",
+    "changes": "USD ParticleField → PLY INRIA con tools/usd2ply.py: cuerpo y cabeza unidos, color lineal → sRGB, posiciones y escalas ×100 (cm) para que los discos finos quepan en la codificación de Spark; scene.json lo devuelve a metros."
+  },
+  "conversion": {
+    "athenea": "--transfer --transfer-cells 32 --transfer-degree 3 --cell-from-camera /World/Cam, bake 512+512",
+    "build": "tx-s42 (tx-transfer-complete 5728d61)",
+    "usd2ply": "tools/usd2ply.py … --scale 100",
+    "lod": "build-lod --quality --rad-chunked",
+    "spz": "splat-transform --spz-version 3"
+  },
+  "thumbnail": "thumb.webp"
+}

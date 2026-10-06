@@ -47,8 +47,11 @@ export function findSlangc() {
   }
 }
 
+// A directory with a VENDOR file holds vendored sources (slang/athenea, see
+// tools/vendor-athenea.mjs): imported by our modules, never built on their own.
 function listSlang(dir) {
   if (!fs.existsSync(dir)) return [];
+  if (fs.existsSync(path.join(dir, "VENDOR"))) return [];
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) return listSlang(p);

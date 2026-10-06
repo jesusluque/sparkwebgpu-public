@@ -35,6 +35,7 @@ nav:
   - WebGPU architecture: docs/webgpu-architecture.md
   - WebGPU attributes: docs/webgpu-attributes.md
   - WebGPU effects: docs/webgpu-fx.md
+  - athenea .athc: docs/athc-v3.md
   - Community Resources: docs/community-resources.md
 markdown_extensions:
   - pymdownx.highlight:

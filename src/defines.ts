@@ -40,6 +40,8 @@ export enum SplatFileType {
   PCSOGS = "pcsogs",
   PCSOGSZIP = "pcsogszip",
   RAD = "rad",
+  /** athenea's cloud with levels of detail (src/athc.ts). */
+  ATHC = "athc",
 }
 
 export type SplatEncoding = {

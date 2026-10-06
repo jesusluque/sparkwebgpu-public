@@ -1,0 +1,61 @@
+{
+  "id": "demo-soar",
+  "title": "Telescopio SOAR",
+  "description": "Captura 3DGS del telescopio SOAR (Cerro Pachón, Chile). Escena de demostración para probar la cadena de publicación antes de las exportaciones de athenea.",
+  "renderer": "spark",
+  "gaussians": 200258,
+  "shDegree": 3,
+  "source": {
+    "kind": "capture",
+    "author": "khyron (GitHub)",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+    "changes": "Convertido desde .compressed.ply (SuperSplat) a PLY, SPZ, SOG y glTF KHR con splat-transform 3.9.0; LOD RAD con build-lod de Spark 2.3.1 (--quality --rad-chunked). Sin cambios de contenido.",
+    "title": "soar.compressed.ply",
+    "url": "https://github.com/khyron/Gaussian-Splatting/releases/tag/1.0"
+  },
+  "transform": {
+    "rotation": [180, 0, 0]
+  },
+  "default": "rad",
+  "files": [
+    {
+      "format": "rad",
+      "path": "soar-lod.rad",
+      "paged": true,
+      "note": "LOD con streaming por trozos (.radc)"
+    },
+    {
+      "format": "sog",
+      "path": "soar.sog",
+      "note": "SOG v2 (PlayCanvas)"
+    },
+    {
+      "format": "spz",
+      "path": "soar.spz",
+      "note": "SPZ v3 (Spark 2.3.1 todavía no lee la v4)"
+    },
+    {
+      "format": "ply",
+      "path": "soar.ply",
+      "note": "PLY INRIA 3DGS, SH3 float"
+    },
+    {
+      "format": "glb",
+      "path": "soar.glb",
+      "note": "glTF KHR_gaussian_splatting (se abre con three.js WebGPU)",
+      "transform": {
+        "rotation": [0, 180, 0]
+      }
+    }
+  ],
+  "background": {
+    "color": "#0b0b0f"
+  },
+  "conversion": {
+    "herramientas": "splat-transform 3.9.0 · Spark build-lod 2.3.1",
+    "lod": "build-lod --quality --rad-chunked",
+    "spz": "splat-transform --spz-version 3"
+  },
+  "thumbnail": "thumb.webp"
+}

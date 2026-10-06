@@ -24,6 +24,10 @@ pub mod ksplat;
 pub mod sogs;
 #[cfg(feature = "rad")]
 pub mod rad;
+#[cfg(feature = "athc")]
+pub mod athc;
+#[cfg(feature = "athc")]
+pub mod athc_v3;
 pub mod decoder;
 pub mod splat_encode;
 pub mod ordering;

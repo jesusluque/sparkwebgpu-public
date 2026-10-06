@@ -13,6 +13,10 @@ use crate::ksplat::KsplatDecoder;
 use crate::ply::{PLY_MAGIC, PlyDecoder};
 #[cfg(feature = "rad")]
 use crate::rad::{RAD_CHUNK_MAGIC, RAD_MAGIC, RadDecoder};
+#[cfg(feature = "athc")]
+use crate::athc::{ATHC_MAGIC, ATHV_MAGIC, AthcDecoder};
+#[cfg(feature = "athc")]
+use crate::athc_v3::ATH3_MAGIC;
 #[cfg(feature = "sogs")]
 use crate::sogs::{PK_MAGIC, SogsDecoder};
 #[cfg(feature = "spz")]
@@ -313,6 +317,8 @@ pub enum SplatFileType {
     SOGS,
     #[cfg(feature = "rad")]
     RAD,
+    #[cfg(feature = "athc")]
+    ATHC,
 }
 
 impl SplatFileType {
@@ -330,6 +336,8 @@ impl SplatFileType {
             Self::SOGS => "pcsogszip",
             #[cfg(feature = "rad")]
             Self::RAD => "rad",
+            #[cfg(feature = "athc")]
+            Self::ATHC => "athc",
         }
     }
 
@@ -347,6 +355,8 @@ impl SplatFileType {
             "pcsogszip" => Ok(Self::SOGS),
             #[cfg(feature = "rad")]
             "rad" => Ok(Self::RAD),
+            #[cfg(feature = "athc")]
+            "athc" => Ok(Self::ATHC),
             _ => Err(anyhow::anyhow!("Invalid file type: {}", enum_str)),
         }
     }
@@ -369,6 +379,8 @@ impl SplatFileType {
             "zip" => Some(Self::SOGS),
             #[cfg(feature = "rad")]
             "rad" => Some(Self::RAD),
+            #[cfg(feature = "athc")]
+            "athc" => Some(Self::ATHC),
             _ => None,
         }
     }
@@ -446,6 +458,11 @@ impl<T: SplatReceiver> MultiDecoder<T> {
             Ok(rad) => { return rad.into_splats(); },
             Err(inner_any) => inner_any,
         };
+        #[cfg(feature = "athc")]
+        let inner_any = match inner_any.downcast::<AthcDecoder<T>>() {
+            Ok(athc) => { return athc.into_splats(); },
+            Err(inner_any) => inner_any,
+        };
         let _ = inner_any;
         panic!("Invalid decoder type");
     }
@@ -509,6 +526,10 @@ impl<T: SplatReceiver> ChunkReceiver for MultiDecoder<T> {
                 (RAD_MAGIC, _) | (RAD_CHUNK_MAGIC, _) => {
                     return self.init_file_type(SplatFileType::RAD);
                 }
+                #[cfg(feature = "athc")]
+                (ATHC_MAGIC, _) | (ATHV_MAGIC, _) | (ATH3_MAGIC, _) => {
+                    return self.init_file_type(SplatFileType::ATHC);
+                }
                 _ => {
                     detection_complete = true;
                 }
@@ -553,6 +574,8 @@ fn new_decoder<T: SplatReceiver>(file_type: SplatFileType, splats: T) -> Box<dyn
         SplatFileType::SOGS => Box::new(SogsDecoder::new(splats, None)),
         #[cfg(feature = "rad")]
         SplatFileType::RAD => Box::new(RadDecoder::new(splats)),
+        #[cfg(feature = "athc")]
+        SplatFileType::ATHC => Box::new(AthcDecoder::new(splats)),
     }
 }
 

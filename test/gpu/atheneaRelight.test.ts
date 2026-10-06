@@ -589,6 +589,9 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
       ior: 1.5,
       // The test also reads the per-pixel slope and sharp records.
       pixelDetail: true,
+      // athenea shades the first frame's splats at their centres (no
+      // footprint prefilter; relightFootprint.test.ts).
+      footprint: 0,
     });
     relight.setStoredLinear(mesh, true);
     host.register(relight).attach(splats);

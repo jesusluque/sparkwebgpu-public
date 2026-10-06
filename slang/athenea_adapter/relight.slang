@@ -57,6 +57,10 @@ public static const uint kRelightLit = 8u;         // the body is baked radiance
 public static const uint kRelightIndirect = 16u;   // use the transfer's indirect half
 public static const uint kRelightCache = 32u;      // relit reads the kept view-independent terms
 public static const uint kRelightSlope = 64u;      // the viewport is known: per-pixel slope and sharp lobes
+public static const uint kRelightNoCells = 128u;   // debug: the open-direction cells are not read
+public static const uint kRelightDebugPlace = 512u;      // debug view: a smooth colour of the place
+public static const uint kRelightDebugNormal = 1024u;    // debug view: the shading normal
+public static const uint kRelightDebugFootprint = 2048u; // debug view: the footprint's spread, the coat roughness
 public static const uint kRelightGroup = 256;
 /// Five uint4 a splat in `relit`: the colour (asuint float4: linear rgb,
 /// alpha, -1 to keep the splat's alpha, -2 to keep its whole rgba), the
@@ -85,6 +89,7 @@ public struct AtheneaRelightParams {
     public float ior;              ///< the cloud's index (0: nothing bends)
     public float emissionScale;
     public uint  curvature;        ///< the curvature attribute (ATTRIB_NONE: absent)
+    public float footprint;        ///< the footprint prefilter's gain (0: none; footprintRoughness)
     public float4 encoding;        ///< packed src: rgbMin, rgbMax, lnScaleMin, lnScaleMax
     public float4 row0;            ///< object to world, rows of a 3x4
     public float4 row1;
@@ -154,7 +159,7 @@ uint transferCount() {
 }
 
 uint shadowWords() {
-    return hasAttr(relightParams.shadowBits) ? relightParams.shadowWords : 0u;
+    return hasAttr(relightParams.shadowBits) && !hasFlag(kRelightNoCells) ? relightParams.shadowWords : 0u;
 }
 
 /// The surface splat_project's relitToward builds, from this mesh's buffers.
@@ -317,6 +322,30 @@ bool projectForSlope(Gsplat g, float3x3 r, out float3 tx3, out float3 ty3, out f
     return true;
 }
 
+/// THE FOOTPRINT PREFILTER: a splat is shaded once, at its centre, and
+/// drawn as one colour over its whole gaussian; on a curved panel the normal
+/// turns across that gaussian, so a sharp reflection (the horizon in the
+/// paint's coat) is point-sampled once a splat, and where it changes faster
+/// than the splats are spaced the draw shows the splats' layout as a fixed
+/// moire (the light Corvette's 9 mm merged cells: the doors' reflected bands
+/// combed across, 2.5 px apart at 4k). So the lobes are widened by the spread of the
+/// normal over the gaussian, as a mipmap widens a texel's filter (Toksvig):
+/// with the shape operator S in the splat's first two axes, the normal
+/// turns by S e_u per unit along u, and its variance over the gaussian is
+/// su^2 |S e_u|^2 + sv^2 |S e_v|^2; GGX's alpha (roughness^2) grows by
+/// `gain` times its square root in quadrature, at most 1. A splat small
+/// against the curvature (the detailed cloud) keeps its roughness.
+public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain) {
+    const float su = scales.x;
+    const float sv = scales.y;
+    const float variance = su * su * (shapeUV.x * shapeUV.x + shapeUV.y * shapeUV.y) +
+                           sv * sv * (shapeUV.y * shapeUV.y + shapeUV.z * shapeUV.z);
+    const float alpha = roughness * roughness;
+    const float add = gain * sqrt(max(variance, 0.0));
+    const float widened = min(sqrt(alpha * alpha + add * add), 1.0);
+    return isfinite(widened) ? max(sqrt(widened), roughness) : roughness;
+}
+
 /// What a relit splat shows the eye (splat_project's projectSplat colour
 /// path for a relit cloud, kTransfer 0, 1 or 2), and its alpha: athenea's
 /// thin sheet held to kSheetAlpha with its colour scaled down to match, or
@@ -362,6 +391,13 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
         const float3 axisN = float3(r[0][2], r[1][2], r[2][2]);
         const float faces = dot(cloudNormal, axisN) >= 0.0 ? 1.0 : -1.0;
         slope.curvature = faces * 0.5 * (shapeUV.x + shapeUV.z);
+    }
+    // Without the per-pixel slope, the splat's one colour stands for its
+    // whole footprint: its lobes widened by how the normal turns over it.
+    if (curved && !hasFlag(kRelightSlope) && relightParams.footprint > 0.0) {
+        const float gain = relightParams.footprint;
+        surface.roughness = footprintRoughness(surface.roughness, shapeUV, g.scales, gain);
+        surface.lobes.coatRoughness = footprintRoughness(surface.lobes.coatRoughness, shapeUV, g.scales, gain);
     }
     float3 tx3, ty3;
     if (curved && hasFlag(kRelightSlope) && shadowWords() >= 8u && transferCount() >= 9u &&
@@ -444,6 +480,19 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
         mark = 1.0;
     }
     light *= sheetScale;
+    // Debug views (AtheneaRelightOptions.debug), in place of the light: what
+    // the draw makes of a smooth colour, the normals, and the footprint's
+    // spread (red: the roughness a gain of 1 adds to a mirror, green: the
+    // coat's own roughness; blue: no curvature).
+    if (hasFlag(kRelightDebugPlace)) {
+        const float3 p = surface.position;
+        light = float3(0.01 * (1.5 + sin(9.0 * p.x + 7.0 * p.y + 5.0 * p.z)));
+    } else if (hasFlag(kRelightDebugNormal)) {
+        light = 0.02 * (surface.normal * 0.5 + 0.5);
+    } else if (hasFlag(kRelightDebugFootprint)) {
+        light = curved ? 0.02 * float3(footprintRoughness(0.0, shapeUV, g.scales, 1.0), surface.lobes.coatRoughness, 0.0)
+                       : float3(0.0, 0.0, 0.02);
+    }
     if (mark > 0.0) {
         held *= sheetScale;
         pixel.centre = uint4(asuint(centre.x), asuint(centre.y), packHalves(held.x, held.y), packHalves(held.z, mark));

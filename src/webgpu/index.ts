@@ -96,6 +96,8 @@ export {
 } from "./athenea/rasterPlugin";
 export {
   ATHENEA_RELIGHT_ID,
+  FOOTPRINT_GAIN,
+  type AtheneaRelightDebug,
   type AtheneaRelightOptions,
   type AtheneaRelightPlugin,
   type AtheneaSun,

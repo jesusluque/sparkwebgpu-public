@@ -1648,6 +1648,19 @@ pub fn drop_hidden_backs(cloud: &PackedCloud, thickness: f32) -> Result<(PackedC
     ))
 }
 
+/// The splats whose centres lie inside the box `lo`..`hi` (`usd-athc --box`):
+/// a small piece of a large bake, every stream kept, for tests.
+pub fn crop_box(cloud: &PackedCloud, lo: [f32; 3], hi: [f32; 3]) -> PackedCloud {
+    let src = &cloud.block;
+    let keep: Vec<u32> = (0..src.n)
+        .filter(|&i| (0..3).all(|k| src.positions[i * 4 + k] >= lo[k] && src.positions[i * 4 + k] <= hi[k]))
+        .map(|i| i as u32)
+        .collect();
+    let mut block = reorder(src, &keep);
+    block.n = keep.len();
+    PackedCloud { block, ..cloud.clone() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2018,6 +2031,29 @@ mod tests {
             !(p[0] < 0.5 && p[2] < 0.001)
         }));
         assert!(build_lod(&kept, &o).is_ok());
+    }
+
+    #[test]
+    fn crops_a_box_with_every_stream() {
+        let s = synthetic(3000);
+        let o = BuildOptions { transfer: TransferKeep::Count(16), ..Default::default() };
+        let cloud = pack_streams(&s, &o).unwrap();
+        let b = &cloud.block;
+        let (lo, hi) = ([-0.2f32, -0.2, -0.2], [0.3f32, 0.3, 0.3]);
+        let inside = |p: &[f32]| (0..3).all(|k| p[k] >= lo[k] && p[k] <= hi[k]);
+        let want: Vec<usize> = (0..b.n).filter(|&i| inside(&b.positions[i * 4..i * 4 + 3])).collect();
+        assert!(!want.is_empty() && want.len() < b.n);
+        let cut = crop_box(&cloud, lo, hi);
+        let c = &cut.block;
+        assert_eq!(c.n, want.len());
+        for (j, &i) in want.iter().enumerate() {
+            assert_eq!(c.positions[j * 4..j * 4 + 4], b.positions[i * 4..i * 4 + 4]);
+            for (cv, bv) in [(&c.shape, &b.shape), (&c.normals, &b.normals), (&c.transfer, &b.transfer), (&c.shadow_bits, &b.shadow_bits), (&c.pbr, &b.pbr), (&c.lobes, &b.lobes)] {
+                let per = bv.len() / b.n;
+                assert_eq!(cv[j * per..(j + 1) * per], bv[i * per..(i + 1) * per]);
+            }
+        }
+        assert!(build_lod(&cut, &o).is_ok());
     }
 
     #[test]

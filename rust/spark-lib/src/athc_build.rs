@@ -279,6 +279,14 @@ pub struct BuildOptions {
     pub material: bool,
     /// Keep the curvature (a v3 section of its own; a v2 file drops it).
     pub curvature: bool,
+    /// The octree's frame, per object: 0 world-aligned from the cloud's
+    /// lower bound (athenea's); otherwise turned by a rotation and shifted
+    /// by up to a level-6 cell, both hashed from the seed, so no
+    /// world-aligned lattice of merged cells survives (Cook's jitter, as
+    /// far as one octree allows: the levels nest, so all of them turn
+    /// together). The header's `bounds_lo` and `extent` are then the
+    /// turned frame's.
+    pub frame_seed: u32,
 }
 
 impl Default for BuildOptions {
@@ -293,7 +301,51 @@ impl Default for BuildOptions {
             normals: true,
             material: true,
             curvature: true,
+            frame_seed: 0,
         }
+    }
+}
+
+fn hash_unit(seed: u32, k: u32) -> f32 {
+    let mut h = seed.wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846C_A68B);
+    h ^= h >> 16;
+    h as f32 / u32::MAX as f32
+}
+
+/// The rotation and the shift (a fraction of the frame's extent) of
+/// `BuildOptions::frame_seed`.
+pub fn octree_frame(seed: u32) -> ([[f32; 3]; 3], [f32; 3]) {
+    // A uniform random rotation (Shoemake), from three hashed numbers.
+    let (u1, u2, u3) = (hash_unit(seed, 1), hash_unit(seed, 2), hash_unit(seed, 3));
+    let tau = std::f32::consts::TAU;
+    let q = [
+        (1.0 - u1).sqrt() * (tau * u2).sin(),
+        (1.0 - u1).sqrt() * (tau * u2).cos(),
+        u1.sqrt() * (tau * u3).sin(),
+        u1.sqrt() * (tau * u3).cos(),
+    ];
+    let shift = [4, 5, 6].map(|k| hash_unit(seed, k) / 64.0);
+    (axes_of_quaternion(q), shift)
+}
+
+/// A built `.athc`'s splats as the packed cloud they were built from (in
+/// Morton order), so its levels can be built again (`build_lod`).
+pub fn packed_of(file: &AthcFile) -> PackedCloud {
+    let mut block = file.splats();
+    block.tail.clear();
+    PackedCloud {
+        block,
+        rest_per_colour: file.header.rest_per_colour,
+        sh_words: file.header.sh_words,
+        transfer_count: file.extra.transfer_count,
+        linear: file.header.has(FLAG_LINEAR),
+        bounds_min: file.header.bounds_min,
+        bounds_max: file.header.bounds_max,
+        dropped: 0,
     }
 }
 
@@ -1094,17 +1146,42 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
     if !src.lobes.is_empty() && src.pbr.is_empty() {
         bail!("lobes without the material: a .athc keeps them only beside pbr");
     }
-    let lo = cloud.bounds_min;
+    // The octree's frame: world-aligned from the lower bound, or turned
+    // and shifted (`frame_seed`).
+    let (turn, shift) = if o.frame_seed == 0 {
+        ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3])
+    } else {
+        octree_frame(o.frame_seed)
+    };
+    let framed = |i: usize| -> [f32; 3] {
+        let p = &src.positions[i * 4..i * 4 + 3];
+        [0, 1, 2].map(|r| turn[r][0] * p[0] + turn[r][1] * p[1] + turn[r][2] * p[2])
+    };
+    let (mut lo, mut hi) = (cloud.bounds_min, cloud.bounds_max);
+    if o.frame_seed != 0 {
+        lo = [f32::MAX; 3];
+        hi = [f32::MIN; 3];
+        for i in 0..n {
+            let q = framed(i);
+            for k in 0..3 {
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
+            }
+        }
+    }
     let mut extent = 0.0f32;
     for k in 0..3 {
-        extent = extent.max(cloud.bounds_max[k] - cloud.bounds_min[k]);
+        extent = extent.max(hi[k] - lo[k]);
     }
-    let extent = extent.max(1e-6) * 1.0001;
+    let extent = extent.max(1e-6) * 1.0001 * if o.frame_seed == 0 { 1.0 } else { 1.0 + 1.0 / 64.0 };
+    for k in 0..3 {
+        lo[k] -= shift[k] * extent;
+    }
 
     // Morton order: a stable sort of the codes, as the radix sort is.
     let codes: Vec<u32> = (0..n)
         .map(|i| {
-            let p = &src.positions[i * 4..i * 4 + 3];
+            let p = framed(i);
             let e = extent.max(1e-20);
             morton30([(p[0] - lo[0]) / e, (p[1] - lo[1]) / e, (p[2] - lo[2]) / e])
         })
@@ -2258,13 +2335,14 @@ mod tests {
                 }
             );
         }
-        // Decoded, it is an attribute of three halves.
+        // Decoded, it is an attribute of four halves (the shape operator and
+        // a merged splat's normal variance).
         let specs = crate::athc::attrib_specs(&layout.header, &layout.extra);
         let c = specs
             .iter()
             .find(|s| s.name == crate::athc::CURVATURE_ATTRIBUTE)
             .unwrap();
-        assert_eq!((c.format.as_str(), c.components), ("f16", 3));
+        assert_eq!((c.format.as_str(), c.components), ("f16", 4));
     }
 
     /// The Corvette paint's layers (athenea-renders/tx/clouds/

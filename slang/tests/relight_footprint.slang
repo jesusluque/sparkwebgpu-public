@@ -5,7 +5,7 @@ import athenea_adapter.relight;
 struct FootprintCase {
     float4 shapeAndRoughness;   ///< the shape operator (xx, xy, yy), the roughness
     float4 scalesAndGain;       ///< the gaussian's scales, the gain
-    float4 filter;              ///< the clamp (kappa), the pixel's variance
+    float4 filter;              ///< the clamp (kappa), the pixel's variance, the merged normals' variance
 };
 
 StructuredBuffer<FootprintCase> footprintCases;
@@ -22,5 +22,5 @@ void footprintTest(uint3 tid: SV_DispatchThreadID) {
     }
     const FootprintCase c = footprintCases[i];
     footprintOut[i] = footprintRoughness(c.shapeAndRoughness.w, c.shapeAndRoughness.xyz, c.scalesAndGain.xyz,
-                                         c.scalesAndGain.w, c.filter.x, c.filter.y);
+                                         c.scalesAndGain.w, c.filter.x, c.filter.z, c.filter.y);
 }

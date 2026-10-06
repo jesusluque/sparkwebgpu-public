@@ -391,7 +391,11 @@ export function athvSectionsPage(
   parts.forEach(({ section, stored, raw }, k) => {
     const e = ATHV_HEAD + 4 + 16 * k;
     view.setUint32(e, fourcc(section.id), true);
-    view.setUint32(e + 4, section.compression, true);
+    view.setUint32(
+      e + 4,
+      (section.compression | (section.encoding << 16)) >>> 0,
+      true,
+    );
     view.setUint32(e + 8, stored.length, true);
     view.setUint32(e + 12, raw, true);
     out.set(stored, at);
@@ -729,6 +733,68 @@ async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
+/** A section's arrays, in words an element (athc_v3.rs section_arrays). */
+function sectionArrays(layout: AthcV3Layout, section: AthcSection): number[] {
+  const { header: h, extra: x } = layout;
+  let arrays = [section.words];
+  if (section.id === "CORE") arrays = [4, 4, 1];
+  if (section.id === "MATL") {
+    arrays = [
+      (h.flags & ATHC_FLAGS.normals) !== 0 ? 1 : 0,
+      (h.flags & ATHC_FLAGS.emission) !== 0 ? 1 : 0,
+      x.pbrWords,
+      x.lobesWords,
+    ].filter((w) => w > 0);
+  }
+  return arrays.reduce((t, w) => t + w, 0) === section.words
+    ? arrays
+    : [section.words];
+}
+
+/**
+ * A section's bytes as stored (after the gunzip) back to its words
+ * (athc_v3.rs decode_section): encoding 1 byte planes, 2 byte planes of the
+ * 16-bit lanes' differences.
+ */
+export function decodeAthcSection(
+  bytes: Uint8Array,
+  n: number,
+  arrays: readonly number[],
+  encoding: number,
+): Uint8Array {
+  if (encoding === 0) return bytes;
+  if (encoding !== 1 && encoding !== 2) {
+    throw new Error(`.athc v3: section encoding ${encoding}`);
+  }
+  const out = new Uint8Array(bytes.length);
+  let at = 0;
+  for (const w of arrays) {
+    const row = 4 * w;
+    if (at + n * row > bytes.length) {
+      throw new Error(".athc v3: an encoded section shorter than its arrays");
+    }
+    if (encoding === 1) {
+      for (let b = 0; b < row; b++) {
+        const src = at + b * n;
+        for (let e = 0; e < n; e++) out[at + e * row + b] = bytes[src + e];
+      }
+    } else {
+      for (let b = 0; b < row; b += 2) {
+        const lo = at + b * n;
+        const hi = lo + n;
+        let prev = 0;
+        for (let e = 0; e < n; e++) {
+          prev = (prev + (bytes[lo + e] | (bytes[hi + e] << 8))) & 0xffff;
+          out[at + e * row + b] = prev & 0xff;
+          out[at + e * row + b + 1] = prev >> 8;
+        }
+      }
+    }
+    at += n * row;
+  }
+  return out;
+}
+
 /** The streams of `specs` in sections `parts` of a block of `n`, as attribute columns. */
 async function streamColumns(
   layout: AthcV3Layout,
@@ -738,8 +804,12 @@ async function streamColumns(
 ): Promise<AttribPool> {
   const raw = new Map<string, Uint32Array>();
   for (const { section, stored } of parts) {
-    const bytes =
-      section.compression === 1 ? await gunzip(stored) : stored.slice();
+    const bytes = decodeAthcSection(
+      section.compression === 1 ? await gunzip(stored) : stored.slice(),
+      n,
+      sectionArrays(layout, section),
+      section.encoding ?? 0,
+    );
     raw.set(
       section.id,
       new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4),

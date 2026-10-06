@@ -288,6 +288,13 @@ bool curvatureOf(uint i, out float3 k) {
     return all(isfinite(k));
 }
 
+/// The variance of a merged splat's normals (the curvature's fourth half;
+/// 0 for a splat, or a cloud written without it).
+float normalSpreadOf(uint i) {
+    const uint id = relightParams.curvature;
+    return hasAttr(id) ? f16tof32(readAttribU(relightPool, id, i, 3u)) : 0.0;
+}
+
 /// splat_project's projection of a gaussian, as far as SplatSlope needs it:
 /// the linearisation a pixel right and down is (`tx3`, `ty3`, in the
 /// cloud's space), the centre in pixels and the 2D covariance (a, b, c)
@@ -339,30 +346,45 @@ bool projectForSlope(Gsplat g, float3x3 r, out float3 tx3, out float3 ty3, out f
 /// spread of the normal, as geometric specular anti-aliasing does over a
 /// pixel (Kaplanyan et al. 2016, Tokuyoshi & Kaplanyan 2019): in slope
 /// space the NDF is convolved with the footprint's slope distribution, and
-/// for GGX/Beckmann that adds twice its variance to alpha^2 (alpha =
-/// roughness^2), clamped by kappa so a crease (a huge |S|) widens to a
-/// rough lobe, not to a diffuse one.
+/// for GGX/Beckmann that adds gain^2 times its variance to alpha^2 (alpha =
+/// roughness^2; filtered GGX's gain is sqrt(2)), clamped by kappa (theirs
+/// 0.18: a crease widens to a rough lobe, not a diffuse one), alpha^2 at
+/// most 1.
 ///
-/// Two footprints, the larger counts: the splat's (`shapeUV`, the shape
-/// operator S in its first two axes: the normal's variance over the
-/// gaussian is su^2 |S e_u|^2 + sv^2 |S e_v|^2) and the pixel's
-/// (`pixelVariance`: the pixel filter's variance times |dn/dx|^2 + |dn/dy|^2,
-/// what a splat smaller than a pixel stands for; 0 when the frame is not
-/// known). `gain` is per standard deviation: sqrt(2) is the filtered GGX's,
-/// 0 none. A splat small against the curvature and the pixel (the detailed
-/// cloud close up) keeps its roughness.
+/// The variance is the largest of three footprints': the splat's (`shapeUV`,
+/// the shape operator S in its first two axes: the normal's variance over
+/// the gaussian is su^2 |S e_u|^2 + sv^2 |S e_v|^2); a merged gaussian's
+/// members' normals (`spread`, LEAN's second moment: .athc's curvature
+/// fourth half, athc.rs store_normal_variance), which a merged cell over a
+/// crease has and the curvature does not see; and the pixel's
+/// (`pixelVariance`: the pixel filter's variance times |dn/dx|^2 +
+/// |dn/dy|^2, what a splat smaller than a pixel stands for; 0 when the frame
+/// is not known). A splat small against the curvature and the pixel (the
+/// detailed cloud close up) keeps its roughness.
 public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain, float kappa,
-                                float pixelVariance) {
+                                float spread, float pixelVariance) {
     const float su = scales.x;
     const float sv = scales.y;
     const float splatVariance = su * su * (shapeUV.x * shapeUV.x + shapeUV.y * shapeUV.y) +
                                 sv * sv * (shapeUV.y * shapeUV.y + shapeUV.z * shapeUV.z);
-    const float variance = max(max(splatVariance, pixelVariance), 0.0);
+    const float variance = max(max(splatVariance, isfinite(spread) ? spread : 0.0),
+                               max(isfinite(pixelVariance) ? pixelVariance : 0.0, 0.0));
     const float alpha = roughness * roughness;
     const float add = min(gain * gain * variance, kappa);
     const float widened = min(alpha * alpha + add, 1.0);
     const float r = sqrt(sqrt(widened));
     return isfinite(r) ? max(r, roughness) : roughness;
+}
+
+/// The same without a clamp (kappa 1) or a pixel term: AM's form, `gain`
+/// in quadrature.
+public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain) {
+    return footprintRoughness(roughness, shapeUV, scales, gain, 1.0, 0.0, 0.0);
+}
+
+/// The same with the merged normals' variance (`spread`).
+public float footprintRoughness(float roughness, float3 shapeUV, float3 scales, float gain, float spread) {
+    return footprintRoughness(roughness, shapeUV, scales, gain, 1.0, spread, 0.0);
 }
 
 /// How the normal turns a pixel right and a pixel down (in the cloud's
@@ -483,11 +505,14 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
         const float gain = relightParams.footprint;
         const float kappa = relightParams.filter.x;
         const float pixelVariance = turns ? relightParams.filter.z * (dot(dx, dx) + dot(dy, dy)) : 0.0;
-        const float3 shape = hasFlag(kRelightSlope) ? float3(0.0) : shapeUV;
-        if (!hasFlag(kRelightSlope) || pixelVariance > 0.0) {
-            surface.roughness = footprintRoughness(surface.roughness, shape, g.scales, gain, kappa, pixelVariance);
+        const bool splatTerms = !hasFlag(kRelightSlope);
+        const float3 shape = splatTerms ? shapeUV : float3(0.0);
+        const float spread = splatTerms ? normalSpreadOf(i) : 0.0;
+        if (splatTerms || pixelVariance > 0.0) {
+            surface.roughness =
+                footprintRoughness(surface.roughness, shape, g.scales, gain, kappa, spread, pixelVariance);
             surface.lobes.coatRoughness =
-                footprintRoughness(surface.lobes.coatRoughness, shape, g.scales, gain, kappa, pixelVariance);
+                footprintRoughness(surface.lobes.coatRoughness, shape, g.scales, gain, kappa, spread, pixelVariance);
         }
     }
     if (turns && hasFlag(kRelightSlope) && shadowWords() >= 8u && transferCount() >= 9u) {
@@ -566,7 +591,7 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     } else if (hasFlag(kRelightDebugNormal)) {
         light = 0.02 * (surface.normal * 0.5 + 0.5);
     } else if (hasFlag(kRelightDebugFootprint)) {
-        light = curved ? 0.02 * float3(footprintRoughness(0.0, shapeUV, g.scales, 1.0, 1.0, 0.0),
+        light = curved ? 0.02 * float3(footprintRoughness(0.0, shapeUV, g.scales, 1.0, normalSpreadOf(i)),
                                        surface.lobes.coatRoughness, 0.0)
                        : float3(0.0, 0.0, 0.02);
     }

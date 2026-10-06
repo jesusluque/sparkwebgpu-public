@@ -26,6 +26,8 @@ type Case = {
   gain: number;
   kappa?: number;
   pixel?: number;
+  /** The merged normals' variance (CURV's fourth half). */
+  spread?: number;
 };
 
 function expected({
@@ -35,12 +37,13 @@ function expected({
   gain,
   kappa = FOOTPRINT_CLAMP,
   pixel = 0,
+  spread = 0,
 }: Case): number {
   const [xx, xy, yy] = shape;
   const splat =
     scales[0] ** 2 * (xx * xx + xy * xy) + scales[1] ** 2 * (xy * xy + yy * yy);
   const alpha = roughness * roughness;
-  const add = Math.min(gain * gain * Math.max(splat, pixel), kappa);
+  const add = Math.min(gain * gain * Math.max(splat, pixel, spread), kappa);
   const widened = Math.min(alpha * alpha + add, 1);
   return Math.max(Math.sqrt(Math.sqrt(widened)), roughness);
 }
@@ -59,7 +62,7 @@ describe.skipIf(!device)("relight footprint prefilter", () => {
           c.gain,
           c.kappa ?? FOOTPRINT_CLAMP,
           c.pixel ?? 0,
-          0,
+          c.spread ?? 0,
           0,
         ],
         i * 12,
@@ -131,6 +134,21 @@ describe.skipIf(!device)("relight footprint prefilter", () => {
     // The coarse splat's coat over twice as rough; the fine one's less.
     expect(got[0]).toBeGreaterThan(0.11);
     expect(got[2]).toBeLessThan(0.075);
+  });
+
+  it("takes the merged normals' variance where it is the larger", async () => {
+    // A merged cell over a crease: flat to the curvature, its members'
+    // normals 0.3 rad apart.
+    const cell = {
+      shape: [0.5, 0, 0.5] as [number, number, number],
+      roughness: 0.05,
+      scales: [0.005, 0.005, 1e-4] as [number, number, number],
+      gain: FOOTPRINT_GAIN,
+    };
+    const cases: Case[] = [cell, { ...cell, spread: 0.09 }];
+    const got = await run(cases);
+    cases.forEach((c, i) => expect(got[i]).toBeCloseTo(expected(c), 5));
+    expect(got[1]).toBeGreaterThan(3 * got[0]);
   });
 
   it("takes the pixel's footprint where it is the larger", async () => {

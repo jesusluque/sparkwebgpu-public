@@ -30,6 +30,17 @@ pub const BLOCK_ENTRY_PER_SECTION: usize = 16;
 pub const COMPRESSION_NONE: u32 = 0;
 pub const COMPRESSION_GZIP: u32 = 1;
 pub const ENCODING_V2_WORDS: u32 = 0;
+/// The section's bytes as byte planes: each of its arrays (`section_arrays`)
+/// is a matrix of n rows of 4 x words bytes, stored transposed (byte 0 of
+/// every element, then byte 1, ...), so the high bytes of each f16 / f32
+/// column, which barely change from a splat to the next, sit together for
+/// gzip. Lossless; undone after the gunzip (`decode_section`).
+pub const ENCODING_BYTE_PLANES: u32 = 1;
+/// Byte planes of the 16-bit lanes' differences: each u16 lane of each
+/// array's row is replaced by its difference (wrapping) from the previous
+/// element's, then split as `ENCODING_BYTE_PLANES`. Lossless.
+pub const ENCODING_DELTA_PLANES: u32 = 2;
+pub const MAX_ENCODING: u32 = ENCODING_DELTA_PLANES;
 
 /// Sections, in the order they sit in every block (tier order). Within the
 /// relight tier the shadow bits come first and the transfer in the order of
@@ -328,6 +339,106 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
     out
 }
 
+/// The arrays a section of `words` words a element is made of, in words a
+/// element, in the order they are stored (they sum to `words`).
+pub fn section_arrays(id: SectionId, words: u32, h: &AthcHeader, x: &ExtraHeader) -> Vec<u32> {
+    let arrays: Vec<u32> = match id {
+        SectionId::Core => vec![4, 4, 1],
+        SectionId::Material => [
+            if h.has(FLAG_NORMALS) { 1 } else { 0 },
+            if h.has(FLAG_EMISSION) { 1 } else { 0 },
+            x.pbr_words,
+            x.lobes_words,
+        ]
+        .into_iter()
+        .filter(|&w| w > 0)
+        .collect(),
+        _ => vec![words],
+    };
+    if arrays.iter().sum::<u32>() == words {
+        arrays
+    } else {
+        vec![words]
+    }
+}
+
+/// A section's raw bytes (n elements, `arrays` as `section_arrays`) in
+/// encoding `encoding`.
+pub fn encode_section(raw: &[u8], n: usize, arrays: &[u32], encoding: u32) -> Vec<u8> {
+    if encoding == ENCODING_V2_WORDS {
+        return raw.to_vec();
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    for &w in arrays {
+        let row = 4 * w as usize;
+        let block = &raw[at..at + n * row];
+        at += n * row;
+        if encoding == ENCODING_DELTA_PLANES {
+            let lane = |e: usize, b: usize| u16::from_le_bytes([block[e * row + b], block[e * row + b + 1]]);
+            for b in (0..row).step_by(2) {
+                let (mut lo, mut hi) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                let mut prev = 0u16;
+                for e in 0..n {
+                    let v = lane(e, b);
+                    let d = v.wrapping_sub(prev).to_le_bytes();
+                    prev = v;
+                    lo.push(d[0]);
+                    hi.push(d[1]);
+                }
+                out.extend_from_slice(&lo);
+                out.extend_from_slice(&hi);
+            }
+        } else {
+            for b in 0..row {
+                out.extend((0..n).map(|e| block[e * row + b]));
+            }
+        }
+    }
+    out.extend_from_slice(&raw[at..]);
+    out
+}
+
+/// `encode_section` undone.
+pub fn decode_section(stored: &[u8], n: usize, arrays: &[u32], encoding: u32) -> Result<Vec<u8>> {
+    if encoding == ENCODING_V2_WORDS {
+        return Ok(stored.to_vec());
+    }
+    if encoding > MAX_ENCODING {
+        bail!(".athc v3: section encoding {}", encoding);
+    }
+    let total: usize = arrays.iter().map(|&w| 4 * w as usize * n).sum();
+    if stored.len() != total {
+        bail!(".athc v3: an encoded section of {} bytes for {} elements of {:?} words", stored.len(), n, arrays);
+    }
+    let mut out = vec![0u8; total];
+    let mut at = 0;
+    for &w in arrays {
+        let row = 4 * w as usize;
+        let src = &stored[at..at + n * row];
+        let dst = &mut out[at..at + n * row];
+        at += n * row;
+        if encoding == ENCODING_DELTA_PLANES {
+            for b in (0..row).step_by(2) {
+                let lo = &src[b * n..(b + 1) * n];
+                let hi = &src[(b + 1) * n..(b + 2) * n];
+                let mut prev = 0u16;
+                for e in 0..n {
+                    prev = prev.wrapping_add(u16::from_le_bytes([lo[e], hi[e]]));
+                    dst[e * row + b..e * row + b + 2].copy_from_slice(&prev.to_le_bytes());
+                }
+            }
+        } else {
+            for b in 0..row {
+                for e in 0..n {
+                    dst[e * row + b] = src[b * n + e];
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 // --- gzip (RFC 1952), what DecompressionStream("gzip") reads ---------------
 
 fn crc32(data: &[u8]) -> u32 {
@@ -468,12 +579,45 @@ pub struct V3Layout {
 
 /// v2 (in memory) to v3 bytes.
 pub fn write_v3(file: &AthcFile, compression: u32) -> Result<Vec<u8>> {
-    write_v3_as(file, compression, false)
+    write_v3_as(file, compression, false, &|_| ENCODING_V2_WORDS)
+}
+
+/// `write_v3` with each section in the encoding `encoding` gives its id.
+pub fn write_v3_encoded(file: &AthcFile, compression: u32, encoding: &dyn Fn(SectionId) -> u32) -> Result<Vec<u8>> {
+    write_v3_as(file, compression, false, encoding)
+}
+
+/// `write_v3` with each section in whichever encoding stores it in the
+/// fewest bytes over the whole file (each tried; gzip makes the choice
+/// matter: byte planes take 11-25 % off the transfer, the material, the
+/// curvature and CORE, and make the shadow bits larger). Returns the file
+/// and the encoding chosen for each section.
+pub fn write_v3_smallest(file: &AthcFile, compression: u32) -> Result<(Vec<u8>, Vec<(SectionId, u32)>)> {
+    let mut best: Vec<(SectionId, u32, u64)> = Vec::new();
+    for encoding in [ENCODING_V2_WORDS, ENCODING_BYTE_PLANES, ENCODING_DELTA_PLANES] {
+        let layout = parse_v3(&write_v3_encoded(file, compression, &|_| encoding)?)?;
+        for (k, s) in layout.sections.iter().enumerate() {
+            let stored: u64 = layout.blocks.iter().map(|b| b.spans[k].stored as u64).sum();
+            match best.iter_mut().find(|(id, _, _)| *id == s.id) {
+                Some(b) if stored < b.2 => *b = (s.id, encoding, stored),
+                Some(_) => {}
+                None => best.push((s.id, encoding, stored)),
+            }
+        }
+    }
+    let chosen: Vec<(SectionId, u32)> = best.iter().map(|&(id, e, _)| (id, e)).collect();
+    let pick = |id: SectionId| chosen.iter().find(|(s, _)| *s == id).map_or(ENCODING_V2_WORDS, |&(_, e)| e);
+    Ok((write_v3_encoded(file, compression, &pick)?, chosen))
 }
 
 /// `write_v3`, or with `legacy` the layout before the three tiers
 /// (`legacy_sections_of`), as files written then are (for tests).
-pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Vec<u8>> {
+pub fn write_v3_as(
+    file: &AthcFile,
+    compression: u32,
+    legacy: bool,
+    encoding: &dyn Fn(SectionId) -> u32,
+) -> Result<Vec<u8>> {
     // The v2 writer settles flags, counts and the extra header; the
     // curvature (no v2 holds it) comes back from the cloud as it was.
     let mut v2 = AthcFile::read(&file.write()?)?;
@@ -502,8 +646,14 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
     }
     let v2 = v2;
     let (h, x) = (v2.header, v2.extra);
-    let sections =
+    let mut sections =
         if legacy { legacy_sections_of(&h, &x, compression) } else { sections_of(&h, &x, compression) };
+    for s in sections.iter_mut() {
+        s.encoding = encoding(s.id);
+        if s.encoding > MAX_ENCODING {
+            bail!(".athc v3: no section encoding {}", s.encoding);
+        }
+    }
     let blocks: Vec<(u32, u32, u32, &AthcBlock)> = v2
         .levels
         .iter()
@@ -528,7 +678,8 @@ pub fn write_v3_as(file: &AthcFile, compression: u32, legacy: bool) -> Result<Ve
             if s.id.is_transfer() {
                 tx_from += s.words;
             }
-            let stored = if compression == COMPRESSION_GZIP { gzip(&raw) } else { raw.clone() };
+            let encoded = encode_section(&raw, block.n, &section_arrays(s.id, s.words, &h, &x), s.encoding);
+            let stored = if compression == COMPRESSION_GZIP { gzip(&encoded) } else { encoded };
             spans.push(SectionSpan { offset: at + (data.len() - begin) as u64, stored: stored.len() as u32, raw: raw.len() as u32 });
             data.extend_from_slice(&stored);
         }
@@ -668,7 +819,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
     {
         bail!(".athc v3: its sections are not those its header implies");
     }
-    if let Some(s) = sections.iter().find(|s| s.encoding != ENCODING_V2_WORDS || s.compression > COMPRESSION_GZIP) {
+    if let Some(s) = sections.iter().find(|s| s.encoding > MAX_ENCODING || s.compression > COMPRESSION_GZIP) {
         bail!(".athc v3: section {:?} has encoding {} / compression {} this reader does not know", s.id, s.encoding, s.compression);
     }
     let entry = BLOCK_ENTRY_HEAD + BLOCK_ENTRY_PER_SECTION * section_count;
@@ -761,7 +912,8 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
 /// 16   the cloud's v2 FileHeader and ExtraHeader (136 bytes; `V3Layout::v2_headers`)
 /// 152  decode flags (ATHV_KEEP_LINEAR)
 /// 156  transfer values kept (`Want::transfer_values`)
-/// 160  m, then m entries: section code, compression, stored bytes, raw bytes
+/// 160  m, then m entries: section code, compression (low 16 bits) and
+///      encoding (high 16 bits), stored bytes, raw bytes
 ///      the m sections' stored bytes, one after the other
 /// ```
 ///
@@ -797,7 +949,7 @@ pub fn athv_sections_page(
     out[156..160].copy_from_slice(&transfer_values.to_le_bytes());
     put_words(&mut out, &[parts.len() as u32]);
     for (s, stored, raw) in parts {
-        put_words(&mut out, &[s.id.code(), s.compression, stored.len() as u32, *raw]);
+        put_words(&mut out, &[s.id.code(), s.compression | s.encoding << 16, stored.len() as u32, *raw]);
     }
     for (_, stored, _) in parts {
         out.extend_from_slice(stored);
@@ -821,7 +973,8 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
     for k in 0..m {
         let e = 164 + 16 * k;
         let code = u32_at(b, e)?;
-        let compression = u32_at(b, e + 4)?;
+        let coding = u32_at(b, e + 4)?;
+        let (compression, encoding) = (coding & 0xffff, coding >> 16);
         let stored = u32_at(b, e + 8)? as usize;
         let raw_bytes = u32_at(b, e + 12)? as usize;
         let id = SectionId::from_code(code).ok_or_else(|| anyhow!("ATHV page: unknown section {:#x}", code))?;
@@ -842,6 +995,8 @@ pub fn read_sections_page(b: &[u8]) -> Result<(AthcHeader, ExtraHeader, AthcBloc
             COMPRESSION_GZIP => gunzip(data)?,
             c => bail!("ATHV page: compression {}", c),
         };
+        let words = (raw_bytes / (4 * n)) as u32;
+        let bytes = decode_section(&bytes, n, &section_arrays(id, words, &h, &x), encoding)?;
         if bytes.len() != raw_bytes {
             bail!("ATHV page: section {} unpacks to {} bytes, not {}", id.name(), bytes.len(), raw_bytes);
         }
@@ -958,6 +1113,7 @@ pub fn read_v3(bytes: &[u8]) -> Result<AthcFile> {
                     .get(span.offset as usize..span.offset as usize + span.stored as usize)
                     .ok_or_else(|| anyhow!(".athc v3: a section past the end"))?;
                 let raw = if s.compression == COMPRESSION_GZIP { gunzip(stored)? } else { stored.to_vec() };
+                let raw = decode_section(&raw, b.n as usize, &section_arrays(s.id, s.words, &layout.header, &layout.extra), s.encoding)?;
                 if raw.len() != span.raw as usize {
                     bail!(".athc v3: section {:?} unpacks to {} bytes, not {}", s.id, raw.len(), span.raw);
                 }
@@ -989,12 +1145,15 @@ mod tests {
     fn v2_to_v3_and_back_is_the_same_file() {
         for (name, v2) in [("two_cards", TWO_CARDS), ("every_stream", EVERY)] {
             for compression in [COMPRESSION_NONE, COMPRESSION_GZIP] {
-                let file = AthcFile::read(v2).unwrap();
-                let v3 = write_v3(&file, compression).unwrap();
-                assert_eq!(&v3[..4], b"ATH3");
-                assert_eq!(v3.len() as u64 % PAGE, 0);
-                let back = read_v3(&v3).unwrap().write().unwrap();
-                assert!(back == v2, "{name} (compression {compression}) did not come back byte for byte");
+                for encoding in 0..=MAX_ENCODING {
+                    let file = AthcFile::read(v2).unwrap();
+                    let v3 = write_v3_encoded(&file, compression, &|_| encoding).unwrap();
+                    assert_eq!(&v3[..4], b"ATH3");
+                    assert_eq!(v3.len() as u64 % PAGE, 0);
+                    assert!(parse_v3(&v3).unwrap().sections.iter().all(|s| s.encoding == encoding));
+                    let back = read_v3(&v3).unwrap().write().unwrap();
+                    assert!(back == v2, "{name} (compression {compression}, encoding {encoding}) did not come back byte for byte");
+                }
             }
         }
     }
@@ -1073,8 +1232,10 @@ mod tests {
     #[test]
     fn a_page_of_sections_is_the_chunk_it_keeps() {
         let file = AthcFile::read(EVERY).unwrap();
-        for compression in [COMPRESSION_NONE, COMPRESSION_GZIP] {
-            let v3 = write_v3(&file, compression).unwrap();
+        for (compression, encoding) in
+            [COMPRESSION_NONE, COMPRESSION_GZIP].into_iter().flat_map(|c| (0..=MAX_ENCODING).map(move |e| (c, e)))
+        {
+            let v3 = write_v3_encoded(&file, compression, &|_| encoding).unwrap();
             let layout = parse_v3(&v3).unwrap();
             let headers = layout.v2_headers();
             let (b, chunk) = (layout.blocks.iter().find(|b| b.kind == 1).unwrap(), &file.chunks[0]);
@@ -1115,7 +1276,7 @@ mod tests {
     #[test]
     fn files_of_the_first_layout_still_read_and_page() {
         let file = AthcFile::read(EVERY).unwrap();
-        let v3 = write_v3_as(&file, COMPRESSION_GZIP, true).unwrap();
+        let v3 = write_v3_as(&file, COMPRESSION_GZIP, true, &|_| ENCODING_V2_WORDS).unwrap();
         let layout = parse_v3(&v3).unwrap();
         use SectionId::*;
         let ids: Vec<SectionId> = layout.sections.iter().map(|s| s.id).collect();
@@ -1190,5 +1351,46 @@ mod tests {
         assert_eq!(&packed[..3], &[0x1f, 0x8b, 8]);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(gunzip(&packed).unwrap(), data);
+    }
+
+    #[test]
+    fn byte_planes_decode_bit_identically() {
+        // Odd lengths, every byte value, several arrays.
+        let mut state = 0x1234_5678u32;
+        for (n, arrays) in [(1usize, vec![1u32]), (7, vec![4, 4, 1]), (300, vec![1, 1, 1, 3]), (1000, vec![8]), (65, vec![2])] {
+            let words: u32 = arrays.iter().sum();
+            let raw: Vec<u8> = (0..n * 4 * words as usize)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect();
+            for encoding in 0..=MAX_ENCODING {
+                let stored = encode_section(&raw, n, &arrays, encoding);
+                assert_eq!(stored.len(), raw.len());
+                assert_eq!(decode_section(&stored, n, &arrays, encoding).unwrap(), raw, "{n} {arrays:?} {encoding}");
+            }
+        }
+        assert!(decode_section(&[0; 8], 1, &[1], 1).is_err());
+        assert!(decode_section(&[0; 4], 1, &[1], 3).is_err());
+    }
+
+    #[test]
+    fn the_smallest_encodings_read_back_the_same_cloud() {
+        const HOOD: &[u8] = include_bytes!("../../../test/fixtures/athc/hood_t16.athc");
+        for bytes in [EVERY, HOOD] {
+            let file = if &bytes[..4] == b"ATH3" { read_v3(bytes).unwrap() } else { AthcFile::read(bytes).unwrap() };
+            let plain = write_v3(&file, COMPRESSION_GZIP).unwrap();
+            let (v3, chosen) = write_v3_smallest(&file, COMPRESSION_GZIP).unwrap();
+            assert!(v3.len() <= plain.len() + PAGE as usize * (file.levels.len() + file.chunks.len()));
+            let layout = parse_v3(&v3).unwrap();
+            for (s, (id, e)) in layout.sections.iter().zip(&chosen) {
+                assert_eq!((s.id, s.encoding), (*id, *e));
+            }
+            // Bit for bit: the cloud read back writes the same plain file.
+            assert!(write_v3(&read_v3(&v3).unwrap(), COMPRESSION_GZIP).unwrap() == plain);
+        }
     }
 }

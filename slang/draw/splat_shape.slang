@@ -254,6 +254,21 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     if (scale1 < params.minPixelRadius && scale2 < params.minPixelRadius) {
         return false;
     }
+    // Past the radius where splatAlpha falls under minAlpha every fragment
+    // is discarded: end the footprint there (fewer pixels and tiles, same
+    // image). Faint splats shrink most. Not where maxPixelRadius clamps,
+    // which ties the quad's edge to adjustedStdDev.
+    float f = params.falloff;
+    float floorAlpha = (1.0 - f) * rgba.a;
+    if (rgba.a <= 1.0 && f > 0.0 && floorAlpha < params.minAlpha && adjustedStdDev * sqrt(eigen1) <= params.maxPixelRadius) {
+        float cut = sqrt(max(0.0, 2.0 * log(f * rgba.a / (params.minAlpha - floorAlpha))));
+        if (cut < adjustedStdDev) {
+            scale1 *= cut / adjustedStdDev;
+            scale2 *= cut / adjustedStdDev;
+            adjustedStdDev = cut;
+            s.adjustedStdDev = cut;
+        }
+    }
     s.axis1 = eigenVec1 * scale1;
     s.axis2 = eigenVec2 * scale2;
     return true;

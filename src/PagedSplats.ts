@@ -26,6 +26,12 @@ export interface PagedSplatsOptions {
   fileBytes?: Uint8Array;
   fileType?: SplatFileType;
   maxSh?: number;
+  /**
+   * A .athc flagged linear keeps its colours linear rather than encoded to
+   * sRGB (src/athc.ts AthcPaging.keepLinear): for the WebGPU athenea raster,
+   * which blends in linear light (atheneaRasterPlugin, storedLinear).
+   */
+  athcKeepLinear?: boolean;
 }
 
 export class PagedSplats implements SplatSource {
@@ -35,6 +41,7 @@ export class PagedSplats implements SplatSource {
   withCredentials?: boolean;
   fileBytes?: Uint8Array;
   fileType?: SplatFileType;
+  athcKeepLinear: boolean;
 
   numSh: number;
   maxSh: number;
@@ -65,6 +72,7 @@ export class PagedSplats implements SplatSource {
     this.rootUrl = options.rootUrl ?? "";
     this.requestHeader = options.requestHeader;
     this.withCredentials = options.withCredentials;
+    this.athcKeepLinear = options.athcKeepLinear ?? false;
     this.numSh = 0;
     this.maxSh = options.maxSh ?? 3;
 
@@ -111,6 +119,7 @@ export class PagedSplats implements SplatSource {
       requestHeader: this.requestHeader,
       withCredentials: this.withCredentials,
       signal: this.abortController.signal,
+      keepLinear: this.athcKeepLinear,
     });
     return this.athcPromise;
   }

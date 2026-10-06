@@ -735,6 +735,12 @@ pub struct VirtualTree {
     pub child_start: Vec<u32>,
     #[serde(skip)]
     pub child_count: Vec<u16>,
+    /// Each merged node's finest groups, `[lo, hi)` as two words: a node
+    /// covers the finest groups lo .. hi (Morton order keeps a subtree's
+    /// groups contiguous). A splat's is its own finest group, `[g, g + 1)`.
+    /// What the `athcGroup` attribute carries (`GROUP_ATTRIBUTE`).
+    #[serde(skip)]
+    pub group_range: Vec<u32>,
     /// Finest groups with more than 65 535 splats: Spark's child count is
     /// 16 bits, so the rest of those splats are left out of the tree.
     pub clipped_groups: u32,
@@ -804,7 +810,33 @@ impl VirtualTree {
             child_start[node] = splat_base + starts[g];
             child_count[node] = n.min(u16::MAX as u32) as u16;
         }
-        Ok(Self { synth_root, level_base, merged, splat_base, count, child_start, child_count, clipped_groups })
+        // Finest groups under each merged node, bottom up: a finest-level
+        // group is its own, a parent spans its first child's to its last's.
+        let mut group_range = vec![0u32; 2 * merged as usize];
+        for g in 0..finest.len() {
+            let node = (level_base[levels - 1] + g as u32) as usize;
+            group_range[2 * node] = g as u32;
+            group_range[2 * node + 1] = g as u32 + 1;
+        }
+        let parents = (0..levels - 1).rev().flat_map(|l| (0..cells[l].len()).map(move |i| (l, i)));
+        let roots = synth_root.then_some(0usize);
+        for node in parents.map(|(l, i)| (level_base[l] + i as u32) as usize).chain(roots) {
+            let first = child_start[node] as usize;
+            let last = first + child_count[node] as usize - 1;
+            group_range[2 * node] = group_range[2 * first];
+            group_range[2 * node + 1] = group_range[2 * last + 1];
+        }
+        Ok(Self {
+            synth_root,
+            level_base,
+            merged,
+            splat_base,
+            count,
+            child_start,
+            child_count,
+            group_range,
+            clipped_groups,
+        })
     }
 
     pub fn of_file(file: &AthcFile, page_aligned: bool) -> Result<Self> {
@@ -931,9 +963,10 @@ pub const ATHV_SPLATS: u32 = 1;
 /// 8    base: the virtual index of its first element
 /// 12   n: its elements
 /// 16   the .athc's FileHeader and ExtraHeader (136 bytes, as in the file)
-/// 152  0, 0
-/// 160  kind 0: child_count u32[n], child_start u32[n] (virtual), then
-///      the block; kind 1: the block (the file's chunk bytes)
+/// 152  decode flags (ATHV_KEEP_LINEAR), 0
+/// 160  kind 0: child_count u32[n], child_start u32[n] (virtual), the
+///      block, then group ranges u32[2n] (VirtualTree::group_range);
+///      kind 1: the block (the file's chunk bytes)
 /// ```
 pub fn athv_head(kind: u32, base: u32, n: u32, header_page: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ATHV_HEAD);
@@ -977,6 +1010,9 @@ pub fn athv_merged_pages(prefix: &[u8], file_bytes: u64) -> Result<(VirtualTree,
             out.extend_from_slice(&tree.child_start[k as usize].to_le_bytes());
         }
         merged.slice(base as usize, n as usize).write(&mut out);
+        for w in &tree.group_range[2 * base as usize..2 * (base + n) as usize] {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
         pages.push(out);
     }
     Ok((tree, pages))
@@ -1011,8 +1047,18 @@ pub fn attrib_specs(h: &AthcHeader, x: &ExtraHeader) -> Vec<AttribSpec> {
     if x.shadow_words > 0 {
         out.push(spec("shadowBits", "u32", x.shadow_words, LodMerge::First));
     }
+    // Every .athc: which of athenea's finest LoD groups a splat is in.
+    out.push(spec(GROUP_ATTRIBUTE, "u32", 2, LodMerge::First));
     out
 }
+
+/// The attribute every decoded .athc carries: `[lo, hi)`, the finest LoD
+/// groups an element covers -- its own group for a splat, a node's subtree
+/// for athenea's merged levels (`VirtualTree::group_range`). A .athc keeps
+/// no Cryptomatte id (athenea's `cloudCrypto` lives in USD, not the file),
+/// so these are the ids it can be picked and overridden by: spatial cells
+/// of the Morton octree rather than prims. Any level's group is a range.
+pub const GROUP_ATTRIBUTE: &str = "athcGroup";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecodeOptions {
@@ -1021,6 +1067,10 @@ pub struct DecodeOptions {
     /// at the base), which is what Spark's blend expects.
     pub keep_linear: bool,
 }
+
+/// An ATHV head's decode flags (word 152): bit 0, keep a linear cloud's
+/// colours linear (`DecodeOptions::keep_linear`).
+pub const ATHV_KEEP_LINEAR: u32 = 1;
 
 /// Feeds `block`'s elements to `receiver` as splats base .. base + n, with
 /// `children` (counts, virtual starts) when they are tree nodes.
@@ -1031,6 +1081,7 @@ pub fn emit_block<T: SplatReceiver>(
     h: &AthcHeader,
     x: &ExtraHeader,
     children: Option<(&[u16], &[u32])>,
+    groups: Option<&[u32]>,
     lod_tree: bool,
     options: DecodeOptions,
 ) {
@@ -1131,7 +1182,14 @@ pub fn emit_block<T: SplatReceiver>(
     }
     if x.shadow_words > 0 {
         receiver.set_attrib(k, base, block.n, &words(&block.shadow_bits));
+        k += 1;
     }
+    // GROUP_ATTRIBUTE: given for merged nodes; a splat's tail is its group.
+    let ranges: Vec<f64> = match groups {
+        Some(g) => g.iter().map(|&w| w as f64).collect(),
+        None => block.tail.iter().flat_map(|&g| [g as f64, (g as f64) + 1.0]).collect(),
+    };
+    receiver.set_attrib(k, base, block.n, &ranges);
 }
 
 fn begin<T: SplatReceiver>(receiver: &mut T, num_splats: usize, h: &AthcHeader, x: &ExtraHeader) -> Result<()> {
@@ -1183,12 +1241,13 @@ impl<T: SplatReceiver> AthcDecoder<T> {
             &h,
             &x,
             Some((&tree.child_count, &tree.child_start)),
+            Some(&tree.group_range),
             true,
             self.options,
         );
         let mut at = tree.splat_base as usize;
         for chunk in &file.chunks {
-            emit_block(&mut self.splats, at, chunk, &h, &x, None, true, self.options);
+            emit_block(&mut self.splats, at, chunk, &h, &x, None, None, true, self.options);
             at += chunk.n;
         }
         self.tree = Some(tree);
@@ -1221,9 +1280,21 @@ impl<T: SplatReceiver> AthcDecoder<T> {
             bail!("ATHV page of kind {}", kind);
         };
         let block = AthcBlock::read(&b[at..], n, &h, &x)?;
+        // Merged pages carry their nodes' group ranges after the block.
+        let groups = if kind == ATHV_MERGED {
+            let mut after = at + n * element_bytes(&h, &x) as usize;
+            if b.len() < after + 8 * n {
+                bail!("ATHV page shorter than its group ranges");
+            }
+            Some(words_of(b, &mut after, 2 * n))
+        } else {
+            None
+        };
+        let mut options = self.options;
+        options.keep_linear |= u32_at(b, 152) & ATHV_KEEP_LINEAR != 0;
         begin(&mut self.splats, n, &h, &x)?;
         let children = children.as_ref().map(|(c, s)| (&c[..], &s[..]));
-        emit_block(&mut self.splats, 0, &block, &h, &x, children, true, self.options);
+        emit_block(&mut self.splats, 0, &block, &h, &x, children, groups.as_deref(), true, options);
         self.splats.finish()
     }
 }
@@ -1398,8 +1469,9 @@ mod tests {
         assert!(out.finished && init.lod_tree);
         assert_eq!(init.num_splats, (tree.merged + 1352) as usize);
         assert_eq!(init.max_sh_degree, 0);
-        assert_eq!(out.specs.len(), 1);
+        assert_eq!(out.specs.len(), 2);
         assert_eq!(out.specs[0].name, "normalOct");
+        assert_eq!(out.specs[1].name, GROUP_ATTRIBUTE);
         let splats = file.splats();
         for s in [0usize, 700, 1351] {
             let v = tree.merged as usize + s;
@@ -1410,6 +1482,9 @@ mod tests {
             let q = &out.quat[v * 4..v * 4 + 4];
             assert!((q.iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-5);
             assert_eq!(out.attribs[0][v], splats.normals[s] as f64);
+            // Its finest group, as a range of one.
+            let g = splats.tail[s] as f64;
+            assert_eq!(out.attribs[1][v * 2..v * 2 + 2], [g, g + 1.0]);
             assert_eq!(out.child_count[v], 0);
             // A converted card: normals unit, colours in 0..1.
             let n = unpack_normal(splats.normals[s]);
@@ -1421,6 +1496,19 @@ mod tests {
         assert_eq!(out.child_start[0], 1);
         let finest = tree.level_base[5] as usize;
         assert_eq!(out.child_start[finest], tree.splat_base as usize);
+        // Group ranges: the root covers every finest group; a node covers
+        // its children's; a finest-level node is its own group.
+        let range = |v: usize| (out.attribs[1][v * 2] as u32, out.attribs[1][v * 2 + 1] as u32);
+        assert_eq!(range(0), (0, file.header.finest_groups));
+        assert_eq!(range(finest + 3), (3, 4));
+        for v in 0..tree.merged as usize {
+            let (first, n) = (out.child_start[v], out.child_count[v] as usize);
+            if v >= finest {
+                continue;
+            }
+            assert_eq!(range(v).0, range(first).0, "node {v}");
+            assert_eq!(range(v).1, range(first + n - 1).1, "node {v}");
+        }
     }
 
     #[test]
@@ -1447,6 +1535,28 @@ mod tests {
         assert_eq!(splats.center[..], whole.center[m * 3..]);
         assert_eq!(splats.attribs[0][..], whole.attribs[0][m..]);
         assert!(splats.child_count.iter().all(|&c| c == 0));
+        // Group ranges, merged and splats, as the whole file has them.
+        assert_eq!(merged.attribs[1][..], whole.attribs[1][..2 * m]);
+        assert_eq!(splats.attribs[1][..], whole.attribs[1][2 * m..]);
+    }
+
+    #[test]
+    fn athv_keep_linear_flag() {
+        let bytes = every_stream().write().unwrap();
+        let layout = AthcLayout::parse(&bytes, bytes.len() as u64).unwrap();
+        let (tree, mut pages) = athv_merged_pages(&bytes[..layout.levels_end() as usize], bytes.len() as u64).unwrap();
+        let e = layout.chunks[0];
+        let mut page = athv_head(ATHV_SPLATS, tree.splat_base, e.count, &bytes);
+        page.extend_from_slice(&bytes[e.offset as usize..(e.offset + e.count as u64 * layout.element_bytes) as usize]);
+        let srgb = decode(&page);
+        assert!((srgb.rgb[1000 * 3] - linear_to_srgb(0.25)).abs() < 1e-6);
+        page[152..156].copy_from_slice(&ATHV_KEEP_LINEAR.to_le_bytes());
+        assert_eq!(decode(&page).rgb[1000 * 3], 0.25);
+        let before = decode(&pages[0]).rgb;
+        pages[0][152..156].copy_from_slice(&ATHV_KEEP_LINEAR.to_le_bytes());
+        let kept = decode(&pages[0]).rgb;
+        assert!(before.iter().zip(&kept).any(|(a, b)| a != b));
+        assert!(kept.iter().zip(&before).all(|(k, b)| (linear_to_srgb(*k) - b).abs() < 1e-5));
     }
 
     #[test]
@@ -1557,7 +1667,7 @@ mod tests {
         let bytes = every_stream().write().unwrap();
         let out = decode(&bytes);
         let names: Vec<&str> = out.specs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["normalOct", "emission", "pbr", "lobes", "transfer", "shadowBits"]);
+        assert_eq!(names, ["normalOct", "emission", "pbr", "lobes", "transfer", "shadowBits", GROUP_ATTRIBUTE]);
         assert_eq!(out.init.as_ref().unwrap().max_sh_degree, 3);
         let tree_root_children = out.child_count[0];
         assert_eq!(tree_root_children, 8, "level 1 has one group: it is the root");

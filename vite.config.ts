@@ -103,6 +103,14 @@ export default defineConfig(({ mode }) => {
       },
     ],
 
+    resolve: {
+      // This checkout's own WASM, also where node_modules is shared with
+      // another checkout (a git worktree with its own Rust).
+      alias: {
+        "spark-rs": path.resolve(import.meta.dirname, sparkRsDirectory),
+      },
+    },
+
     build: {
       minify: isMinify,
       lib: {

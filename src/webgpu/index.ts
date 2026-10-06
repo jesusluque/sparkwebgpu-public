@@ -59,3 +59,25 @@ export {
   type AttributeSpec,
   type LodMerge,
 } from "./attributes/schema";
+export {
+  ATHENEA_VIEWABLE,
+  type AtheneaCamera,
+  type AtheneaScene,
+  type AtheneaSceneFile,
+  type AtheneaTransform,
+  applyAtheneaCamera,
+  applyAtheneaTransform,
+  atheneaSceneMesh,
+  loadAtheneaScene,
+  parseAtheneaScene,
+  pickAtheneaFile,
+} from "./athenea/sceneJson";
+export {
+  type AthcLayout,
+  type AthcPaging,
+  readAthcLayout,
+  unpackAthcLobes,
+  unpackAthcNormal,
+  unpackAthcPbr,
+  unpackRgb9e5,
+} from "../athc";

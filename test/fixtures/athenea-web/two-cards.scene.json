@@ -1,0 +1,20 @@
+{
+  "id": "two-cards",
+  "title": "two_cards (athenea mesh2splat test)",
+  "renderer": "spark",
+  "gaussians": 1352,
+  "shDegree": 0,
+  "default": "athc",
+  "cameras": [
+    {
+      "name": "Front",
+      "position": [1.25, 1.25, 4],
+      "target": [1.25, 1.25, -2],
+      "fov": 50
+    }
+  ],
+  "files": [
+    { "format": "athc", "path": "../athc/two_cards.athc", "paged": true }
+  ],
+  "background": { "color": "#202024" }
+}

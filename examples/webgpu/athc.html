@@ -34,9 +34,16 @@
     // `paged: true` streams it a 65 536-splat chunk at a time (src/athc.ts).
     //   ?url=<.athc>   (default: test/fixtures/athc/two_cards.athc)
     //   &paged=1       page it
+    //   ?scene=<athenea-web scene.json>   open what athenea-web publishes:
+    //                  its .athc (or other format), transform, camera, background
     import * as THREE from "three/webgpu";
     import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
-    import { splatRequiredLimits } from "@sparkjsdev/spark/webgpu";
+    import {
+      splatRequiredLimits,
+      loadAtheneaScene,
+      atheneaSceneMesh,
+      applyAtheneaCamera,
+    } from "@sparkjsdev/spark/webgpu";
 
     const params = new URLSearchParams(location.search);
     const url = params.get("url") ?? "../../test/fixtures/athc/two_cards.athc";
@@ -61,14 +68,19 @@
     const spark = new SparkRenderer({ renderer });
     scene.add(spark);
 
-    const mesh = new SplatMesh({ url, paged });
+    const sceneUrl = params.get("scene");
+    const athenea = sceneUrl ? await loadAtheneaScene(sceneUrl) : null;
+    const mesh = athenea ? atheneaSceneMesh(athenea) : new SplatMesh({ url, paged });
     scene.add(mesh);
+    if (athenea?.background.color) scene.background = new THREE.Color(athenea.background.color);
     window.__athc = { mesh, loaded: false, error: null };
     try {
       await mesh.initialized;
       window.__athc.loaded = true;
       const box = mesh.getBoundingBox?.(false);
-      if (box && !box.isEmpty()) {
+      if (athenea?.cameras.length) {
+        applyAtheneaCamera(camera, athenea.cameras[0]);
+      } else if (box && !box.isEmpty()) {
         const centre = box.getCenter(new THREE.Vector3());
         const size = box.getSize(new THREE.Vector3()).length();
         camera.position.copy(centre).add(new THREE.Vector3(0, 0, size * 1.2));
@@ -77,7 +89,9 @@
         camera.position.set(1.25, 1.25, 6);
         camera.lookAt(1.25, 1.25, -2);
       }
-      status.textContent = `${url.split("/").pop()}${paged ? " (paged)" : ""}`;
+      status.textContent = athenea
+        ? `${athenea.title ?? athenea.id} (scene.json)`
+        : `${url.split("/").pop()}${paged ? " (paged)" : ""}`;
     } catch (error) {
       window.__athc.error = String(error);
       status.textContent = `error: ${error}`;

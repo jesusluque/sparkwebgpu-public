@@ -194,7 +194,7 @@ describe("hood_t16.athc decoded (WASM)", () => {
       ["lobes", "u32", 3],
       ["transfer", "f16", 16],
       ["shadowBits", "u32", 8],
-      ["curvature", "f16", 3],
+      ["curvature", "f16", 4],
       ["athcGroup", "u32", 2],
     ]);
     // Words, not f64 values: a full transfer as f64 (896 bytes a splat) ran

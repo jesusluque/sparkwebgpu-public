@@ -1,0 +1,363 @@
+#usda 1.0
+# Copyright (c) 2026 jesus luque.
+(
+    defaultPrim = "Corvette"
+    doc = """Corvette C7 lights sidecar (proposals 066/067), validated against Cycles Light Groups
+(work/light_groups.py, renders in ~/luc/athenea-renders/lights/blender).
+
+The exporter dropped the emitters' emission (strength 0 in the .blend). The three Light* materials get their
+colour back here, off (emission_luminance 0) as shipped; one material per group specializes them with the group's
+emission when on and is bound to the group's emitting faces. Composed as is, every group is on at its ground-truth
+strength, the stage Cycles renders. emission_luminance x emission_color is linear radiance in scene units, the
+same number as Cycles' emission strength (athenea reads it as it stands; no nits conversion is applied here).
+
+Groups, states and rules are namespaced attributes on Scope prims until AtheneaLightGroupAPI exists (066). Each
+group prim is named as its Cycles Light Group.
+
+Known asset defect: Headlights_Housing and Main_Lens_Reflecotr hold the left headlight's DRL strip and projector
+reflector mirrored front-to-rear (x 0.52..0.82, y +1.5..+2.0, inside the rear body) instead of left-to-right, so
+only the right headlight shows cruce and drl, and the hidden rear halves leak a little light under the car. The
+fix (a 180 degree turn about z through (-0.015, 0.0065)) is FIX_MIRROR=1 in work/light_groups.py; the USD geometry
+is not changed here."""
+    metersPerUnit = 1
+    subLayers = [
+        @./corvette_c7.usda@
+    ]
+    upAxis = "Z"
+)
+
+over "Corvette"
+{
+    over "Looks"
+    {
+        # ---- the asset's emitters, colour restored, off as shipped ----
+        over "Light"
+        {
+            over "OpenPBR"
+            {
+                color3f inputs:emission_color = (1, 1, 1)
+                float inputs:emission_luminance = 0
+            }
+        }
+
+        over "Light_Rear"
+        {
+            over "OpenPBR"
+            {
+                color3f inputs:emission_color = (1, 1, 1)   # white: the red comes from the Glass_Red lenses in front
+                float inputs:emission_luminance = 0
+            }
+        }
+
+        over "Light_Rear_Red"
+        {
+            over "OpenPBR"
+            {
+                color3f inputs:emission_color = (0.381, 0.003, 0)
+                float inputs:emission_luminance = 0
+            }
+        }
+
+        # ---- one material per group: the group's emission when on (w = 1), Cycles strength 1:1 ----
+        def Material "Light_cruce" (
+            specializes = </Corvette/Looks/Light>
+        )
+        {
+            over "OpenPBR"
+            {
+                float inputs:emission_luminance = 10000
+            }
+
+            over "PreviewSurface"
+            {
+                color3f inputs:emissiveColor = (10000, 10000, 10000)
+            }
+        }
+
+        def Material "Light_largas" (
+            specializes = </Corvette/Looks/Light>
+        )
+        {
+            over "OpenPBR"
+            {
+                float inputs:emission_luminance = 5000
+            }
+
+            over "PreviewSurface"
+            {
+                color3f inputs:emissiveColor = (5000, 5000, 5000)
+            }
+        }
+
+        def Material "Light_drl" (
+            specializes = </Corvette/Looks/Light>
+        )
+        {
+            over "OpenPBR"
+            {
+                float inputs:emission_luminance = 1500
+            }
+
+            over "PreviewSurface"
+            {
+                color3f inputs:emissiveColor = (1500, 1500, 1500)
+            }
+        }
+
+        def Material "Light_pilotos" (
+            specializes = </Corvette/Looks/Light_Rear>
+        )
+        {
+            over "OpenPBR"
+            {
+                float inputs:emission_luminance = 500
+            }
+
+            over "PreviewSurface"
+            {
+                color3f inputs:emissiveColor = (500, 500, 500)
+            }
+        }
+
+        def Material "Light_tubo_trasero" (
+            specializes = </Corvette/Looks/Light_Rear_Red>
+        )
+        {
+            over "OpenPBR"
+            {
+                float inputs:emission_luminance = 1000
+            }
+
+            over "PreviewSurface"
+            {
+                color3f inputs:emissiveColor = (381, 3, 0)
+            }
+        }
+    }
+
+    over "Corvette_C7_Stingray"
+    {
+        # ---- the emitting faces, bound to their group's material ----
+        over "Main_Lens_Reflecotr"
+        {
+            over "Cube_001"
+            {
+                over "Light"
+                {
+                    rel material:binding = </Corvette/Looks/Light_cruce>
+                }
+            }
+        }
+
+        over "Mini_Lens_Reflectors"
+        {
+            over "Plane_053"
+            {
+                rel material:binding = </Corvette/Looks/Light_largas>
+            }
+        }
+
+        over "Headlights_Housing"
+        {
+            over "Plane_038"
+            {
+                over "Light"
+                {
+                    rel material:binding = </Corvette/Looks/Light_drl>
+                }
+            }
+        }
+
+        over "Rear_Light_Relfectors"
+        {
+            over "Plane_068"
+            {
+                over "Light_Rear"
+                {
+                    rel material:binding = </Corvette/Looks/Light_pilotos>
+                }
+            }
+        }
+
+        over "Rear_Light_Relfectors_001"
+        {
+            over "Plane_065"
+            {
+                over "Light_Rear"
+                {
+                    rel material:binding = </Corvette/Looks/Light_pilotos>
+                }
+            }
+        }
+
+        over "Rear_Light_Tube"
+        {
+            over "Plane_071"
+            {
+                rel material:binding = </Corvette/Looks/Light_tubo_trasero>
+            }
+        }
+    }
+
+    def Scope "LightGroups"
+    {
+        # members: the emitting faces (a GeomSubset, or the whole mesh where it has one material).
+        # lenses: what the light crosses on its way out; lensTint is the group's mean transmittance through them
+        # (measured in Cycles, work/lens_tint.py: three directions into the lamp, lenses shown over hidden), for the 060 direct term, whose polygon sits behind the lens.
+        def Scope "cruce"
+        {
+            rel athenea:lightGroup:members = </Corvette/Corvette_C7_Stingray/Main_Lens_Reflecotr/Cube_001/Light>
+            rel athenea:lightGroup:material = </Corvette/Looks/Light_cruce>
+            rel athenea:lightGroup:lenses = [
+                </Corvette/Corvette_C7_Stingray/Main_Lens>,
+                </Corvette/Corvette_C7_Stingray/Headlights_Cover>,
+            ]
+            token athenea:lightGroup:function = "lowBeam"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:emissionLuminance = 10000
+            color3f athenea:lightGroup:emissionColor = (1, 1, 1)
+            color3f athenea:lightGroup:lensTint = (0.692, 0.692, 0.692)
+            float athenea:lightGroup:riseSeconds = 0.15
+            float athenea:lightGroup:temperatureK = 5500
+            bool athenea:lightGroup:initialOn = false
+        }
+
+        def Scope "largas"
+        {
+            # Mini_Lens_Reflectors: two staggered rows of reflector cups behind Mini_Lens, aimed forward; beam
+            # optics, not a signature strip (the signature is the drl light guide), so the high beam.
+            rel athenea:lightGroup:members = </Corvette/Corvette_C7_Stingray/Mini_Lens_Reflectors/Plane_053>
+            rel athenea:lightGroup:material = </Corvette/Looks/Light_largas>
+            rel athenea:lightGroup:lenses = [
+                </Corvette/Corvette_C7_Stingray/Mini_Lens>,
+                </Corvette/Corvette_C7_Stingray/Headlights_Cover>,
+            ]
+            token athenea:lightGroup:function = "highBeam"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:emissionLuminance = 5000
+            color3f athenea:lightGroup:emissionColor = (1, 1, 1)
+            color3f athenea:lightGroup:lensTint = (0.675, 0.675, 0.675)
+            float athenea:lightGroup:riseSeconds = 0.15
+            bool athenea:lightGroup:initialOn = false
+        }
+
+        def Scope "drl"
+        {
+            # The white light-guide strip along the lower edge of the housing, behind Glass_Strip. It has no side
+            # marker: the strip stays inside the headlight, and the front corner lenses (F#1, Glass_Orange) have no
+            # emitter behind them.
+            rel athenea:lightGroup:members = </Corvette/Corvette_C7_Stingray/Headlights_Housing/Plane_038/Light>
+            rel athenea:lightGroup:material = </Corvette/Looks/Light_drl>
+            rel athenea:lightGroup:lenses = [
+                </Corvette/Corvette_C7_Stingray/Glass_Strip>,
+                </Corvette/Corvette_C7_Stingray/Headlights_Housing_Lens>,
+                </Corvette/Corvette_C7_Stingray/Headlights_Cover>,
+            ]
+            token athenea:lightGroup:function = "daytimeRunning"
+            token athenea:lightGroup:technology = "lightGuide"
+            float athenea:lightGroup:emissionLuminance = 1500
+            color3f athenea:lightGroup:emissionColor = (1, 1, 1)
+            color3f athenea:lightGroup:lensTint = (0.557, 0.557, 0.557)
+            bool athenea:lightGroup:initialOn = false
+        }
+
+        def Scope "pilotos"
+        {
+            # White emitters behind the red lenses: tail light, and the brake light at brakeScale.
+            rel athenea:lightGroup:members = [
+                </Corvette/Corvette_C7_Stingray/Rear_Light_Relfectors/Plane_068/Light_Rear>,
+                </Corvette/Corvette_C7_Stingray/Rear_Light_Relfectors_001/Plane_065/Light_Rear>,
+            ]
+            rel athenea:lightGroup:material = </Corvette/Looks/Light_pilotos>
+            rel athenea:lightGroup:lenses = [
+                </Corvette/Corvette_C7_Stingray/Rear_LIghts_Lens>,
+                </Corvette/Corvette_C7_Stingray/Rear_LIghts_Lens_001>,
+                </Corvette/Corvette_C7_Stingray/Rear_Lights>,
+            ]
+            token athenea:lightGroup:function = "tail"
+            token athenea:lightGroup:technology = "led"
+            float athenea:lightGroup:emissionLuminance = 500
+            color3f athenea:lightGroup:emissionColor = (1, 1, 1)
+            color3f athenea:lightGroup:lensTint = (0.533, 0.0002, 0.0082)
+            float athenea:lightGroup:brakeScale = 4
+            bool athenea:lightGroup:initialOn = false
+        }
+
+        def Scope "tubo_trasero"
+        {
+            # The 65 cm x 8 mm red light guide on the spoiler, centred, at the top: the centre high-mounted stop
+            # lamp (third brake light). It lights with the brake, not with the tail lights.
+            rel athenea:lightGroup:members = </Corvette/Corvette_C7_Stingray/Rear_Light_Tube/Plane_071>
+            rel athenea:lightGroup:material = </Corvette/Looks/Light_tubo_trasero>
+            rel athenea:lightGroup:lenses = </Corvette/Corvette_C7_Stingray/Rear_Light_Lens>
+            token athenea:lightGroup:function = "centreHighMountedStop"
+            token athenea:lightGroup:technology = "lightGuide"
+            float athenea:lightGroup:emissionLuminance = 1000
+            color3f athenea:lightGroup:emissionColor = (0.381, 0.003, 0)
+            color3f athenea:lightGroup:lensTint = (0.60, 0.60, 0.60)
+            bool athenea:lightGroup:initialOn = false
+        }
+
+        # No amber emitter exists in the asset (F#1, Glass_Orange, has nothing behind it): no indicators until a
+        # source is added there. The sky is the Cycles group "cielo": the scene's DomeLight, not part of the car.
+    }
+
+    def Scope "LightStates"
+    {
+        # A state is the weights w_k it sets, one attribute per group it turns on (athenea:lightState:target:<group>);
+        # a group it does not name is at 0. (USD has no dictionary-valued attributes, so not one dictionary.)
+        def Scope "aparcado"
+        {
+            # every group at 0
+        }
+
+        def Scope "diurno"
+        {
+            double athenea:lightState:target:drl = 1
+        }
+
+        def Scope "noche_ciudad"
+        {
+            double athenea:lightState:target:cruce = 1
+            double athenea:lightState:target:pilotos = 1
+        }
+
+        def Scope "noche_carretera"
+        {
+            double athenea:lightState:target:cruce = 1
+            double athenea:lightState:target:largas = 1
+            double athenea:lightState:target:pilotos = 1
+        }
+
+        def Scope "frenando"
+        {
+            double athenea:lightState:target:pilotos = 4
+            double athenea:lightState:target:tubo_trasero = 1
+        }
+
+        def Scope "noche_frenando"
+        {
+            double athenea:lightState:target:cruce = 1
+            double athenea:lightState:target:pilotos = 4
+            double athenea:lightState:target:tubo_trasero = 1
+        }
+    }
+
+    def Scope "LightRules"
+    {
+        def Scope "drl_off_with_low_beam"
+        {
+            # UN R48 6.19.7, as quoted by a search (062)
+            token athenea:lightRule:target = "drl"
+            double athenea:lightRule:scale = 0
+            token athenea:lightRule:when = "cruce"
+        }
+
+        def Scope "high_needs_low"
+        {
+            token athenea:lightRule:target = "largas"
+            double athenea:lightRule:scale = 0
+            token athenea:lightRule:when = "!cruce"
+        }
+    }
+}

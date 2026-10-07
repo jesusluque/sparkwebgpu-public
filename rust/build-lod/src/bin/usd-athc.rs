@@ -98,9 +98,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use openusd::sdf::{self, AbstractData, Value};
 use serde_json::{json, Value as Json};
 use spark_lib::athc_build::{
-    build_lod, cell_for_target, crop_box, drop_hidden_backs, pack_streams, reduce_cells, reduce_thin, BuildOptions,
-    CloudStreams, LobeStreams, TransferKeep,
+    build_lod, cell_for_target, crop_box_kept, drop_hidden_backs_kept, lod_order, pack_streams, pack_streams_kept,
+    reduce_cells_runs, reduce_thin_runs, BuildOptions, CloudStreams, LobeStreams, TransferKeep, SH0,
 };
+use spark_lib::athl::SplatSources;
 use spark_lib::athc_skin::{AthcSkeleton, SkinClip};
 use spark_lib::athc_v3::{gzip, parse_v3, write_v3_skinned, COMPRESSION_GZIP, COMPRESSION_NONE};
 
@@ -158,7 +159,13 @@ pub struct Prim {
 
 /// A `.usdc` or a `.usda` layer.
 fn read_layer(path: &str) -> Result<Box<dyn AbstractData>> {
-    if path.ends_with(".usda") {
+    // By its first bytes: a text layer whatever its name says.
+    let mut head = [0u8; 5];
+    let text = std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok()
+        && &head == b"#usda";
+    if text || path.ends_with(".usda") {
         return Ok(Box::new(openusd::usda::read_file(path).with_context(|| format!("reading {path}"))?));
     }
     openusd::usdc::read_file(path).with_context(|| format!("reading {path}"))
@@ -181,6 +188,13 @@ fn matrix(m: &openusd::gf::Matrix4d) -> [f32; 16] {
 
 impl Prim {
     pub fn read(data: &dyn AbstractData, prim: &str) -> Result<Self> {
+        Self::read_some(data, prim, None)
+    }
+
+    /// [`Prim::read`] of the attributes named (with or without `primvars:`)
+    /// alone: a light layer's cloud is read for its colours and positions,
+    /// not its transfer.
+    pub fn read_some(data: &dyn AbstractData, prim: &str, only: Option<&[&str]>) -> Result<Self> {
         let path = sdf::path(prim).map_err(|e| anyhow!("{prim}: {e}"))?;
         let names = match data
             .try_field(&path, "propertyChildren")
@@ -195,6 +209,12 @@ impl Prim {
         let mut attributes = BTreeMap::new();
         let mut samples = BTreeMap::new();
         for name in names {
+            if let Some(only) = only {
+                let bare = name.strip_prefix("primvars:").unwrap_or(&name);
+                if !only.contains(&bare) {
+                    continue;
+                }
+            }
             let at = sdf::path(format!("{prim}.{name}")).map_err(|e| anyhow!("{name}: {e}"))?;
             if let Some(v) = data
                 .try_field(&at, "default")
@@ -744,6 +764,258 @@ fn clip_report(r: &AthcSkeleton, c: &SkinClip) -> Json {
     })
 }
 
+/// The linear colours (0.5 + SH0 dc, RGB a splat) of a light layer's
+/// clouds, one a source cloud, masked as the base's streams were, and a
+/// check that they line up: the same count, and the same positions.
+fn read_layer_colours(
+    files: &[&str],
+    prim_path: &str,
+    masks: &[(Option<Vec<bool>>, usize)],
+    streams: &CloudStreams,
+) -> Result<(Vec<f32>, Json)> {
+    let mut out = Vec::with_capacity(streams.count * 3);
+    let mut worst = 0f32;
+    let mut max = 0f32;
+    let mut negative = 0usize;
+    for (file, (mask, offset)) in files.iter().zip(masks) {
+        let data = read_layer(file)?;
+        let p = Prim::read_some(
+            data.as_ref(),
+            prim_path,
+            Some(&[
+                "positions",
+                "positionsh",
+                "radiance:sphericalHarmonicsCoefficients",
+                "radiance:sphericalHarmonicsCoefficientsh",
+                "athenea:splat:linear",
+            ]),
+        )?;
+        let positions = p.floats(&["positions", "positionsh"])?;
+        let count = positions.len() / 3;
+        let sh = p.floats(&["radiance:sphericalHarmonicsCoefficients", "radiance:sphericalHarmonicsCoefficientsh"])?;
+        if count == 0 || sh.len() % (3 * count) != 0 || sh.is_empty() {
+            bail!("{file}: {count} splats and {} SH values", sh.len());
+        }
+        if p.bool("athenea:splat:linear") != streams.linear {
+            eprintln!("warning: {file}: linear is {}, the base's {}", p.bool("athenea:splat:linear"), streams.linear);
+        }
+        let per = sh.len() / count;
+        if let Some(m) = mask {
+            if m.len() != count {
+                bail!("{file}: {count} splats, its base cloud {} (not the same gaussians)", m.len());
+            }
+        }
+        let mut k = *offset;
+        for i in 0..count {
+            if mask.as_ref().is_some_and(|m| !m[i]) {
+                continue;
+            }
+            if k >= streams.count {
+                bail!("{file}: more splats than its base cloud");
+            }
+            for c in 0..3 {
+                worst = worst.max((positions[i * 3 + c] - streams.positions[k * 3 + c]).abs());
+                let v = 0.5 + SH0 * sh[i * per + c];
+                if v < 0.0 {
+                    negative += 1;
+                }
+                max = max.max(v);
+                out.push(v.max(0.0));
+            }
+            k += 1;
+        }
+        let expect = masks.iter().map(|(_, o)| *o).find(|&o| o > *offset).unwrap_or(streams.count);
+        if k != expect {
+            bail!("{file}: {} splats after the mask, its base cloud {}", k - offset, expect - offset);
+        }
+    }
+    if worst > 1e-5 {
+        bail!("the layer {:?} is not the base's gaussians: positions differ by up to {worst}", files);
+    }
+    Ok((out, json!({ "files": files, "maxPositionError": worst, "max": max, "negativeClamped": negative })))
+}
+
+/// A group's radiance in a `.lights.usda`: `athenea:lightGroup:radiance`,
+/// or athenea's `emissionLuminance` (the per-group bakes are per unit of
+/// it, the material's emission colour included). A plain text scan of the
+/// group's `def Scope "NAME"` block.
+fn sidecar_radiance(text: &str, name: &str) -> Option<f32> {
+    let head = format!("def Scope \"{name}\"");
+    let at = text.find(&head)? + head.len();
+    let rest = &text[at..];
+    let end = rest.find("def ").unwrap_or(rest.len());
+    for line in rest[..end].lines() {
+        let line = line.trim();
+        for key in ["athenea:lightGroup:radiance =", "athenea:lightGroup:emissionLuminance ="] {
+            if let Some(v) = line.split_once(key).map(|(_, v)| v.trim()) {
+                if let Ok(v) = v.split_whitespace().next().unwrap_or("").parse::<f32>() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A stand-in for one of athenea's per-group clouds (tests, before its
+/// bakes land): a `.usda` layer with the base's positions, in its order,
+/// and as linear colour a lamp's glow from a point (`--emit x,y,z,r`): 1 at
+/// the point, falling to 0 at r (squared), plus a faint bounce to 2r.
+fn fake_layer(prim: &Prim, prim_path: &str, up: Option<&str>, out: &str, emit: &str) -> Result<()> {
+    use std::fmt::Write as _;
+    let e: Vec<f32> = emit.split(',').map(|v| v.trim().parse()).collect::<Result<_, _>>().context("--emit")?;
+    if e.len() != 4 {
+        bail!("--emit x,y,z,r");
+    }
+    let positions = prim.floats(&["positions", "positionsh"])?;
+    let n = positions.len() / 3;
+    let (mut pos, mut sh) = (String::with_capacity(n * 40), String::with_capacity(n * 40));
+    let mut lit = 0;
+    for i in 0..n {
+        let p = &positions[i * 3..i * 3 + 3];
+        let d = ((p[0] - e[0]).powi(2) + (p[1] - e[1]).powi(2) + (p[2] - e[2]).powi(2)).sqrt();
+        let core = (1.0 - d / e[3]).max(0.0).powi(2);
+        let bounce = 0.01 * (1.0 - d / (2.0 * e[3])).max(0.0);
+        let v = core + bounce;
+        if v > 0.0 {
+            lit += 1;
+        }
+        let rgb = [v, 0.9 * v, 0.75 * v].map(|c| (c - 0.5) / SH0);
+        let sep = if i == 0 { "" } else { ", " };
+        write!(pos, "{sep}({:?}, {:?}, {:?})", p[0], p[1], p[2])?;
+        write!(sh, "{sep}({:?}, {:?}, {:?})", rgb[0], rgb[1], rgb[2])?;
+    }
+    let names: Vec<&str> = prim_path.trim_start_matches('/').split('/').collect();
+    let mut text = format!("#usda 1.0\n(\n    upAxis = \"{}\"\n)\n\n", up.unwrap_or("Y"));
+    for (k, name) in names.iter().enumerate() {
+        let _ = writeln!(text, "{}def Xform \"{name}\"\n{}{{", "    ".repeat(k), "    ".repeat(k));
+    }
+    let pad = "    ".repeat(names.len());
+    let _ = writeln!(text, "{pad}bool primvars:athenea:splat:linear = true");
+    let _ = writeln!(text, "{pad}point3f[] positions = [{pos}]");
+    let _ = writeln!(text, "{pad}float3[] radiance:sphericalHarmonicsCoefficients = [{sh}]");
+    for k in (0..names.len()).rev() {
+        let _ = writeln!(text, "{}}}", "    ".repeat(k));
+    }
+    std::fs::write(out, text)?;
+    eprintln!("{out}: {n} splats, {lit} lit from ({}, {}, {}) r {}", e[0], e[1], e[2], e[3]);
+    Ok(())
+}
+
+struct LayerOptions {
+    /// A block of 256 is kept when a value passes this (radiance units).
+    threshold: f32,
+    /// Splats whose largest component (radiance units) is under this are
+    /// zeroed first: the bake's grainy faint indirect, dropped.
+    floor: f32,
+    /// A layer to compare with the file's own base colour (a layer that is
+    /// the base cloud itself: an alignment check).
+    verify: Option<String>,
+}
+
+/// The `.athl` of the built cloud: each layer through the splats' sources
+/// (`track`), scaled to its group's radiance (f16 keeps the faint bounce:
+/// per unit of a 10 000-nit lamp it would be subnormal), as kind 0 over
+/// the virtual order (merged nodes their splats' weighted mean).
+fn write_athl(
+    file: &spark_lib::athc::AthcFile,
+    athc_bytes: &[u8],
+    track: &SplatSources,
+    layers: &[(String, Vec<f32>, Json)],
+    sidecar: Option<&str>,
+    o: &LayerOptions,
+    path: &str,
+) -> Result<Json> {
+    use spark_lib::athc::{high_half, low_half, VirtualTree};
+    use spark_lib::athl::{cloud_hash, sparse_layers, validate, virtual_values, AthlFile, AthlGroup, KIND_INDIRECT};
+    let n = file.header.count as usize;
+    if track.len() != n {
+        bail!("tracked {} splats, the file has {n}", track.len());
+    }
+    let tree = VirtualTree::of_file(file, true)?;
+    let mut athl = AthlFile {
+        element_count: tree.splat_base + n as u32,
+        merged: tree.merged,
+        splat_base: tree.splat_base,
+        splat_count: n as u32,
+        cloud_hash: cloud_hash(athc_bytes),
+        ..Default::default()
+    };
+    let mut bake = 0xcbf2_9ce4_8422_2325u64;
+    let mut reports = Vec::new();
+    for (k, (name, values, check)) in layers.iter().enumerate() {
+        let per = track.gather(values, 3)?;
+        let mut report = check.clone();
+        if o.verify.as_deref() == Some(name) {
+            let splats = file.splats();
+            let (mut abs, mut rel) = (0f32, 0f32);
+            for i in 0..n {
+                let s = &splats.shape[4 * i..4 * i + 4];
+                let base = [high_half(s[2]), low_half(s[3]), high_half(s[3])];
+                for c in 0..3 {
+                    let d = (per[3 * i + c] - base[c]).abs();
+                    abs = abs.max(d);
+                    rel = rel.max(d / base[c].abs().max(1e-3));
+                }
+            }
+            report["verify"] = json!({ "maxAbs": abs, "maxRel": rel });
+            eprintln!("verify {name}: layer vs the file's base colour, max abs {abs:.3e}, max rel {rel:.3e}");
+        }
+        let radiance = sidecar.and_then(|t| sidecar_radiance(t, name)).unwrap_or(1.0);
+        let mut scaled: Vec<f32> = per.iter().map(|v| v * radiance).collect();
+        let mut floored = 0usize;
+        if o.floor > 0.0 {
+            for px in scaled.chunks_mut(3) {
+                if px.iter().all(|v| v.abs() < o.floor) && px.iter().any(|v| *v != 0.0) {
+                    px.fill(0.0);
+                    floored += 1;
+                }
+            }
+        }
+        let lit = scaled.chunks(3).filter(|p| p.iter().any(|v| *v != 0.0)).count();
+        let virt = virtual_values(file, &tree, &scaled, 3)?;
+        let sparse = sparse_layers(k as u16, KIND_INDIRECT, 3, &virt, o.threshold)?;
+        let blocks: usize = sparse.iter().map(|l| l.blocks.len()).sum();
+        let total = (athl.element_count as usize).div_ceil(spark_lib::athl::BLOCK_SPLATS as usize);
+        report["group"] = json!(name);
+        report["radiance"] = json!(radiance);
+        report["litSplats"] = json!(lit);
+        report["flooredSplats"] = json!(floored);
+        report["blocks"] = json!(blocks);
+        report["blockFraction"] = json!(blocks as f64 / total.max(1) as f64);
+        reports.push(report);
+        athl.layers.extend(sparse);
+        for b in name.bytes().chain(radiance.to_le_bytes()) {
+            bake = (bake ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        athl.groups.push(AthlGroup {
+            name: name.clone(),
+            profile: -1,
+            // The bake went through the lenses: no tint over the layer.
+            tint: [1.0; 3],
+            axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            radiance,
+            ..Default::default()
+        });
+    }
+    athl.bake_hash = bake;
+    // Sorted by chunk, group, kind (one byte range a page).
+    athl.layers.sort_by_key(|l| (l.chunk, l.group, l.kind));
+    validate(&athl)?;
+    let bytes = athl.write()?;
+    std::fs::write(path, &bytes)?;
+    Ok(json!({
+        "athl": path,
+        "bytes": bytes.len(),
+        "cloudHash": format!("{:016x}", athl.cloud_hash),
+        "merged": tree.merged,
+        "splatBase": tree.splat_base,
+        "threshold": o.threshold,
+        "floor": o.floor,
+        "groups": reports,
+    }))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
@@ -767,6 +1039,14 @@ fn main() -> Result<()> {
         "--clips",
         "--clip-skeleton",
         "--clip-files",
+        "--light-layer",
+        "--athl",
+        "--lights-usda",
+        "--light-threshold",
+        "--light-floor",
+        "--light-verify",
+        "--fake-layer",
+        "--emit",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -799,6 +1079,9 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Some(out) = arg(&args, "--fake-layer") {
+        return fake_layer(&prim, prim_path, up_axis.as_deref(), out, arg(&args, "--emit").unwrap_or("0,0,0,0.5"));
+    }
     let Some(output) = paths.get(1) else {
         bail!("no output path")
     };
@@ -807,7 +1090,7 @@ fn main() -> Result<()> {
     let transfer_arg = arg(&args, "--transfer").unwrap_or("full");
     // A transfer of its direct half only: the other halves need not be read.
     let direct_only = matches!(transfer_arg, "none" | "9" | "16");
-    let filtered = |mut prim: Prim, more_excluded: &[&str]| -> Result<CloudStreams> {
+    let filtered = |mut prim: Prim, more_excluded: &[&str]| -> Result<(CloudStreams, Option<Vec<bool>>)> {
         if direct_only {
             for half in ["transferIndirect", "transferReflected"] {
                 prim.attributes
@@ -816,10 +1099,11 @@ fn main() -> Result<()> {
         }
         let count = prim.floats(&["positions", "positionsh"])?.len() / 3;
         let exclude: Vec<&str> = exclude.iter().chain(more_excluded).copied().collect();
-        if let Some(keep) = prim_mask(&prim, count, &only, &exclude)? {
-            prim.retain(&keep);
+        let mask = prim_mask(&prim, count, &only, &exclude)?;
+        if let Some(keep) = &mask {
+            prim.retain(keep);
         }
-        prim.streams()
+        Ok((prim.streams()?, mask))
     };
     let constants = prim.constants();
     // The rig, before the prim's arrays are moved into streams.
@@ -831,8 +1115,10 @@ fn main() -> Result<()> {
             Some(Value::HalfVec(h)) if k > 1 && h.len() == count * 2 * (k as usize - 1));
         prim.skeleton(arg(&args, "--clip").unwrap_or("default"), fps, k, if has_gradients { k - 1 } else { 0 })?
     };
-    let mut streams = filtered(prim, &[])?;
+    let (mut streams, mask) = filtered(prim, &[])?;
     let mut sources = vec![json!({ "source": input, "splats": streams.count })];
+    // Each source cloud's prim mask and where its splats start in the streams.
+    let mut masks: Vec<(Option<Vec<bool>>, usize)> = vec![(mask, 0)];
     if rig.is_some() {
         for f in ["--add", "--cell", "--target", "--thin"] {
             if flag(f) {
@@ -886,8 +1172,9 @@ fn main() -> Result<()> {
         let (more, own) = added.split_once("::").unwrap_or((added, ""));
         let own: Vec<&str> = own.split(',').filter(|t| !t.is_empty()).collect();
         let data = read_layer(more)?;
-        let s = filtered(Prim::read(data.as_ref(), prim_path)?, &own)?;
+        let (s, mask) = filtered(Prim::read(data.as_ref(), prim_path)?, &own)?;
         sources.push(json!({ "source": more, "splats": s.count }));
+        masks.push((mask, streams.count));
         append(&mut streams, s)?;
     }
     let read_s = t.elapsed().as_secs_f32();
@@ -953,25 +1240,57 @@ fn main() -> Result<()> {
         println!("{} distinct (pbr, lobes) words", rows.len());
         return Ok(());
     }
-    let mut packed = pack_streams(&streams, &options)?;
+    // athenea's per-group light clouds (`--light-layer NAME=a.usdc[,b.usdc]`,
+    // one file a source cloud, in the order of the input and its --add):
+    // the same gaussians in the same order, their linear colours the group's
+    // light per unit radiance. Read now, masked as the streams were.
+    let layer_specs = args_all(&args, "--light-layer");
+    let mut layers: Vec<(String, Vec<f32>, Json)> = Vec::new();
+    for spec in &layer_specs {
+        let (name, files) = spec.split_once('=').ok_or_else(|| anyhow!("--light-layer NAME=file.usdc[,more.usdc]"))?;
+        let files: Vec<&str> = files.split(',').collect();
+        if files.len() != masks.len() {
+            bail!("--light-layer {name}: {} files for {} source clouds", files.len(), masks.len());
+        }
+        let (values, check) = read_layer_colours(&files, prim_path, &masks, &streams)?;
+        layers.push((name.to_string(), values, check));
+    }
+    if layers.len() > spark_lib::athl::MAX_GROUPS {
+        bail!("at most {} light groups", spark_lib::athl::MAX_GROUPS);
+    }
+    let (mut packed, kept) = if layers.is_empty() {
+        (pack_streams(&streams, &options)?, Vec::new())
+    } else {
+        pack_streams_kept(&streams, &options)?
+    };
     let source_splats = streams.count;
     drop(streams);
+    // Where each built splat comes from, for the layers.
+    let mut track = (!layers.is_empty()).then(|| SplatSources::identity(source_splats).select(&kept)).transpose()?;
     let drop_backs: Option<f32> = arg(&args, "--drop-backs")
         .map(|t| t.parse())
         .transpose()
         .context("--drop-backs")?;
     let mut dropped_backs = None;
     if let Some(t) = drop_backs {
-        let (kept, dropped) = drop_hidden_backs(&packed, t)?;
+        let before = packed.block.n;
+        let (kept, keep) = drop_hidden_backs_kept(&packed, t)?;
         packed = kept;
-        dropped_backs = Some(dropped);
+        dropped_backs = Some(before - keep.len());
+        if let Some(s) = track.as_mut() {
+            *s = s.select(&keep)?;
+        }
     }
     if let Some(b) = arg(&args, "--box") {
         let v: Vec<f32> = b.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>().context("--box")?;
         if v.len() != 6 {
             bail!("--box takes x0,y0,z0,x1,y1,z1");
         }
-        packed = crop_box(&packed, [v[0], v[1], v[2]], [v[3], v[4], v[5]]);
+        let (cropped, keep) = crop_box_kept(&packed, [v[0], v[1], v[2]], [v[3], v[4], v[5]]);
+        packed = cropped;
+        if let Some(s) = track.as_mut() {
+            *s = s.select(&keep)?;
+        }
     }
     let fill: f32 = arg(&args, "--fill")
         .map_or(Ok(1.0), |f| f.parse())
@@ -984,14 +1303,25 @@ fn main() -> Result<()> {
         cell = Some(cell_for_target(&packed, t.parse().context("--target")?));
     }
     if let Some(c) = cell {
-        packed = reduce_cells(&packed, c, fill)?;
+        let (reduced, runs) = reduce_cells_runs(&packed, c, fill)?;
+        packed = reduced;
+        if let Some(s) = track.as_mut() {
+            *s = s.merge(&runs.members, &runs.starts, &runs.weights)?;
+        }
     }
     let thin: Option<f32> = arg(&args, "--thin")
         .map(|t| t.parse())
         .transpose()
         .context("--thin")?;
     if let Some(r) = thin {
-        packed = reduce_thin(&packed, r)?;
+        let (reduced, runs) = reduce_thin_runs(&packed, r)?;
+        packed = reduced;
+        if let Some(s) = track.as_mut() {
+            *s = s.merge(&runs.members, &runs.starts, &runs.weights)?;
+        }
+    }
+    if let Some(s) = track.as_mut() {
+        *s = s.select(&lod_order(&packed, &options))?;
     }
     let mut file = build_lod(&packed, &options)?;
     // v3 keeps the merged levels' whole coverage (athc::coverage_ratios);
@@ -1012,6 +1342,22 @@ fn main() -> Result<()> {
         write_v3_skinned(&file, compression, rig.as_ref())?
     };
     std::fs::write(output, &bytes)?;
+    let lights = match &track {
+        Some(track) => {
+            let athl_path = arg(&args, "--athl").map(str::to_string).unwrap_or_else(|| {
+                format!("{}.lights.athl", output.trim_end_matches(".athc"))
+            });
+            let sidecar = arg(&args, "--lights-usda").map(std::fs::read_to_string).transpose()?;
+            let opts = LayerOptions {
+                threshold: arg(&args, "--light-threshold").map_or(Ok(1e-4), |v| v.parse()).context("--light-threshold")?,
+                floor: arg(&args, "--light-floor").map_or(Ok(0.0), |v| v.parse()).context("--light-floor")?,
+                verify: arg(&args, "--light-verify").map(str::to_string),
+            };
+            let report = write_athl(&file, &bytes, track, &layers, sidecar.as_deref(), &opts, &athl_path)?;
+            Some(report)
+        }
+        None => None,
+    };
 
     let h = &file.header;
     let mut report = json!({
@@ -1061,6 +1407,9 @@ fn main() -> Result<()> {
         "upAxis": up_axis,
         "seconds": { "read": read_s, "build": build_s },
     });
+    if let Some(l) = lights {
+        report["lights"] = l;
+    }
     if !flag("--v2") {
         let layout = parse_v3(&bytes)?;
         let mut sections = serde_json::Map::new();

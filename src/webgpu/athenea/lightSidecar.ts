@@ -15,6 +15,9 @@
 //     token   athenea:lightGroup:side           left, right, centre
 //     token   athenea:lightGroup:technology     led (default), halogen, xenon, blinker, lightGuide
 //     float   athenea:lightGroup:radiance       the lamp's "on" radiance, nits (default 1)
+//     float   athenea:lightGroup:emissionLuminance  athenea's corvette.lights.usda: the radiance, where
+//                                               `radiance` is not given (its per-group bakes are per unit
+//                                               of it, the material's emission colour baked in)
 //     color3f athenea:lightGroup:color          rgb (default 1, 1, 1)
 //     float   athenea:lightGroup:temperatureK   blackbody colour (times `color`); xenon/halogen: the final one
 //     float   athenea:lightGroup:startTemperatureK  xenon's (default 4300), halogen's cold glow (default 1000)
@@ -27,6 +30,9 @@
 //     bool    athenea:lightGroup:initialOn      on at load (level 1)
 //     asset   shaping:ies:file                  076's author profile (read, not yet evaluated)
 //   a state:    dictionary athenea:lightState:targets = { double <group> = level }
+//               or double athenea:lightState:target:<group> = level (athenea's form: USD has no
+//               dictionary-valued attributes); any prim under a `LightStates` scope is a state,
+//               one with no targets every group off
 //               token athenea:lightState:base   another state its targets start from
 //   a rule:     token athenea:lightRule:when    condition: group names, state:<name>, !, &&, ||, ( )
 //               token athenea:lightRule:target  (or token[]) the groups it acts on
@@ -233,7 +239,7 @@ function groupOf(
     function: fn,
     side: str(get("side"), ""),
     technology,
-    radiance: num(get("radiance"), 1),
+    radiance: num(get("radiance"), num(get("emissionLuminance"), 1)),
     color: rgb(get("color")) ?? [1, 1, 1],
     temperatureK: typeof t === "number" ? t : null,
     startTemperatureK: num(
@@ -284,13 +290,25 @@ export function readLightSidecar(layer: UsdLayer): LightSidecar {
       out.groups.push(groupOf(p, out.groups.length, out.warnings));
     }
     const targets = attr(p, `${S}targets`);
-    if (targets !== undefined) {
+    const segments = p.path.split("/");
+    if (
+      targets !== undefined ||
+      hasPrefix(p, `${S}target:`) ||
+      segments[segments.length - 2] === "LightStates"
+    ) {
       const t: Record<string, number> = {};
       if (targets && typeof targets === "object" && !Array.isArray(targets)) {
         for (const [k, v] of Object.entries(targets)) {
           if (typeof v === "number") t[k] = v;
           else if (typeof v === "boolean") t[k] = v ? 1 : 0;
         }
+      }
+      for (const [k, prop] of p.properties) {
+        if (!k.startsWith(`${S}target:`)) continue;
+        const v = prop.value;
+        if (typeof v === "number") t[k.slice(`${S}target:`.length)] = v;
+        else if (typeof v === "boolean")
+          t[k.slice(`${S}target:`.length)] = v ? 1 : 0;
       }
       out.states.push({ name: p.name, path: p.path, targets: t });
       const base = attr(p, `${S}base`);

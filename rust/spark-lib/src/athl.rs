@@ -596,19 +596,50 @@ pub fn sparse_layers(
 /// LoD merges colours (lod_common.slang: opacity x the area of the two
 /// longest axes).
 pub fn virtual_values(file: &AthcFile, tree: &VirtualTree, per_splat: &[f32], components: u32) -> Result<Vec<f32>> {
+    virtual_values_weighted(file, tree, per_splat, components, None)
+}
+
+/// Each splat's colour weight in a LoD merge: opacity x the area of its two
+/// longest axes.
+pub fn splat_weights(file: &AthcFile) -> Vec<f32> {
+    let splats = file.splats();
+    (0..file.header.count as usize)
+        .map(|i| {
+            let opacity = splats.positions[4 * i + 3];
+            let s = &splats.shape[4 * i..4 * i + 4];
+            let mut axes = [low_half(s[1]).exp(), high_half(s[1]).exp(), low_half(s[2]).exp()];
+            axes.sort_by(|a, b| b.total_cmp(a));
+            opacity * axes[0] * axes[1]
+        })
+        .collect()
+}
+
+/// [`virtual_values`] with the splats' weights given (`None`: their own,
+/// [`splat_weights`]). A cut cloud (`athc::truncate_levels`) passes the
+/// summed weights of the original splats under each element, so that its
+/// merged nodes are the same means as the uncut cloud's.
+pub fn virtual_values_weighted(
+    file: &AthcFile,
+    tree: &VirtualTree,
+    per_splat: &[f32],
+    components: u32,
+    weights: Option<&[f32]>,
+) -> Result<Vec<f32>> {
     let c = components as usize;
     let n = file.header.count as usize;
     ensure!(per_splat.len() == n * c, "a layer of {} values for {} splats x {}", per_splat.len(), n, c);
     ensure!(tree.splat_base % CHUNK_SPLATS == 0, "the tree is not page-aligned");
-    let splats = file.splats();
-    let mut weight = vec![0f32; n];
-    for (i, w) in weight.iter_mut().enumerate() {
-        let opacity = splats.positions[4 * i + 3];
-        let s = &splats.shape[4 * i..4 * i + 4];
-        let mut axes = [low_half(s[1]).exp(), high_half(s[1]).exp(), low_half(s[2]).exp()];
-        axes.sort_by(|a, b| b.total_cmp(a));
-        *w = opacity * axes[0] * axes[1];
-    }
+    let own;
+    let weight = match weights {
+        Some(w) => {
+            ensure!(w.len() == n, "{} weights for {} splats", w.len(), n);
+            w
+        }
+        None => {
+            own = splat_weights(file);
+            &own[..]
+        }
+    };
     let mut out = vec![0f32; (tree.splat_base as usize + n) * c];
     out[tree.splat_base as usize * c..].copy_from_slice(per_splat);
     // Prefix sums over splats in file order: a merged node's splats are
@@ -640,6 +671,152 @@ pub fn virtual_values(file: &AthcFile, tree: &VirtualTree, per_splat: &[f32], co
         }
     }
     Ok(out)
+}
+
+/// Where each splat of a built cloud came from, through every step that
+/// selects, reorders or merges splats (`usd-athc`: validation, hidden backs,
+/// a box, cells, thinning, the LoD's order): splat j is the weighted mean of
+/// sources `index[offsets[j]..offsets[j + 1]]` (indices into the source
+/// cloud), weights summing to 1. A layer baked over the source cloud's
+/// gaussians, in its order (athenea's per-group clouds), follows the built
+/// cloud through [`SplatSources::gather`] exactly as its colours did.
+#[derive(Clone, Debug, Default)]
+pub struct SplatSources {
+    pub offsets: Vec<u32>,
+    pub index: Vec<u32>,
+    pub weight: Vec<f32>,
+}
+
+impl SplatSources {
+    /// `n` splats, each its own source.
+    pub fn identity(n: usize) -> Self {
+        Self { offsets: (0..=n as u32).collect(), index: (0..n as u32).collect(), weight: vec![1.0; n] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn sources(&self, j: usize) -> std::ops::Range<usize> {
+        self.offsets[j] as usize..self.offsets[j + 1] as usize
+    }
+
+    /// The splats `keep` (indices into these, any order, repeats allowed):
+    /// a filter or a permutation.
+    pub fn select(&self, keep: &[u32]) -> Result<Self> {
+        let mut out = Self { offsets: Vec::with_capacity(keep.len() + 1), ..Default::default() };
+        out.offsets.push(0);
+        for &k in keep {
+            ensure!((k as usize) < self.len(), "select: splat {k} of {}", self.len());
+            let r = self.sources(k as usize);
+            out.index.extend_from_slice(&self.index[r.clone()]);
+            out.weight.extend_from_slice(&self.weight[r]);
+            out.offsets.push(out.index.len() as u32);
+        }
+        Ok(out)
+    }
+
+    /// Each output splat the weighted mean of a run of these
+    /// (`athc_build::SplatRuns`: members, run starts, weights).
+    pub fn merge(&self, members: &[u32], starts: &[u32], weights: &[f32]) -> Result<Self> {
+        ensure!(members.len() == weights.len(), "merge: members and weights differ");
+        let runs = starts.len();
+        let mut out = Self { offsets: Vec::with_capacity(runs + 1), ..Default::default() };
+        out.offsets.push(0);
+        for r in 0..runs {
+            let a = starts[r] as usize;
+            let b = if r + 1 < runs { starts[r + 1] as usize } else { members.len() };
+            let total: f64 = weights[a..b].iter().map(|&w| w.max(0.0) as f64).sum();
+            for m in a..b {
+                // A run of no weight (all transparent): an even mean.
+                let share = if total > 0.0 { weights[m].max(0.0) as f64 / total } else { 1.0 / (b - a) as f64 };
+                if share == 0.0 {
+                    continue;
+                }
+                let k = members[m] as usize;
+                ensure!(k < self.len(), "merge: splat {k} of {}", self.len());
+                for s in self.sources(k) {
+                    out.index.push(self.index[s]);
+                    out.weight.push((share * self.weight[s] as f64) as f32);
+                }
+            }
+            out.offsets.push(out.index.len() as u32);
+        }
+        Ok(out)
+    }
+
+    /// A per-source array (`components` a source) as a per-splat one.
+    pub fn gather(&self, values: &[f32], components: usize) -> Result<Vec<f32>> {
+        let c = components;
+        let max = self.index.iter().copied().max().map_or(0, |m| m as usize + 1);
+        ensure!(values.len() >= max * c, "gather: {} values for sources up to {}", values.len() / c.max(1), max);
+        let mut out = vec![0f32; self.len() * c];
+        for j in 0..self.len() {
+            for s in self.sources(j) {
+                let (i, w) = (self.index[s] as usize, self.weight[s]);
+                for k in 0..c {
+                    out[j * c + k] += w * values[i * c + k];
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// For each element of a cut cloud ([`crate::athc::cut_sources`]: the
+/// original splats `[lo, hi)` each element stands for), the original
+/// per-splat layer merged as a LoD merges colours, and the summed weights
+/// (for [`virtual_values_weighted`] over the cut file).
+pub fn cut_values(original: &AthcFile, ranges: &[[u32; 2]], per_splat: &[f32], components: usize) -> (Vec<f32>, Vec<f32>) {
+    let c = components;
+    let w = splat_weights(original);
+    let mut values = vec![0f32; ranges.len() * c];
+    let mut sums = vec![0f32; ranges.len()];
+    for (e, r) in ranges.iter().enumerate() {
+        let mut sw = 0f64;
+        let mut sv = vec![0f64; c];
+        for i in r[0] as usize..r[1] as usize {
+            sw += w[i] as f64;
+            for k in 0..c {
+                sv[k] += w[i] as f64 * per_splat[i * c + k] as f64;
+            }
+        }
+        sums[e] = sw as f32;
+        if sw > 0.0 {
+            for k in 0..c {
+                values[e * c + k] = (sv[k] / sw) as f32;
+            }
+        }
+    }
+    (values, sums)
+}
+
+impl AthlFile {
+    /// The layers of one group and kind, dense over the virtual elements
+    /// (`components` each; 0 where no block is kept), or None without any.
+    pub fn dense(&self, group: u16, kind: u16) -> Option<(u32, Vec<f32>)> {
+        let mine: Vec<&AthlLayer> = self.layers.iter().filter(|l| l.group == group && l.kind == kind).collect();
+        let c = mine.first()?.components as usize;
+        let mut out = vec![0f32; self.element_count as usize * c];
+        for l in mine {
+            for (b, &block) in l.blocks.iter().enumerate() {
+                let first = l.chunk as usize * CHUNK_SPLATS as usize + block as usize * BLOCK_SPLATS as usize;
+                for e in 0..BLOCK_SPLATS as usize {
+                    if first + e >= self.element_count as usize {
+                        break;
+                    }
+                    for k in 0..c {
+                        out[(first + e) * c + k] = f16::from_bits(l.data[(b * BLOCK_SPLATS as usize + e) * c + k]).to_f32();
+                    }
+                }
+            }
+        }
+        Some((c as u32, out))
+    }
 }
 
 // --- the direct term, as the shader evaluates it ----------------------------
@@ -757,6 +934,169 @@ pub fn validate(file: &AthlFile) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shell 3 mm thick (two faces on one grid, normals opposed, the
+    /// inner one dark and closed), shuffled, with some empty slots: the
+    /// cloud usd-athc builds from athenea's bakes.
+    fn shell() -> crate::athc_build::CloudStreams {
+        use crate::athc_build::{CloudStreams, SH0};
+        let mut s = CloudStreams { linear: true, coefficients: 1, ..Default::default() };
+        let mut rows = Vec::new();
+        for face in 0..2 {
+            for i in 0..90 {
+                for j in 0..90 {
+                    rows.push((face, i, j));
+                }
+            }
+        }
+        // A fixed shuffle (an LCG), so the source order is not Morton's.
+        let mut x = 12345u64;
+        for k in (1..rows.len()).rev() {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rows.swap(k, (x >> 33) as usize % (k + 1));
+        }
+        for (k, &(face, i, j)) in rows.iter().enumerate() {
+            let p = [i as f32 * 0.004, j as f32 * 0.004 + 0.0003 * (i % 7) as f32, face as f32 * 0.003];
+            s.count += 1;
+            s.positions.extend_from_slice(&p);
+            s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+            s.scales.extend_from_slice(&[0.0025 + 0.0001 * (j % 5) as f32, 0.0022, 0.0003]);
+            // Every 37th slot empty (dropped by validation).
+            s.opacities.push(if k % 37 == 0 { 0.0 } else { 0.4 + 0.5 * ((i * 7 + j * 3) % 11) as f32 / 11.0 });
+            s.normals.extend_from_slice(&[0.0, 0.0, if face == 1 { 1.0 } else { -1.0 }]);
+            let colour = [0.1 + 0.8 * i as f32 / 90.0, 0.2 + 0.5 * j as f32 / 90.0, 0.3 + 0.2 * face as f32];
+            s.sh.extend(colour.map(|c| (c - 0.5) / SH0));
+            // The outer face (z = 3 mm) open, the inner one closed.
+            let mut direct = [0.0f32; 16];
+            direct[0] = if face == 1 { 1.0 } else { 0.1 };
+            s.transfer_direct.extend_from_slice(&direct);
+        }
+        s
+    }
+
+    /// The base colours of a stream (a light layer that is the base itself).
+    fn base_colours(s: &crate::athc_build::CloudStreams) -> Vec<f32> {
+        (0..s.count).flat_map(|i| (0..3).map(move |c| 0.5 + crate::athc_build::SH0 * s.sh[i * 3 + c])).collect()
+    }
+
+    fn file_base(b: &crate::athc::AthcBlock, i: usize) -> [f32; 3] {
+        let s = &b.shape[4 * i..4 * i + 4];
+        [high_half(s[2]), low_half(s[3]), high_half(s[3])]
+    }
+
+    /// usd-athc's pipeline with the splats' sources tracked: validation,
+    /// hidden backs, thinning (optional), the LoD's order.
+    fn built(thin: Option<f32>) -> (crate::athc_build::CloudStreams, AthcFile, SplatSources, usize) {
+        use crate::athc_build::*;
+        let s = shell();
+        let o = BuildOptions { transfer: TransferKeep::Count(16), ..Default::default() };
+        let (mut packed, kept) = pack_streams_kept(&s, &o).unwrap();
+        let mut track = SplatSources::identity(s.count).select(&kept).unwrap();
+        let before = packed.block.n;
+        let (p, keep) = drop_hidden_backs_kept(&packed, 0.004).unwrap();
+        packed = p;
+        let dropped = before - keep.len();
+        track = track.select(&keep).unwrap();
+        if let Some(r) = thin {
+            let (p, runs) = reduce_thin_runs(&packed, r).unwrap();
+            packed = p;
+            track = track.merge(&runs.members, &runs.starts, &runs.weights).unwrap();
+        }
+        track = track.select(&lod_order(&packed, &o)).unwrap();
+        let file = build_lod(&packed, &o).unwrap();
+        (s, file, track, dropped)
+    }
+
+    #[test]
+    fn a_layer_that_is_the_base_follows_the_build() {
+        for thin in [None, Some(3.0)] {
+            let (s, file, track, dropped) = built(thin);
+            let n = file.header.count as usize;
+            assert_eq!(track.len(), n);
+            assert!(dropped > 3000, "the closed inner face is dropped ({dropped})");
+            let layer = track.gather(&base_colours(&s), 3).unwrap();
+            let splats = file.splats();
+            let mut worst = 0f32;
+            for i in 0..n {
+                let b = file_base(&splats, i);
+                for c in 0..3 {
+                    worst = worst.max((layer[3 * i + c] - b[c]).abs());
+                }
+            }
+            // Within the file's f16 colour (and thinning's f16 inputs).
+            assert!(worst < 2e-3, "thin {thin:?}: layer vs base colour {worst}");
+            // Merged nodes: the weighted mean, as the LoD merged the colour.
+            let tree = VirtualTree::of_file(&file, true).unwrap();
+            let virt = virtual_values(&file, &tree, &layer, 3).unwrap();
+            assert_eq!(virt.len(), (tree.splat_base as usize + n) * 3);
+            let merged = crate::athc::merged_block(&file, &tree);
+            let mut worst = 0f32;
+            for m in (tree.synth_root as usize)..tree.merged as usize {
+                let b = file_base(&merged, m);
+                for c in 0..3 {
+                    worst = worst.max((virt[3 * m + c] - b[c]).abs());
+                }
+            }
+            assert!(tree.merged > 100);
+            assert!(worst < 3e-3, "merged nodes vs the levels' colours {worst}");
+        }
+    }
+
+    #[test]
+    fn a_cut_carries_its_layers() {
+        let (s, file, track, _) = built(None);
+        let layer = track.gather(&base_colours(&s), 3).unwrap();
+        let keep = file.levels.len() - 1;
+        let ranges = crate::athc::cut_sources(&file, keep);
+        let cut = crate::athc::truncate_levels(&file, keep).unwrap();
+        assert_eq!(ranges.len(), cut.header.count as usize);
+        assert_eq!(ranges.last().unwrap()[1], file.header.count);
+        let (values, weights) = cut_values(&file, &ranges, &layer, 3);
+        let cut_splats = cut.splats();
+        let mut worst = 0f32;
+        for e in 0..ranges.len() {
+            let b = file_base(&cut_splats, e);
+            for c in 0..3 {
+                worst = worst.max((values[3 * e + c] - b[c]).abs());
+            }
+        }
+        assert!(worst < 3e-3, "cut elements vs their colours {worst}");
+        // Its merged nodes (the uncut cloud's coarser levels, the first in
+        // the virtual order): the same means as the uncut cloud's.
+        let (t0, t1) = (VirtualTree::of_file(&file, true).unwrap(), VirtualTree::of_file(&cut, true).unwrap());
+        assert!(t1.merged > 0 && t1.merged < t0.merged);
+        let v0 = virtual_values(&file, &t0, &layer, 3).unwrap();
+        let v1 = virtual_values_weighted(&cut, &t1, &values, 3, Some(&weights)).unwrap();
+        for m in 0..t1.merged as usize * 3 {
+            assert!((v0[m] - v1[m]).abs() < 1e-5, "merged {m}: {} vs {}", v0[m], v1[m]);
+        }
+        // And the crease-aware cut, element by element.
+        let (crease, stats) = crate::athc::truncate_creases(&file, keep, 0.0, 1).unwrap();
+        assert_eq!(stats.sources.len(), crease.header.count as usize);
+        let (cv, _) = cut_values(&file, &stats.sources, &layer, 3);
+        let cs = crease.splats();
+        let mut worst = 0f32;
+        for e in 0..stats.sources.len() {
+            let b = file_base(&cs, e);
+            for c in 0..3 {
+                worst = worst.max((cv[3 * e + c] - b[c]).abs());
+            }
+        }
+        assert!(worst < 3e-3, "crease cut elements vs their colours {worst}");
+    }
+
+    #[test]
+    fn dense_reads_back_the_sparse_layers() {
+        let f = sample();
+        let (c, d) = f.dense(1, KIND_INDIRECT).unwrap();
+        assert_eq!(c, 3);
+        for i in [5usize, 300, 66_000, 69_999] {
+            assert_eq!(d[i * 3], 0.25);
+            assert_eq!(d[i * 3 + 2], 2.0);
+        }
+        assert_eq!(d.iter().filter(|v| **v != 0.0).count(), 8);
+        assert!(f.dense(3, KIND_INDIRECT).is_none());
+    }
 
     fn sample() -> AthlFile {
         let n = 70_000u32;

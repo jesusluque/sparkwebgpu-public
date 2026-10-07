@@ -524,6 +524,13 @@ fn transfer_layout(s: &CloudStreams, keep: TransferKeep) -> Result<(u32, u32, u3
 /// streams -> records -> validate -> decode: the packed cloud athenea's
 /// `CloudLoader::upload(SplatStreams)` makes, compacted.
 pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
+    Ok(pack_streams_kept(s, o)?.0)
+}
+
+/// [`pack_streams`], and the stream index of each packed record (those that
+/// passed validation, in order): what a per-splat array beside the streams
+/// (a light layer, `athl`) needs to follow the cloud.
+pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCloud, Vec<u32>)> {
     let n = s.count;
     let need = |name: &str, v: &[f32], per: usize| -> Result<()> {
         if !v.is_empty() && v.len() != n * per {
@@ -598,6 +605,7 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
     let mut lo = [f32::INFINITY; 3];
     let mut hi = [f32::NEG_INFINITY; 3];
     let mut dropped = 0;
+    let mut kept: Vec<u32> = Vec::with_capacity(n);
     let mut values = vec![0.0f32; transfer_count as usize];
     for i in 0..n {
         let p = [
@@ -622,6 +630,7 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
             dropped += 1;
             continue;
         }
+        kept.push(i as u32);
         b.n += 1;
         b.positions
             .extend_from_slice(&[p[0], p[1], p[2], saturate(a)]);
@@ -757,18 +766,21 @@ pub fn pack_streams(s: &CloudStreams, o: &BuildOptions) -> Result<PackedCloud> {
     if skin_out_of_range > 0 {
         eprintln!("warning: {skin_out_of_range} splats name a joint past the skeleton or a weight outside [0, 1]");
     }
-    Ok(PackedCloud {
-        block: b,
-        rest_per_colour: keep as u32,
-        sh_words: sh_words as u32,
-        transfer_count,
-        linear: s.linear,
-        bounds_min: lo,
-        bounds_max: hi,
-        dropped,
-        skin_influences: k_skin as u32,
-        skin_gradient_words: g_skin as u32,
-    })
+    Ok((
+        PackedCloud {
+            block: b,
+            rest_per_colour: keep as u32,
+            sh_words: sh_words as u32,
+            transfer_count,
+            linear: s.linear,
+            bounds_min: lo,
+            bounds_max: hi,
+            dropped,
+            skin_influences: k_skin as u32,
+            skin_gradient_words: g_skin as u32,
+        },
+        kept,
+    ))
 }
 
 fn normalize4(q: [f32; 4]) -> [f32; 4] {
@@ -1209,18 +1221,20 @@ fn extras_merge(
 
 /// `LodBuilder::build` and `writeAthc`'s header: the `.athc` of a packed
 /// cloud, its splats in Morton order, its levels merged.
-pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
+/// The order [`build_lod`] puts `cloud`'s splats in (the file's splat order:
+/// `file.splats()` record k is `cloud.block` record `order[k]`).
+pub fn lod_order(cloud: &PackedCloud, o: &BuildOptions) -> Vec<u32> {
+    let (codes, _, _) = lod_codes(cloud, o);
+    let mut order: Vec<u32> = (0..codes.len() as u32).collect();
+    order.sort_by_key(|&i| codes[i as usize]);
+    order
+}
+
+/// The octree's frame and each splat's Morton code in it: (codes, lower
+/// bound, extent).
+fn lod_codes(cloud: &PackedCloud, o: &BuildOptions) -> (Vec<u32>, [f32; 3], f32) {
     let src = &cloud.block;
     let n = src.n;
-    if n == 0 {
-        bail!("an empty cloud has no levels of detail");
-    }
-    if !src.emission.is_empty() {
-        bail!("emission is not built here yet");
-    }
-    if !src.lobes.is_empty() && src.pbr.is_empty() {
-        bail!("lobes without the material: a .athc keeps them only beside pbr");
-    }
     // The octree's frame: world-aligned from the lower bound, or turned
     // and shifted (`frame_seed`).
     let (turn, shift) = if o.frame_seed == 0 {
@@ -1252,8 +1266,6 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
     for k in 0..3 {
         lo[k] -= shift[k] * extent;
     }
-
-    // Morton order: a stable sort of the codes, as the radix sort is.
     let codes: Vec<u32> = (0..n)
         .map(|i| {
             let p = framed(i);
@@ -1261,6 +1273,23 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
             morton30([(p[0] - lo[0]) / e, (p[1] - lo[1]) / e, (p[2] - lo[2]) / e])
         })
         .collect();
+    (codes, lo, extent)
+}
+
+pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
+    let src = &cloud.block;
+    let n = src.n;
+    if n == 0 {
+        bail!("an empty cloud has no levels of detail");
+    }
+    if !src.emission.is_empty() {
+        bail!("emission is not built here yet");
+    }
+    if !src.lobes.is_empty() && src.pbr.is_empty() {
+        bail!("lobes without the material: a .athc keeps them only beside pbr");
+    }
+    // Morton order: a stable sort of the codes, as the radix sort is.
+    let (codes, lo, extent) = lod_codes(cloud, o);
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| codes[i as usize]);
     let keys: Vec<u32> = order.iter().map(|&i| codes[i as usize]).collect();
@@ -1451,6 +1480,35 @@ pub fn cell_for_target(cloud: &PackedCloud, target: usize) -> f32 {
     large
 }
 
+/// Which input splats each output splat of a reduction was made from:
+/// output j is `members[starts[j]..starts[j + 1]]` (the last runs to the
+/// end), each with its weight in the merged colour (opacity x the area of
+/// the two longest axes, as the moments and `reduce_thin` weigh it). What a
+/// per-splat array beside the cloud (a light layer) needs to be merged as
+/// the base colour was.
+#[derive(Clone, Debug, Default)]
+pub struct SplatRuns {
+    pub members: Vec<u32>,
+    pub starts: Vec<u32>,
+    pub weights: Vec<f32>,
+}
+
+/// A packed splat's colour weight: opacity x the area of its two longest axes.
+fn colour_weight(b: &AthcBlock, i: usize) -> f32 {
+    let sh = &b.shape[i * 4..i * 4 + 4];
+    let sc = [f16_of(sh[1] & 0xffff).exp(), f16_of(sh[1] >> 16).exp(), f16_of(sh[2] & 0xffff).exp()];
+    let smallest = sc[0].min(sc[1]).min(sc[2]);
+    b.positions[i * 4 + 3].max(0.0) * sc[0] * sc[1] * sc[2] / smallest.max(1e-20)
+}
+
+fn runs_of(src: &AthcBlock, order: &[u32], starts: &[u32]) -> SplatRuns {
+    SplatRuns {
+        members: order.to_vec(),
+        starts: starts.to_vec(),
+        weights: order.iter().map(|&i| colour_weight(src, i as usize)).collect(),
+    }
+}
+
 /// A cloud made lighter for the web: the splats are grouped by a grid of
 /// cells of side `cell` (from the cloud's lower bound), and each group is
 /// merged into one Gaussian as a LoD level merges one (athenea's moments; the
@@ -1461,6 +1519,11 @@ pub fn cell_for_target(cloud: &PackedCloud, target: usize) -> f32 {
 /// up); its opacity is the merged weight over the widened area, as `finalize`
 /// computes it, at most 0.99. [`cell_for_target`] finds the cell for a count.
 pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedCloud> {
+    Ok(reduce_cells_runs(cloud, cell, fill)?.0)
+}
+
+/// [`reduce_cells`], and the runs each merged splat was made from.
+pub fn reduce_cells_runs(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<(PackedCloud, SplatRuns)> {
     let src = &cloud.block;
     let n = src.n;
     if !src.emission.is_empty() {
@@ -1499,6 +1562,7 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
     let sh_words = cloud.sh_words as usize;
     let moments = leaf_moments(&splats, &level, &l, sh_words);
     let mut block = finalize(&moments, level.groups, &l, sh_words);
+    let runs = runs_of(src, &order, &level.starts);
     if fill != 1.0 {
         let f = fill.max(1e-3);
         for g in 0..block.n {
@@ -1565,7 +1629,7 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
             &splats,
         );
     }
-    Ok(PackedCloud {
+    Ok((PackedCloud {
         block,
         rest_per_colour: cloud.rest_per_colour,
         sh_words: cloud.sh_words,
@@ -1576,7 +1640,7 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
         dropped: cloud.dropped,
         skin_influences: cloud.skin_influences,
         skin_gradient_words: cloud.skin_gradient_words,
-    })
+    }, runs))
 }
 
 /// A cloud thinned for the web to about one splat in `ratio`: the splats in
@@ -1589,6 +1653,11 @@ pub fn reduce_cells(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<PackedC
 /// [`reduce_cells`], every kept Gaussian has a real splat's shape on the
 /// surface, so a surface cut by the grid shows no seams or moiré.
 pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
+    Ok(reduce_thin_runs(cloud, ratio)?.0)
+}
+
+/// [`reduce_thin`], and the runs each kept splat stands for.
+pub fn reduce_thin_runs(cloud: &PackedCloud, ratio: f32) -> Result<(PackedCloud, SplatRuns)> {
     let src = &cloud.block;
     let n = src.n;
     if !src.emission.is_empty() {
@@ -1651,6 +1720,7 @@ pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
                 .unwrap() as u32
         })
         .collect();
+    let runs = runs_of(src, &order, &starts);
     let mut block = reorder(&splats, &reps);
     block.n = target; // reorder keeps a permutation's count
     for j in 0..target {
@@ -1719,7 +1789,7 @@ pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
             &splats,
         );
     }
-    Ok(PackedCloud {
+    Ok((PackedCloud {
         block,
         rest_per_colour: cloud.rest_per_colour,
         sh_words: cloud.sh_words,
@@ -1730,7 +1800,7 @@ pub fn reduce_thin(cloud: &PackedCloud, ratio: f32) -> Result<PackedCloud> {
         dropped: cloud.dropped,
         skin_influences: cloud.skin_influences,
         skin_gradient_words: cloud.skin_gradient_words,
-    })
+    }, runs))
 }
 
 /// How open a splat is to the environment: its shadow bits' open
@@ -1761,6 +1831,12 @@ fn exposure(b: &AthcBlock, i: usize) -> Option<f32> {
 /// moiré bands. A panel open on both sides keeps both faces. Returns the
 /// cloud and how many splats were dropped.
 pub fn drop_hidden_backs(cloud: &PackedCloud, thickness: f32) -> Result<(PackedCloud, usize)> {
+    let (kept, keep) = drop_hidden_backs_kept(cloud, thickness)?;
+    Ok((kept, cloud.block.n - keep.len()))
+}
+
+/// [`drop_hidden_backs`], and the input index of each splat kept.
+pub fn drop_hidden_backs_kept(cloud: &PackedCloud, thickness: f32) -> Result<(PackedCloud, Vec<u32>)> {
     let src = &cloud.block;
     let n = src.n;
     if src.normals.is_empty() {
@@ -1818,7 +1894,6 @@ pub fn drop_hidden_backs(cloud: &PackedCloud, thickness: f32) -> Result<(PackedC
         })
         .map(|i| i as u32)
         .collect();
-    let dropped = n - keep.len();
     let mut block = reorder(src, &keep);
     block.n = keep.len();
     Ok((
@@ -1834,13 +1909,18 @@ pub fn drop_hidden_backs(cloud: &PackedCloud, thickness: f32) -> Result<(PackedC
             skin_influences: cloud.skin_influences,
             skin_gradient_words: cloud.skin_gradient_words,
         },
-        dropped,
+        keep,
     ))
 }
 
 /// The splats whose centres lie inside the box `lo`..`hi` (`usd-athc --box`):
 /// a small piece of a large bake, every stream kept, for tests.
 pub fn crop_box(cloud: &PackedCloud, lo: [f32; 3], hi: [f32; 3]) -> PackedCloud {
+    crop_box_kept(cloud, lo, hi).0
+}
+
+/// [`crop_box`], and the input index of each splat kept.
+pub fn crop_box_kept(cloud: &PackedCloud, lo: [f32; 3], hi: [f32; 3]) -> (PackedCloud, Vec<u32>) {
     let src = &cloud.block;
     let keep: Vec<u32> = (0..src.n)
         .filter(|&i| (0..3).all(|k| src.positions[i * 4 + k] >= lo[k] && src.positions[i * 4 + k] <= hi[k]))
@@ -1848,7 +1928,7 @@ pub fn crop_box(cloud: &PackedCloud, lo: [f32; 3], hi: [f32; 3]) -> PackedCloud 
         .collect();
     let mut block = reorder(src, &keep);
     block.n = keep.len();
-    PackedCloud { block, ..cloud.clone() }
+    (PackedCloud { block, ..cloud.clone() }, keep)
 }
 
 #[cfg(test)]

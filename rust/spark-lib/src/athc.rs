@@ -1458,6 +1458,27 @@ pub struct CreaseCut {
     /// file's levels, from `keep`), then real splats.
     pub per_level: Vec<usize>,
     pub splats: usize,
+    /// The original splats `[lo, hi)` each element of the cut stands for.
+    #[serde(skip)]
+    pub sources: Vec<[u32; 2]>,
+}
+
+/// The splats (file order, `[lo, hi)`) under group `g` of level index `l`
+/// (into `file.levels`): the run of its finest groups.
+pub fn group_splats(file: &AthcFile, l: usize, g: usize) -> [u32; 2] {
+    let (finest_level, finest) = file.levels.last().map(|(r, b)| (*r, &b.tail)).expect("levels");
+    let (level, code) = (file.levels[l].0, file.levels[l].1.tail[g]);
+    let shift = 3 * (finest_level - level);
+    let lo = finest.partition_point(|&c| (c >> shift) < code);
+    let hi = finest.partition_point(|&c| (c >> shift) <= code);
+    let n = file.header.count;
+    let start = |k: usize| file.starts.get(k).copied().unwrap_or(n);
+    [start(lo), start(hi)]
+}
+
+/// [`truncate_levels`]' elements as the original splats each stands for.
+pub fn cut_sources(file: &AthcFile, keep: usize) -> Vec<[u32; 2]> {
+    (0..file.levels[keep].1.n).map(|g| group_splats(file, keep, g)).collect()
 }
 
 /// [`truncate_levels`], aware of creases: a group of level `keep` whose
@@ -1516,7 +1537,7 @@ pub fn truncate_creases(file: &AthcFile, keep: usize, max_spread: f32, max_depth
             b
         })
         .collect();
-    let mut stats = CreaseCut { per_level: vec![0; levels - keep], splats: 0 };
+    let mut stats = CreaseCut { per_level: vec![0; levels - keep], splats: 0, sources: Vec::with_capacity(cut.len()) };
     let mut splats = AthcBlock::default();
     let mut codes = Vec::with_capacity(cut.len());
     let parent_level = full.levels[keep - 1].0;
@@ -1541,8 +1562,10 @@ pub fn truncate_creases(file: &AthcFile, keep: usize, max_spread: f32, max_depth
         codes.push(code >> (3 * (level - parent_level)));
         if l == usize::MAX {
             stats.splats += 1;
+            stats.sources.push([i as u32, i as u32 + 1]);
         } else {
             stats.per_level[l - keep] += 1;
+            stats.sources.push(group_splats(&full, l, i));
         }
         run = match run {
             Some((rl, lo, hi)) if rl == l && hi == i => Some((rl, lo, hi + 1)),

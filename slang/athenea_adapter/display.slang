@@ -82,6 +82,16 @@ public float srgbDecodeOf(float x) {
     return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
 }
 
+/// The ACES parameters copied out of their buffer in one load. Read in place,
+/// their float3x3 members were indexed component by component in device
+/// memory, which WebKit's WGSL→Metal translation cannot compile (Safari:
+/// "no viable overloaded operator[] for type 'const device PackedVec3<float>'"),
+/// and the invalid pipeline voided the whole effect chain.
+[noinline]
+Aces2Params loadAces2Params(StructuredBuffer<Aces2Params> aces) {
+    return aces[0];
+}
+
 /// display.slang's `displayColour`, with its ACES tables and headroom given.
 public float3 displayColourOf(float4 premultiplied, float3 background, float exposure, uint view, uint display,
                               float peakScale, StructuredBuffer<Aces2Params> aces, StructuredBuffer<float> tables) {
@@ -91,7 +101,7 @@ public float3 displayColourOf(float4 premultiplied, float3 background, float exp
         c = agx(c);
     }
     if (view == 2) {
-        const Aces2Params p = aces[0];
+        const Aces2Params p = loadAces2Params(aces);
         return transferEncodeOf(outputTransformFwd(mul(c, p.sceneToAP0), p, tables), display, peakScale);
     }
     if (display == 2 || display == 3) {
@@ -124,6 +134,10 @@ void atheneaDisplay(uint3 tid: SV_DispatchThreadID) {
 
 ConstantBuffer<AcesPrepareParams> prepare;
 RWStructuredBuffer<Aces2Params>   acesParamsOut;
+// The same buffer, read-only, for the passes that only read it: Slang reads
+// a read-write buffer's matrices in place, component by component, which
+// WebKit's Metal translation rejects (see loadAces2Params).
+StructuredBuffer<Aces2Params>     acesParamsIn;
 RWStructuredBuffer<float>         acesTablesOut;
 
 Chromaticities limitingPrimaries() { return prepare.limiting == 1 ? kP3D65 : kRec709; }
@@ -164,7 +178,7 @@ void acesPrepareParams(uint3 tid: SV_DispatchThreadID) {
 void acesPrepareTables(uint3 tid: SV_DispatchThreadID) {
     const int i = int(tid.x);
     if (i >= kTableSize) return;
-    const Aces2Params p = acesParamsOut[0];
+    const Aces2Params p = loadAces2Params(acesParamsIn);
     acesTablesOut[kReachOffset + kBaseIndex + i] =
         reachMForHue(float(i) * 360.0 / float(kTableSize), p.reach, p.limit_J_max);
     float3 limitRGB[kTotalCorners];

@@ -181,7 +181,10 @@ describe.skipIf(!device)("athenea display transform", () => {
         encoded: 1,
       });
       const want = await reference(view, display, exposure);
-      expect(worst(got, want)).toBeLessThan(2e-6);
+      // ACES reads its parameters through a local copy (Safari's Metal
+      // translation rejects them indexed in place), which rounds a few
+      // operations differently: under 3e-6, a thousandth of an 8-bit step.
+      expect(worst(got, want)).toBeLessThan(view === 2 ? 5e-6 : 2e-6);
     });
   }
 

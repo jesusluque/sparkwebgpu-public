@@ -87,6 +87,7 @@ export function prepareAces2(
   });
   const buffers = {
     acesParamsOut: aces.params,
+    acesParamsIn: aces.params,
     acesTablesOut: aces.tables,
   };
   gpu.run(gpu.load(displayModule, "acesPrepareParams"), [1], buffers, u);

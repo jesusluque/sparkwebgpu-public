@@ -152,16 +152,19 @@ export interface AtheneaRelightOptions {
    */
   footprintClamp?: number;
   /**
-   * How whole a curved solid glass covers what is behind it: its splats are
-   * drawn at 1 - (1 - a)^glassCover (default 1, athenea's own alpha).
-   * athenea draws a solid glass at mesh2splat's glassOpacity (0.145 a splat
-   * on the pawn's head, 0.83 over its whole stack), so a sixth of the room
-   * behind passes straight through beside the lens image the relit colour
-   * carries: under a ball, a lamp of 90 read as a straight bar across it.
-   * At 8 the head covers 0.999 and shows the lens alone (its mean against
-   * the mesh path traced 0.77 -> 1.03). Only for a glass whose behind is
-   * the dome: through a car's tinted window the straight-through view is
-   * the cabin, which the lens (the dome) does not know.
+   * How whole a solid glass covers what is behind it (default 1: athenea's
+   * own alpha). Above 1, each of its splats is drawn as `glassCover` of its
+   * gaussians stacked: Spark's LoD opacity, 1 - (1 - g)^(glassCover x its
+   * coverage), its own coverage a splat's opacity or a merged node's ratio
+   * (relight.slang coveredGlassAlpha). athenea draws a solid glass at
+   * mesh2splat's glassOpacity (0.145 a splat on the pawn's head, 0.83 over
+   * its whole stack), so a sixth of the room behind passes straight through
+   * beside the lens image the relit colour carries: under a ball, a lamp of
+   * 90 read as a straight bar across it. At 8 the head shows the lens alone,
+   * from its splats and from its merged levels (its mean against the mesh
+   * path traced 0.77 -> 1.03). Only for a glass whose behind is the dome:
+   * through a car's tinted window the straight-through view is the cabin,
+   * which the lens (the dome) does not know.
    */
   glassCover?: number;
   /**

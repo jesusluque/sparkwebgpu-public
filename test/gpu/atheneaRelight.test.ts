@@ -643,12 +643,14 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     splats.dispose();
   }, 120_000);
 
-  it("covers a solid lens whole with glassCover (no room straight through)", async () => {
+  it("covers a solid glass whole with glassCover (no room straight through)", async () => {
     // athenea draws a solid glass at its own opacity (mesh2splat's
     // glassOpacity, 0.145 on the pawn's head: 0.83 over the whole stack), so
     // a sixth of the room behind passes straight through beside the lens
     // image -- a lamp of 90 under a ball read as a straight bar across it.
-    // glassCover n draws a curved solid glass at 1 - (1 - a)^n; nothing else.
+    // glassCover n draws a solid glass as n of its gaussians stacked: past
+    // a coverage of 1, Spark's LoD opacity (1 - (1 - g)^(n a), wider than
+    // the gaussian, so a merged level's cells close their gaps); nothing else.
     const alphas = async (glassCover: number) => {
       const splats = new WgpuSplatRenderer(fakeRenderer as never, {
         depthTest: false,
@@ -679,9 +681,11 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     const athenea = await alphas(1);
     const covered = await alphas(3);
     const glass = MATERIALS.findIndex((m) => m.name === "glass");
-    // athenea's: the splat keeps its own alpha (-1); covered: 1 - 0.1^3.
+    // athenea's: the splat keeps its own alpha (-1); covered: 3 x 0.9
+    // stacked, as the LoD opacity athc::spark_lod_opacity writes for 2.7.
     expect(athenea[glass]).toBe(-1);
-    expect(covered[glass]).toBeCloseTo(0.999, 3);
+    const lod = 1 + 0.25 * (Math.sqrt(1 + Math.E * Math.log(2.7)) - 1);
+    expect(covered[glass]).toBeCloseTo(lod, 3);
     MATERIALS.forEach((m, i) => {
       if (i !== glass) expect(covered[i], m.name).toBe(athenea[i]);
     });

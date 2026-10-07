@@ -444,6 +444,29 @@ bool culledBack(uint i, Gsplat g, float3x3 r) {
     return dot(storedFacing(r, g.scales, i), toEye / far) < relightParams.filter.y;
 }
 
+/// A solid glass's alpha under glassCover `n`: n of its gaussians stacked,
+/// as Spark's LoD opacity draws a coverage past 1 (splat_shape's splatAlpha:
+/// 1 - (1 - g)^ratio, wider than the gaussian). Its own coverage is kept in
+/// it: a splat's opacity, or a merged node's ratio past 1 (the LoD opacity
+/// the decoder gave it, athc::spark_lod_opacity). Holding a merged node to a
+/// plain gaussian under 1 instead opened the gaps between the cells of a
+/// level: drawn from its merged levels 4-5 (the pawn a little way off), the
+/// head let 3-5% of the room straight through, a bright window enough.
+public float coveredGlassAlpha(float a, float n) {
+    const float e = 2.718281828459045;
+    float ratio = a;
+    if (a > 1.0) {
+        const float d = min(4.0 * a - 3.0, 5.0);
+        ratio = exp((d * d - 1.0) / e);
+    }
+    const float covered = n * ratio;
+    if (covered <= 1.0) {
+        return 1.0 - pow(max(1.0 - min(a, 1.0), 0.0), n);
+    }
+    const float d = min(sqrt(1.0 + e * log(covered)), 5.0);
+    return 1.0 + 0.25 * (d - 1.0);
+}
+
 /// What a relit splat shows the eye (splat_project's projectSplat colour
 /// path for a relit cloud, kTransfer 0, 1 or 2), and its alpha: athenea's
 /// thin sheet held to kSheetAlpha with its colour scaled down to match, or
@@ -550,11 +573,10 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
         const float alphaOwn = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
         alpha = max(alphaOwn, 0.1);
         sheetScale = alphaOwn / alpha;
-    } else if (hasPbr && !pbrThinWalled(pbr) && pbrTransmission(pbr) > 0.5 && curved &&
-               relightParams.filter.w > 1.0) {
-        // A curved solid glass covered whole (glassCover): what it lets
-        // through is its lens, not the room straight behind it.
-        alpha = 1.0 - pow(max(1.0 - min(g.rgba.a, 1.0), 0.0), relightParams.filter.w);
+    } else if (hasPbr && !pbrThinWalled(pbr) && pbrTransmission(pbr) > 0.5 && relightParams.filter.w > 1.0) {
+        // A solid glass covered whole (glassCover): what it lets through is
+        // its lens, not the room straight behind it.
+        alpha = coveredGlassAlpha(g.rgba.a, relightParams.filter.w);
     }
     // splat_project's records for the blend. The colour keeps the centre's
     // reading of a sharp lobe (athenea takes it out at the projection; here

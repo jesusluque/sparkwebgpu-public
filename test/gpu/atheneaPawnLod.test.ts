@@ -183,7 +183,7 @@ describe.skipIf(!wideDevice || !available)(
       return out;
     }
 
-    function relit(source: GpuSplatSource, sky: SkyImage) {
+    function relit(source: GpuSplatSource, sky: SkyImage, glassCover = 1) {
       const splats = new WgpuSplatRenderer(fakeRenderer as never, {
         depthTest: false,
       });
@@ -191,7 +191,7 @@ describe.skipIf(!wideDevice || !available)(
         capabilities: splats.capabilities,
         tier: 2,
       });
-      const relight = atheneaRelightPlugin({ hdri: sky });
+      const relight = atheneaRelightPlugin({ hdri: sky, glassCover });
       host.register(relight).attach(splats);
       const mesh = splats.add(source);
       relight.setIor(mesh, 1.5);
@@ -293,6 +293,68 @@ describe.skipIf(!wideDevice || !available)(
       expect(diff / sum).toBeLessThan(1e-4);
       fresh.host.detach();
       fresh.splats.dispose();
+    }, 900_000);
+
+    // A little way off (1 m: the head some 80 px across) the page draws its
+    // merged levels 4-5. Covered whole (glassCover 8, the pawn pages'), each
+    // level shuts the head as its splats do: none lets the room through.
+    // Held to a plain gaussian under 1, levels 4-7 let 3-5% of it through
+    // between their cells (alpha p10 0.95-0.97), a bright window enough.
+    it("covers the head whole from its merged levels too (glassCover)", async () => {
+      const sky = loadSky(SKY as string);
+      const { source, count } = await loadWhole(d, TOP);
+      const merged = LEVELS.reduce((a, b) => a + b, 0);
+      const root = count - LEAVES - merged;
+      const range = (a: number, b: number) =>
+        Uint32Array.from({ length: b - a }, (_, k) => a + k);
+      const far = new THREE.PerspectiveCamera(
+        2 * THREE.MathUtils.radToDeg(Math.atan(18 / 260)),
+        1,
+        0.01,
+        10,
+      );
+      far.coordinateSystem = THREE.WebGPUCoordinateSystem;
+      far.position.set(0, 0.07 - 0.12, 0.99);
+      far.lookAt(0, 0.07, 0);
+      far.updateProjectionMatrix();
+      far.updateMatrixWorld();
+      const { splats, host, mesh } = relit(source, sky, 8);
+      await host.ready();
+      splats.setLodIndices(mesh, range(count - LEAVES, count));
+      const whole = await draw(splats, far);
+      // The head's inside: where its splats cover past a half, and its
+      // neighbours too (no outline).
+      const inside: number[] = [];
+      for (let y = 1; y < SIZE - 1; y++) {
+        for (let x = 1; x < SIZE - 1; x++) {
+          const p = y * SIZE + x;
+          if (
+            [p, p - 1, p + 1, p - SIZE, p + SIZE].every(
+              (q) => whole[q * 4 + 3] > 0.5,
+            )
+          )
+            inside.push(p);
+        }
+      }
+      expect(inside.length).toBeGreaterThan(2000);
+      let at = root;
+      const open: number[] = [];
+      for (const [l, n] of LEVELS.entries()) {
+        if (l >= 3 && l <= 6) {
+          splats.setLodIndices(mesh, range(at, at + n));
+          const f = await draw(splats, far);
+          const through =
+            inside.filter((p) => f[p * 4 + 3] < 0.99).length / inside.length;
+          process.stderr.write(
+            `level ${l + 1} from 1 m, covered: ${(100 * through).toFixed(2)}% of ${inside.length} px under 0.99\n`,
+          );
+          open.push(through);
+        }
+        at += n;
+      }
+      for (const through of open) expect(through).toBeLessThan(0.02);
+      host.detach();
+      splats.dispose();
     }, 900_000);
   },
 );

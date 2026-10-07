@@ -37,6 +37,36 @@ cached `skinningXforms` ([the format](athc-v3.md#a-skinned-cloud-skin-and-the-sk
 A cloud converted without `--transfer` (no bake) is carried the same way and
 shaded by its material.
 
+### Many clips
+
+athenea keeps each of a rig's animations as a layer of its own,
+`<clip>_rig.usda`: an `over` of the cloud's prim holding its
+`skinningXforms` over time (the older `primvars:lrt:splat:` name is read
+too). `usd-athc` adds a folder of them:
+
+```sh
+usd-athc sparrow_tx.usdc sparrow.athc --clip own \
+    --clip-dir sparrow-web/clips --clips air_fly_A0,land_idle_B1,... \
+    --clip-skeleton SparrowAir.usdc --drop-own-clip \
+    --clip-files clips/ --gzip --json report.json
+```
+
+`--clips` is a comma list (or `all`); `--clip-skeleton layer[::/Skel/Prim]`
+reads the joint order the rigs' transforms index (default prim
+`/root/Bird/Bird`) and remaps them by name to the cloud's; `--drop-own-clip`
+drops the clip the cloud itself carries. `--clip-files DIR` writes every clip
+as `DIR/<clip>.atcl.gz` and keeps only the first in the `.athc`: an `ATCL`
+file (`athc_skin.rs` `SkinClip::to_atcl`) is one clip, lossless, its
+transforms joint-major with each float's bits XORed with the previous
+sample's in four byte planes, so gzip finds the joints that hold still (about
+15 KB a frame of 609 joints, against 39 KB raw). A page fetches a clip when
+it plays it (`fetchAthcClip`, `decodeAthcClip` in `@sparkjsdev/spark/webgpu`)
+and pushes it onto the skeleton's `clips` before `skin.set({ clip })`. The
+report gives each clip's length, its seam (how far its last pose is from its
+first: zero for the loops) and how far it carries the bird.
+`scripts/build-sparrow.mjs` makes the sparrow demo's data this way in one
+command (examples/webgpu-site/sparrow.html).
+
 ## What runs, and when
 
 Per frame, when the time code, the clip or the options changed

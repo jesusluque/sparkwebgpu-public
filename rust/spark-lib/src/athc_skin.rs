@@ -414,6 +414,111 @@ pub fn element_skin(
     (pairs, grads)
 }
 
+pub const ATCL_MAGIC: u32 = u32::from_le_bytes(*b"ATCL");
+pub const ATCL_VERSION: u32 = 1;
+const ATCL_HEAD: usize = 32;
+
+impl SkinClip {
+    /// One clip on its own (an `ATCL` file, usually gzipped): what a page
+    /// fetches when it plays that clip, so a skinned `.athc` with many
+    /// animations need not carry them all in its skeleton. Lossless.
+    ///
+    /// ```text
+    /// 0  "ATCL"  4 version 1  8 joints  12 samples  16 timeCodesPerSecond (f32)
+    /// 20 name bytes  24 0  28 0
+    /// 32 name, padded to 4; times (f32 x samples);
+    ///    the transforms, joint-major (joint, element, sample), each f32's
+    ///    bits XOR the same element's at the previous sample (the first
+    ///    sample as is), then split into four byte planes (all low bytes,
+    ///    ..., all high bytes): a joint that holds still is zeros.
+    /// ```
+    pub fn to_atcl(&self, joints: usize) -> Vec<u8> {
+        let samples = self.times.len();
+        let mut out = Vec::new();
+        put(
+            &mut out,
+            &[
+                ATCL_MAGIC,
+                ATCL_VERSION,
+                joints as u32,
+                samples as u32,
+                self.time_codes_per_second.to_bits(),
+                self.name.len() as u32,
+                0,
+                0,
+            ],
+        );
+        out.extend_from_slice(self.name.as_bytes());
+        pad4(&mut out);
+        put_f(&mut out, &self.times);
+        let n = joints * 16 * samples;
+        let mut words = Vec::with_capacity(n);
+        for j in 0..joints {
+            for e in 0..16 {
+                let mut prev = 0u32;
+                for s in 0..samples {
+                    let v = self.xforms[(s * joints + j) * 16 + e].to_bits();
+                    words.push(v ^ prev);
+                    prev = v;
+                }
+            }
+        }
+        for b in 0..4 {
+            out.extend(words.iter().map(|w| (w >> (8 * b)) as u8));
+        }
+        out
+    }
+
+    /// The clip an `ATCL` file holds, and its joint count.
+    pub fn from_atcl(b: &[u8]) -> Result<(Self, usize)> {
+        if u32_at(b, 0)? != ATCL_MAGIC {
+            bail!("not an ATCL clip (no magic)");
+        }
+        if u32_at(b, 4)? != ATCL_VERSION {
+            bail!("ATCL version {} (this reads {ATCL_VERSION})", u32_at(b, 4)?);
+        }
+        let joints = u32_at(b, 8)? as usize;
+        let samples = u32_at(b, 12)? as usize;
+        let fps = f32::from_bits(u32_at(b, 16)?);
+        let name_len = u32_at(b, 20)? as usize;
+        let name = text(b, ATCL_HEAD, name_len)?;
+        let mut at = (ATCL_HEAD + name_len).div_ceil(4) * 4;
+        let times = f32s(b, at, samples)?;
+        at += 4 * samples;
+        let n = joints * 16 * samples;
+        let planes = b
+            .get(at..at + 4 * n)
+            .ok_or_else(|| anyhow!("ATCL clip too short"))?;
+        let mut xforms = vec![0.0f32; n];
+        let mut k = 0;
+        for j in 0..joints {
+            for e in 0..16 {
+                let mut prev = 0u32;
+                for s in 0..samples {
+                    let w = u32::from_le_bytes([
+                        planes[k],
+                        planes[n + k],
+                        planes[2 * n + k],
+                        planes[3 * n + k],
+                    ]) ^ prev;
+                    prev = w;
+                    xforms[(s * joints + j) * 16 + e] = f32::from_bits(w);
+                    k += 1;
+                }
+            }
+        }
+        Ok((
+            Self {
+                name,
+                time_codes_per_second: fps,
+                times,
+                xforms,
+            },
+            joints,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +565,27 @@ mod tests {
         assert_eq!(p[31], 47.0);
         assert_eq!(s.pose(0, 0.0)[5], 5.0);
         assert_eq!(s.pose(0, 9.0)[5], 37.0);
+    }
+
+    #[test]
+    fn a_clip_goes_through_its_atcl_file() {
+        let c = SkinClip {
+            name: "hop".into(),
+            time_codes_per_second: 30.0,
+            times: vec![1.0, 2.0, 3.0],
+            xforms: (0..3 * 2 * 16).map(|k| (k % 7) as f32 * 0.25 - 1.0).collect(),
+        };
+        let b = c.to_atcl(2);
+        let (back, joints) = SkinClip::from_atcl(&b).unwrap();
+        assert_eq!(joints, 2);
+        assert_eq!(back, c);
+        // The page's fixture (src/athc.ts decodeAthcClip reads it) is this clip.
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test/fixtures/athc/hop.atcl.gz"
+        ))
+        .unwrap();
+        assert_eq!(crate::athc_v3::gunzip(&fixture).unwrap(), b);
     }
 
     #[test]

@@ -340,6 +340,85 @@ export async function readAthcSkeleton(
   return athc_skeleton(prefix) as AthcSkeleton | null;
 }
 
+export const ATCL_MAGIC = 0x4c435441; // "ATCL"
+
+/**
+ * One clip on its own (athc_skin.rs SkinClip::to_atcl, usd-athc
+ * --clip-files): its joint count and the clip, from the file's bytes
+ * (gzipped or not). Times f32; the transforms joint-major, each f32's bits
+ * XOR the previous sample's, in four byte planes.
+ */
+export async function decodeAthcClip(
+  bytes: Uint8Array,
+): Promise<{ joints: number; clip: AthcSkinClip }> {
+  let b = bytes;
+  if (b[0] === 0x1f && b[1] === 0x8b) {
+    const stream = new Blob([b as BlobPart])
+      .stream()
+      .pipeThrough(new DecompressionStream("gzip"));
+    b = new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  if (view.getUint32(0, true) !== ATCL_MAGIC) {
+    throw new Error("not an ATCL clip (no magic)");
+  }
+  if (view.getUint32(4, true) !== 1) {
+    throw new Error(`ATCL version ${view.getUint32(4, true)} (this reads 1)`);
+  }
+  const joints = view.getUint32(8, true);
+  const samples = view.getUint32(12, true);
+  const timeCodesPerSecond = view.getFloat32(16, true);
+  const nameLen = view.getUint32(20, true);
+  const name = new TextDecoder().decode(b.subarray(32, 32 + nameLen));
+  let at = 32 + Math.ceil(nameLen / 4) * 4;
+  const times = new Float32Array(samples);
+  for (let s = 0; s < samples; s++)
+    times[s] = view.getFloat32(at + 4 * s, true);
+  at += 4 * samples;
+  const n = joints * 16 * samples;
+  if (b.length < at + 4 * n) throw new Error("ATCL clip too short");
+  const p0 = b.subarray(at, at + n);
+  const p1 = b.subarray(at + n, at + 2 * n);
+  const p2 = b.subarray(at + 2 * n, at + 3 * n);
+  const p3 = b.subarray(at + 3 * n, at + 4 * n);
+  const bits = new Uint32Array(n);
+  let k = 0;
+  for (let j = 0; j < joints; j++) {
+    for (let e = 0; e < 16; e++) {
+      let prev = 0;
+      for (let s = 0; s < samples; s++) {
+        const w = (p0[k] | (p1[k] << 8) | (p2[k] << 16) | (p3[k] << 24)) ^ prev;
+        prev = w;
+        bits[(s * joints + j) * 16 + e] = w >>> 0;
+        k++;
+      }
+    }
+  }
+  return {
+    joints,
+    clip: {
+      name,
+      timeCodesPerSecond,
+      times,
+      xforms: new Float32Array(bits.buffer),
+    },
+  };
+}
+
+/** Fetches an ATCL clip (decodeAthcClip) from a URL. */
+export async function fetchAthcClip(
+  url: string,
+  init?: RequestInit,
+): Promise<{ joints: number; clip: AthcSkinClip }> {
+  const response = await fetch(url, init);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch "${url}": ${response.status} ${response.statusText}`,
+    );
+  }
+  return decodeAthcClip(new Uint8Array(await response.arrayBuffer()));
+}
+
 /** Merged nodes and the virtual index of the first splat (athc.rs VirtualTree). */
 export function athcSplatBase(layout: AnyAthcLayout): {
   merged: number;

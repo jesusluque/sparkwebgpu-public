@@ -168,6 +168,8 @@ export {
   type AthcPaging,
   type AthcSkeleton,
   type AthcSkinClip,
+  decodeAthcClip,
+  fetchAthcClip,
   readAthcLayout,
   readAthcSkeleton,
   unpackAthcLobes,

@@ -988,6 +988,7 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     let mut weights = Vec::with_capacity(n);
     let mut covs = Vec::with_capacity(n);
     let mut sum_w = 0.0f64;
+    let mut share = 0.0f64;
     let mut mu = [0.0f64; 3];
     for i in 0..n {
         let p = &level1.positions[i * 4..i * 4 + 4];
@@ -998,6 +999,7 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
         let w = (p[3] * sorted[0] * sorted[1]).max(1e-20) as f64;
         weights.push(w);
+        share += (merged_share(level1, i, p[3]) * sorted[0] * sorted[1]) as f64;
         covs.push(SymMat3::new_scale_quaternion(Vec3A::from_array(scale), Quat::from_array(q)));
         sum_w += w;
         for d in 0..3 {
@@ -1047,7 +1049,11 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     let mut sorted = scale;
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
     // Uncapped: see `coverage_ratios`.
-    let opacity = (sum_w as f32) / (sorted[0] * sorted[1]).max(1e-20);
+    let opacity = if is_sheet(level1, heaviest) {
+        (share as f32) / (sorted[0] * sorted[1]).max(1e-20) + SHEET_PAD
+    } else {
+        (sum_w as f32) / (sorted[0] * sorted[1]).max(1e-20)
+    };
     let base = base.map(|v| (v / sum_w) as f32);
     let mut root = level1.slice(heaviest, 1);
     root.positions = vec![mu[0] as f32, mu[1] as f32, mu[2] as f32, opacity];
@@ -1101,6 +1107,40 @@ pub fn merged_block(file: &AthcFile, tree: &VirtualTree) -> AthcBlock {
 // Spark draws as 1 - (1 - g)^ratio: `ratio` gaussians composited, the way the
 // splats under the group composite. A v2 file is written capped, as athenea's.
 
+/// athenea's coverage alpha on a thin sheet of glass (mesh2splat's
+/// m2sCoverageAlpha): what the sheet reflects head on, plus the 1/255 it adds
+/// for the radius the gaussian would be cut at. splat_project draws a sheet
+/// at its opacity less that 1/255 (`alphaOwn`), so the 1/255 is a splat's,
+/// not an area's: a merged sheet whose opacity is W / A of its splats' whole
+/// opacities kept the 1/255 of every splat under it as reflection. On the
+/// Corvette's windshield (0.0057 a splat, 0.0018 of it reflection) the
+/// merged levels reflected 2.2-2.9 times what their splats do, and the
+/// headlights 2.7-3.2: bright dots wherever the LoD drew a merged cell
+/// among splats. A sheet's coverage is merged as its reflection (opacity
+/// less the 1/255) and the 1/255 added back once.
+pub const SHEET_PAD: f32 = 1.0 / 255.0;
+
+/// Whether element i is a thin sheet of glass (splat_project's `sheet`:
+/// thin-walled, transmission past one half).
+pub fn is_sheet(block: &AthcBlock, i: usize) -> bool {
+    if block.pbr.is_empty() || block.n == 0 {
+        return false;
+    }
+    let words = block.pbr.len() / block.n;
+    let w = block.pbr[i * words];
+    (w >> 24) & 1 == 1 && ((w >> 16) & 255) as f32 / 255.0 > 0.5
+}
+
+/// What of element i's opacity merges by area: all of it, or a sheet's
+/// reflection (`SHEET_PAD`).
+fn merged_share(block: &AthcBlock, i: usize, o: f32) -> f32 {
+    if is_sheet(block, i) {
+        (o - SHEET_PAD).max(0.0)
+    } else {
+        o
+    }
+}
+
 /// The two longest of a shape word's three scales, multiplied.
 fn two_axis_area(shape: &[u32]) -> f32 {
     let mut s = [low_half(shape[1]).exp(), high_half(shape[1]).exp(), low_half(shape[2]).exp()];
@@ -1127,7 +1167,8 @@ pub fn coverage_ratios(file: &AthcFile) -> Vec<Vec<f32>> {
                 g += 1;
             }
             if g < finest.len() && at < count {
-                let w = chunk.positions[i * 4 + 3].max(0.0) * two_axis_area(&chunk.shape[i * 4..i * 4 + 4]);
+                let o = merged_share(chunk, i, chunk.positions[i * 4 + 3].max(0.0));
+                let w = o * two_axis_area(&chunk.shape[i * 4..i * 4 + 4]);
                 finest[g] += w as f64;
             }
             at += 1;
@@ -1151,7 +1192,12 @@ pub fn coverage_ratios(file: &AthcFile) -> Vec<Vec<f32>> {
         .iter()
         .zip(&weights)
         .map(|((_, b), w)| {
-            (0..b.n).map(|i| (w[i] as f32 / two_axis_area(&b.shape[i * 4..i * 4 + 4]).max(1e-30)).max(0.0)).collect()
+            (0..b.n)
+                .map(|i| {
+                    let r = (w[i] as f32 / two_axis_area(&b.shape[i * 4..i * 4 + 4]).max(1e-30)).max(0.0);
+                    if is_sheet(b, i) { r + SHEET_PAD } else { r }
+                })
+                .collect()
         })
         .collect()
 }
@@ -1182,8 +1228,10 @@ pub const MERGED_FILL: f32 = 0.35;
 /// Corvette (paint and body, CPU raster of Spark's draw): the light let
 /// through at 58 m goes from 5.2% to 0.6%.
 pub fn widen_merged(block: &mut AthcBlock, edge: f32) {
+    orient_merged(block);
     let grow = (MERGED_FILL * edge).powi(2);
     for i in 0..block.n {
+        let sheet = is_sheet(block, i);
         let w = &mut block.shape[i * 4..i * 4 + 4];
         let mut s = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()];
         let mut order = [0usize, 1, 2];
@@ -1196,8 +1244,66 @@ pub fn widen_merged(block: &mut AthcBlock, edge: f32) {
         w[1] = pack_halves(s[0].ln(), s[1].ln());
         w[2] = pack_halves(s[2].ln(), high_half(w[2]));
         let o = &mut block.positions[i * 4 + 3];
+        if sheet {
+            // The reflection keeps its weight; the 1/255 stays one.
+            *o = (*o - SHEET_PAD).max(0.0) * before / after.max(1e-30) + SHEET_PAD;
+            continue;
+        }
         let widened = *o * before / after.max(1e-30);
         *o = if *o >= 0.98 { widened.max(0.99) } else { widened };
+    }
+}
+
+/// A splat's third axis is its surface's normal, the way mesh2splat lays
+/// it: athenea's relighting reads the curvature "on the mesh's normal" and
+/// turns it to the face the eye sees by the sign of that axis against the
+/// shading normal (splat_project: `faces`), and takes the shape operator in
+/// the first two axes. A merged gaussian's axes are its moments'
+/// eigenvectors, in no order and of either sign: on the pawn's glass head
+/// the third axis was the thinnest for 29% of the merged nodes and pointed
+/// along the stored normal for 50% -- half of every LoD level's cells read
+/// the head as a convex lens and half as a concave one (a checker of dark
+/// and bright cells, and no lens image). So a merged gaussian with a normal
+/// gets its axes turned (the same gaussian) until its third axis is the one
+/// nearest its stored normal, pointing the same way; without normals, the
+/// thinnest axis third.
+pub fn orient_merged(block: &mut AthcBlock) {
+    let normals = !block.normals.is_empty();
+    for i in 0..block.n {
+        let w = &mut block.shape[i * 4..i * 4 + 4];
+        let q = decode_quaternion(w[0]);
+        let m = Mat3::from_quat(Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize());
+        let mut axes = [m.x_axis, m.y_axis, m.z_axis];
+        let mut ln = [low_half(w[1]), high_half(w[1]), low_half(w[2])];
+        let normal = if normals { Some(glam::Vec3::from_array(unpack_normal(block.normals[i]))) } else { None };
+        // The axis to put third.
+        let third = match normal {
+            Some(n) => (0..3).max_by(|&a, &b| axes[a].dot(n).abs().total_cmp(&axes[b].dot(n).abs())).unwrap(),
+            None => (0..3).min_by(|&a, &b| ln[a].total_cmp(&ln[b])).unwrap(),
+        };
+        // A cyclic turn keeps the frame right-handed.
+        let turn = (third + 1) % 3;
+        let mut changed = third != 2;
+        if changed {
+            axes = [axes[turn], axes[(turn + 1) % 3], axes[(turn + 2) % 3]];
+            ln = [ln[turn], ln[(turn + 1) % 3], ln[(turn + 2) % 3]];
+        }
+        // Against the normal: the third and the first axes turned over (a
+        // half turn about the second), the same gaussian.
+        if let Some(n) = normal {
+            if axes[2].dot(n) < 0.0 {
+                axes[2] = -axes[2];
+                axes[0] = -axes[0];
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let q = Quat::from_mat3(&Mat3::from_cols(axes[0], axes[1], axes[2])).normalize();
+        w[0] = encode_quaternion(q.to_array());
+        w[1] = pack_halves(ln[0], ln[1]);
+        w[2] = pack_halves(ln[2], high_half(w[2]));
     }
 }
 

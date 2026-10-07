@@ -107,7 +107,8 @@ public struct AtheneaRelightParams {
     public float4 focal;           ///< pixels: focal x, focal y (negative: rows go down), centre x, centre y
     public float4 viewport;        ///< width, height in pixels
     public float4 filter;          ///< x: the footprint's clamp (kappa), y: the facing below which a back is
-                                   ///< culled (kRelightCullBacks), z: the pixel filter's variance (px^2)
+                                   ///< culled (kRelightCullBacks), z: the pixel filter's variance (px^2),
+                                   ///< w: a solid lens's cover (glassCover; at most 1: athenea's alpha)
 };
 
 StructuredBuffer<uint4>              relightSrc;
@@ -549,6 +550,11 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
         const float alphaOwn = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
         alpha = max(alphaOwn, 0.1);
         sheetScale = alphaOwn / alpha;
+    } else if (hasPbr && !pbrThinWalled(pbr) && pbrTransmission(pbr) > 0.5 && curved &&
+               relightParams.filter.w > 1.0) {
+        // A curved solid glass covered whole (glassCover): what it lets
+        // through is its lens, not the room straight behind it.
+        alpha = 1.0 - pow(max(1.0 - min(g.rgba.a, 1.0), 0.0), relightParams.filter.w);
     }
     // splat_project's records for the blend. The colour keeps the centre's
     // reading of a sharp lobe (athenea takes it out at the projection; here

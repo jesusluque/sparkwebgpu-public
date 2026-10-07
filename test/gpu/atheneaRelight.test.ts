@@ -643,6 +643,50 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     splats.dispose();
   }, 120_000);
 
+  it("covers a solid lens whole with glassCover (no room straight through)", async () => {
+    // athenea draws a solid glass at its own opacity (mesh2splat's
+    // glassOpacity, 0.145 on the pawn's head: 0.83 over the whole stack), so
+    // a sixth of the room behind passes straight through beside the lens
+    // image -- a lamp of 90 under a ball read as a straight bar across it.
+    // glassCover n draws a curved solid glass at 1 - (1 - a)^n; nothing else.
+    const alphas = async (glassCover: number) => {
+      const splats = new WgpuSplatRenderer(fakeRenderer as never, {
+        depthTest: false,
+        alwaysGenerate: true,
+      });
+      const mesh = splats.add(source(20), object);
+      const host = new PluginHost({
+        capabilities: splats.capabilities,
+        tier: 2,
+      });
+      const relight = atheneaRelightPlugin({
+        hdri: sky(256, 128),
+        ior: 1.5,
+        footprint: 0,
+        glassCover,
+      });
+      host.register(relight).attach(splats);
+      await host.ready();
+      splats.render(camera, target);
+      await d.queue.onSubmittedWorkDone();
+      const relit = relight.buffers?.("splat", { frame: null, mesh })
+        .atheneaRelit as GPUBuffer;
+      const got = new Float32Array(await read(relit));
+      host.detach();
+      splats.dispose();
+      return MATERIALS.map((_, i) => got[20 * i + 3]);
+    };
+    const athenea = await alphas(1);
+    const covered = await alphas(3);
+    const glass = MATERIALS.findIndex((m) => m.name === "glass");
+    // athenea's: the splat keeps its own alpha (-1); covered: 1 - 0.1^3.
+    expect(athenea[glass]).toBe(-1);
+    expect(covered[glass]).toBeCloseTo(0.999, 3);
+    MATERIALS.forEach((m, i) => {
+      if (i !== glass) expect(covered[i], m.name).toBe(athenea[i]);
+    });
+  }, 120_000);
+
   it("keeps the captured colour where the transfer's page is not resident", async () => {
     const splats = new WgpuSplatRenderer(fakeRenderer as never, {
       depthTest: false,

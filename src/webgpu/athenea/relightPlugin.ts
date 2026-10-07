@@ -152,6 +152,19 @@ export interface AtheneaRelightOptions {
    */
   footprintClamp?: number;
   /**
+   * How whole a curved solid glass covers what is behind it: its splats are
+   * drawn at 1 - (1 - a)^glassCover (default 1, athenea's own alpha).
+   * athenea draws a solid glass at mesh2splat's glassOpacity (0.145 a splat
+   * on the pawn's head, 0.83 over its whole stack), so a sixth of the room
+   * behind passes straight through beside the lens image the relit colour
+   * carries: under a ball, a lamp of 90 read as a straight bar across it.
+   * At 8 the head covers 0.999 and shows the lens alone (its mean against
+   * the mesh path traced 0.77 -> 1.03). Only for a glass whose behind is
+   * the dome: through a car's tinted window the straight-through view is
+   * the cabin, which the lens (the dome) does not know.
+   */
+  glassCover?: number;
+  /**
    * The prefilter's pixel term (geometric specular AA): once the frame's
    * size is known, the normal's spread over the pixel filter (variance
    * FOOTPRINT_PIXEL_VARIANCE px^2) where it is larger than over the splat
@@ -362,6 +375,7 @@ export function atheneaRelightPlugin(
     pixelDetail: false,
     footprint: FOOTPRINT_GAIN,
     footprintClamp: FOOTPRINT_CLAMP,
+    glassCover: 1,
     footprintPixel: false,
     cullBacks: false,
     cullBacksFacing: CULL_BACKS_FACING,
@@ -688,7 +702,7 @@ export function atheneaRelightPlugin(
         options.footprintClamp,
         options.cullBacksFacing,
         FOOTPRINT_PIXEL_VARIANCE,
-        0,
+        options.glassCover,
       ],
     });
     emptyPool ??= upload(device, new Uint32Array([0, 0, 4, 0]), "relight pool");
@@ -743,7 +757,7 @@ export function atheneaRelightPlugin(
     // The colours of the splats the LoD draws: a list of them when it cuts
     // some (relightList), every splat otherwise. The kept terms above stay
     // per splat of the cloud: they change only with the sky, lights or place.
-    const key = `${placed}|${flags & eyeFlags}|${identity(mesh.lodIndices)}|${mesh.lodIndices?.length ?? -1}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
+    const key = `${placed}|${flags & eyeFlags}|${identity(mesh.lodIndices)}|${mesh.lodIndices?.length ?? -1}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${options.glassCover}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
@@ -949,6 +963,7 @@ export function atheneaRelightPlugin(
         options.footprintClamp = o.footprintClamp;
       if (o.footprintPixel !== undefined)
         options.footprintPixel = o.footprintPixel;
+      if (o.glassCover !== undefined) options.glassCover = o.glassCover;
       if (o.cullBacks !== undefined) options.cullBacks = o.cullBacks;
       if (o.cullBacksFacing !== undefined)
         options.cullBacksFacing = o.cullBacksFacing;

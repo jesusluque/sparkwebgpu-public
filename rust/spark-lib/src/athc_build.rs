@@ -2243,6 +2243,124 @@ mod tests {
     /// (the whole coverage, `athc::uncap_levels`, drawn as Spark's LoD
     /// opacity, and each cell widened, `athc::widen_merged`) the sheet stays
     /// shut at every level, whether its cells are pixels wide or under one.
+    /// The pawn's glass head drawn from its merged LoD levels was a checker
+    /// of dark and bright cells and showed no lens: the relight reads a
+    /// splat's curvature on its third axis' side (`faces`), and a merged
+    /// gaussian's axes were its moments' eigenvectors in any order and sign.
+    /// As decoded (`athc::orient_merged`, through `widen_merged`) every
+    /// merged gaussian of a sphere has its thinnest axis third, along its
+    /// stored normal.
+    #[test]
+    fn merged_levels_keep_the_normal_as_the_third_axis() {
+        use crate::athc::{high_half, low_half};
+        // A glass ball's cap: 11 mm, splats 0.25 mm on a 0.2 mm lattice of
+        // latitude and longitude, their third axis the outward normal.
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let r = 0.011f32;
+        let step = 0.0002f32;
+        let rings = (0.5 * std::f32::consts::PI * r / step) as usize;
+        for a in 0..rings {
+            let theta = (a as f32 + 0.5) * step / r;
+            let around = ((2.0 * std::f32::consts::PI * r * theta.sin() / step) as usize).max(1);
+            for b in 0..around {
+                let phi = (b as f32 + 0.5) / around as f32 * 2.0 * std::f32::consts::PI;
+                let n = glam::Vec3::new(theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos());
+                let q = glam::Quat::from_rotation_arc(glam::Vec3::Z, n);
+                s.positions.extend_from_slice(&(n * r).to_array());
+                s.rotations.extend_from_slice(&q.to_array());
+                s.scales.extend_from_slice(&[0.00025, 0.00025, 0.000025]);
+                s.opacities.push(0.1448);
+                s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+                s.normals.extend_from_slice(&n.to_array());
+                s.count += 1;
+            }
+        }
+        let o = BuildOptions::default();
+        let file = build_lod(&pack_streams(&s, &o).unwrap(), &o).unwrap();
+        let along = |b: &crate::athc::AthcBlock| {
+            let (mut aligned, mut thinnest) = (0usize, 0usize);
+            for i in 0..b.n {
+                let q = crate::athc::decode_quaternion(b.shape[i * 4]);
+                let z = glam::Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize() * glam::Vec3::Z;
+                let n = glam::Vec3::from_array(crate::athc::unpack_normal(b.normals[i]));
+                if z.dot(n) > 0.9 {
+                    aligned += 1;
+                }
+                let ln = [low_half(b.shape[i * 4 + 1]), high_half(b.shape[i * 4 + 1]), low_half(b.shape[i * 4 + 2])];
+                if ln[2] <= ln[0] && ln[2] <= ln[1] {
+                    thinnest += 1;
+                }
+            }
+            (aligned as f32 / b.n as f32, thinnest as f32 / b.n as f32)
+        };
+        let mut worst_before = 1.0f32;
+        for (level, block) in &file.levels {
+            if block.n < 16 {
+                continue;
+            }
+            let (a0, _) = along(block);
+            let mut b = block.clone();
+            crate::athc::widen_merged(&mut b, file.header.extent / (1u64 << *level) as f32);
+            let (a1, t1) = along(&b);
+            eprintln!("level {level} ({} groups): third axis along the normal {a0:.2} as merged, {a1:.2} decoded (thinnest {t1:.2})", block.n);
+            worst_before = worst_before.min(a0);
+            assert!(a1 > 0.99 && t1 > 0.99, "level {level}: {a1} {t1}");
+        }
+        assert!(worst_before < 0.7, "the merged axes were the bug: {worst_before}");
+    }
+
+    /// A thin sheet of glass is drawn at its opacity less the 1/255 athenea's
+    /// coverage adds a splat (splat_project's `alphaOwn`): merged by area
+    /// with that 1/255 in, the Corvette's windshield reflected 2.2-2.9 times
+    /// as much from its merged levels as from its splats (bright dots where
+    /// the LoD mixes them). As decoded, every level reflects what its splats do.
+    #[test]
+    fn merged_sheets_of_glass_reflect_what_their_splats_do() {
+        use crate::athc::{high_half, low_half};
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let (side, step) = (0.192f32, 0.002f32);
+        let k = (side / step) as usize;
+        let alpha = 0.0018 + 1.0 / 255.0;
+        for a in 0..k {
+            for b in 0..k {
+                let jitter = ((a * 7 + b * 13) % 5) as f32 * 0.0001;
+                s.positions.extend_from_slice(&[(a as f32 + 0.5) * step + jitter, (b as f32 + 0.5) * step, 0.0]);
+                s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                s.scales.extend_from_slice(&[0.0018, 0.0018, 0.0002]);
+                s.opacities.push(alpha);
+                s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+                s.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+                s.metallic.push(0.0);
+                s.roughness.push(0.02);
+                s.transmission.push(1.0);
+                s.thin_walled.push(1);
+                s.count += 1;
+            }
+        }
+        let o = BuildOptions::default();
+        let mut file = build_lod(&pack_streams(&s, &o).unwrap(), &o).unwrap();
+        assert!(crate::athc::is_sheet(&file.chunks[0], 0));
+        let area = |sh: &[u32]| {
+            let mut t = [low_half(sh[1]).exp(), high_half(sh[1]).exp(), low_half(sh[2]).exp()];
+            t.sort_by(|a, b| b.total_cmp(a));
+            (t[0] * t[1]) as f64
+        };
+        // splat_project's alphaOwn by area: what a block reflects.
+        let reflects = |b: &crate::athc::AthcBlock| -> f64 {
+            (0..b.n).map(|i| area(&b.shape[i * 4..i * 4 + 4]) * (b.positions[i * 4 + 3] - 1.0 / 255.0).max(0.0) as f64).sum()
+        };
+        let splats: f64 = file.chunks.iter().map(reflects).sum();
+        crate::athc::uncap_levels(&mut file);
+        let extent = file.header.extent;
+        for (level, block) in &file.levels {
+            let mut b = block.clone();
+            crate::athc::widen_merged(&mut b, extent / (1u64 << *level) as f32);
+            let ratio = reflects(&b) / splats;
+            eprintln!("level {level} ({} groups): reflects {ratio:.3} of its splats", b.n);
+            assert!((ratio - 1.0).abs() < 0.03, "level {level}: {ratio}");
+        }
+    }
+
     #[test]
     fn merged_levels_keep_a_closed_sheet_closed() {
         // A 192 mm sheet of the paint's splats: 2.4 mm wide, 0.24 mm thin,

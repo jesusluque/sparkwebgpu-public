@@ -82,6 +82,15 @@
 //! same rig holds as a second clip. `--add`, `--cell`, `--target` and
 //! `--thin` are refused with a skin; a v2 file drops it. A `.usda` layer is
 //! read too.
+//!
+//! Many clips: `--clip-dir DIR [--clips a,b,c|all]` adds the clips of a
+//! folder of athenea's rigs (`<clip>_rig.usda`, an `over` of the cloud's
+//! prim holding its `skinningXforms`; the older `lrt:` name is read too),
+//! `--clip-skeleton layer.usdc[::/Skel]` remaps their joints by name from
+//! that Skeleton's order to the cloud's, `--drop-own-clip` drops the clip
+//! the cloud itself carries, and `--clip-files DIR` writes every clip as
+//! `DIR/<clip>.atcl.gz` (`SkinClip::to_atcl`) and keeps only the first in
+//! the `.athc`, for a page that fetches a clip when it plays it.
 
 use std::collections::BTreeMap;
 
@@ -432,7 +441,11 @@ impl Prim {
 
     /// `skinningXforms`, as a clip: its time samples, or its default alone.
     fn clip(&self, name: &str, fps: f32) -> Result<SkinClip> {
-        let key = "primvars:athenea:splat:skinningXforms";
+        // athenea's name, or the older `lrt:` one its first rigs carry.
+        let key = ["primvars:athenea:splat:skinningXforms", "primvars:lrt:splat:skinningXforms"]
+            .into_iter()
+            .find(|k| self.samples.contains_key(*k))
+            .unwrap_or("primvars:athenea:splat:skinningXforms");
         let mut out = SkinClip {
             name: name.to_string(),
             time_codes_per_second: fps,
@@ -610,6 +623,127 @@ fn up_axis(data: &dyn AbstractData) -> Option<String> {
     }
 }
 
+/// Adds the clips a folder of athenea's rigs holds (`<clip>_rig.usda`, each
+/// an `over` of the cloud's prim with its `skinningXforms`; or `<clip>.usda`):
+/// `names` a comma list, or `all` / none for every rig there, sorted. A rig
+/// names no joints; `skeleton` (`layer[::/Skel/Prim]`, default prim
+/// `/root/Bird/Bird`) gives the order its transforms index, and they are
+/// remapped by name to the cloud's.
+fn add_clip_dir(
+    r: &mut AthcSkeleton,
+    dir: &str,
+    names: Option<&str>,
+    skeleton: Option<&str>,
+    prim_path: &str,
+) -> Result<()> {
+    let dir = std::path::Path::new(dir);
+    let names: Vec<String> = match names {
+        None | Some("all") => {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .with_context(|| format!("{}", dir.display()))?
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter_map(|f| f.strip_suffix("_rig.usda").map(str::to_string))
+                .collect();
+            v.sort();
+            v
+        }
+        Some(list) => list.split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect(),
+    };
+    if names.is_empty() {
+        bail!("{}: no clips", dir.display());
+    }
+    // The order the rigs' transforms are in -> the cloud's joint index.
+    let remap: Option<Vec<usize>> = match skeleton {
+        None => None,
+        Some(s) => {
+            let (layer, skel) = s.split_once("::").unwrap_or((s, "/root/Bird/Bird"));
+            let data = read_layer(layer)?;
+            let p = Prim::read(data.as_ref(), skel)?;
+            let order: Vec<String> = match p.get("joints") {
+                Some(Value::TokenVec(t)) => t.iter().map(|t| t.to_string()).collect(),
+                Some(Value::StringVec(t)) => t.clone(),
+                _ => bail!("{s}: no joints"),
+            };
+            if order.len() != r.joints.len() {
+                bail!("{s}: {} joints, the cloud {}", order.len(), r.joints.len());
+            }
+            let m = order
+                .iter()
+                .map(|n| r.joints.iter().position(|j| j == n).ok_or_else(|| anyhow!("{s}: joint {n} not in the cloud")))
+                .collect::<Result<Vec<_>>>()?;
+            let moved = m.iter().enumerate().filter(|(i, j)| i != *j).count();
+            eprintln!("{s}: {} joints, {moved} in another order than the cloud's", m.len());
+            (moved > 0).then_some(m)
+        }
+    };
+    for name in names {
+        let rig = dir.join(format!("{name}_rig.usda"));
+        let path = if rig.exists() { rig } else { dir.join(format!("{name}.usda")) };
+        let path = path.to_string_lossy().to_string();
+        let data = read_layer(&path)?;
+        let p = Prim::read(data.as_ref(), prim_path)?;
+        if !p.joints().is_empty() && p.joints() != r.joints {
+            bail!("{path}: another skeleton's joints");
+        }
+        let mut c = p.clip(&name, time_codes_per_second(data.as_ref()))?;
+        if let Some(m) = &remap {
+            let j = r.joints.len();
+            let mut x = vec![0.0; c.xforms.len()];
+            for s in 0..c.times.len() {
+                for (from, &to) in m.iter().enumerate() {
+                    x[(s * j + to) * 16..(s * j + to + 1) * 16]
+                        .copy_from_slice(&c.xforms[(s * j + from) * 16..(s * j + from + 1) * 16]);
+                }
+            }
+            c.xforms = x;
+        }
+        r.clips.push(c);
+        r.check().with_context(|| path.clone())?;
+    }
+    Ok(())
+}
+
+/// A clip, for the report: its length, how far its last pose is from its
+/// first (a loop's seam), and how far it carries the bird: where the
+/// pelvis joint's skinning transform takes the bind-space origin (the
+/// sparrow's sits between its feet), against the first sample.
+fn clip_report(r: &AthcSkeleton, c: &SkinClip) -> Json {
+    let j = r.joints.len();
+    let n = c.times.len();
+    let per = j * 16;
+    let first = &c.xforms[..per];
+    let last = &c.xforms[(n - 1) * per..n * per];
+    // The seam: the largest change of a rotation element, and of a translation.
+    let (mut rot, mut tr) = (0.0f32, 0.0f32);
+    for k in 0..per {
+        let d = (first[k] - last[k]).abs();
+        if k % 16 >= 12 { tr = tr.max(d) } else { rot = rot.max(d) }
+    }
+    let pelvis = r.joints.iter().position(|n| n.ends_with("Pelvis")).unwrap_or(0);
+    // p' = p M (USD rows): the origin's image is the translation row.
+    let origin = |s: usize| {
+        let m = &c.xforms[(s * j + pelvis) * 16..(s * j + pelvis + 1) * 16];
+        [m[12], m[13], m[14]]
+    };
+    let o0 = origin(0);
+    let dist = |a: [f32; 3]| ((a[0] - o0[0]).powi(2) + (a[1] - o0[1]).powi(2) + (a[2] - o0[2]).powi(2)).sqrt();
+    let travel = dist(origin(n - 1));
+    let excursion = (0..n).map(|s| dist(origin(s))).fold(0.0f32, f32::max);
+    let span = c.times[n - 1] - c.times[0];
+    json!({
+        "name": c.name,
+        "samples": n,
+        "from": c.times.first(),
+        "to": c.times.last(),
+        "timeCodesPerSecond": c.time_codes_per_second,
+        "seconds": span / c.time_codes_per_second.max(1e-6),
+        "seamRotation": rot,
+        "seamTranslation": tr,
+        "rootTravel": travel,
+        "rootExcursion": excursion,
+    })
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
@@ -629,6 +763,10 @@ fn main() -> Result<()> {
         "--drop-backs",
         "--clip",
         "--add-clip",
+        "--clip-dir",
+        "--clips",
+        "--clip-skeleton",
+        "--clip-files",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -713,6 +851,35 @@ fn main() -> Result<()> {
         }
         r.clips.push(p.clip(name, time_codes_per_second(other.as_ref()))?);
         r.check()?;
+    }
+    if let Some(dir) = arg(&args, "--clip-dir") {
+        let Some(r) = rig.as_mut() else { bail!("--clip-dir on a cloud nothing carries") };
+        add_clip_dir(r, dir, arg(&args, "--clips"), arg(&args, "--clip-skeleton"), prim_path)?;
+    }
+    if flag("--drop-own-clip") {
+        let Some(r) = rig.as_mut() else { bail!("--drop-own-clip on a cloud nothing carries") };
+        if r.clips.len() < 2 {
+            bail!("--drop-own-clip leaves no clip (add some with --clip-dir or --add-clip)");
+        }
+        r.clips.remove(0);
+    }
+    // Every clip in a file of its own (ATCL, gzipped), the .athc keeping the
+    // first alone: a page fetches a clip when it plays it.
+    let all_clips: Vec<Json> = rig
+        .as_ref()
+        .map(|r| r.clips.iter().map(|c| clip_report(r, c)).collect())
+        .unwrap_or_default();
+    let mut clip_files: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    if let Some(dir) = arg(&args, "--clip-files") {
+        let Some(r) = rig.as_mut() else { bail!("--clip-files on a cloud nothing carries") };
+        std::fs::create_dir_all(dir)?;
+        for c in &r.clips {
+            let file = format!("{}.atcl.gz", c.name);
+            let bytes = gzip(&c.to_atcl(r.joints.len()));
+            std::fs::write(std::path::Path::new(dir).join(&file), &bytes)?;
+            clip_files.insert(c.name.clone(), (file, bytes.len()));
+        }
+        r.clips.truncate(1);
     }
     for added in args_all(&args, "--add") {
         // path::TEXT,TEXT drops those prims from this cloud only
@@ -875,13 +1042,15 @@ fn main() -> Result<()> {
             "influences": r.influences,
             "gradientWords": r.gradient_words,
             "skeleton": r.skeleton,
-            "clips": r.clips.iter().map(|c| json!({
-                "name": c.name,
-                "samples": c.times.len(),
-                "from": c.times.first(),
-                "to": c.times.last(),
-                "timeCodesPerSecond": c.time_codes_per_second,
-            })).collect::<Vec<_>>(),
+            "clips": all_clips.iter().map(|c| {
+                let mut c = c.clone();
+                if let Some((file, bytes)) = c["name"].as_str().and_then(|n| clip_files.get(n)) {
+                    c["file"] = json!(file);
+                    c["fileBytes"] = json!(bytes);
+                }
+                c
+            }).collect::<Vec<_>>(),
+            "embeddedClips": r.clips.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
         })),
         "boundsMin": h.bounds_min,
         "boundsMax": h.bounds_max,

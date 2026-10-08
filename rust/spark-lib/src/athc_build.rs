@@ -1542,8 +1542,24 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
     if !src.lobes.is_empty() && src.pbr.is_empty() {
         bail!("lobes without the material: a .athc keeps them only beside pbr");
     }
-    // Morton order: a stable sort of the codes, as the radix sort is.
     let (codes, lo, extent) = lod_codes(cloud, o);
+    build_lod_from_codes(cloud, o, &codes, lo, extent)
+}
+
+/// [`build_lod`] over given 30-bit codes instead of the octree's Morton
+/// codes: level r's groups are the splats whose codes agree in their top
+/// 3r bits (`groups_of`), a group's children the next level's within it.
+/// Any hierarchy of at most eight children a group whose leaves all sit at
+/// the finest level can be written so (`athc_merge`'s error-driven tree);
+/// `lo` and `extent` go to the header (the decoder widens level r's
+/// groups by `MERGED_FILL` x extent / 2^r).
+pub fn build_lod_from_codes(cloud: &PackedCloud, o: &BuildOptions, codes: &[u32], lo: [f32; 3], extent: f32) -> Result<AthcFile> {
+    let src = &cloud.block;
+    let n = src.n;
+    if codes.len() != n {
+        bail!("{} codes for {} splats", codes.len(), n);
+    }
+    // Morton order: a stable sort of the codes, as the radix sort is.
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| codes[i as usize]);
     let keys: Vec<u32> = order.iter().map(|&i| codes[i as usize]).collect();

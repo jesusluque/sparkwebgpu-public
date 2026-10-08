@@ -341,7 +341,35 @@ impl Scene {
             aspect: 16.0 / 9.0,
         };
         let corvette_parts = ["paint", "body", "windshield", "tinted", "headlights", "trim"];
-        let (dir, files, cam, below): (String, Vec<(String, String)>, CamSpec, bool) = match asset {
+        // `kind@DIR`: every .athc of DIR (but the catcher and the lamp floor),
+        // with the camera of `kind` (corvette, sparrow, pawn).
+        let (kind, at_dir) = match asset.split_once('@') {
+            Some((k, d)) => (k, Some(d.to_string())),
+            None => (asset, None),
+        };
+        let (dir, files, cam, below): (String, Vec<(String, String)>, CamSpec, bool) = match kind {
+            _ if at_dir.is_some() => {
+                let dir = at_dir.clone().unwrap();
+                let mut files = Vec::new();
+                for e in std::fs::read_dir(&dir)? {
+                    let name = e?.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".athc") && !name.starts_with("catcher") && !name.starts_with("lamp-floor") {
+                        files.push((name.split('-').next().unwrap().to_string(), name));
+                    }
+                }
+                files.sort();
+                let (cam, below) = match kind {
+                    "corvette" => (corvette_cam, false),
+                    "sparrow" => {
+                        let v = 39.59775f32.to_radians();
+                        let aspect = 16.0 / 9.0;
+                        (CamSpec { eye: [0.38, -0.48, 0.2], target: [0.0, 0.02, 0.03], up: [0.0, 0.0, 1.0], hfov: 2.0 * ((v / 2.0).tan() * aspect).atan(), aspect }, true)
+                    }
+                    "pawn" => (CamSpec { eye: [0.0, 0.048, 0.18], target: [0.0, 0.048, 0.0], up: [0.0, 1.0, 0.0], hfov: 39.6f32.to_radians(), aspect: 1.0 }, true),
+                    _ => bail!("unknown camera {kind}"),
+                };
+                (dir, files, cam, below)
+            }
             "corvette-hd" | "corvette-light" => {
                 let d = if asset == "corvette-hd" { "corvette-v2-hd" } else { "corvette-v5-light" };
                 (
@@ -402,7 +430,7 @@ impl Scene {
             // Only a cloud whose splats are the baked ones has meaningful levels
             // (a cut cloud's splats are merged groups already).
             let merged = f.chunks.iter().any(|c| c.positions.chunks_exact(4).any(|p| p[3] > 1.0));
-            level_data.push(if f.levels.len() > 1 && !merged && !asset.contains("light") && asset != "sparrow-mobile" {
+            level_data.push(if f.levels.len() > 1 && !merged && (at_dir.is_some() || (!asset.contains("light") && asset != "sparrow-mobile")) {
                 Some(level_data_of(&f, pi as u16)?)
             } else {
                 None

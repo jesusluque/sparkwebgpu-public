@@ -19,10 +19,27 @@
 //!                         the output: each element of a cut the weighted mean of the original
 //!                         splats under it, merged nodes as before; the cloud hash re-stamped
 //!   --athl-threshold T    a block is kept when a value passes T (default 0: any light)
+//!   --error               with --keep-splats S: merge the splats down to S by an image-space
+//!                         error (athc_merge::error_cut: greedy pair merges, Runnalls cost x
+//!                         on-screen weight, never across glass/thin/Schlick/mirror/joint or
+//!                         normals past 60 degrees), the levels above an error-driven tree too
+//!   --error-levels        the levels built again as an error-driven tree, every splat kept
+//!                         (athc_merge::error_levels; the splats reordered depth first)
+//!   --error-orbit X,Y,Z,D[,HFOV,WIDTH]  where the error is seen from: an orbit at D around
+//!                         X,Y,Z (default: three bound radii around the bounds' centre), HFOV
+//!                         degrees over WIDTH pixels (39.6, 1920). Give a scene's parts the same
+//!   --error-lambda L      colour weight (128); --error-material M (32); --error-normal N (0)
+//!   --error-widen F       the cut's clusters widened by F x their own cell edge (0)
+//!   --error-ratio R       groups of a level over the next coarser (4)
+//!   --error-max E         with --error: merge nothing dearer than E (the same E over a scene's
+//!                         parts seen from the same orbit spends the splats where the error is;
+//!                         --keep-splats is then a floor); --error-curve prints splats left and
+//!                         the dearest merge after each pass
 
 use anyhow::{bail, Context, Result};
-use spark_lib::athl::{cloud_hash, cut_values, sparse_layers, validate, virtual_values_weighted, AthlFile};
+use spark_lib::athl::{cloud_hash, splat_weights, sparse_layers, validate, virtual_values_weighted, AthlFile};
 use spark_lib::athc_build::{build_lod, packed_of, BuildOptions};
+use spark_lib::athc_merge::{error_cut_to, error_levels, ErrorOptions, ErrorView};
 use spark_lib::athc::{cut_sources, truncate_creases, truncate_levels, uncap_levels, AthcFile, VirtualTree};
 use spark_lib::athc_v3::{
     parse_v3, read_v3, read_v3_skeleton, write_v3_encoded, write_v3_full, write_v3_smallest_with, SectionId, ATH3_MAGIC, COMPRESSION_GZIP, COMPRESSION_NONE,
@@ -44,7 +61,7 @@ fn main() -> Result<()> {
         .iter()
         .enumerate()
         .filter(|&(i, a)| {
-            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl")))
+            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
         })
         .map(|(_, a)| a)
         .collect();
@@ -65,6 +82,52 @@ fn main() -> Result<()> {
     // The uncut cloud, for the layers, and what each output element stands for.
     let original = athl_io.as_ref().map(|_| file.clone());
     let mut ranges: Option<Vec<[u32; 2]>> = None;
+    // The original splats (file order) each output element stands for, when
+    // not a run of them (an error-driven tree reorders).
+    let mut lists: Option<Vec<Vec<u32>>> = None;
+    let cut_to = if flag("--error") {
+        Some(text("--keep-splats").ok_or_else(|| anyhow::anyhow!("--error goes with --keep-splats N"))?.parse::<usize>()?)
+    } else {
+        None
+    };
+    if cut_to.is_some() || flag("--error-levels") {
+        let floats = |f: &str| -> Result<Option<Vec<f64>>> {
+            text(f).map(|v| v.split(',').map(|x| x.parse::<f64>().map_err(anyhow::Error::from)).collect()).transpose()
+        };
+        let view = match floats("--error-orbit")? {
+            Some(v) if v.len() >= 4 => ErrorView::orbit([v[0], v[1], v[2]], v[3], *v.get(4).unwrap_or(&39.6), *v.get(5).unwrap_or(&1920.0)),
+            Some(_) => bail!("--error-orbit X,Y,Z,D[,HFOV,WIDTH]"),
+            None => ErrorView::around(file.header.bounds_min, file.header.bounds_max),
+        };
+        let mut o = ErrorOptions::new(view);
+        let num = |f: &str, d: f64| -> Result<f64> { Ok(text(f).map(|v| v.parse::<f64>()).transpose()?.unwrap_or(d)) };
+        o.lambda = num("--error-lambda", o.lambda)?;
+        o.lambda_material = num("--error-material", o.lambda_material)?;
+        o.lambda_normal = num("--error-normal", o.lambda_normal)?;
+        o.widen = num("--error-widen", o.widen as f64)? as f32;
+        o.level_ratio = num("--error-ratio", o.level_ratio)?;
+        o.threads = num("--error-threads", o.threads as f64)? as usize;
+        let t = std::time::Instant::now();
+        let before = file.header.count;
+        let (out, tree) = match cut_to {
+            Some(k) => error_cut_to(&file, k, num("--error-max", f64::INFINITY)?, &o)?,
+            None => error_levels(&file, &o)?,
+        };
+        if let Some(c) = &tree.cut {
+            println!("error cut: {} -> {} splats in {} passes, dearest merge {:.3e}, {} past the strict rules", c.from, c.to, c.passes, c.last_cost, c.relaxed);
+            if flag("--error-curve") {
+                let pts: Vec<String> = c.curve.iter().map(|(n, e)| format!("{n}:{e:.4e}")).collect();
+                println!("error curve: {}", pts.join(" "));
+            }
+        }
+        for r in &tree.runs {
+            println!("  level step {} -> {} in {} passes (dearest {:.3e}, {} relaxed)", r.from, r.to, r.passes, r.last_cost, r.relaxed);
+        }
+        println!("error-driven levels: groups {:?}, extent {:.4}, {:.1}s", tree.groups, tree.extent, t.elapsed().as_secs_f32());
+        lists = Some(tree.sources);
+        file = out;
+        println!("kept {} levels: {} splats (of {})", file.levels.len(), file.header.count, before);
+    }
     if let Some(seed) = args.iter().position(|a| a == "--rebuild-frame").and_then(|i| args.get(i + 1)) {
         let o = BuildOptions { frame_seed: seed.parse()?, chunk_splats: file.header.chunk_splats, ..Default::default() };
         let before: Vec<usize> = file.levels.iter().map(|(_, b)| b.n).collect();
@@ -73,7 +136,7 @@ fn main() -> Result<()> {
         println!("levels built again (frame {seed}): groups {before:?} -> {after:?}");
     }
     let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).map(|v| v.parse::<usize>());
-    let keep = match (value("--keep-levels"), value("--keep-splats")) {
+    let keep = if lists.is_some() { None } else { match (value("--keep-levels"), value("--keep-splats")) {
         (Some(n), _) => Some(n?),
         (None, Some(s)) => {
             let s = s?;
@@ -81,7 +144,7 @@ fn main() -> Result<()> {
             Some(k.ok_or_else(|| anyhow::anyhow!("no level below the coarsest has at most {s} groups"))?)
         }
         _ => None,
-    };
+    } };
     let creases = args.iter().position(|a| a == "--creases").and_then(|i| args.get(i + 1)).map(|v| v.parse::<f32>());
     if let Some(k) = keep {
         let before = file.header.count;
@@ -152,8 +215,10 @@ fn main() -> Result<()> {
     if let (Some((athl_in, athl_out)), Some(original)) = (&athl_io, &original) {
         let threshold: f32 = text("--athl-threshold").map_or(Ok(0.0), |v| v.parse()).context("--athl-threshold")?;
         let n0 = original.header.count;
-        let ranges = ranges.unwrap_or_else(|| (0..n0).map(|i| [i, i + 1]).collect());
-        let athl = carry_athl(&AthlFile::read(&std::fs::read(athl_in)?)?, original, &file, &ranges, &out, threshold)?;
+        let lists = lists.unwrap_or_else(|| {
+            ranges.unwrap_or_else(|| (0..n0).map(|i| [i, i + 1]).collect()).iter().map(|r| (r[0]..r[1]).collect()).collect()
+        });
+        let athl = carry_athl(&AthlFile::read(&std::fs::read(athl_in)?)?, original, &file, &lists, &out, threshold)?;
         let written = athl.write()?;
         std::fs::write(athl_out, &written)?;
         println!(
@@ -170,12 +235,12 @@ fn main() -> Result<()> {
 }
 
 /// `athl` (over `original`'s virtual order) over the cut cloud `file`,
-/// whose element e stands for `original`'s splats `ranges[e]`.
+/// whose element e stands for `original`'s splats `lists[e]`.
 fn carry_athl(
     athl: &AthlFile,
     original: &AthcFile,
     file: &AthcFile,
-    ranges: &[[u32; 2]],
+    ranges: &[Vec<u32>],
     file_bytes: &[u8],
     threshold: f32,
 ) -> Result<AthlFile> {
@@ -211,11 +276,36 @@ fn carry_athl(
         let (c, dense) = athl.dense(group, kind).expect("a layer of that group and kind");
         let c = c as usize;
         let per = &dense[athl.splat_base as usize * c..];
-        let (values, weights) = cut_values(original, ranges, per, c);
+        let (values, weights) = cut_values_of(&splat_weights(original), ranges, per, c);
         let virt = virtual_values_weighted(file, &tree, &values, c as u32, Some(&weights))?;
         out.layers.extend(sparse_layers(group, kind, c as u32, &virt, threshold)?);
     }
     out.layers.sort_by_key(|l| (l.chunk, l.group, l.kind));
     validate(&out)?;
     Ok(out)
+}
+
+/// `athl::cut_values` over lists of splats: each element's value the
+/// weighted mean of its splats', and their summed weight.
+fn cut_values_of(w: &[f32], lists: &[Vec<u32>], per_splat: &[f32], c: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut values = vec![0f32; lists.len() * c];
+    let mut sums = vec![0f32; lists.len()];
+    for (e, list) in lists.iter().enumerate() {
+        let mut sw = 0f64;
+        let mut sv = vec![0f64; c];
+        for &i in list {
+            let i = i as usize;
+            sw += w[i] as f64;
+            for k in 0..c {
+                sv[k] += w[i] as f64 * per_splat[i * c + k] as f64;
+            }
+        }
+        sums[e] = sw as f32;
+        if sw > 0.0 {
+            for k in 0..c {
+                values[e * c + k] = (sv[k] / sw) as f32;
+            }
+        }
+    }
+    (values, sums)
 }

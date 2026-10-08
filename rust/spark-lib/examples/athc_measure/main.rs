@@ -9,6 +9,7 @@
 //! cargo run --release -p spark-lib --example athc_measure -- <command> ...
 
 mod cloud;
+mod cmp;
 mod merge;
 mod pose;
 mod raster;
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
         "levels" => levels(&scene, &args),
         "surfel" => surfel(&scene, width),
         "merge" => merge::run(&scene, &args),
+        "cmp" => cmp::run(&scene, &args),
         "bytes" => bytes(&scene),
         "overlap" => overlap(&scene),
         "thin" => thin(&scene, &args),

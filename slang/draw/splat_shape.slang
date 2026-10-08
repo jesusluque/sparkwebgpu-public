@@ -23,6 +23,12 @@ static const uint DRAW_ORTHOGRAPHIC = 16u;
 static const uint DRAW_ENCODE_LINEAR = 32u; // sRGB colours to linear output
 static const uint DRAW_PREMULTIPLIED = 64u; // write premultiplied alpha
 static const uint DRAW_DISK_CLIP = 128u;    // portal disk clip (diskCenter)
+// With additive splats (generate's GEN_ADDITIVE) drawn as a layer of their
+// own: the pass that draws only them, blended among themselves as any
+// splats (athenea's light catcher, `lampTransmittance`), into a layer added
+// to the frame; and the pass that draws the rest over it.
+static const uint DRAW_ADDITIVE_ONLY = 256u;
+static const uint DRAW_NO_ADDITIVE = 512u;
 
 struct DrawParams {
     float4 proj0;   // projection matrix columns

@@ -133,6 +133,8 @@ export const drawSplatShape = {
   DRAW_ENCODE_LINEAR: 32,
   DRAW_PREMULTIPLIED: 64,
   DRAW_DISK_CLIP: 128,
+  DRAW_ADDITIVE_ONLY: 256,
+  DRAW_NO_ADDITIVE: 512,
 } as const;
 
 /** slang/fx/bridge.slang */

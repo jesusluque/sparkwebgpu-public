@@ -9,11 +9,22 @@ import core.math;
 import core.quat_codec;
 import core.splat_types;
 
+// A surfel's flat axis (a scale of exactly 0, 2DGS) as a finite f16 ln:
+// log(0) = -inf, and packHalf2x16 of a value outside f16's finite range is
+// indeterminate in WGSL. exp(-65504) is exactly 0 in f32 (as the CPU's
+// athc::SURFEL_LN), so unpackSplatExt gives the 0 back.
+public static const float kSurfelLnScale = -65504.0;
+
+public float3 lnScales(float3 scales) {
+    return select(scales > 0.0, log(max(scales, float3(1.0e-30))), float3(kSurfelLnScale));
+}
+
 public void packSplatExt(out uint4 a, out uint4 b, float3 center, float3 scales, float4 quaternion, float4 rgba) {
     a = uint4(asuint(center), packHalf2x16(float2(rgba.a, 0.0)));
     b.x = packHalf2x16(rgba.rg);
-    b.y = packHalf2x16(float2(rgba.b, log(scales.x)));
-    b.z = packHalf2x16(log(scales.yz));
+    const float3 ln = lnScales(scales);
+    b.y = packHalf2x16(float2(rgba.b, ln.x));
+    b.z = packHalf2x16(ln.yz);
     b.w = encodeQuatOctXy1010R12(quaternion);
 }
 

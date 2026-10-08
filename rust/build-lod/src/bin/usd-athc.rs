@@ -15,6 +15,7 @@
 //!          [--add more.usdc]... [--only-prim TEXT]... [--exclude-prim TEXT]...
 //!          [--thin RATIO | --target SPLATS | --cell SIDE [--fill 1.0]]
 //!          [--drop-backs THICKNESS] [--box x0,y0,z0,x1,y1,z1]
+//!          [--surfel-nodes auto|on|off]
 //! usd-athc in.usdc --list            the prim's attributes, their types and lengths
 //! ```
 //!
@@ -41,6 +42,13 @@
 //! ```text
 //! positions (point3f[] | positionsh)          positions xyz
 //! opacities (float[], linear)                 positions w; < 1/255 dropped
+//! primvars:athenea:splat:coverage (float[])   positions w in place of the
+//!                                             opacity: a merged gaussian's
+//!                                             W / A without the 0.99 cap
+//!                                             (past 1, Spark's LoD opacity)
+//! scales: one exactly 0 is a surfel (2DGS)    shape f16 ln -65504 (exp = 0);
+//!                                             merged nodes of discs are
+//!                                             surfels (--surfel-nodes)
 //! orientations (quatf[] | quath[])            shape[0] smallest three
 //! scales (float3[], linear)                   shape[1..2] f16 ln
 //! radiance:sphericalHarmonicsCoefficients     shape base (0.5 + SH0 dc), sh rest
@@ -99,7 +107,7 @@ use openusd::sdf::{self, AbstractData, Value};
 use serde_json::{json, Value as Json};
 use spark_lib::athc_build::{
     build_lod, cell_for_target, crop_box_kept, drop_hidden_backs_kept, lod_order, pack_streams, pack_streams_kept,
-    reduce_cells_runs, reduce_thin_runs, BuildOptions, CloudStreams, LobeStreams, TransferKeep, SH0,
+    reduce_cells_runs, reduce_thin_runs, BuildOptions, CloudStreams, LobeStreams, SurfelNodes, TransferKeep, SH0,
 };
 use spark_lib::athl::SplatSources;
 use spark_lib::athc_skin::{AthcSkeleton, SkinClip};
@@ -333,6 +341,7 @@ impl Prim {
             rotations: self.floats(&["orientations", "orientationsh"])?,
             scales: self.floats(&["scales", "scalesh"])?,
             opacities: self.floats(&["opacities", "opacitiesh"])?,
+            coverage: self.floats(&["athenea:splat:coverage"])?,
             coefficients,
             sh,
             linear: self.bool("athenea:splat:linear"),
@@ -578,6 +587,20 @@ fn append(a: &mut CloudStreams, b: CloudStreams) -> Result<()> {
             mine.resize(a.count + b.count, 0);
         } else {
             mine.extend_from_slice(&theirs[..b.count]);
+        }
+    }
+    // athenea's coverage: where one cloud has none, its opacity is its own.
+    // (`a.opacities` holds both clouds' by now.)
+    if !a.coverage.is_empty() || !b.coverage.is_empty() {
+        let own = |o: &[f32], i: usize| o.get(i).copied().unwrap_or(1.0);
+        if a.coverage.is_empty() {
+            a.coverage = (0..a.count).map(|i| own(&a.opacities, i)).collect();
+        }
+        if b.coverage.is_empty() {
+            let more: Vec<f32> = (0..b.count).map(|i| own(&a.opacities, a.count + i)).collect();
+            a.coverage.extend(more);
+        } else {
+            a.coverage.extend_from_slice(&b.coverage);
         }
     }
     a.lobes.append(a.count, b.lobes, b.count);
@@ -1240,6 +1263,14 @@ fn main() -> Result<()> {
     }
     if let Some(c) = arg(&args, "--chunk") {
         options.chunk_splats = c.parse().context("--chunk")?;
+    }
+    if let Some(v) = arg(&args, "--surfel-nodes") {
+        options.surfel_nodes = match v {
+            "auto" => SurfelNodes::Auto,
+            "on" => SurfelNodes::On,
+            "off" => SurfelNodes::Off,
+            _ => bail!("--surfel-nodes auto|on|off, not {v}"),
+        };
     }
     if flag("--no-lobes") {
         // The material's base alone, as before the layers were carried.

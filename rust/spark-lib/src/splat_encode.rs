@@ -124,14 +124,22 @@ pub fn decode_packed_splat_quat(packed: &[u32]) -> [f32; 4] {
     decode_quat_oct888(u_quat)
 }
 
+/// A scale as the f16 ln an ext splat holds: a surfel's flat axis (exactly
+/// 0) as the finite sentinel [`crate::athc::SURFEL_LN`], which `exp()` decodes
+/// to exactly 0 (ln 0 = -inf is an f16 infinity, which WGSL's packHalf2x16
+/// leaves indeterminate).
+pub fn ext_ln_scale(scale: f32) -> f32 {
+    crate::athc::ln_scale(scale)
+}
+
 pub fn encode_ext_splat(ext_a: &mut [u32], ext_b: &mut [u32], center: [f32; 3], opacity: f32, rgb: [f32; 3], scale: [f32; 3], quat_xyzw: [f32; 4]) {
     ext_a[0] = center[0].to_bits();
     ext_a[1] = center[1].to_bits();
     ext_a[2] = center[2].to_bits();
     ext_a[3] = f16::from_f32(opacity).to_bits() as u32;
     ext_b[0] = f16::from_f32(rgb[0]).to_bits() as u32 | ((f16::from_f32(rgb[1]).to_bits() as u32) << 16);
-    ext_b[1] = f16::from_f32(rgb[2]).to_bits() as u32 | ((f16::from_f32(scale[0].ln()).to_bits() as u32) << 16);
-    ext_b[2] = f16::from_f32(scale[1].ln()).to_bits() as u32 | ((f16::from_f32(scale[2].ln()).to_bits() as u32) << 16);
+    ext_b[1] = f16::from_f32(rgb[2]).to_bits() as u32 | ((f16::from_f32(ext_ln_scale(scale[0])).to_bits() as u32) << 16);
+    ext_b[2] = f16::from_f32(ext_ln_scale(scale[1])).to_bits() as u32 | ((f16::from_f32(ext_ln_scale(scale[2])).to_bits() as u32) << 16);
     ext_b[3] = encode_quat_oct101012(quat_xyzw);
 }
 
@@ -174,8 +182,8 @@ pub fn decode_ext_splat_rgba(ext_a: &[u32], ext_b: &[u32]) -> [f32; 4] {
 }
 
 pub fn encode_ext_splat_scale(ext_b: &mut [u32], scale: [f32; 3]) {
-    ext_b[1] = (ext_b[1] & 0xffff) | ((f16::from_f32(scale[0].ln()).to_bits() as u32) << 16);
-    ext_b[2] = f16::from_f32(scale[1].ln()).to_bits() as u32 | ((f16::from_f32(scale[2].ln()).to_bits() as u32) << 16);
+    ext_b[1] = (ext_b[1] & 0xffff) | ((f16::from_f32(ext_ln_scale(scale[0])).to_bits() as u32) << 16);
+    ext_b[2] = f16::from_f32(ext_ln_scale(scale[1])).to_bits() as u32 | ((f16::from_f32(ext_ln_scale(scale[2])).to_bits() as u32) << 16);
 }
 
 pub fn decode_ext_splat_scale(ext_b: &[u32]) -> [f32; 3] {
@@ -479,7 +487,13 @@ pub fn decode_sh3_internal_words(words: [u32; 4], sh3_scale: f32) -> [f32; 21] {
 
 pub fn encode_lod_tree(buffer: &mut [u32], center: &[f32], opacity: f32, scale: &[f32], child_count: u16, child_start: u32) {
     let center: [f16; 3] = array::from_fn(|d| f16::from_f32(center[d]));
-    let avg_scale = (scale[0] + scale[1] + scale[2]) / 3.0;
+    // A surfel (an axis exactly 0) is as big as its disc: the mean of its
+    // two other axes, not of three (which refined it a third too late).
+    let avg_scale = if scale[0].min(scale[1]).min(scale[2]) <= 0.0 {
+        (scale[0] + scale[1] + scale[2]) / 2.0
+    } else {
+        (scale[0] + scale[1] + scale[2]) / 3.0
+    };
     let expansion = if opacity <= 1.0 { 1.0 } else {
         let a = opacity * 4.0 - 3.0;
         1.0 + 0.7 * (a - 1.0)
@@ -495,4 +509,33 @@ pub fn decode_lod_tree_children(buffer: &[u32]) -> (u16, u32) {
     let child_count = (buffer[2] & 0xffff) as u16;
     let child_start = buffer[3];
     (child_count, child_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A surfel's flat axis is the finite sentinel, decoded to exactly 0;
+    /// its LoD size is its disc's.
+    #[test]
+    fn a_surfel_encodes_its_flat_axis_finitely() {
+        let (mut a, mut b) = ([0u32; 4], [0u32; 4]);
+        encode_ext_splat(&mut a, &mut b, [0.0; 3], 0.5, [0.5; 3], [0.02, 0.01, 0.0], [0.0, 0.0, 0.0, 1.0]);
+        let ln = f16::from_bits((b[2] >> 16) as u16);
+        assert!(ln.is_finite() && ln.to_f32() == crate::athc::SURFEL_LN);
+        let s = decode_ext_splat_scale(&b);
+        assert_eq!(s[2], 0.0);
+        assert!((s[0] - 0.02).abs() < 1e-4 && (s[1] - 0.01).abs() < 1e-4);
+        encode_ext_splat_scale(&mut b, [0.0, 0.01, 0.02]);
+        assert_eq!(decode_ext_splat_scale(&b)[0], 0.0);
+        assert!(f16::from_bits((b[1] >> 16) as u16).is_finite());
+
+        let mut node = [0u32; 4];
+        encode_lod_tree(&mut node, &[0.0; 3], 0.5, &[0.02, 0.01, 0.0], 0, 0);
+        let size = f16::from_bits((node[1] >> 16) as u16).to_f32();
+        assert!((size - 0.03).abs() < 1e-4, "{size}");
+        encode_lod_tree(&mut node, &[0.0; 3], 0.5, &[0.02, 0.01, 0.003], 0, 0);
+        let size = f16::from_bits((node[1] >> 16) as u16).to_f32();
+        assert!((size - 0.022).abs() < 1e-4, "{size}");
+    }
 }

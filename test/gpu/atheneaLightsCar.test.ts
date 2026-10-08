@@ -86,3 +86,43 @@ describe("a car's light layers from usd-athc", () => {
     expect(packed[0]).toBe(3);
   });
 });
+
+// Opt-in: a set built by scripts/build-corvette-lights.mjs
+// (CORVETTE_LIGHTS=<dir with corvette.json>): every part with an .athl
+// lines up with its cloud's whole-file decode, its hash and the sidecar.
+const SET = process.env.CORVETTE_LIGHTS;
+describe.skipIf(!SET)("a built Corvette lights set", () => {
+  it("lines up part by part", async () => {
+    const dir = new URL(`file://${SET}/`);
+    const read = (n: string) => new Uint8Array(readFileSync(new URL(n, dir)));
+    const scene = JSON.parse(new TextDecoder().decode(read("corvette.json")));
+    const side = parseLightSidecar(
+      new TextDecoder().decode(read(scene.lights)),
+    );
+    const lit = scene.parts.filter((p: { athl?: string }) => p.athl);
+    expect(lit.length).toBeGreaterThan(0);
+    for (const part of lit) {
+      const cloud = read(part.file);
+      const data = await decodeAthl(read(part.athl));
+      expect(data.header.cloudHash).toBe(
+        athcCloudHash(cloud.subarray(0, 4096)),
+      );
+      const decoder = wasm.decode_to_extsplats(
+        undefined,
+        "cloud.athc",
+        undefined,
+        undefined,
+        undefined,
+      );
+      decoder.push(cloud);
+      const { numSplats } = decoder.finish() as { numSplats: number };
+      expect(numSplats).toBe(data.header.merged + data.header.splatCount);
+      expect(data.groups.map((g) => g.name)).toEqual(
+        side.groups.map((g) => g.name),
+      );
+      expect(data.groups.map((g) => g.radiance)).toEqual(
+        side.groups.map((g) => g.radiance),
+      );
+    }
+  }, 300_000);
+});

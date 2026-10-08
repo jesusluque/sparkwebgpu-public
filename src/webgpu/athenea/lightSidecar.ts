@@ -17,7 +17,8 @@
 //     float   athenea:lightGroup:radiance       the lamp's "on" radiance, nits (default 1)
 //     float   athenea:lightGroup:emissionLuminance  athenea's corvette.lights.usda: the radiance, where
 //                                               `radiance` is not given (its per-group bakes are per unit
-//                                               of it, the material's emission colour baked in)
+//                                               of it, baked white)
+//     color3f athenea:lightGroup:emissionColor  athenea's: the colour, where `color` is not given
 //     color3f athenea:lightGroup:color          rgb (default 1, 1, 1)
 //     float   athenea:lightGroup:temperatureK   blackbody colour (times `color`); xenon/halogen: the final one
 //     float   athenea:lightGroup:startTemperatureK  xenon's (default 4300), halogen's cold glow (default 1000)
@@ -240,7 +241,9 @@ function groupOf(
     side: str(get("side"), ""),
     technology,
     radiance: num(get("radiance"), num(get("emissionLuminance"), 1)),
-    color: rgb(get("color")) ?? [1, 1, 1],
+    // athenea bakes a group white, per unit of emissionLuminance: its
+    // emissionColor goes in the weight (corvette-lights NOTES.md).
+    color: rgb(get("color")) ?? rgb(get("emissionColor")) ?? [1, 1, 1],
     temperatureK: typeof t === "number" ? t : null,
     startTemperatureK: num(
       get("startTemperatureK"),

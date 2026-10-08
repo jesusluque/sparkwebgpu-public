@@ -304,8 +304,9 @@ those clouds (same splats, same order): `sparse_layers` + `virtual_values`.
 athenea bakes the interim of 069: a base cloud with every lamp off and, per
 group, a cloud of the **same gaussians in the same order** baked with only
 that group lit at `emission_luminance` 1 and the dome black (its linear
-colour, `0.5 + SH0 · dc`, is the group's light per unit of luminance, the
-material's emission colour and the lenses included). `usd-athc` builds the
+colour, `0.5 + SH0 · dc`, is the group's light per unit of luminance,
+through the lenses, the emitter baked white: the sidecar's `emissionColor`
+is the group's colour in `w_k`). `usd-athc` builds the
 `.athl` beside the `.athc`:
 
 ```sh
@@ -337,6 +338,12 @@ athc-convert car.athc light.athc --gzip --keep-splats 1000000 --creases 0.03 \
 - **Sparsity.** `--light-threshold` (radiance units) drops blocks with no
   value past it; `--light-floor` first zeroes splats fainter than it (the
   bake's grainy faint indirect).
+- **The floor.** The lamps' light on the ground comes as an additive cloud
+  (`catcher_layer_<group>.usdc`), built as its own part with its `.athl`
+  (`additive: true` in the scene). The renderer has no additive blend yet,
+  so the page leaves it out (premultiplied blend with the fragment's alpha
+  written 0 would add it; a per-splat flag through generate, the draw and
+  the tile rasterizer).
 - **Sidecar forms.** athenea's `corvette.lights.usda` writes states as
   `double athenea:lightState:target:<group>` (any prim under `LightStates`
   is a state; none: every group off) and the radiance as

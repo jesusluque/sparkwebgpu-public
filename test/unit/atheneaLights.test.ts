@@ -275,6 +275,7 @@ describe("light sidecar (066/067)", () => {
       "frenando",
       "noche_frenando",
     ]);
+    expect(c7.groups[4].color).toEqual([0.381, 0.003, 0]); // baked white
     expect(c7.states[0].targets).toEqual({});
     expect(c7.states[3].targets).toEqual({ cruce: 1, largas: 1, pilotos: 1 });
     expect(c7.rules.map((r) => r.when)).toEqual(["cruce", "!cruce"]);

@@ -330,6 +330,12 @@ athc-convert car.athc light.athc --gzip --keep-splats 1000000 --creases 0.03 \
   weighted mean of the original splats under it (`athc::cut_sources`,
   `CreaseCut::sources`), merged nodes with the original weights
   (`virtual_values_weighted`), the cloud hash re-stamped.
+- **Unbaked gaussians.** A gaussian the bake did not reach keeps an
+  all-zero SH in every layer (the first Corvette bake: 3 782 of 2 998 230,
+  those its transfer missed). Read as `0.5 + SH0 · 0` that is mid grey: 5 000
+  nits under a 10 000-nit low beam, white specks all over the car. usd-athc
+  reads an all-zero SH as no light (a baked black is `dc = -0.5 / SH0`) and
+  reports the count (`unbaked`).
 - **Scale.** The values are stored times the group's radiance from the
   sidecar (`radiance`, or athenea's `emissionLuminance`), with GRPS
   `radiance` set to it, so the plugin's `w / radiance` gives the same light

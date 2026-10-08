@@ -777,6 +777,7 @@ fn read_layer_colours(
     let mut worst = 0f32;
     let mut max = 0f32;
     let mut negative = 0usize;
+    let mut unbaked = 0usize;
     for (file, (mask, offset)) in files.iter().zip(masks) {
         let data = read_layer(file)?;
         let p = Prim::read_some(
@@ -813,9 +814,16 @@ fn read_layer_colours(
             if k >= streams.count {
                 bail!("{file}: more splats than its base cloud");
             }
+            // A gaussian the bake did not reach keeps an all-zero SH, which
+            // reads as 0.5 (mid grey, 5000 nits on a 10 000-nit lamp): no
+            // light. A baked black is dc = -0.5 / SH0, never 0.
+            let empty = sh[i * per..i * per + 3].iter().all(|v| *v == 0.0);
+            if empty {
+                unbaked += 1;
+            }
             for c in 0..3 {
                 worst = worst.max((positions[i * 3 + c] - streams.positions[k * 3 + c]).abs());
-                let v = 0.5 + SH0 * sh[i * per + c];
+                let v = if empty { 0.0 } else { 0.5 + SH0 * sh[i * per + c] };
                 if v < 0.0 {
                     negative += 1;
                 }
@@ -832,7 +840,10 @@ fn read_layer_colours(
     if worst > 1e-5 {
         bail!("the layer {:?} is not the base's gaussians: positions differ by up to {worst}", files);
     }
-    Ok((out, json!({ "files": files, "maxPositionError": worst, "max": max, "negativeClamped": negative })))
+    if unbaked > 0 {
+        eprintln!("{files:?}: {unbaked} gaussians with no SH (not baked): no light");
+    }
+    Ok((out, json!({ "files": files, "maxPositionError": worst, "max": max, "negativeClamped": negative, "unbaked": unbaked })))
 }
 
 /// A group's radiance in a `.lights.usda`: `athenea:lightGroup:radiance`,
@@ -1047,6 +1058,7 @@ fn main() -> Result<()> {
         "--light-verify",
         "--fake-layer",
         "--emit",
+        "--dump-layers",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -1253,6 +1265,16 @@ fn main() -> Result<()> {
             bail!("--light-layer {name}: {} files for {} source clouds", files.len(), masks.len());
         }
         let (values, check) = read_layer_colours(&files, prim_path, &masks, &streams)?;
+        // Diagnostics: the base's positions and this layer, f32 x y z r g b a splat.
+        if let Some(dir) = arg(&args, "--dump-layers") {
+            let mut out = Vec::with_capacity(streams.count * 24);
+            for i in 0..streams.count {
+                for v in streams.positions[3 * i..3 * i + 3].iter().chain(&values[3 * i..3 * i + 3]) {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            std::fs::write(std::path::Path::new(dir).join(format!("{name}.f32")), out)?;
+        }
         layers.push((name.to_string(), values, check));
     }
     if layers.len() > spark_lib::athl::MAX_GROUPS {

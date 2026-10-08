@@ -29,7 +29,7 @@
 //! Measured on the CPU (`athc_measure trav`, research/simplify-measurements.md
 //! § BE): on corvette-v6e-light (an error-driven tree, thread BC) the relMSE
 //! at a budget of 150k / 300k / 600k drops by 14 / 13 / 29 % from the
-//! geometric sizes (the same error with ~28% fewer splats), on the pawn by
+//! geometric sizes (the same error with ~31% fewer splats), on the pawn by
 //! 9 / 17 / 35 %; on the octree of corvette-v5-light it is mixed (-2 / +14 /
 //! -11 %) and on the sparrow even (its feathers saturate the factor). A size that is the error
 //! alone, `k sqrt(A eps)` with eps BC's merge cost (`level_error_sizes`),

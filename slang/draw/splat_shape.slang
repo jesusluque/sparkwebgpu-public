@@ -33,6 +33,24 @@ static const uint DRAW_DISK_CLIP = 128u;    // portal disk clip (diskCenter)
 // to the frame; and the pass that draws the rest over it.
 static const uint DRAW_ADDITIVE_ONLY = 256u;
 static const uint DRAW_NO_ADDITIVE = 512u;
+// Faint splats keep their mass (projectSplat's faint path) instead of being
+// dropped when the AA blur takes their alpha under minAlpha.
+static const uint DRAW_FAINT = 1024u;
+// The faint path: under FAINT_ALPHA x minAlpha after the blur, a splat
+// takes less blur, down to FAINT_MIN_BLUR px^2.
+static const float FAINT_ALPHA = 4.0;
+static const float FAINT_MIN_BLUR = 0.15;
+
+// A hash of a splat index in [0, 1) (athc_measure's faint_hash).
+float faintHash(uint i) {
+    uint x = (i * 0x9e3779b9u) ^ 0x85ebca6bu;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return float(x >> 8u) / 16777216.0;
+}
 
 struct DrawParams {
     float4 proj0;   // projection matrix columns
@@ -396,10 +414,41 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
 
     // Convolve with a ~0.5-pixel Gaussian for anti-aliasing, keeping energy.
     float detOrig = a * d - b * b;
+    const float a0 = a;
+    const float d0 = d;
     a += fullBlurAmount;
     d += fullBlurAmount;
     float det = a * d - b * b;
-    rgba.a *= sqrt(max(0.0, detOrig / det));
+    const float blurred = rgba.a * sqrt(max(0.0, detOrig / det));
+    // THE FAINT PATH (DRAW_FAINT): a faint splat under a pixel, which the
+    // blur would take under minAlpha (glass, a far cloud without LoD), keeps
+    // its mass alpha sqrt(det) instead of vanishing: less blur, for an alpha
+    // of FAINT_ALPHA x minAlpha; past FAINT_MIN_BLUR drawn at that alpha with
+    // the probability that keeps its mass on average (a hash of the splat);
+    // and minAlpha added back, as the fragments' minAlpha cut keeps alpha -
+    // minAlpha of a Gaussian's mass (falloff 1). athc_measure faint: the
+    // pawn's glass head at 192 px, relMSE 0.41 -> 0.009.
+    const float faintTarget = FAINT_ALPHA * params.minAlpha;
+    if (hasFlag(DRAW_FAINT) && rgba.a <= 1.0 && params.falloff == 1.0 && detOrig > 0.0 && blurred < faintTarget) {
+        const float mass = rgba.a * sqrt(detOrig);
+        const float tr = a0 + d0;
+        const float want = sqr(mass / faintTarget);
+        const float blur = clamp(0.5 * (sqrt(max(tr * tr + 4.0 * (want - detOrig), 0.0)) - tr), FAINT_MIN_BLUR,
+                                 max(fullBlurAmount, FAINT_MIN_BLUR));
+        a = a0 + blur;
+        d = d0 + blur;
+        det = a * d - b * b;
+        float alpha = mass / sqrt(det);
+        if (alpha < faintTarget) {
+            if (faintHash(splatIndex) >= alpha / faintTarget) {
+                return false;
+            }
+            alpha = faintTarget;
+        }
+        rgba.a = alpha + params.minAlpha;
+    } else {
+        rgba.a = blurred;
+    }
     if (rgba.a < params.minAlpha) {
         return false;
     }

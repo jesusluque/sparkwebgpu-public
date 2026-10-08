@@ -233,7 +233,28 @@ const BLUR: f32 = 0.3;
 /// Spark's default minAlpha (WgpuSplatRenderer).
 pub const MIN_ALPHA: f32 = 0.5 / 255.0;
 
-fn project(s: &Splat, cam: &Camera) -> Option<(Proj, f32, f32)> {
+/// Spark's faint-splat path (splat_shape.slang, DRAW_FAINT): a splat whose
+/// alpha after the AA blur would be under FAINT_ALPHA x minAlpha keeps its
+/// mass instead: less blur (down to FAINT_MIN_BLUR) for an alpha of that
+/// target, past the floor drawn at the target with the probability that
+/// keeps its mass on average, and minAlpha added back for what the
+/// fragments' minAlpha cut leaves out (alpha - minAlpha of the mass).
+pub static FAINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub const FAINT_ALPHA: f32 = 4.0;
+pub const FAINT_MIN_BLUR: f32 = 0.15;
+
+/// splat_shape.slang's faintKeep: a hash of the splat index in [0, 1).
+pub fn faint_hash(i: u32) -> f32 {
+    let mut x = i.wrapping_mul(0x9e3779b9) ^ 0x85ebca6b;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846ca68b);
+    x ^= x >> 16;
+    (x >> 8) as f32 / 16777216.0
+}
+
+fn project(s: &Splat, cam: &Camera, idx: u32) -> Option<(Proj, f32, f32)> {
     let d = sub(s.p, cam.eye);
     let z = dot(d, cam.fwd);
     if z < cam.near {
@@ -257,14 +278,36 @@ fn project(s: &Splat, cam: &Camera) -> Option<(Proj, f32, f32)> {
         c += t1 * t1;
     }
     let det0 = (a * c - b * b).max(0.0);
+    let (a0, c0) = (a, c);
     a += BLUR;
     c += BLUR;
-    let det = a * c - b * b;
+    let mut det = a * c - b * b;
     if det <= 0.0 {
         return None;
     }
+    let mut faint_alpha = None;
+    if FAINT.load(std::sync::atomic::Ordering::Relaxed) && s.o <= 1.0 && det0 > 0.0 {
+        let target = FAINT_ALPHA * MIN_ALPHA;
+        if s.o * (det0 / det).sqrt() < target {
+            let mass = s.o * det0.sqrt();
+            let tr = a0 + c0;
+            let want = (mass / target) * (mass / target);
+            let blur = (0.5 * (-tr + (tr * tr + 4.0 * (want - det0)).max(0.0).sqrt())).clamp(FAINT_MIN_BLUR, BLUR);
+            a = a0 + blur;
+            c = c0 + blur;
+            det = a * c - b * b;
+            let mut al = mass / det.sqrt();
+            if al < target {
+                if faint_hash(idx) >= al / target {
+                    return None;
+                }
+                al = target;
+            }
+            faint_alpha = Some(al + MIN_ALPHA);
+        }
+    }
     let (alpha, e, maxstd) = if s.o <= 1.0 {
-        let al = s.o * (det0 / det).sqrt();
+        let al = faint_alpha.unwrap_or(s.o * (det0 / det).sqrt());
         if al < MIN_ALPHA {
             return None;
         }
@@ -292,7 +335,7 @@ pub fn render(splats: &[Splat], cam: &Camera, track: Option<&Track>) -> Image {
         let mut projs = Vec::new();
         let mut entries: Vec<(u32, f32, u32)> = Vec::new();
         for i in r {
-            let Some((mut p, rad, z)) = project(&splats[i], cam) else { continue };
+            let Some((mut p, rad, z)) = project(&splats[i], cam, i as u32) else { continue };
             p.idx = i as u32;
             let x0 = ((p.u - rad).floor().max(0.0) as usize) / TILE;
             let x1 = ((p.u + rad).ceil().min(w as f32 - 1.0).max(-1.0) as isize).max(-1);

@@ -96,6 +96,7 @@ const {
   DRAW_EXT,
   DRAW_COV,
   DRAW_2DGS,
+  DRAW_FAINT,
   DRAW_LOD_INFLATE,
   DRAW_ORTHOGRAPHIC,
   DRAW_ENCODE_LINEAR,
@@ -261,6 +262,14 @@ export interface WgpuSplatRendererOptions {
    * with the anti-alias blur (the 3D path; edge-on discs keep the blur).
    */
   surfels?: "auto" | "ewa";
+  /**
+   * Faint splats smaller than a pixel, whose alpha the anti-alias blur takes
+   * under minAlpha. "keep" (default): they keep their mass (less blur, then
+   * drawn at a floor alpha with the probability that keeps it on average;
+   * splat_shape.slang's faint path): a far glass or a cloud without LoD
+   * stays on screen. "drop": discarded, as WebGL Spark does.
+   */
+  faintSplats?: "keep" | "drop";
   /**
    * SparkRenderer.enable2DGS: forces `surfels: "auto"`. Default false.
    */
@@ -491,6 +500,7 @@ export class WgpuSplatRenderer {
       cull: true,
       covSplats: false,
       surfels: "auto",
+      faintSplats: "keep",
       enable2DGS: false,
       srgbBlend: false,
       hdr: false,
@@ -1973,6 +1983,7 @@ export class WgpuSplatRenderer {
         DRAW_PREMULTIPLIED |
         (o.covSplats ? DRAW_COV : 0) |
         (o.surfels !== "ewa" || o.enable2DGS ? DRAW_2DGS : 0) |
+        (o.faintSplats !== "drop" ? DRAW_FAINT : 0) |
         (o.lodInflate ? DRAW_LOD_INFLATE : 0) |
         (linear ? DRAW_ENCODE_LINEAR : 0) |
         (disk ? DRAW_DISK_CLIP : 0) |

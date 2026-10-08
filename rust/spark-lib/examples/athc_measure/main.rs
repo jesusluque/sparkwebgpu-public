@@ -52,6 +52,7 @@ fn main() -> Result<()> {
         "thin" => thin(&scene, &args),
         "posevis" => pose::run(&scene, &args),
         "noise" => noise(&scene),
+        "faint" => faint(&scene),
         "render" => {
             let cam = scene.camera(width, 1.0, 0.0, 0.0);
             let img = render(&scene.splats, &cam, None);
@@ -369,6 +370,36 @@ fn levels(scene: &Scene, _args: &[String]) -> Result<()> {
             img.alpha_diff(&full),
             plain.rel_mse(&full),
             plain.alpha_diff(&full)
+        );
+    }
+    Ok(())
+}
+
+/// The faint-splat path (raster::FAINT) against dropping faint splats, the
+/// whole cloud at a few widths, against the splats supersampled 4x.
+fn faint(scene: &Scene) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    println!("## {} — faint splats: drop vs keep their mass\n", scene.name);
+    println!("| width | drop: relMSE | Δcov | faint: relMSE | Δcov | ref faint vs drop: relMSE | vs the faint ref: drop | faint |\n|---|---|---|---|---|---|---|---|");
+    for w in [96usize, 192, 368, 736, 1504] {
+        let cam = scene.camera(w, 1.0, 0.0, 0.0);
+        raster::FAINT.store(false, Ordering::Relaxed);
+        let reference = render(&scene.splats, &scene.camera(4 * w, 1.0, 0.0, 0.0), None).downsample(4);
+        let drop = render(&scene.splats, &cam, None);
+        raster::FAINT.store(true, Ordering::Relaxed);
+        let reference_faint = render(&scene.splats, &scene.camera(4 * w, 1.0, 0.0, 0.0), None).downsample(4);
+        let keep = render(&scene.splats, &cam, None);
+        raster::FAINT.store(false, Ordering::Relaxed);
+        println!(
+            "| {} | {:.3e} | {:.2e} | {:.3e} | {:.2e} | {:.2e} | {:.3e} | {:.3e} |",
+            w,
+            drop.rel_mse(&reference),
+            drop.alpha_diff(&reference),
+            keep.rel_mse(&reference),
+            keep.alpha_diff(&reference),
+            reference_faint.rel_mse(&reference),
+            drop.rel_mse(&reference_faint),
+            keep.rel_mse(&reference_faint)
         );
     }
     Ok(())

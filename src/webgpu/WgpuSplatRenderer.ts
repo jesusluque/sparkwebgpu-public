@@ -96,6 +96,7 @@ const {
   DRAW_EXT,
   DRAW_COV,
   DRAW_2DGS,
+  DRAW_FAINT,
   DRAW_LOD_INFLATE,
   DRAW_ORTHOGRAPHIC,
   DRAW_ENCODE_LINEAR,
@@ -222,8 +223,8 @@ export interface WgpuSplatRendererOptions {
    * Project each sorted splat once, in a compute pass after the sort
    * (draw/splat_draw.slang projectSplats), and have the quads' vertices read
    * that record, instead of projecting it in each of its four vertices.
-   * Same image. Applies to the GPU sort's quad draw (not 2DGS, attribute
-   * draw stages or the tile rasterizer) while the records (64 B a splat)
+   * Same image. Applies to the GPU sort's quad draw, surfels included (not
+   * attribute draw stages or the tile rasterizer) while the records (64 B a splat)
    * fit one storage binding. Default false: on an Apple GPU (Chrome) the
    * draw took as long either way (the quads' raster, not their vertex
    * shading, is what costs; docs/docs/webgpu-performance-audit.md), and the
@@ -253,8 +254,24 @@ export interface WgpuSplatRendererOptions {
    */
   covSplats?: boolean;
   /**
-   * Draw splats with a zero scale as flat 2D Gaussians (2DGS) rather than
-   * projected 3D ones (SparkRenderer.enable2DGS). Default false.
+   * Surfels (2DGS): how a splat with exactly one scale 0, as decoded, is
+   * drawn. Detected per splat, so clouds may mix discs and 3D Gaussians.
+   * "auto" (default): the exact ray-splat intersection with Huang et al.'s
+   * screen filter (sigma sqrt(2)/2 px, as athenea's raster), on every path
+   * (quads, projectOnce, tiles). "ewa": as a projected 3D Gaussian of rank 2
+   * with the anti-alias blur (the 3D path; edge-on discs keep the blur).
+   */
+  surfels?: "auto" | "ewa";
+  /**
+   * Faint splats smaller than a pixel, whose alpha the anti-alias blur takes
+   * under minAlpha. "keep" (default): they keep their mass (less blur, then
+   * drawn at a floor alpha with the probability that keeps it on average;
+   * splat_shape.slang's faint path): a far glass or a cloud without LoD
+   * stays on screen. "drop": discarded, as WebGL Spark does.
+   */
+  faintSplats?: "keep" | "drop";
+  /**
+   * SparkRenderer.enable2DGS: forces `surfels: "auto"`. Default false.
    */
   enable2DGS?: boolean;
   /**
@@ -277,7 +294,7 @@ export interface WgpuSplatRendererOptions {
    * quads blended back to front. "tiles" (experimental): a compute tile
    * rasterizer (TileRasterizer) blending each 16 x 16 tile front to back,
    * stopping where transmittance drops under 1/255, then composited. Needs
-   * the GPU sort; 2DGS, draw stages and renderInPass stay on hardware.
+   * the GPU sort; draw stages and renderInPass stay on hardware.
    * "auto": whichever of the two the GPU draws faster, timed with timestamp
    * queries and re-probed now and then (AutoRasterizer); hardware without
    * the timestamp-query feature. stats.rasterizer says which drew.
@@ -365,6 +382,8 @@ export class WgpuSplatRenderer {
     auto: null as AutoRasterizerState | null,
     /** The last draw drew additive splats as a layer of their own. */
     additiveLayer: false,
+    /** The last frame ran the projector (projectOnce). */
+    projected: false,
   };
   options: Required<WgpuSplatRendererOptions>;
   /** What the device allows; consulted for the sort path and sizes. */
@@ -480,6 +499,8 @@ export class WgpuSplatRenderer {
       accumulator: "auto",
       cull: true,
       covSplats: false,
+      surfels: "auto",
+      faintSplats: "keep",
       enable2DGS: false,
       srgbBlend: false,
       hdr: false,
@@ -926,6 +947,7 @@ export class WgpuSplatRenderer {
       this.generateAll(encoder, camera, cameraPos, cameraDir);
       readback = this.sortPending ? null : this.copyMetric(encoder, total);
     }
+    this.stats.projected = projected !== null;
     // Additive splats as a layer of their own (drawAdditiveLayer), drawn
     // now without the scene's depth (three's pass has not run yet), added
     // in three's pass before the other splats.
@@ -1420,12 +1442,11 @@ export class WgpuSplatRenderer {
   }
 
   // Whether this frame's quads read the projector's records (projectOnce):
-  // GPU sort, no 2DGS, while the records fit one binding.
+  // GPU sort, while the records fit one binding.
   private projects(total: number): boolean {
     return (
       this.options.projectOnce &&
       this.options.sort === "gpu" &&
-      !this.options.enable2DGS &&
       total * PROJECTED_BYTES <= this.device.limits.maxStorageBufferBindingSize
     );
   }
@@ -1569,8 +1590,7 @@ export class WgpuSplatRenderer {
       !layer &&
       !this.written.packed &&
       this.meshes.some((m) => this.isAdditive(m));
-    const either =
-      gpu && !variant && !this.options.enable2DGS && !additiveLayer;
+    const either = gpu && !variant && !additiveLayer;
     const path = either ? this.rasterPath() : "hardware";
     this.stats.additiveLayer = additiveLayer;
     // Times the draw for rasterizer "auto" (options.profile times it anyway).
@@ -1585,6 +1605,7 @@ export class WgpuSplatRenderer {
       this.stats.draws += 1;
       this.stats.drawn = gpuSorted as number;
       this.stats.rasterizer = "tiles";
+      this.stats.projected = false;
       return;
     }
     if (path === "warm") {
@@ -1597,6 +1618,7 @@ export class WgpuSplatRenderer {
         ? this.encodeProject(encoder, gpuSorted as number, drawParams)
         : null;
     const vertex = projected ? "splatVertexProjected" : "splatVertex";
+    this.stats.projected = projected !== null;
     if (additiveLayer) {
       this.drawAdditiveLayer(
         encoder,
@@ -1960,7 +1982,8 @@ export class WgpuSplatRenderer {
         (this.written.packed ? 0 : DRAW_EXT) |
         DRAW_PREMULTIPLIED |
         (o.covSplats ? DRAW_COV : 0) |
-        (o.enable2DGS ? DRAW_2DGS : 0) |
+        (o.surfels !== "ewa" || o.enable2DGS ? DRAW_2DGS : 0) |
+        (o.faintSplats !== "drop" ? DRAW_FAINT : 0) |
         (o.lodInflate ? DRAW_LOD_INFLATE : 0) |
         (linear ? DRAW_ENCODE_LINEAR : 0) |
         (disk ? DRAW_DISK_CLIP : 0) |

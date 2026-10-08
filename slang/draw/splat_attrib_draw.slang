@@ -75,6 +75,10 @@ struct AttribVertexOut {
     // For DRAW_DISK_CLIP, as splat_draw.slang's VertexOut.
     float3 viewRay : TEXCOORD7;
     nointerpolation float viewDepth : TEXCOORD8;
+    // A surfel's rows, as splat_draw.slang's VertexOut.
+    nointerpolation float3 surfelX : TEXCOORD9;
+    nointerpolation float3 surfelY : TEXCOORD10;
+    nointerpolation float3 surfelW : TEXCOORD11;
 };
 
 float4 readSlot(uint k, uint splat) {
@@ -153,6 +157,9 @@ AttribVertexOut splatAttribVertex(uint vertexId: SV_VertexID, uint instanceId: S
     o.splatUv = base.splatUv;
     o.adjustedStdDev = base.adjustedStdDev;
     o.splatIndex = base.splatIndex;
+    o.surfelX = base.surfelX;
+    o.surfelY = base.surfelY;
+    o.surfelW = base.surfelW;
     float2 ndc = base.position.xy / base.position.w;
     o.viewRay = float3(ndc.x / params.proj0.x, ndc.y / params.proj1.y, -1.0);
     o.viewDepth = base.position.w;
@@ -187,6 +194,9 @@ AttribFragmentOut splatAttribFragment(AttribVertexOut v) {
     base.splatUv = v.splatUv;
     base.adjustedStdDev = v.adjustedStdDev;
     base.splatIndex = v.splatIndex;
+    base.surfelX = v.surfelX;
+    base.surfelY = v.surfelY;
+    base.surfelW = v.surfelW;
     AttribFragmentOut o;
     o.color = computeSplatFragment<SPLAT_BLEND>(base);
     // Premultiplied or not, the colour's alpha is the splat's coverage here.

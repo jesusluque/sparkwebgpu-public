@@ -355,14 +355,16 @@ describe.skipIf(!device)("WgpuSplatRenderer features", () => {
     );
   });
 
-  it("draws zero-scale splats as 2D Gaussians with enable2DGS", async () => {
-    // Flat in z, seen nearly face-on: the 2D splat covers what the projected
-    // 3D one does, without the anti-aliasing blur.
+  it("draws zero-scale splats as surfels, and enable2DGS forces it", async () => {
+    // Flat in z, seen nearly face-on: the surfel covers what the projected
+    // 3D one does (surfels: "ewa"), with Huang's filter for the blur.
     const flat = grid([0.04, 0.03, 0]);
-    const projected = await render(flat, {});
-    const flat2d = await render(flat, { enable2DGS: true });
-    expect(lit(flat2d)).toBeGreaterThan(W * H * 0.1);
-    const diff = meanDiff(projected, flat2d);
+    const projected = await render(flat, { surfels: "ewa" });
+    const surfels = await render(flat, {});
+    const forced = await render(flat, { surfels: "ewa", enable2DGS: true });
+    expect(lit(surfels)).toBeGreaterThan(W * H * 0.1);
+    expect(meanDiff(surfels, forced)).toBe(0);
+    const diff = meanDiff(projected, surfels);
     expect(diff).toBeGreaterThan(0);
     expect(diff).toBeLessThan(4);
   });

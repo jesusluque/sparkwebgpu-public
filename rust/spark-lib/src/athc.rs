@@ -93,6 +93,24 @@ pub const KNOWN_FLAGS: u32 = FLAG_NORMALS | FLAG_LINEAR | FLAG_EMISSION | FLAG_M
 /// Spark's LoD pages (and athenea's default chunk): 65 536 splats.
 pub const PAGE_SPLATS: u32 = 65536;
 
+/// A surfel's flat axis (2DGS: a scale of exactly 0) as an f16 ln scale: the
+/// most negative finite half, which `exp()` takes back to exactly 0 in f32.
+/// ln(0) = -inf would be an f16 infinity, which WGSL's `packHalf2x16` leaves
+/// indeterminate; athenea writes its own finite sentinel (-65000) the same way.
+pub const SURFEL_LN: f32 = -65504.0;
+
+/// A scale as the f16 ln a shape word holds: [`SURFEL_LN`] for 0 (or less),
+/// its log otherwise, never below the sentinel.
+pub fn ln_scale(s: f32) -> f32 {
+    if s > 0.0 { s.ln().max(SURFEL_LN) } else { SURFEL_LN }
+}
+
+/// Whether an f16 ln scale is a surfel's flat axis: at or below the
+/// sentinels (ours, athenea's -65000, or an older file's -inf).
+pub fn is_flat_ln(ln: f32) -> bool {
+    ln <= -60000.0
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AthcHeader {
@@ -1059,8 +1077,8 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     root.positions = vec![mu[0] as f32, mu[1] as f32, mu[2] as f32, opacity];
     root.shape = vec![
         encode_quaternion(q.to_array()),
-        pack_halves(scale[0].ln(), scale[1].ln()),
-        pack_halves(scale[2].ln(), base[0]),
+        pack_halves(ln_scale(scale[0]), ln_scale(scale[1])),
+        pack_halves(ln_scale(scale[2]), base[0]),
         pack_halves(base[1], base[2]),
     ];
     root.sh = (0..sh_words)
@@ -1141,8 +1159,9 @@ fn merged_share(block: &AthcBlock, i: usize, o: f32) -> f32 {
     }
 }
 
-/// The two longest of a shape word's three scales, multiplied.
-fn two_axis_area(shape: &[u32]) -> f32 {
+/// The two longest of a shape word's three scales, multiplied: a gaussian's
+/// area (a surfel's too, whose third is 0).
+pub fn two_axis_area(shape: &[u32]) -> f32 {
     let mut s = [low_half(shape[1]).exp(), high_half(shape[1]).exp(), low_half(shape[2]).exp()];
     s.sort_by(|a, b| b.total_cmp(a));
     s[0] * s[1]
@@ -1241,8 +1260,8 @@ pub fn widen_merged(block: &mut AthcBlock, edge: f32) {
             s[k] = (s[k] * s[k] + grow).sqrt();
         }
         let after = s[order[0]] * s[order[1]];
-        w[1] = pack_halves(s[0].ln(), s[1].ln());
-        w[2] = pack_halves(s[2].ln(), high_half(w[2]));
+        w[1] = pack_halves(ln_scale(s[0]), ln_scale(s[1]));
+        w[2] = pack_halves(ln_scale(s[2]), high_half(w[2]));
         let o = &mut block.positions[i * 4 + 3];
         if sheet {
             // The reflection keeps its weight; the 1/255 stays one.

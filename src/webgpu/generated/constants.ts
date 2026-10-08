@@ -91,6 +91,11 @@ export const coreAttrib = {
   ATTRIB_PAGE_SHIFT: 16,
 } as const;
 
+/** slang/core/ext.slang */
+export const coreExt = {
+  kSurfelLnScale: -65504,
+} as const;
+
 /** slang/core/math.slang */
 export const coreMath = {
   LN_SCALE_MIN: -12,

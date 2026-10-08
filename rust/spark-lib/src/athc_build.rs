@@ -20,8 +20,8 @@ use anyhow::{bail, Result};
 use half::f16;
 
 use crate::athc::{
-    encode_quaternion, pack_halves, pack_normal, AthcBlock, AthcFile, AthcHeader, ExtraHeader,
-    FLAG_LINEAR, FLAG_MATERIAL, FLAG_NORMALS, FLAG_TRANSFER, OLDEST_VERSION, VERSION,
+    encode_quaternion, is_flat_ln, pack_halves, pack_normal, AthcBlock, AthcFile, AthcHeader,
+    ExtraHeader, FLAG_LINEAR, FLAG_MATERIAL, FLAG_NORMALS, FLAG_TRANSFER, OLDEST_VERSION, SURFEL_LN, VERSION,
 };
 
 /// `packing.slang`'s kSH0.
@@ -44,6 +44,10 @@ pub struct CloudStreams {
     pub scales: Vec<f32>,
     /// linear
     pub opacities: Vec<f32>,
+    /// `primvars:athenea:splat:coverage`: a merged gaussian's W / A without
+    /// athenea's 0.99 cap (`athenea decimate`), empty when absent. Where it
+    /// is, it is the opacity (past 1, Spark's LoD opacity when decoded).
+    pub coverage: Vec<f32>,
     /// SH coefficients a splat, DC first: (degree + 1)^2
     pub coefficients: usize,
     /// rgb per coefficient
@@ -300,6 +304,9 @@ pub struct BuildOptions {
     /// together). The header's `bounds_lo` and `extent` are then the
     /// turned frame's.
     pub frame_seed: u32,
+    /// Merged nodes written as surfels where they and all their members
+    /// are discs (`SurfelNodes`; by default where the cloud has surfels).
+    pub surfel_nodes: SurfelNodes,
 }
 
 impl Default for BuildOptions {
@@ -315,6 +322,7 @@ impl Default for BuildOptions {
             material: true,
             curvature: true,
             frame_seed: 0,
+            surfel_nodes: SurfelNodes::Auto,
         }
     }
 }
@@ -405,7 +413,21 @@ pub struct PackedCloud {
 }
 
 fn half_safe(v: f32) -> f32 {
-    v.clamp(-65000.0, 65000.0)
+    v.clamp(SURFEL_LN, -SURFEL_LN)
+}
+
+/// A shape word's three scales (a surfel's flat axis exactly 0).
+fn scales_of(sh: &[u32]) -> [f32; 3] {
+    [f16_of(sh[1] & 0xffff).exp(), f16_of(sh[1] >> 16).exp(), f16_of(sh[2] & 0xffff).exp()]
+}
+
+/// A gaussian's area: its two widest scales multiplied, the mass athenea's
+/// merges weigh (`opacity x area`). Not s0 s1 s2 / min(s), which is the same
+/// for a 3D gaussian and 0 for a surfel (whose thinnest is exactly 0).
+fn disc_area(s: [f32; 3]) -> f32 {
+    let mut t = s;
+    t.sort_by(|a, b| b.total_cmp(a));
+    t[0] * t[1]
 }
 fn f16_bits(v: f32) -> u32 {
     f16::from_f32(v).to_bits() as u32
@@ -542,6 +564,7 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
     need("orientations", &s.rotations, 4)?;
     need("scales", &s.scales, 3)?;
     need("opacities", &s.opacities, 1)?;
+    need("coverage", &s.coverage, 1)?;
     need("normals", &s.normals, 3)?;
     need("curvature", &s.curvature, 3)?;
     if s.positions.is_empty() {
@@ -625,7 +648,7 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
         };
         // A scale of exactly 0 is a surfel's flat axis (2DGS): kept as the
         // most negative half, which exp() decodes back to 0.
-        let ls = sc.map(|v| if v == 0.0 { -65000.0 } else { v.max(1e-30).ln() });
+        let ls = sc.map(|v| if v == 0.0 { SURFEL_LN } else { v.max(1e-30).ln() });
         let flat = sc.iter().filter(|&&v| v == 0.0).count();
         let finite = p.iter().all(|v| v.is_finite())
             && flat <= 1
@@ -636,8 +659,13 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
         }
         kept.push(i as u32);
         b.n += 1;
-        b.positions
-            .extend_from_slice(&[p[0], p[1], p[2], saturate(a)]);
+        // athenea's uncapped coverage, where it writes one, is the
+        // merged gaussian's whole mass: kept past 1 (the LoD opacity).
+        let o = match s.coverage.get(i) {
+            Some(&c) if c.is_finite() && c > 0.0 => c.max(saturate(a)),
+            _ => saturate(a),
+        };
+        b.positions.extend_from_slice(&[p[0], p[1], p[2], o]);
         for k in 0..3 {
             lo[k] = lo[k].min(p[k]);
             hi[k] = hi[k].max(p[k]);
@@ -987,6 +1015,64 @@ struct MomentLayout {
     keep: usize,
     normals: bool,
     stride: usize,
+    /// Merged nodes may be written as surfels (`SurfelNodes`).
+    planar: bool,
+}
+
+impl MomentLayout {
+    /// The moments of a cloud of `keep` rest harmonics a colour: the head,
+    /// the harmonics, the normals' sum if any, and last the count of members
+    /// that are not discs (`is_disc`).
+    fn new(keep: usize, normals: bool, planar: bool) -> Self {
+        Self { keep, normals, stride: MOMENTS_HEAD + keep * 3 + if normals { 3 } else { 0 } + 1, planar }
+    }
+    fn not_discs(&self) -> usize {
+        self.stride - 1
+    }
+}
+
+/// athenea's rule (`decimate`, surfels-web/PLAN.md §2): a member is a disc
+/// when its thinnest axis is at most this times its middle one, and a
+/// cluster of discs whose own thinnest axis is too is written as a surfel.
+pub const DISC_RATIO: f32 = 0.12;
+/// Our guard on top: the cluster's normals spread at most this (1 - |mean
+/// normal|, `athc::normal_spread`: 0.03 is about 28 degrees between two
+/// equal faces) and its thin axis within 0.9 of their mean.
+pub const DISC_SPREAD: f32 = 0.03;
+
+/// Whether merged LoD nodes are written as surfels where flat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SurfelNodes {
+    /// Where the cloud brings surfels of its own (a scale of exactly 0).
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl SurfelNodes {
+    fn applies(self, b: &AthcBlock) -> bool {
+        match self {
+            SurfelNodes::On => true,
+            SurfelNodes::Off => false,
+            SurfelNodes::Auto => has_surfels(b),
+        }
+    }
+}
+
+/// Whether any splat of `b` is a surfel (an axis exactly 0).
+pub fn has_surfels(b: &AthcBlock) -> bool {
+    (0..b.n).any(|i| {
+        let sh = &b.shape[i * 4..i * 4 + 4];
+        is_flat_ln(f16_of(sh[1] & 0xffff)) || is_flat_ln(f16_of(sh[1] >> 16)) || is_flat_ln(f16_of(sh[2] & 0xffff))
+    })
+}
+
+/// [`DISC_RATIO`] on three scales.
+fn is_disc(s: [f32; 3]) -> bool {
+    let mut t = s;
+    t.sort_by(|a, b| a.total_cmp(b));
+    t[0] <= DISC_RATIO * t[1]
 }
 
 /// `lod_leaf_moments.slang`, over the Morton-sorted splats.
@@ -1030,9 +1116,7 @@ fn leaf_moments(s: &AthcBlock, level: &Level, l: &MomentLayout, sh_words: usize)
             let mm: M3 =
                 [0, 1, 2].map(|row| [r[row][0] * sc[0], r[row][1] * sc[1], r[row][2] * sc[2]]);
             let cov = mul(&mm, &transpose(&mm));
-            let smallest = sc[0].min(sc[1]).min(sc[2]);
-            let area = sc[0] * sc[1] * sc[2] / smallest.max(1e-20);
-            let wt = p[3] * area;
+            let wt = p[3] * disc_area(sc);
             m[at] += wt;
             m[at + 1] += wt * p[0];
             m[at + 2] += wt * p[1];
@@ -1046,6 +1130,9 @@ fn leaf_moments(s: &AthcBlock, level: &Level, l: &MomentLayout, sh_words: usize)
             m[at + 10] += wt * f16_of(sh[2] >> 16);
             m[at + 11] += wt * f16_of(sh[3] & 0xffff);
             m[at + 12] += wt * f16_of(sh[3] >> 16);
+            if !is_disc(sc) {
+                m[at + l.not_discs()] += 1.0;
+            }
             for h in 0..l.keep * 3 {
                 let word = s.sh[i * sh_words + h / 2];
                 let v = if h & 1 == 0 {
@@ -1116,9 +1203,22 @@ fn finalize(m: &[f32], groups: usize, l: &MomentLayout, sh_words: usize) -> Athc
             }
         }
         let s = [cov[0][0], cov[1][1], cov[2][2]].map(|v| v.max(1e-14).sqrt());
-        let smallest = s[0].min(s[1]).min(s[2]);
-        let area = s[0] * s[1] * s[2] / smallest.max(1e-20);
+        let area = disc_area(s);
         let opacity = (m[at] / area.max(1e-30)).min(0.99);
+        // A cluster of discs that is a disc itself is written as one: its
+        // thinnest axis exactly 0 (a surfel), the same area and mass.
+        let thin = shortest(s);
+        let flat = l.planar && m[at + l.not_discs()] == 0.0 && is_disc(s) && {
+            if l.normals {
+                let nb = at + MOMENTS_HEAD + l.keep * 3;
+                let sum = [m[nb], m[nb + 1], m[nb + 2]];
+                let len = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
+                let along = (axes[0][thin] * sum[0] + axes[1][thin] * sum[1] + axes[2][thin] * sum[2]).abs();
+                1.0 - len / weight <= DISC_SPREAD && along >= 0.9 * len
+            } else {
+                true
+            }
+        };
         let base = [
             m[at + 10] / weight,
             m[at + 11] / weight,
@@ -1126,7 +1226,10 @@ fn finalize(m: &[f32], groups: usize, l: &MomentLayout, sh_words: usize) -> Athc
         ];
         b.positions
             .extend_from_slice(&[mu[0], mu[1], mu[2], opacity]);
-        let ls = s.map(f32::ln);
+        let mut ls = s.map(f32::ln);
+        if flat {
+            ls[thin] = SURFEL_LN;
+        }
         b.shape.extend_from_slice(&[
             encode_quaternion(quaternion_of_axes(&axes)),
             pack_halves(half_safe(ls[0]), half_safe(ls[1])),
@@ -1223,6 +1326,153 @@ fn extras_merge(
     target
 }
 
+/// `octEncode` (common/octahedral.slang): a unit direction to [0, 1]^2.
+pub fn oct_encode(n: [f32; 3]) -> [f32; 2] {
+    let l1 = (n[0].abs() + n[1].abs() + n[2].abs()).max(1e-20);
+    let n = n.map(|v| v / l1);
+    let p = if n[2] >= 0.0 {
+        [n[0], n[1]]
+    } else {
+        let sx = if n[0] >= 0.0 { 1.0 } else { -1.0 };
+        let sy = if n[1] >= 0.0 { 1.0 } else { -1.0 };
+        [(1.0 - n[1].abs()) * sx, (1.0 - n[0].abs()) * sy]
+    };
+    p.map(|v| v * 0.5 + 0.5)
+}
+
+/// `octDecode`: [0, 1]^2 back to a unit direction.
+pub fn oct_decode(f: [f32; 2]) -> [f32; 3] {
+    let f = f.map(|v| v * 2.0 - 1.0);
+    let mut n = [f[0], f[1], 1.0 - f[0].abs() - f[1].abs()];
+    let t = (-n[2]).clamp(0.0, 1.0);
+    n[0] += if n[0] >= 0.0 { -t } else { t };
+    n[1] += if n[1] >= 0.0 { -t } else { t };
+    normalize3(n)
+}
+
+/// Element i's frame: its axes as columns (`axesOfQuaternion`), local to world.
+fn frame_of(b: &AthcBlock, i: usize) -> M3 {
+    axes_of_quaternion(crate::athc::decode_quaternion(b.shape[i * 4]))
+}
+
+fn to_world(r: &M3, a: [f32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|row| r[row][0] * a[0] + r[row][1] * a[1] + r[row][2] * a[2])
+}
+
+fn to_local(r: &M3, w: [f32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|col| r[0][col] * w[0] + r[1][col] * w[1] + r[2][col] * w[2])
+}
+
+fn half_at(words: &[u32], k: usize) -> f32 {
+    let w = words[k / 2];
+    f16_of(if k & 1 == 0 { w & 0xffff } else { w >> 16 })
+}
+
+/// What lies in each member's own frame merged in the world: the zonal
+/// transfer's lobes (`zonal`, 10 halves a splat, two lobes of an octahedral
+/// axis and three coefficients) or the curvature (2 words: the shape
+/// operator S in the first two axes, xx xy yy, and a fourth half). Each
+/// member's is turned into the world -- a lobe's axis by its frame
+/// (`splatTransferFrame`: R = axesOfQuaternion, columns the axes), the
+/// curvature as U S U^T (U its first two axes) -- averaged by mass (opacity
+/// x area, as the moments weigh) and turned into the merged element's own
+/// frame (`frames`: what it holds once oriented, `athc::orient_merged`).
+/// Averaging the stored halves instead mixes frames that turn: a curved
+/// panel's or a merged disc's lobes and curvature pointed anywhere.
+fn frame_merge(
+    source: &[u32],
+    words: usize,
+    zonal: bool,
+    starts: &[u32],
+    splats: &AthcBlock,
+    frames: &AthcBlock,
+) -> Vec<u32> {
+    let groups = starts.len();
+    let mut target = vec![0u32; groups * words];
+    for g in 0..groups {
+        let first = starts[g] as usize;
+        let end = if g + 1 < groups { starts[g + 1] as usize } else { splats.n };
+        let mass = |i: usize| {
+            splats.positions[i * 4 + 3].max(0.0) * disc_area(scales_of(&splats.shape[i * 4..i * 4 + 4]))
+        };
+        let total: f32 = (first..end).map(mass).sum();
+        let weight = |i: usize| if total > 0.0 { mass(i) / total } else { 1.0 / (end - first) as f32 };
+        let heaviest = (first..end).max_by(|&a, &b| weight(a).total_cmp(&weight(b))).unwrap_or(first);
+        let node = frame_of(frames, g);
+        let mut halves = vec![0.0f32; words * 2];
+        if zonal {
+            for lobe in 0..2 {
+                let base = lobe * 5;
+                let (mut axis, mut z) = ([0.0f32; 3], [0.0f32; 3]);
+                for i in first..end {
+                    let v = &source[i * words..i * words + words];
+                    let w = weight(i);
+                    let a = to_world(&frame_of(splats, i), oct_decode([half_at(v, base), half_at(v, base + 1)]));
+                    for k in 0..3 {
+                        axis[k] += w * a[k];
+                        z[k] += w * half_at(v, base + 2 + k);
+                    }
+                }
+                // Opposed axes cancel: the heaviest member's then.
+                if axis.iter().map(|v| v * v).sum::<f32>() < 1e-8 {
+                    let v = &source[heaviest * words..heaviest * words + words];
+                    axis = to_world(&frame_of(splats, heaviest), oct_decode([half_at(v, base), half_at(v, base + 1)]));
+                }
+                let sq = oct_encode(to_local(&node, normalize3(axis)));
+                halves[base] = sq[0];
+                halves[base + 1] = sq[1];
+                halves[base + 2..base + 5].copy_from_slice(&z);
+            }
+        } else {
+            let mut t = [[0.0f32; 3]; 3];
+            let mut rest = 0.0f32;
+            for i in first..end {
+                let v = &source[i * words..i * words + words];
+                let w = weight(i);
+                let r = frame_of(splats, i);
+                let (xx, xy, yy) = (half_at(v, 0), half_at(v, 1), half_at(v, 2));
+                for a in 0..3 {
+                    for b in 0..3 {
+                        let (u, vv) = ((r[a][0], r[a][1]), (r[b][0], r[b][1]));
+                        t[a][b] += w * (u.0 * (xx * vv.0 + xy * vv.1) + u.1 * (xy * vv.0 + yy * vv.1));
+                    }
+                }
+                rest += w * half_at(v, 3);
+            }
+            // S' = U'^T T U' in the merged element's first two axes.
+            let s = |c: usize, d: usize| -> f32 {
+                let mut sum = 0.0;
+                for a in 0..3 {
+                    for b in 0..3 {
+                        sum += node[a][c] * t[a][b] * node[b][d];
+                    }
+                }
+                sum
+            };
+            halves[0] = s(0, 0);
+            halves[1] = s(0, 1);
+            halves[2] = s(1, 1);
+            halves[3] = rest;
+        }
+        for w in 0..words {
+            target[g * words + w] =
+                pack_halves(half_safe(halves[2 * w]), half_safe(halves[2 * w + 1]));
+        }
+    }
+    target
+}
+
+/// The transfer of `cloud`'s groups: zonal lobes in each one's frame
+/// (`frame_merge`), the world's harmonics by opacity (`extras_merge`).
+fn merge_transfer(transfer_count: u32, splats: &AthcBlock, starts: &[u32], frames: &AthcBlock) -> Vec<u32> {
+    let words = splats.transfer.len() / splats.n;
+    if transfer_count == 10 {
+        frame_merge(&splats.transfer, words, true, starts, splats, frames)
+    } else {
+        extras_merge(&splats.transfer, words, 1, starts, splats)
+    }
+}
+
 /// `LodBuilder::build` and `writeAthc`'s header: the `.athc` of a packed
 /// cloud, its splats in Morton order, its levels merged.
 /// The order [`build_lod`] puts `cloud`'s splats in (the file's splat order:
@@ -1312,13 +1562,11 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
         finest = r;
     }
 
-    let l = MomentLayout {
-        keep: cloud.rest_per_colour as usize,
-        normals: !splats.normals.is_empty(),
-        stride: MOMENTS_HEAD
-            + cloud.rest_per_colour as usize * 3
-            + if splats.normals.is_empty() { 0 } else { 3 },
-    };
+    let l = MomentLayout::new(
+        cloud.rest_per_colour as usize,
+        !splats.normals.is_empty(),
+        o.surfel_nodes.applies(&splats),
+    );
     let sh_words = cloud.sh_words as usize;
     let mut stored: Vec<(u32, AthcBlock)> = Vec::new();
     let mut fine_moments = Vec::new();
@@ -1335,6 +1583,11 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
             )
         };
         let mut block = finalize(&moments, level.groups, &l, sh_words);
+        // The frame the decoder reads each group in (`orient_merged`, third
+        // axis the normal), for what lies in a frame to be merged into it.
+        // The levels keep athenea's moments as they are.
+        let mut frames = block.clone();
+        crate::athc::orient_merged(&mut frames);
         let per = |v: &[u32]| v.len() / n;
         if !splats.pbr.is_empty() {
             block.pbr = extras_merge(&splats.pbr, per(&splats.pbr), 0, &level.starts, &splats);
@@ -1345,13 +1598,7 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
             block.lobes = extras_merge(&splats.lobes, 3, 0, &level.starts, &splats);
         }
         if !splats.transfer.is_empty() {
-            block.transfer = extras_merge(
-                &splats.transfer,
-                per(&splats.transfer),
-                1,
-                &level.starts,
-                &splats,
-            );
+            block.transfer = merge_transfer(cloud.transfer_count, &splats, &level.starts, &frames);
         }
         if !splats.shadow_bits.is_empty() {
             block.shadow_bits = extras_merge(
@@ -1362,11 +1609,10 @@ pub fn build_lod(cloud: &PackedCloud, o: &BuildOptions) -> Result<AthcFile> {
                 &splats,
             );
         }
-        // The curvature merged as the transfer is, by opacity: the mean of
-        // the shape operators' half traces (what a lens reads) is exact,
-        // the rest is each splat's own frame and only indicative.
+        // The curvature as a tensor in the world, averaged by mass and
+        // read in the group's own frame (`frame_merge`).
         if !splats.curvature.is_empty() {
-            block.curvature = extras_merge(&splats.curvature, 2, 1, &level.starts, &splats);
+            block.curvature = frame_merge(&splats.curvature, 2, false, &level.starts, &splats, &frames);
         }
         // The skin: each group carried by its splats' heaviest joints.
         if !splats.skin.is_empty() {
@@ -1500,9 +1746,7 @@ pub struct SplatRuns {
 /// A packed splat's colour weight: opacity x the area of its two longest axes.
 fn colour_weight(b: &AthcBlock, i: usize) -> f32 {
     let sh = &b.shape[i * 4..i * 4 + 4];
-    let sc = [f16_of(sh[1] & 0xffff).exp(), f16_of(sh[1] >> 16).exp(), f16_of(sh[2] & 0xffff).exp()];
-    let smallest = sc[0].min(sc[1]).min(sc[2]);
-    b.positions[i * 4 + 3].max(0.0) * sc[0] * sc[1] * sc[2] / smallest.max(1e-20)
+    b.positions[i * 4 + 3].max(0.0) * disc_area(scales_of(sh))
 }
 
 fn runs_of(src: &AthcBlock, order: &[u32], starts: &[u32]) -> SplatRuns {
@@ -1556,16 +1800,15 @@ pub fn reduce_cells_runs(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<(P
         group,
         starts,
     };
-    let l = MomentLayout {
-        keep: cloud.rest_per_colour as usize,
-        normals: !splats.normals.is_empty(),
-        stride: MOMENTS_HEAD
-            + cloud.rest_per_colour as usize * 3
-            + if splats.normals.is_empty() { 0 } else { 3 },
-    };
+    let l = MomentLayout::new(
+        cloud.rest_per_colour as usize,
+        !splats.normals.is_empty(),
+        SurfelNodes::Auto.applies(&splats),
+    );
     let sh_words = cloud.sh_words as usize;
     let moments = leaf_moments(&splats, &level, &l, sh_words);
     let mut block = finalize(&moments, level.groups, &l, sh_words);
+    crate::athc::orient_merged(&mut block);
     let runs = runs_of(src, &order, &level.starts);
     if fill != 1.0 {
         let f = fill.max(1e-3);
@@ -1589,9 +1832,7 @@ pub fn reduce_cells_runs(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<(P
             // finalize clamped at 0.99 before the area grew: the weight
             // over the widened area.
             let weight = moments[g * l.stride];
-            let s = grown.map(f32::exp);
-            let smallest = s[0].min(s[1]).min(s[2]);
-            let area = s[0] * s[1] * s[2] / smallest.max(1e-20);
+            let area = disc_area(grown.map(f32::exp));
             block.positions[g * 4 + 3] = (weight / area.max(1e-30)).min(0.99);
         }
     }
@@ -1604,13 +1845,7 @@ pub fn reduce_cells_runs(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<(P
         block.lobes = extras_merge(&splats.lobes, 3, 0, &level.starts, &splats);
     }
     if !splats.transfer.is_empty() {
-        block.transfer = extras_merge(
-            &splats.transfer,
-            per(&splats.transfer),
-            1,
-            &level.starts,
-            &splats,
-        );
+        block.transfer = merge_transfer(cloud.transfer_count, &splats, &level.starts, &block);
     }
     if !splats.shadow_bits.is_empty() {
         block.shadow_bits = extras_merge(
@@ -1622,7 +1857,7 @@ pub fn reduce_cells_runs(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<(P
         );
     }
     if !splats.curvature.is_empty() {
-        block.curvature = extras_merge(&splats.curvature, 2, 1, &level.starts, &splats);
+        block.curvature = frame_merge(&splats.curvature, 2, false, &level.starts, &splats, &block);
     }
     if !splats.skin.is_empty() {
         block.skin = crate::athc_skin::skin_merge(
@@ -1733,14 +1968,7 @@ pub fn reduce_thin_runs(cloud: &PackedCloud, ratio: f32) -> Result<(PackedCloud,
         let (mut w, mut c) = (0.0f32, [0.0f32; 3]);
         for i in first..last {
             let sh = &splats.shape[i * 4..i * 4 + 4];
-            let sc = [
-                f16_of(sh[1] & 0xffff).exp(),
-                f16_of(sh[1] >> 16).exp(),
-                f16_of(sh[2] & 0xffff).exp(),
-            ];
-            let smallest = sc[0].min(sc[1]).min(sc[2]);
-            let wt =
-                splats.positions[i * 4 + 3].max(0.0) * sc[0] * sc[1] * sc[2] / smallest.max(1e-20);
+            let wt = splats.positions[i * 4 + 3].max(0.0) * disc_area(scales_of(sh));
             w += wt;
             c[0] += wt * f16_of(sh[2] >> 16);
             c[1] += wt * f16_of(sh[3] & 0xffff);
@@ -1770,7 +1998,7 @@ pub fn reduce_thin_runs(cloud: &PackedCloud, ratio: f32) -> Result<(PackedCloud,
     }
     let per = |v: &[u32]| v.len() / n;
     if !splats.transfer.is_empty() {
-        block.transfer = extras_merge(&splats.transfer, per(&splats.transfer), 1, &starts, &splats);
+        block.transfer = merge_transfer(cloud.transfer_count, &splats, &starts, &block);
     }
     if !splats.shadow_bits.is_empty() {
         block.shadow_bits = extras_merge(
@@ -1782,7 +2010,7 @@ pub fn reduce_thin_runs(cloud: &PackedCloud, ratio: f32) -> Result<(PackedCloud,
         );
     }
     if !splats.curvature.is_empty() {
-        block.curvature = extras_merge(&splats.curvature, 2, 1, &starts, &splats);
+        block.curvature = frame_merge(&splats.curvature, 2, false, &starts, &splats, &block);
     }
     if !splats.skin.is_empty() {
         block.skin = crate::athc_skin::skin_merge(
@@ -2578,6 +2806,10 @@ mod tests {
     #[test]
     fn carries_the_curvature_in_v3_and_drops_it_from_v2() {
         let mut s = synthetic(3000);
+        // The splats turn about z: their normal is their third axis.
+        for n in s.normals.chunks_mut(3) {
+            n.copy_from_slice(&[0.0, 0.0, 1.0]);
+        }
         for i in 0..s.count {
             // A ball of radius 1/(10 + i % 7), a little anisotropic.
             let k = 10.0 + (i % 7) as f32;
@@ -2596,10 +2828,14 @@ mod tests {
         assert!(f.has_curvature());
         for (_, b) in &f.levels {
             assert_eq!(b.curvature.len(), b.n * 2);
-            // A merged group's mean curvature is a mean of 10 .. 16.5.
+            // A merged group's mean curvature (in its own frame, whose
+            // third axis is the normal) is a mean of 10 .. 16.5, a little
+            // less where the group's plane tilts off its splats' (by
+            // sin^2(tilt) / 2: the frame is the group's eigenvector nearest
+            // the normal, up to ~25 degrees off on this curve).
             for w in b.curvature.chunks(2) {
                 let h = 0.5 * (f16_of(w[0] & 0xffff) + f16_of(w[1] & 0xffff));
-                assert!((10.0..=16.6).contains(&h), "{h}");
+                assert!((8.5..=16.6).contains(&h), "{h}");
             }
         }
         // v2 leaves it out: the same file as the cloud without it.
@@ -3079,5 +3315,267 @@ mod tests {
             ..Default::default()
         };
         assert!(pack_streams(&s, &o).is_err());
+    }
+
+    /// A plane of surfels (athenea's 2DGS: the third axis exactly 0, the
+    /// normal along it). Their area is that of their two axes: weighed as
+    /// s0 s1 s2 / min(s) every surfel weighed 0, and the merged levels sat
+    /// at the origin with opacity 0. Now every level's nodes have weight,
+    /// sit at their splats' mean, are surfels themselves and, as decoded,
+    /// keep the sheet shut.
+    #[test]
+    fn a_plane_of_surfels_merges_into_surfels_that_cover_it() {
+        use crate::athc::{high_half, low_half};
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let (side, step) = (0.2f32, 0.002f32);
+        let k = (side / step) as usize;
+        for a in 0..k {
+            for b in 0..k {
+                let jitter = ((a * 7 + b * 13) % 5) as f32 * 0.0001;
+                s.positions.extend_from_slice(&[(a as f32 + 0.5) * step + jitter, (b as f32 + 0.5) * step, 0.05]);
+                // Turned about the normal, as a bake leaves them.
+                let q = glam::Quat::from_rotation_z((a * 3 + b) as f32 * 0.37);
+                s.rotations.extend_from_slice(&q.to_array());
+                s.scales.extend_from_slice(&[0.0024, 0.0016, 0.0]);
+                s.opacities.push(0.95);
+                s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+                s.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+                s.count += 1;
+            }
+        }
+        let o = BuildOptions::default();
+        let p = pack_streams(&s, &o).unwrap();
+        assert_eq!(p.block.n, k * k);
+        let file = build_lod(&p, &o).unwrap();
+        let splats = file.splats();
+        let extent = file.header.extent;
+        let mut uncapped = file.clone();
+        crate::athc::uncap_levels(&mut uncapped);
+        for (l, (level, block)) in uncapped.levels.iter().enumerate() {
+            let edge = extent / (1u64 << *level) as f32;
+            for g in 0..block.n {
+                let pos = &block.positions[g * 4..g * 4 + 4];
+                assert!(pos[3] > 0.0, "level {level} group {g}: no weight");
+                // At its splats' mean (they all weigh the same).
+                let [lo, hi] = crate::athc::group_splats(&file, l, g);
+                let mut mean = [0.0f64; 3];
+                for i in lo..hi {
+                    for c in 0..3 {
+                        mean[c] += splats.positions[i as usize * 4 + c] as f64;
+                    }
+                }
+                for c in 0..3 {
+                    let m = (mean[c] / (hi - lo) as f64) as f32;
+                    assert!((pos[c] - m).abs() <= 1e-4 * edge.max(step), "level {level} group {g}: {pos:?} vs {mean:?}");
+                }
+                // A surfel, its flat axis the normal.
+                let sh = &block.shape[g * 4..g * 4 + 4];
+                let ln = [low_half(sh[1]), high_half(sh[1]), low_half(sh[2])];
+                assert_eq!(ln.iter().filter(|&&v| v.exp() == 0.0).count(), 1, "level {level} group {g}: {ln:?}");
+                let q = crate::athc::decode_quaternion(sh[0]);
+                let r = axes_of_quaternion(q);
+                let flat = (0..3).find(|&a| ln[a].exp() == 0.0).unwrap();
+                assert!(r[2][flat].abs() > 0.999, "level {level} group {g}: flat axis off the normal");
+            }
+            // As decoded: widened, the whole coverage as LoD opacity.
+            let mut b = block.clone();
+            crate::athc::widen_merged(&mut b, edge);
+            assert!((0..b.n).all(|i| {
+                let sh = &b.shape[i * 4..i * 4 + 4];
+                low_half(sh[2]).exp() == 0.0 && low_half(sh[2]).is_finite()
+            }), "level {level}: decoded with the flat axis third");
+            let margin = 1.5 * edge;
+            if side - 2.0 * margin < 4.0 * edge {
+                continue;
+            }
+            let (t, sub) = sheet_transmittance(&b, side, margin);
+            eprintln!("level {level} (cell {:.1} mm, {} surfels): through {t:.4} (sub-pixel {sub:.4})", edge * 1e3, b.n);
+            assert!(t <= 0.01 && sub <= 0.05, "level {level}: {t} {sub}");
+        }
+    }
+
+    /// A ball of surfels smaller than a cell is no disc: the levels whose
+    /// cells hold all of it keep it a 3D gaussian.
+    #[test]
+    fn a_small_ball_of_surfels_stays_a_gaussian() {
+        use crate::athc::{high_half, low_half};
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let (r, n) = (0.002f32, 2000);
+        let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
+        for i in 0..n {
+            let y = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+            let rr = (1.0 - y * y).sqrt();
+            let t = golden * i as f32;
+            let nv = glam::Vec3::new(rr * t.cos(), y, rr * t.sin());
+            s.positions.extend_from_slice(&(nv * r + glam::Vec3::splat(0.5)).to_array());
+            s.rotations.extend_from_slice(&glam::Quat::from_rotation_arc(glam::Vec3::Z, nv).to_array());
+            s.scales.extend_from_slice(&[0.0002, 0.0002, 0.0]);
+            s.opacities.push(0.9);
+            s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+            s.normals.extend_from_slice(&nv.to_array());
+            s.count += 1;
+        }
+        // A far corner, so the octree's cells are large around the ball.
+        s.positions.extend_from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        for _ in 0..2 {
+            s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+            s.scales.extend_from_slice(&[0.001, 0.001, 0.0]);
+            s.opacities.push(0.9);
+            s.sh.extend_from_slice(&[0.5, 0.5, 0.5]);
+            s.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+            s.count += 1;
+        }
+        let o = BuildOptions::default();
+        let file = build_lod(&pack_streams(&s, &o).unwrap(), &o).unwrap();
+        let mut checked = 0;
+        for (level, block) in &file.levels {
+            let edge = file.header.extent / (1u64 << *level) as f32;
+            if edge < 4.0 * r {
+                continue;
+            }
+            for g in 0..block.n {
+                let p = &block.positions[g * 4..g * 4 + 3];
+                if (p[0] - 0.5).abs() > 0.01 {
+                    continue; // the corners
+                }
+                let sh = &block.shape[g * 4..g * 4 + 4];
+                let ln = [low_half(sh[1]), high_half(sh[1]), low_half(sh[2])];
+                assert!(ln.iter().all(|v| v.exp() > 0.0), "level {level}: the ball became a disc {ln:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    fn zonal_words(lobes: [([f32; 3], [f32; 3]); 2], frame: &M3) -> Vec<u32> {
+        let mut v = Vec::new();
+        for (axis, z) in lobes {
+            let sq = oct_encode(to_local(frame, axis));
+            v.extend_from_slice(&[sq[0], sq[1], z[0], z[1], z[2]]);
+        }
+        v.chunks(2).map(|p| pack_halves(p[0], p[1])).collect()
+    }
+
+    fn zonal_world(words: &[u32], frame: &M3) -> [([f32; 3], [f32; 3]); 2] {
+        [0, 1].map(|lobe| {
+            let b = lobe * 5;
+            let axis = to_world(frame, oct_decode([half_at(words, b), half_at(words, b + 1)]));
+            (axis, [half_at(words, b + 2), half_at(words, b + 3), half_at(words, b + 4)])
+        })
+    }
+
+    /// Two splats, the second turned: what lies in each one's frame (a
+    /// zonal transfer's lobes, the curvature) merged in the world, read in
+    /// the merged element's frame. Averaging the stored halves (what
+    /// extras_merge did) mixed the two frames.
+    #[test]
+    fn merges_zonal_lobes_and_curvature_in_the_world() {
+        let turns = [
+            glam::Quat::from_rotation_z(0.3),
+            glam::Quat::from_euler(glam::EulerRot::XYZ, 0.9, -0.4, 2.1),
+        ];
+        let node_turn = glam::Quat::from_euler(glam::EulerRot::XYZ, -0.2, 1.1, 0.5);
+        let shape = |q: glam::Quat| -> [u32; 4] {
+            [encode_quaternion(q.normalize().to_array()), pack_halves(0.01f32.ln(), 0.008f32.ln()), pack_halves(0.001f32.ln(), 0.5), pack_halves(0.5, 0.5)]
+        };
+        let mut splats = AthcBlock { n: 2, ..Default::default() };
+        for (i, q) in turns.iter().enumerate() {
+            splats.positions.extend_from_slice(&[i as f32 * 0.01, 0.0, 0.0, if i == 0 { 0.9 } else { 0.3 }]);
+            splats.shape.extend_from_slice(&shape(*q));
+        }
+        let mut frames = AthcBlock { n: 1, ..Default::default() };
+        frames.positions.extend_from_slice(&[0.005, 0.0, 0.0, 0.9]);
+        frames.shape.extend_from_slice(&shape(node_turn));
+        let frame = |b: &AthcBlock, i: usize| frame_of(b, i);
+        let mass: Vec<f32> = (0..2).map(|i| splats.positions[i * 4 + 3] * 0.01 * 0.008).collect();
+        let wsum = mass[0] + mass[1];
+
+        // The same world lobes on both: the merge gives them back.
+        let d0 = normalize3([0.3, -0.5, 0.8]);
+        let d1 = normalize3([-0.7, 0.1, 0.2]);
+        let same = [(d0, [0.8, 0.4, 0.1]), (d1, [0.2, -0.1, 0.05])];
+        let mut source = Vec::new();
+        for i in 0..2 {
+            source.extend(zonal_words(same, &frame(&splats, i)));
+        }
+        let merged = frame_merge(&source, 5, true, &[0], &splats, &frames);
+        let back = zonal_world(&merged, &frame(&frames, 0));
+        for (lobe, (axis, z)) in back.iter().enumerate() {
+            let dot: f32 = axis.iter().zip(&same[lobe].0).map(|(a, b)| a * b).sum();
+            assert!(dot > 0.9995, "lobe {lobe}: {axis:?} vs {:?}", same[lobe].0);
+            for k in 0..3 {
+                assert!((z[k] - same[lobe].1[k]).abs() < 2e-3, "lobe {lobe} z{k}");
+            }
+        }
+        // As the old merge did it (the halves averaged): another direction.
+        let naive = extras_merge(&source, 5, 1, &[0], &splats);
+        let naive_axis = zonal_world(&naive, &frame(&frames, 0))[0].0;
+        let naive_dot: f32 = naive_axis.iter().zip(&d0).map(|(a, b)| a * b).sum();
+        assert!(naive_dot < 0.99, "the bug: {naive_dot}");
+
+        // Different world lobes: the mass-weighted mean axis and coefficients.
+        let other = [(normalize3([0.5, 0.5, 0.6]), [0.4, 0.2, 0.3]), (d1, [0.6, 0.1, -0.05])];
+        let mut source = zonal_words(same, &frame(&splats, 0));
+        source.extend(zonal_words(other, &frame(&splats, 1)));
+        let merged = frame_merge(&source, 5, true, &[0], &splats, &frames);
+        let back = zonal_world(&merged, &frame(&frames, 0));
+        for lobe in 0..2 {
+            let a = [0, 1, 2].map(|k| mass[0] * same[lobe].0[k] + mass[1] * other[lobe].0[k]);
+            let expect = normalize3(a);
+            let dot: f32 = back[lobe].0.iter().zip(&expect).map(|(a, b)| a * b).sum();
+            assert!(dot > 0.9995, "lobe {lobe}");
+            for k in 0..3 {
+                let z = (mass[0] * same[lobe].1[k] + mass[1] * other[lobe].1[k]) / wsum;
+                assert!((back[lobe].1[k] - z).abs() < 2e-3, "lobe {lobe} z{k}: {} vs {z}", back[lobe].1[k]);
+            }
+        }
+
+        // The curvature: one world tensor (a cylinder of radius 1/12 along
+        // x, on a surface whose normal is z), stored in each splat's frame.
+        let world = |a: usize, b: usize| if a == 1 && b == 1 { 12.0f32 } else { 0.0 };
+        let curv_words = |r: &M3| -> [u32; 2] {
+            let s = |c: usize, d: usize| -> f32 {
+                let mut sum = 0.0;
+                for a in 0..3 {
+                    for b in 0..3 {
+                        sum += r[a][c] * world(a, b) * r[b][d];
+                    }
+                }
+                sum
+            };
+            [pack_halves(s(0, 0), s(0, 1)), pack_halves(s(1, 1), 0.0)]
+        };
+        // Both splats in the surface (third axis z), turned about it.
+        let mut flat = splats.clone();
+        flat.shape.clear();
+        for q in [glam::Quat::from_rotation_z(0.3), glam::Quat::from_rotation_z(-1.2)] {
+            flat.shape.extend_from_slice(&shape(q));
+        }
+        let mut source = Vec::new();
+        for i in 0..2 {
+            source.extend(curv_words(&frame(&flat, i)));
+        }
+        let mut node = frames.clone();
+        node.shape = shape(glam::Quat::from_rotation_z(0.8)).to_vec();
+        let merged = frame_merge(&source, 2, false, &[0], &flat, &node);
+        let expect = curv_words(&frame(&node, 0));
+        for k in 0..3 {
+            let (a, e) = (half_at(&merged, k), half_at(&expect, k));
+            assert!((a - e).abs() < 0.02, "curvature {k}: {a} vs {e}");
+        }
+        let naive = extras_merge(&source, 2, 1, &[0], &flat);
+        assert!((half_at(&naive, 1) - half_at(&expect, 1)).abs() > 0.5, "the bug");
+    }
+
+    /// athenea's uncapped coverage (`athenea:splat:coverage`, W / A of a
+    /// merged gaussian) is the opacity where it is there, past 1 included.
+    #[test]
+    fn reads_the_uncapped_coverage_as_the_opacity() {
+        let mut s = synthetic(4);
+        s.opacities = vec![0.99, 0.5, 0.99, 0.2];
+        s.coverage = vec![2.5, 0.5, f32::NAN, 0.0];
+        let p = pack_streams(&s, &BuildOptions::default()).unwrap();
+        let o: Vec<f32> = p.block.positions.chunks(4).map(|v| v[3]).collect();
+        assert_eq!(o, vec![2.5, 0.5, 0.99, 0.2]);
     }
 }

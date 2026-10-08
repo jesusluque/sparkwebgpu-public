@@ -189,7 +189,7 @@ void tilePreprocess(uint3 tid: SV_DispatchThreadID) {
                 tileSplats[2u * i + 1u] = uint4(asuint(u2.x), asuint(u2.y), asuint(rgb.r), asuint(rgb.g));
                 tileExtra[i] = uint4(
                     asuint(s.adjustedStdDev * s.adjustedStdDev),
-                    asuint(s.rgba.a),
+                    asuint(markedRgba(s).a),
                     asuint(s.clipCenter.z / s.clipCenter.w),
                     asuint(rgb.b));
             }
@@ -322,7 +322,10 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                 if (z2 > g1.z) {
                     continue;
                 }
-                float alpha = splatAlpha(g1.w, z2);
+                // Additive (a negative alpha, markedRgba): adds its light,
+                // leaves the transmittance.
+                const bool additive = g1.w < 0.0;
+                float alpha = splatAlpha(abs(g1.w), z2);
                 if (alpha < params.minAlpha) {
                     continue;
                 }
@@ -339,7 +342,9 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                     rgb = min(rgb, float3(1.0));
                 }
                 color += T * rgb;
-                T *= 1.0 - alpha;
+                if (!additive) {
+                    T *= 1.0 - alpha;
+                }
                 if (T < tileParams.minTransmittance) {
                     done = true;
                     break;

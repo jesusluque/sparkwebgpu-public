@@ -92,7 +92,16 @@ struct SplatShape {
     float4 viewQuaternion;
     float3 scales;
     bool3 zeroScales;
+    // Adds its light and covers nothing (generate's GEN_ADDITIVE: an ext,
+    // non-covariance splat whose alpha word has a non-zero high half).
+    bool additive;
 };
+
+// rgba with the additive mark as alpha's sign, for the draw's varyings and
+// the tile rasterizer's records (alpha is never 0 past projectSplat).
+float4 markedRgba(SplatShape s) {
+    return s.additive ? float4(s.rgba.rgb, -s.rgba.a) : s.rgba;
+}
 
 // The screen footprint of accumulator splat `splatIndex`; false when it
 // draws nothing.
@@ -107,6 +116,7 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     s.viewQuaternion = float4(0.0, 0.0, 0.0, 1.0);
     s.scales = float3(0.0);
     s.zeroScales = bool3(false);
+    s.additive = false;
 
     float3 center, scales, xxyyzz, xyxzyz;
     float4 quaternion, rgba;
@@ -122,6 +132,7 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
         uint4 b = splats[2u * splatIndex + 1u];
         if (!cov) {
             unpackSplatExt(a, b, center, scales, quaternion, rgba);
+            s.additive = (a.w >> 16u) != 0u;
             zeroScales = scales == float3(0.0);
             if (all(zeroScales)) {
                 return false;

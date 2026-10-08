@@ -117,12 +117,12 @@ describe.skipIf(!SET)("a built Corvette lights set", () => {
       decoder.push(cloud);
       const { numSplats } = decoder.finish() as { numSplats: number };
       expect(numSplats).toBe(data.header.merged + data.header.splatCount);
-      expect(data.groups.map((g) => g.name)).toEqual(
-        side.groups.map((g) => g.name),
-      );
-      expect(data.groups.map((g) => g.radiance)).toEqual(
-        side.groups.map((g) => g.radiance),
-      );
+      // Every group the sidecar's, at its radiance (an additive part may
+      // leave some out: build-corvette-lights --ground-exclude).
+      const radiance = new Map(side.groups.map((g) => [g.name, g.radiance]));
+      if (!part.additive) expect(data.groups.length).toBe(side.groups.length);
+      for (const g of data.groups)
+        expect(g.radiance).toBe(radiance.get(g.name));
     }
   }, 300_000);
 });

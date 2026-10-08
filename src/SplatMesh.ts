@@ -309,6 +309,12 @@ export class SplatMesh extends SplatGenerator {
   // after changing. (default: 3)
   maxSh = 3;
 
+  // WebGPU backend only (an ext accumulator, not covariance splats): the
+  // splats only add light, premultiplied colour with alpha 0 -- they never
+  // cover or darken what is behind them (a light catcher, a glow).
+  // Ignored by WebGL. (default: false)
+  additive = false;
+
   enableLod?: boolean;
   lodScale: number;
   behindFoveate?: number;

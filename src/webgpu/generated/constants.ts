@@ -223,6 +223,7 @@ export const kernelsGenerate = {
   GEN_COV_TRANSFORM: 1024,
   GEN_CULL: 2048,
   GEN_LOD_FADE: 65536,
+  GEN_ADDITIVE: 131072,
   GEN_LOD_INDEX_MASK: 16777215,
 } as const;
 

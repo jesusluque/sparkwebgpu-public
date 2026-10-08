@@ -623,9 +623,13 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
         } else {
             [s.scales[i * 3], s.scales[i * 3 + 1], s.scales[i * 3 + 2]]
         };
-        let ls = sc.map(|v| v.max(1e-30).ln());
-        let finite =
-            p.iter().all(|v| v.is_finite()) && ls.iter().all(|v| v.is_finite() && v.abs() < 60.0);
+        // A scale of exactly 0 is a surfel's flat axis (2DGS): kept as the
+        // most negative half, which exp() decodes back to 0.
+        let ls = sc.map(|v| if v == 0.0 { -65000.0 } else { v.max(1e-30).ln() });
+        let flat = sc.iter().filter(|&&v| v == 0.0).count();
+        let finite = p.iter().all(|v| v.is_finite())
+            && flat <= 1
+            && sc.iter().zip(ls.iter()).all(|(&v, l)| v == 0.0 || (l.is_finite() && l.abs() < 60.0));
         if !(finite && a >= 1.0 / 255.0) {
             dropped += 1;
             continue;
@@ -2029,6 +2033,27 @@ mod tests {
         // And the file it writes reads back.
         let bytes = built.write().unwrap();
         assert_eq!(AthcFile::read(&bytes).unwrap().write().unwrap(), bytes);
+    }
+
+    /// A surfel's flat axis (scale exactly 0) survives packing as exp() == 0;
+    /// two flat axes (a line) are dropped.
+    #[test]
+    fn keeps_surfel_zero_scales() {
+        let mut s = synthetic(4);
+        s.opacities = vec![1.0; 4];
+        s.scales[2] = 0.0;
+        s.scales[3 + 1] = 0.0;
+        s.scales[6] = 0.0;
+        s.scales[7] = 0.0;
+        let (cloud, kept) = pack_streams_kept(&s, &BuildOptions::default()).unwrap();
+        assert_eq!(kept, vec![0, 1, 3]);
+        let sc = |i: usize| {
+            let sh = &cloud.block.shape[i * 4..i * 4 + 4];
+            [f16_of(sh[1] & 0xffff).exp(), f16_of(sh[1] >> 16).exp(), f16_of(sh[2] & 0xffff).exp()]
+        };
+        assert_eq!(sc(0)[2], 0.0);
+        assert_eq!(sc(1)[1], 0.0);
+        assert!(sc(2).iter().all(|&v| v > 0.0));
     }
 
     fn synthetic(n: usize) -> CloudStreams {

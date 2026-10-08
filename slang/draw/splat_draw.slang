@@ -22,7 +22,10 @@ StructuredBuffer<uint> ordering;
 // vertices, in draw order, PROJECTED_WORDS uint4 a slot:
 //   [0] clip centre (f32 x4)   [1] rgba (f32 x4)
 //   [2] axis1.xy, axis2.xy (f32, scaled pixels)
-//   [3] adjustedStdDev (f32), splat index, 1 when drawn (else 0), 0
+//   [3] adjustedStdDev (f32), splat index, 1, 0; all 0 when not drawn
+// A surfel's (projectSplat's surfel) holds its SurfelRows instead:
+//   [0] x.xyz, y.x   [1] y.yz, w.xy   [2] w.z, ndc depth, r, g
+//   [3] -adjustedStdDev (f32, the mark), splat index, b, a
 static const uint PROJECTED_WORDS = 4u;
 static const uint PROJECT_WG = 256u;
 static const uint PROJECT_ROUNDS = 4u; // slots a thread: PROJECT_WG x this = the sort's TILE
@@ -39,6 +42,11 @@ struct VertexOut {
     // View ray through the fragment (z = -1) and the splat's axial depth.
     float3 viewRay : TEXCOORD3;
     nointerpolation float viewDepth : TEXCOORD4;
+    // A surfel's SurfelRows (adjustedStdDev < 0; splatUv is then the offset
+    // from its centre in surfel pixels).
+    nointerpolation float3 surfelX : TEXCOORD5;
+    nointerpolation float3 surfelY : TEXCOORD6;
+    nointerpolation float3 surfelW : TEXCOORD7;
 };
 
 // VertexOut without semantics, for the stage functions below: slangc gives
@@ -48,9 +56,50 @@ struct SplatVertex {
     float4 position;
     float4 rgba;
     float2 splatUv;
-    float adjustedStdDev;
+    float adjustedStdDev; // negative for a surfel
     uint splatIndex;
+    float3 surfelX;
+    float3 surfelY;
+    float3 surfelW;
 };
+
+SplatVertex emptySplatVertex() {
+    SplatVertex o;
+    // Outside the clip volume, so the quad is dropped if we return early.
+    o.position = float4(0.0, 0.0, 2.0, 1.0);
+    o.rgba = float4(0.0);
+    o.splatUv = float2(0.0);
+    o.adjustedStdDev = 0.0;
+    o.splatIndex = 0u;
+    o.surfelX = float3(0.0);
+    o.surfelY = float3(0.0);
+    o.surfelW = float3(0.0);
+    return o;
+}
+
+// A surfel's quad corner: surfelBox around its centre, at its centre's
+// depth (as the 3D quads), the offset from the centre as splatUv.
+void surfelCorner(inout SplatVertex o, float2 corner, SurfelRows rows, float adjustedStdDev, float ndcDepth) {
+    float2 lo, hi;
+    surfelBox(rows, adjustedStdDev, lo, hi);
+    const float2 c = float2(rows.x.z, rows.y.z);
+    // The corner outwards onto a sixteenth of a pixel, which the raster's
+    // snap of vertex positions leaves where it is (any 4+ subpixel bits):
+    // else the interpolated offset is off by up to a 512th of a pixel,
+    // which a disc near edge-on turns into ~2e-3 of alpha.
+    const float2 size = float2(params.renderWidth, params.renderHeight);
+    const float2 fb = 0.5 * size + (c + lerp(lo, hi, corner * 0.5 + 0.5)) / params.focalAdjustment;
+    const float2 snapped = (corner > float2(0.0) ? ceil(fb * 16.0) : floor(fb * 16.0)) / 16.0;
+    const float2 d = (snapped - 0.5 * size) * params.focalAdjustment - c;
+    const float w = rows.w.z;
+    const float2 ndc = (c + d) / surfelPixelScale();
+    o.position = float4(ndc * w, ndcDepth * w, w);
+    o.splatUv = d;
+    o.adjustedStdDev = -adjustedStdDev;
+    o.surfelX = rows.x;
+    o.surfelY = rows.y;
+    o.surfelW = rows.w;
+}
 
 static const float2 CORNERS[4] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0), float2(1.0, 1.0) };
 
@@ -64,14 +113,7 @@ bool layerDrops(float markedAlpha) {
 // The stages as plain functions, for draw variants to call (slangc hangs
 // calling an entry point from another).
 SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
-    SplatVertex o;
-    // Outside the clip volume, so the quad is dropped if we return early.
-    o.position = float4(0.0, 0.0, 2.0, 1.0);
-    o.rgba = float4(0.0);
-    o.splatUv = float2(0.0);
-    o.adjustedStdDev = 0.0;
-    o.splatIndex = 0u;
-
+    SplatVertex o = emptySplatVertex();
     uint splatIndex = ordering[instanceId];
     if (splatIndex == 0xffffffffu) {
         return o;
@@ -86,22 +128,13 @@ SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
         o.rgba = float4(0.0);
         return o;
     }
-    o.splatUv = corner * s.adjustedStdDev;
-    o.adjustedStdDev = s.adjustedStdDev;
     o.splatIndex = splatIndex;
-
-    if (s.flat) {
-        float3 offset;
-        if (s.zeroScales.z) {
-            offset = float3(o.splatUv * s.scales.xy, 0.0);
-        } else if (s.zeroScales.y) {
-            offset = float3(o.splatUv.x * s.scales.x, 0.0, o.splatUv.y * s.scales.z);
-        } else {
-            offset = float3(0.0, o.splatUv * s.scales.yz);
-        }
-        o.position = project(s.viewCenter + quatVec(s.viewQuaternion, offset));
+    if (s.surfel) {
+        surfelCorner(o, corner, s.rows, s.adjustedStdDev, s.clipCenter.z / s.clipCenter.w);
         return o;
     }
+    o.splatUv = corner * s.adjustedStdDev;
+    o.adjustedStdDev = s.adjustedStdDev;
 
     o.position = quadCorner(corner, s.clipCenter, s.axis1, s.axis2);
     return o;
@@ -116,8 +149,7 @@ float4 quadCorner(float2 corner, float4 clipCenter, float2 axis1, float2 axis2) 
     return float4(ndc * clipCenter.w, clipCenter.zw);
 }
 
-// The projector: projectSplat once per sorted slot (not 2DGS: flat splats
-// keep the vertex path), dispatched with the sort's radix dispatch args
+// The projector: projectSplat once per sorted slot, dispatched with the sort's radix dispatch args
 // (a workgroup per TILE active slots).
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -130,10 +162,19 @@ void projectSplats(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         }
         uint splatIndex = ordering[slot];
         SplatShape s;
-        bool drawn = splatIndex != 0xffffffffu && projectSplat(splatIndex, s) && !s.flat;
+        bool drawn = splatIndex != 0xffffffffu && projectSplat(splatIndex, s);
         uint o = PROJECTED_WORDS * slot;
         if (!drawn) {
             projectedOut[o + 3u] = uint4(0u);
+            continue;
+        }
+        if (s.surfel) {
+            const SurfelRows r = s.rows;
+            const float4 rgba = markedRgba(s);
+            projectedOut[o] = asuint(float4(r.x, r.y.x));
+            projectedOut[o + 1u] = asuint(float4(r.y.yz, r.w.xy));
+            projectedOut[o + 2u] = asuint(float4(r.w.z, s.clipCenter.z / s.clipCenter.w, rgba.rg));
+            projectedOut[o + 3u] = uint4(asuint(-s.adjustedStdDev), splatIndex, asuint(rgba.b), asuint(rgba.a));
             continue;
         }
         projectedOut[o] = asuint(s.clipCenter);
@@ -145,18 +186,27 @@ void projectSplats(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
 
 // computeSplatVertex from the projector's record of slot `instanceId`.
 SplatVertex projectedSplatVertex(uint vertexId, uint instanceId) {
-    SplatVertex o;
-    o.position = float4(0.0, 0.0, 2.0, 1.0);
-    o.rgba = float4(0.0);
-    o.splatUv = float2(0.0);
-    o.adjustedStdDev = 0.0;
-    o.splatIndex = 0u;
+    SplatVertex o = emptySplatVertex();
     uint b = PROJECTED_WORDS * instanceId;
     uint4 e = projected[b + 3u];
-    if (e.z == 0u) {
+    if (e.x == 0u) {
         return o;
     }
     float2 corner = CORNERS[vertexId & 3u];
+    if (asfloat(e.x) < 0.0) {
+        const float4 r0 = asfloat(projected[b]);
+        const float4 r1 = asfloat(projected[b + 1u]);
+        const float4 r2 = asfloat(projected[b + 2u]);
+        o.rgba = float4(r2.zw, asfloat(e.zw));
+        if (layerDrops(o.rgba.a)) {
+            o.rgba = float4(0.0);
+            return o;
+        }
+        o.splatIndex = e.y;
+        const SurfelRows rows = { r0.xyz, float3(r0.w, r1.xy), float3(r1.zw, r2.x) };
+        surfelCorner(o, corner, rows, -asfloat(e.x), r2.y);
+        return o;
+    }
     float4 axes = asfloat(projected[b + 2u]);
     float adjustedStdDev = asfloat(e.x);
     o.rgba = asfloat(projected[b + 1u]);
@@ -178,15 +228,17 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     // premultiplied, and its alpha written 0 so nothing behind is covered.
     const bool additive = rgba.a < 0.0;
     rgba.a = abs(rgba.a);
-    float z2 = dot(v.splatUv, v.splatUv);
-    if (z2 > v.adjustedStdDev * v.adjustedStdDev) {
+    float2 uv = v.splatUv;
+    const float stdDev = abs(v.adjustedStdDev);
+    const float z2 = v.adjustedStdDev < 0.0 ? surfelRadius2(v.splatUv, v.surfelX, v.surfelY, v.surfelW, uv) : dot(uv, uv);
+    if (z2 > stdDev * stdDev) {
         discard;
     }
     rgba.a = splatAlpha(rgba.a, z2);
     if (rgba.a < params.minAlpha) {
         discard;
     }
-    BlendInput blendIn = { v.splatIndex, v.splatUv, v.position };
+    BlendInput blendIn = { v.splatIndex, uv, v.position };
     rgba = applyBlendTerm<B>(rgba, blendIn);
     if (hasFlag(DRAW_ENCODE_LINEAR)) {
         rgba.rgb = srgbToLinear(rgba.rgb);
@@ -202,7 +254,7 @@ VertexOut splatVertex(uint vertexId: SV_VertexID, uint instanceId: SV_InstanceID
     SplatVertex s = computeSplatVertex(vertexId, instanceId);
     float2 ndc = s.position.xy / s.position.w;
     float3 viewRay = float3(ndc.x / params.proj0.x, ndc.y / params.proj1.y, -1.0);
-    return { s.position, s.rgba, s.splatUv, s.adjustedStdDev, s.splatIndex, viewRay, s.position.w };
+    return { s.position, s.rgba, s.splatUv, s.adjustedStdDev, s.splatIndex, viewRay, s.position.w, s.surfelX, s.surfelY, s.surfelW };
 }
 
 [shader("vertex")]
@@ -210,7 +262,7 @@ VertexOut splatVertexProjected(uint vertexId: SV_VertexID, uint instanceId: SV_I
     SplatVertex s = projectedSplatVertex(vertexId, instanceId);
     float2 ndc = s.position.xy / s.position.w;
     float3 viewRay = float3(ndc.x / params.proj0.x, ndc.y / params.proj1.y, -1.0);
-    return { s.position, s.rgba, s.splatUv, s.adjustedStdDev, s.splatIndex, viewRay, s.position.w };
+    return { s.position, s.rgba, s.splatUv, s.adjustedStdDev, s.splatIndex, viewRay, s.position.w, s.surfelX, s.surfelY, s.surfelW };
 }
 
 [shader("fragment")]
@@ -218,5 +270,5 @@ float4 splatFragment(VertexOut v) : SV_Target {
     if (hasFlag(DRAW_DISK_CLIP) && params.diskCenter.w != 0.0 && diskClipped(v.viewRay, v.viewDepth)) {
         discard;
     }
-    return computeSplatFragment<SPLAT_BLEND>({ v.position, v.rgba, v.splatUv, v.adjustedStdDev, v.splatIndex });
+    return computeSplatFragment<SPLAT_BLEND>({ v.position, v.rgba, v.splatUv, v.adjustedStdDev, v.splatIndex, v.surfelX, v.surfelY, v.surfelW });
 }

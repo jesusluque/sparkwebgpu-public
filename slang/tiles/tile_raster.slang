@@ -157,7 +157,7 @@ void tilePreprocess(uint3 tid: SV_DispatchThreadID) {
     uint splatIndex = i < sortCount[1] ? ordering[i] : 0xffffffffu;
     // 2DGS quads are drawn in perspective; the host keeps those on the
     // hardware path, and a flat splat here is skipped.
-    if (splatIndex != 0xffffffffu && projectSplat(splatIndex, s) && !s.flat) {
+    if (splatIndex != 0xffffffffu && projectSplat(splatIndex, s) && !s.surfel) {
         float2 size = float2(float(tileParams.width), float(tileParams.height));
         float2 ndc = s.clipCenter.xy / s.clipCenter.w;
         float2 center = float2(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y) * size;

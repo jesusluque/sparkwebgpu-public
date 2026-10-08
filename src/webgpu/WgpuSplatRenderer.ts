@@ -253,8 +253,16 @@ export interface WgpuSplatRendererOptions {
    */
   covSplats?: boolean;
   /**
-   * Draw splats with a zero scale as flat 2D Gaussians (2DGS) rather than
-   * projected 3D ones (SparkRenderer.enable2DGS). Default false.
+   * Surfels (2DGS): how a splat with exactly one scale 0, as decoded, is
+   * drawn. Detected per splat, so clouds may mix discs and 3D Gaussians.
+   * "auto" (default): the exact ray-splat intersection with Huang et al.'s
+   * screen filter (sigma sqrt(2)/2 px, as athenea's raster), on every path
+   * (quads, projectOnce, tiles). "ewa": as a projected 3D Gaussian of rank 2
+   * with the anti-alias blur (the 3D path; edge-on discs keep the blur).
+   */
+  surfels?: "auto" | "ewa";
+  /**
+   * SparkRenderer.enable2DGS: forces `surfels: "auto"`. Default false.
    */
   enable2DGS?: boolean;
   /**
@@ -365,6 +373,8 @@ export class WgpuSplatRenderer {
     auto: null as AutoRasterizerState | null,
     /** The last draw drew additive splats as a layer of their own. */
     additiveLayer: false,
+    /** The last frame ran the projector (projectOnce). */
+    projected: false,
   };
   options: Required<WgpuSplatRendererOptions>;
   /** What the device allows; consulted for the sort path and sizes. */
@@ -480,6 +490,7 @@ export class WgpuSplatRenderer {
       accumulator: "auto",
       cull: true,
       covSplats: false,
+      surfels: "auto",
       enable2DGS: false,
       srgbBlend: false,
       hdr: false,
@@ -926,6 +937,7 @@ export class WgpuSplatRenderer {
       this.generateAll(encoder, camera, cameraPos, cameraDir);
       readback = this.sortPending ? null : this.copyMetric(encoder, total);
     }
+    this.stats.projected = projected !== null;
     // Additive splats as a layer of their own (drawAdditiveLayer), drawn
     // now without the scene's depth (three's pass has not run yet), added
     // in three's pass before the other splats.
@@ -1420,12 +1432,11 @@ export class WgpuSplatRenderer {
   }
 
   // Whether this frame's quads read the projector's records (projectOnce):
-  // GPU sort, no 2DGS, while the records fit one binding.
+  // GPU sort, while the records fit one binding.
   private projects(total: number): boolean {
     return (
       this.options.projectOnce &&
       this.options.sort === "gpu" &&
-      !this.options.enable2DGS &&
       total * PROJECTED_BYTES <= this.device.limits.maxStorageBufferBindingSize
     );
   }
@@ -1569,8 +1580,7 @@ export class WgpuSplatRenderer {
       !layer &&
       !this.written.packed &&
       this.meshes.some((m) => this.isAdditive(m));
-    const either =
-      gpu && !variant && !this.options.enable2DGS && !additiveLayer;
+    const either = gpu && !variant && !additiveLayer;
     const path = either ? this.rasterPath() : "hardware";
     this.stats.additiveLayer = additiveLayer;
     // Times the draw for rasterizer "auto" (options.profile times it anyway).
@@ -1585,6 +1595,7 @@ export class WgpuSplatRenderer {
       this.stats.draws += 1;
       this.stats.drawn = gpuSorted as number;
       this.stats.rasterizer = "tiles";
+      this.stats.projected = false;
       return;
     }
     if (path === "warm") {
@@ -1597,6 +1608,7 @@ export class WgpuSplatRenderer {
         ? this.encodeProject(encoder, gpuSorted as number, drawParams)
         : null;
     const vertex = projected ? "splatVertexProjected" : "splatVertex";
+    this.stats.projected = projected !== null;
     if (additiveLayer) {
       this.drawAdditiveLayer(
         encoder,
@@ -1960,7 +1972,7 @@ export class WgpuSplatRenderer {
         (this.written.packed ? 0 : DRAW_EXT) |
         DRAW_PREMULTIPLIED |
         (o.covSplats ? DRAW_COV : 0) |
-        (o.enable2DGS ? DRAW_2DGS : 0) |
+        (o.surfels !== "ewa" || o.enable2DGS ? DRAW_2DGS : 0) |
         (o.lodInflate ? DRAW_LOD_INFLATE : 0) |
         (linear ? DRAW_ENCODE_LINEAR : 0) |
         (disk ? DRAW_DISK_CLIP : 0) |

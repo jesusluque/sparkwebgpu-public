@@ -17,7 +17,11 @@ import core.ext;
 
 static const uint DRAW_EXT = 1u;            // accumulator is ext (else packed)
 static const uint DRAW_COV = 2u;            // covariance splats
-static const uint DRAW_2DGS = 4u;           // flat splats when a scale is 0
+// Surfels (2DGS): a splat with exactly one scale 0, as decoded, is a disc,
+// drawn by its exact ray-splat intersection with Huang et al.'s screen
+// filter (projectSplat's surfel). The renderer sets it unless `surfels:
+// "ewa"`, which draws discs as projected 3D Gaussians of rank 2.
+static const uint DRAW_2DGS = 4u;
 static const uint DRAW_LOD_INFLATE = 8u;    // trade LOD opacity for size
 static const uint DRAW_ORTHOGRAPHIC = 16u;
 static const uint DRAW_ENCODE_LINEAR = 32u; // sRGB colours to linear output
@@ -81,6 +85,94 @@ float3x3 fromColumns(float3 c0, float3 c1, float3 c2) {
     return transpose(float3x3(c0, c1, c2));
 }
 
+// A surfel's ray-splat record (Huang et al. 2024, 2DGS; gsplat's 3x3 M):
+// the rows of T = H [s_u t_u, s_v t_v, p] in "surfel pixels" (scaled
+// pixels from the screen centre, y up: ndc * scaledRenderSize / 2), where H
+// is the projection to homogeneous surfel pixels and t_u, t_v the disc's
+// axes in view space. A point (u, v) of the disc in sigmas projects to
+// T (u, v, 1). The rows are kept relative to the projected centre c
+// (row_x - c.x row_w, row_y - c.y row_w), so x.z = y.z = 0 and those slots
+// carry c itself; w.z is the centre's clip w.
+struct SurfelRows {
+    float3 x;
+    float3 y;
+    float3 w;
+};
+
+// The 2DGS screen filter's sigma (Huang et al., gsplat's
+// FILTER_INV_SQUARE_2DGS = 2, athenea's raster): sqrt(2) / 2 pixels, so
+// its squared splat-space radius at pixel offset d is 2 |d|^2.
+static const float SURFEL_FILTER_INV_SQUARE = 2.0;
+
+// The squared splat-space radius at offset `d` from a surfel's projected
+// centre (surfel pixels; rows from SurfelRows, the centre slots ignored):
+// the ray-splat intersection's |uv|^2, or the screen filter's where it is
+// less: Huang's Ghat = max(G(u, v), G(d / sigma)). `uv` is the one taken.
+float surfelRadius2(float2 d, float3 rx, float3 ry, float3 rw, out float2 uv) {
+    const float3 x = float3(rx.xy, 0.0);
+    const float3 y = float3(ry.xy, 0.0);
+    const float3 hu = d.x * rw - x;
+    const float3 hv = d.y * rw - y;
+    const float3 s = cross(hu, hv);
+    const float screen = SURFEL_FILTER_INV_SQUARE * dot(d, d);
+    uv = d * sqrt(SURFEL_FILTER_INV_SQUARE);
+    // Edge-on (s.z 0) the ray runs in the plane; and a plane met behind the
+    // eye (clip w of the hit, dot(rw, s) / s.z, not positive) is not seen.
+    if (s.z == 0.0 || !(dot(rw, s) * s.z > 0.0)) {
+        return screen;
+    }
+    const float2 hit = s.xy / s.z;
+    const float z2 = dot(hit, hit);
+    if (!(z2 < screen)) {
+        return screen;
+    }
+    uv = hit;
+    return z2;
+}
+
+// A surfel's quad, relative to its projected centre (surfel pixels): the
+// box of its ellipse of radius `stdDev` sigmas (the dual conic's tangents,
+// gsplat's AABB with the radius in place of 3.33), joined with the
+// filter's disc of the same radius around the centre, and held within
+// maxPixelRadius of it. Where the ellipse reaches the eye's plane (no
+// ellipse on screen) the whole maxPixelRadius square: the fragment's
+// intersection decides.
+void surfelBox(SurfelRows r, float stdDev, out float2 lo, out float2 hi) {
+    const float2 rx = r.x.xy;
+    const float2 ry = r.y.xy;
+    const float3 w = r.w;
+    const float k = 1.0 / (stdDev * stdDev);
+    // Dual conic T diag(1, 1, -1/stdDev^2) T^T, relative rows (x.z = y.z = 0).
+    const float cxx = dot(rx, rx);
+    const float cyy = dot(ry, ry);
+    const float cxw = dot(rx, w.xy);
+    const float cyw = dot(ry, w.xy);
+    const float cww = dot(w.xy, w.xy) - k * w.z * w.z;
+    const float reach = stdDev / sqrt(SURFEL_FILTER_INV_SQUARE);
+    const float most = params.maxPixelRadius;
+    if (cww < 0.0) {
+        const float2 mid = float2(cxw, cyw) / cww;
+        const float2 ext = sqrt(max(mid * mid - float2(cxx, cyy) / cww, float2(0.0)));
+        lo = max(min(mid - ext, float2(-reach)), float2(-most));
+        hi = min(max(mid + ext, float2(reach)), float2(most));
+    } else {
+        lo = float2(-most);
+        hi = float2(most);
+    }
+}
+
+// The surfel pixels per unit of ndc: scaledRenderSize / 2.
+float2 surfelPixelScale() {
+    return 0.5 * float2(params.renderWidth, params.renderHeight) * params.focalAdjustment;
+}
+
+// A view-space vector `v` (w 0: a direction; 1: a point) in homogeneous
+// surfel pixels.
+float3 surfelHomogeneous(float3 v, float w) {
+    const float4 c = params.proj0 * v.x + params.proj1 * v.y + params.proj2 * v.z + params.proj3 * w;
+    return float3(c.xy * surfelPixelScale(), c.w);
+}
+
 // A splat on screen. Its quad spans clipCenter + corner.x * axis1 +
 // corner.y * axis2 (corners in [-1, 1]^2, axes in scaled pixels: the render
 // size times focalAdjustment), where the splat-space coordinate is
@@ -92,12 +184,10 @@ struct SplatShape {
     float3 viewCenter;
     float2 axis1;
     float2 axis2;
-    // 2DGS (DRAW_2DGS with a zero scale): the quad is the flat splat in view
-    // space, viewCenter + viewQuaternion * (offset by scales); axes unset.
-    bool flat;
-    float4 viewQuaternion;
-    float3 scales;
-    bool3 zeroScales;
+    // A surfel (DRAW_2DGS, exactly one zero scale): its record, surfelRows
+    // relative to its projected centre; axes unset. The quad is surfelBox.
+    bool surfel;
+    SurfelRows rows;
     // Adds its light and covers nothing (generate's GEN_ADDITIVE: an ext,
     // non-covariance splat whose alpha word has a non-zero high half).
     bool additive;
@@ -109,6 +199,42 @@ float4 markedRgba(SplatShape s) {
     return s.additive ? float4(s.rgba.rgb, -s.rgba.a) : s.rgba;
 }
 
+// projectSplat's surfel: the record and the cuts, with s's centre and
+// colour set. Huang's filter adds no energy and takes none: rgba is the
+// splat's own.
+bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, bool3 zeroScales) {
+    const float3 eu = zeroScales.x ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    const float3 ev = zeroScales.z ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
+    const float su = zeroScales.x ? scales.y : scales.x;
+    const float sv = zeroScales.z ? scales.y : scales.z;
+    const float3 hu = surfelHomogeneous(quatVec(viewQuaternion, eu * su), 0.0);
+    const float3 hv = surfelHomogeneous(quatVec(viewQuaternion, ev * sv), 0.0);
+    const float3 hp = surfelHomogeneous(s.viewCenter, 1.0);
+    const float2 c = hp.xy / hp.z;
+    s.surfel = true;
+    s.rows.x = float3(hu.x - c.x * hu.z, hv.x - c.x * hv.z, c.x);
+    s.rows.y = float3(hu.y - c.y * hu.z, hv.y - c.y * hv.z, c.y);
+    s.rows.w = float3(hu.z, hv.z, hp.z);
+    // As the 3D path: past the radius where the falloff's alpha is under
+    // minAlpha every fragment is discarded.
+    const float a = s.rgba.a;
+    const float f = params.falloff;
+    const float floorAlpha = (1.0 - f) * a;
+    if (a <= 1.0 && f > 0.0 && floorAlpha < params.minAlpha) {
+        const float cut = sqrt(max(0.0, 2.0 * log(f * a / (params.minAlpha - floorAlpha))));
+        s.adjustedStdDev = min(s.adjustedStdDev, cut);
+    }
+    if (!(s.adjustedStdDev > 0.0)) {
+        return false;
+    }
+    float2 lo, hi;
+    surfelBox(s.rows, s.adjustedStdDev, lo, hi);
+    // As the 3D path's minPixelRadius on its axes (the filter's disc keeps
+    // an edge-on disc on screen).
+    const float2 ext = 0.5 * (hi - lo);
+    return !(ext.x < params.minPixelRadius && ext.y < params.minPixelRadius);
+}
+
 // The screen footprint of accumulator splat `splatIndex`; false when it
 // draws nothing.
 bool projectSplat(uint splatIndex, out SplatShape s) {
@@ -118,10 +244,10 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     s.viewCenter = float3(0.0);
     s.axis1 = float2(0.0);
     s.axis2 = float2(0.0);
-    s.flat = false;
-    s.viewQuaternion = float4(0.0, 0.0, 0.0, 1.0);
-    s.scales = float3(0.0);
-    s.zeroScales = bool3(false);
+    s.surfel = false;
+    s.rows.x = float3(0.0);
+    s.rows.y = float3(0.0);
+    s.rows.w = float3(0.0);
     s.additive = false;
 
     float3 center, scales, xxyyzz, xyxzyz;
@@ -207,12 +333,10 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     float3x3 cov3D;
     if (!cov) {
         float4 viewQuaternion = quatQuat(params.renderToViewQuat, quaternion);
-        if (hasFlag(DRAW_2DGS) && any(zeroScales)) {
-            s.flat = true;
-            s.viewQuaternion = viewQuaternion;
-            s.scales = scales;
-            s.zeroScales = zeroScales;
-            return true;
+        // Exactly one zero scale: a disc (two: a line, drawn as a 3D splat).
+        const uint zeros = uint(zeroScales.x) + uint(zeroScales.y) + uint(zeroScales.z);
+        if (hasFlag(DRAW_2DGS) && zeros == 1u) {
+            return projectSurfel(s, viewQuaternion, scales, zeroScales);
         }
         float3x3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);
         cov3D = mul(RS, transpose(RS));

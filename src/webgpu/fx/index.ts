@@ -20,6 +20,7 @@ export { Grade } from "./effects/Grade";
 export { Merge, MERGE_OPERATIONS } from "./effects/Merge";
 export { Transform, TRANSFORM_FILTERS } from "./effects/Transform";
 export { CornerPin, CornerPinSS } from "./effects/CornerPin";
+export { Bloom, bloomLevels, BLOOM_MAX_LEVELS } from "./effects/Bloom";
 export {
   CheckerBoard,
   ColorBars,
@@ -29,6 +30,7 @@ export {
   NoOp,
 } from "./effects/Generate";
 
+import { Bloom } from "./effects/Bloom";
 import { Blur } from "./effects/Blur";
 import { CornerPin, CornerPinSS } from "./effects/CornerPin";
 import { Crop } from "./effects/Crop";
@@ -51,6 +53,7 @@ export function exampleEffects() {
     new Invert(),
     new Crop(),
     new Blur(),
+    new Bloom(),
     new Grade(),
     new Merge(),
     new Transform(),

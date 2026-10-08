@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  Bloom,
   Blur,
   CheckerBoard,
   Constant,
@@ -428,6 +429,55 @@ describe.skipIf(!device)("aofx effects", () => {
       );
     });
     expect(maxError(pic as Pic, want)).toBeLessThan(2e-3);
+  });
+
+  it("Bloom: below the threshold untouched; a point's energy spread, alpha kept", async () => {
+    const r = rect(0, 0, 64, 48);
+    const dim = picFrom(r, (x, y) => [0.3, 0.2 * ((x + y) % 2), 0.1, 0.8]);
+    const quiet = await render(
+      new Bloom(),
+      { threshold: 1, knee: 0.5, intensity: 1, size: 0.5 },
+      { Source: dim },
+      r,
+    );
+    expect(maxError(quiet.pic as Pic, dim)).toBeLessThan(1e-6);
+
+    // One pixel of light, dim enough for the Karis weights to be 1: every
+    // level keeps its energy, so the added light is the intensity times it.
+    const v = 0.01;
+    const point = picFrom(r, (x, y) =>
+      x === 32 && y === 24 ? [v, v / 2, v / 4, 1] : [0, 0, 0, 1],
+    );
+    const { pic } = await render(
+      new Bloom(),
+      { threshold: 0, knee: 0, intensity: 0.5, size: 0.25 },
+      { Source: point },
+      r,
+    );
+    const out = pic as Pic;
+    const added = [0, 0, 0];
+    for (let i = 0; i < out.w * out.h; i++) {
+      for (let c = 0; c < 3; c++)
+        added[c] += out.data[i * 4 + c] - point.data[i * 4 + c];
+      expect(out.data[i * 4 + 3]).toBe(1);
+    }
+    expect(added[0] / (0.5 * v)).toBeCloseTo(1, 1);
+    expect(added[1] / added[0]).toBeCloseTo(0.5, 3);
+    // Spread: light far from the point, about as much either side (a
+    // pyramid on a power-of-two grid is not quite shift invariant).
+    const right = at(out, 32 + 6, 24)[0];
+    const left = at(out, 32 - 6, 24)[0];
+    expect(right).toBeGreaterThan(0);
+    expect(Math.abs(right / left - 1)).toBeLessThan(0.25);
+
+    // Intensity zero is the input, not rendered.
+    const none = await render(
+      new Bloom(),
+      { intensity: 0 },
+      { Source: point },
+      r,
+    );
+    expect(maxError(none.pic as Pic, point)).toBe(0);
   });
 
   it("Constant fills the project, CheckerBoard its size", async () => {

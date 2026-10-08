@@ -975,10 +975,12 @@ pub fn error_cut_tree(file: &AthcFile, tree: &MergeTree, keep: usize, o: &ErrorO
     for (i, r) in ratios[levels - 1].iter().enumerate() {
         splats.positions[i * 4 + 3] = *r;
     }
+    let areas = crate::athc::translucent_areas(&full);
     let mut kept = full.clone();
-    for ((_, b), r) in kept.levels.iter_mut().zip(&ratios) {
+    for (((_, b), r), a) in kept.levels.iter_mut().zip(&ratios).zip(&areas) {
         for (i, v) in r.iter().enumerate() {
             b.positions[i * 4 + 3] = *v;
+            crate::athc::spread_translucent(b, i, a[i]);
         }
     }
     // The clusters' geometry from their f64 moments (the builder sums f32
@@ -989,6 +991,10 @@ pub fn error_cut_tree(file: &AthcFile, tree: &MergeTree, keep: usize, o: &ErrorO
     refine_scales(&mut splats, &h.levels[0], &clusters, &codes);
     if o.widen > 0.0 {
         widen_own(&mut splats, o.widen);
+    }
+    // Merged glass as large as its splats (see `athc::spread_translucent`).
+    for (i, a) in areas[levels - 1].iter().enumerate() {
+        crate::athc::spread_translucent(&mut splats, i, *a);
     }
     // Sources: the cluster each output splat is (the level's groups are in
     // code order, as the splats under them).
@@ -1070,8 +1076,15 @@ fn refine_scales(splats: &mut AthcBlock, groups: &[Vec<u32>], clusters: &[Cl], c
         let ratio = area(old) / area(sc).max(1e-30);
         w[1] = crate::athc::pack_halves(crate::athc::ln_scale(sc[0] as f32), crate::athc::ln_scale(sc[1] as f32));
         w[2] = crate::athc::pack_halves(crate::athc::ln_scale(sc[2] as f32), high_half(w[2]));
+        let sheet = crate::athc::is_sheet(splats, i);
         let p = &mut splats.positions[i * 4 + 3];
-        *p = (*p as f64 * ratio) as f32;
+        *p = if sheet {
+            // A sheet's 1/255 is a splat's, not an area's (athc::SHEET_PAD).
+            let pad = crate::athc::SHEET_PAD as f64;
+            ((*p as f64 - pad).max(0.0) * ratio + pad) as f32
+        } else {
+            (*p as f64 * ratio) as f32
+        };
     }
 }
 
@@ -1079,6 +1092,7 @@ fn refine_scales(splats: &mut AthcBlock, groups: &[Vec<u32>], clusters: &[Cl], c
 /// quadrature (`edge_of`), the opacity divided by the area gained.
 fn widen_own(b: &mut AthcBlock, fill: f32) {
     for i in 0..b.n {
+        let sheet = crate::athc::is_sheet(b, i);
         let w = &mut b.shape[i * 4..i * 4 + 4];
         let mut s = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()];
         let mut ord = [0usize, 1, 2];
@@ -1092,7 +1106,13 @@ fn widen_own(b: &mut AthcBlock, fill: f32) {
         let after = s[ord[0]] * s[ord[1]];
         w[1] = crate::athc::pack_halves(crate::athc::ln_scale(s[0]), crate::athc::ln_scale(s[1]));
         w[2] = crate::athc::pack_halves(crate::athc::ln_scale(s[2]), high_half(w[2]));
-        b.positions[i * 4 + 3] *= before / after.max(1e-30);
+        let o = &mut b.positions[i * 4 + 3];
+        if sheet {
+            let pad = crate::athc::SHEET_PAD;
+            *o = (*o - pad).max(0.0) * before / after.max(1e-30) + pad;
+        } else {
+            *o *= before / after.max(1e-30);
+        }
     }
 }
 
@@ -1561,6 +1581,57 @@ mod tests {
         let w0: f64 = crate::athl::splat_weights(&file).iter().map(|&w| w as f64).sum();
         let w1: f64 = crate::athl::splat_weights(&cut).iter().map(|&w| w as f64).sum();
         assert!((w1 / w0 - 1.0).abs() < 0.02, "mass {w0} -> {w1}");
+    }
+
+    /// A flat pane of glass, 60 x 60 discs overlapping about twice: thin
+    /// sheets (opacity 0.0057) or solid (0.145).
+    fn pane(thin: bool) -> AthcFile {
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let step = 0.01f32;
+        for a in 0..60 {
+            for b in 0..60 {
+                s.positions.extend_from_slice(&[a as f32 * step, b as f32 * step, 0.0]);
+                s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                s.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+                s.sh.extend_from_slice(&[0.2, 0.2, 0.2]);
+                s.scales.extend_from_slice(&[0.8 * step, 0.8 * step, 0.05 * step]);
+                s.opacities.push(if thin { 0.0057 } else { 0.145 });
+                s.metallic.push(0.0);
+                s.roughness.push(0.0);
+                s.transmission.push(if thin { 3.0 } else { 1.0 });
+                s.count += 1;
+            }
+        }
+        let p = pack_streams(&s, &BuildOptions::default()).unwrap();
+        build_lod(&p, &BuildOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn cut_glass_keeps_its_splats_area() {
+        use crate::athc::{is_sheet, two_axis_area, SHEET_PAD};
+        for thin in [true, false] {
+            let file = pane(thin);
+            let sums = |f: &AthcFile| {
+                let b = f.splats();
+                let (mut area, mut mass) = (0.0f64, 0.0f64);
+                for i in 0..b.n {
+                    assert_eq!(is_sheet(&b, i), thin);
+                    let a = two_axis_area(&b.shape[i * 4..i * 4 + 4]) as f64;
+                    let o = b.positions[i * 4 + 3] as f64 - if thin { SHEET_PAD as f64 } else { 0.0 };
+                    area += a;
+                    mass += o * a;
+                }
+                (area, mass)
+            };
+            let (a0, m0) = sums(&file);
+            let (cut, _) = error_cut(&file, 720, &options(&file)).unwrap();
+            let (a1, m1) = sums(&cut);
+            // What a pane at kSheetAlpha lets through, and the solid
+            // glass's compositing, go with the area covered; the light it
+            // reflects with the mass.
+            assert!((a1 / a0 - 1.0).abs() < 0.02, "thin {thin}: area {a0} -> {a1}");
+            assert!((m1 / m0 - 1.0).abs() < 0.02, "thin {thin}: mass {m0} -> {m1}");
+        }
     }
 
     #[test]

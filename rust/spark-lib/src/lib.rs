@@ -31,6 +31,8 @@ pub mod athc_v3;
 #[cfg(feature = "athc")]
 pub mod athc_merge;
 #[cfg(feature = "athc")]
+pub mod athc_lod_error;
+#[cfg(feature = "athc")]
 pub mod athc_build;
 #[cfg(feature = "athc")]
 pub mod athc_skin;

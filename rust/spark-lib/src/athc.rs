@@ -88,7 +88,10 @@ pub const FLAG_LINEAR: u32 = 2;
 pub const FLAG_EMISSION: u32 = 4;
 pub const FLAG_MATERIAL: u32 = 16;
 pub const FLAG_TRANSFER: u32 = 32;
-pub const KNOWN_FLAGS: u32 = FLAG_NORMALS | FLAG_LINEAR | FLAG_EMISSION | FLAG_MATERIAL | FLAG_TRANSFER;
+/// sparkwebGPU's LoD sizes by error (`athc_lod_error`): a v3 file's `LODS`
+/// section, or a merged ATHV page's sizes. Never in a v2 file.
+pub const FLAG_LOD_SIZE: u32 = 64;
+pub const KNOWN_FLAGS: u32 = FLAG_NORMALS | FLAG_LINEAR | FLAG_EMISSION | FLAG_MATERIAL | FLAG_TRANSFER | FLAG_LOD_SIZE;
 
 /// Spark's LoD pages (and athenea's default chunk): 65 536 splats.
 pub const PAGE_SPLATS: u32 = 65536;
@@ -353,7 +356,7 @@ pub fn parse_headers(bytes: &[u8]) -> Result<(AthcHeader, ExtraHeader)> {
     if unknown != 0 {
         let bits: Vec<String> = (0..32).filter(|b| unknown & (1 << b) != 0).map(|b| b.to_string()).collect();
         bail!(
-            "not a readable .athc (unknown flag bits {}; this reads bits 0 (normals), 1 (linear), 2 (emission), 4 (material) and 5 (transfer))",
+            "not a readable .athc (unknown flag bits {}; this reads bits 0 (normals), 1 (linear), 2 (emission), 4 (material), 5 (transfer) and 6 (LoD sizes))",
             bits.join(", ")
         );
     }
@@ -472,6 +475,9 @@ pub struct AthcBlock {
     /// sparkwebGPU's skin (`athc_skin`): influences then gradient words a
     /// splat, or empty.
     pub skin: Vec<u32>,
+    /// sparkwebGPU's LoD size by error (`athc_lod_error`, v3 section LODS):
+    /// one a merged node, 0 for a splat (its geometric size), or empty.
+    pub lod_size: Vec<f32>,
 }
 
 fn words_of(b: &[u8], at: &mut usize, n: usize) -> Vec<u32> {
@@ -502,7 +508,7 @@ impl AthcBlock {
         let shadow_bits = opt(x.shadow_words > 0, &mut at, x.shadow_words);
         let curvature = opt(x.curvature_words > 0, &mut at, x.curvature_words);
         let skin = opt(x.skin_words() > 0, &mut at, x.skin_words());
-        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin })
+        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new() })
     }
 
     /// Every array after positions, in file order.
@@ -556,6 +562,7 @@ impl AthcBlock {
             shadow_bits: cut(&self.shadow_bits),
             curvature: cut(&self.curvature),
             skin: cut(&self.skin),
+            lod_size: if self.lod_size.is_empty() { Vec::new() } else { self.lod_size[start..start + n].to_vec() },
         }
     }
 
@@ -573,6 +580,15 @@ impl AthcBlock {
         self.shadow_bits.extend_from_slice(&other.shadow_bits);
         self.curvature.extend_from_slice(&other.curvature);
         self.skin.extend_from_slice(&other.skin);
+        // A block with sizes and one without: the latter's are 0 (geometric).
+        if !self.lod_size.is_empty() || !other.lod_size.is_empty() {
+            self.lod_size.resize(self.n - other.n, 0.0);
+            if other.lod_size.is_empty() {
+                self.lod_size.resize(self.n, 0.0);
+            } else {
+                self.lod_size.extend_from_slice(&other.lod_size);
+            }
+        }
     }
 
     /// Words per element of an array of this block (0 when absent).
@@ -1085,6 +1101,10 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
         .map(|k| pack_halves((rest[2 * k] / sum_w) as f32, (rest[2 * k + 1] / sum_w) as f32))
         .collect();
     root.tail = vec![0];
+    // A LoD size at least its children's (athc_lod_error).
+    if !level1.lod_size.is_empty() {
+        root.lod_size = vec![level1.lod_size.iter().cloned().fold(0.0, f32::max)];
+    }
     root
 }
 
@@ -1692,6 +1712,12 @@ pub fn merged_pages_of(file: &AthcFile, header_page: &[u8]) -> Result<(VirtualTr
         for w in &tree.group_range[2 * base as usize..2 * (base + n) as usize] {
             out.extend_from_slice(&w.to_le_bytes());
         }
+        if !merged.lod_size.is_empty() {
+            out[152..156].copy_from_slice(&ATHV_LOD_SIZES.to_le_bytes());
+            for v in &merged.lod_size[base as usize..(base + n) as usize] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         pages.push(out);
     }
     Ok((tree, pages))
@@ -1765,6 +1791,9 @@ pub struct DecodeOptions {
 /// An ATHV head's decode flags (word 152): bit 0, keep a linear cloud's
 /// colours linear (`DecodeOptions::keep_linear`).
 pub const ATHV_KEEP_LINEAR: u32 = 1;
+/// An ATHV merged page's decode flags, bit 1: its nodes' LoD sizes
+/// (`AthcBlock::lod_size`, f32 each) follow its group ranges.
+pub const ATHV_LOD_SIZES: u32 = 2;
 
 /// Feeds `block`'s elements to `receiver` as splats base .. base + n, with
 /// `children` (counts, virtual starts) when they are tree nodes.
@@ -1892,6 +1921,10 @@ pub fn emit_block<T: SplatReceiver>(
             k += 1;
         }
     }
+    // LoD sizes by error, for the nodes that have them (0: geometric).
+    if lod_tree && block.lod_size.len() == block.n && block.lod_size.iter().any(|&v| v > 0.0) {
+        receiver.set_lod_size(base, block.n, &block.lod_size);
+    }
     // GROUP_ATTRIBUTE: given for merged nodes; a splat's tail is its group.
     let ranges: Vec<u32> = match groups {
         Some(g) => g.to_vec(),
@@ -2011,12 +2044,21 @@ impl<T: SplatReceiver> AthcDecoder<T> {
         };
         let block = AthcBlock::read(&b[at..], n, &h, &x)?;
         // Merged pages carry their nodes' group ranges after the block.
+        let mut block = block;
         let groups = if kind == ATHV_MERGED {
             let mut after = at + n * element_bytes(&h, &x) as usize;
             if b.len() < after + 8 * n {
                 bail!("ATHV page shorter than its group ranges");
             }
-            Some(words_of(b, &mut after, 2 * n))
+            let ranges = words_of(b, &mut after, 2 * n);
+            // ... and their LoD sizes, when the page says so.
+            if u32_at(b, 152) & ATHV_LOD_SIZES != 0 {
+                if b.len() < after + 4 * n {
+                    bail!("ATHV page shorter than its LoD sizes");
+                }
+                block.lod_size = words_of(b, &mut after, n).into_iter().map(f32::from_bits).collect();
+            }
+            Some(ranges)
         } else {
             None
         };

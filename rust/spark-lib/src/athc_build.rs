@@ -850,7 +850,8 @@ pub fn morton30(unit: [f32; 3]) -> u32 {
 }
 
 /// The block's elements in `order`.
-fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
+/// The rows `order` of `b` (any of them, in that order), tail left empty.
+pub fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
     let pick = |v: &Vec<u32>| -> Vec<u32> {
         if v.is_empty() {
             return Vec::new();
@@ -867,7 +868,7 @@ fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         positions.extend_from_slice(&b.positions[i as usize * 4..i as usize * 4 + 4]);
     }
     AthcBlock {
-        n: b.n,
+        n: order.len(),
         positions,
         shape: pick(&b.shape),
         sh: pick(&b.sh),
@@ -880,6 +881,7 @@ fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         shadow_bits: pick(&b.shadow_bits),
         curvature: pick(&b.curvature),
         skin: pick(&b.skin),
+        lod_size: Vec::new(),
     }
 }
 

@@ -794,6 +794,18 @@ pub fn athc_prefix_bytes(bytes: Uint8Array) -> Result<f64, JsValue> {
 }
 stub_fn!(feature = "athc", athc_prefix_bytes);
 
+/// A .athc v3 CPCA transfer section (encoding 3, after its gunzip) back to
+/// its words (athc_cpca::decode_cpca), for the streams a chunk page fetches
+/// on the main thread (src/athc.ts decodeAthcSection): the same halves the
+/// TypeScript decoder gives, several times faster.
+#[wasm_bindgen]
+#[cfg(feature = "athc")]
+pub fn athc_decode_cpca(stored: &[u8], n: u32, words: u32) -> Result<Uint8Array, JsValue> {
+    let raw = spark_lib::athc_cpca::decode_cpca(stored, n as usize, words as usize).map_err(|e| JsValue::from(e.to_string()))?;
+    Ok(Uint8Array::from(&raw[..]))
+}
+stub_fn!(feature = "athc", athc_decode_cpca);
+
 /// A .athc's headers and tables (AthcLayout) plus `levelsEnd`, the bytes a
 /// stream reads before any chunk, from the file's first bytes.
 #[wasm_bindgen]

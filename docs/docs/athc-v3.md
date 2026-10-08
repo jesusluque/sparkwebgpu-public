@@ -128,7 +128,8 @@ page 0   header, 160 bytes
          152 skeleton (u64, the ATSK blob's offset; 0: none)
 @160     section table, 32 bytes each:
            id (fourcc), tier, encoding (0 v2 words, 1 byte planes,
-           2 delta planes), compression (0 none, 1 gzip), words a
+           2 delta planes, 3 CPCA: transfer sections only, lossy),
+           compression (0 none, 1 gzip), words a
            element, 3 x 0
          block index, (32 + 16 × sectionCount) bytes each:
            kind (0 level, 1 chunk), level (1.. or 0), first element, n,
@@ -196,6 +197,63 @@ Measured on the published clouds (gzip, MB):
 
 The Corvette's trim and wheels (athenea's whole-car bake) keep their
 transfer as it is. The shadow bits never gain.
+
+### Encoding 3: clustered PCA of the transfer (lossy)
+
+The transfer is most of a relit cloud (30–70 % of its bytes), and its
+values are smooth functions of a splat's surroundings: neighbours' transfers
+are close, and a block's span few directions. Encoding 3 (`athc_cpca.rs`,
+Sloan et al. 2003) stores a transfer section (`TXDI`, `TXIN`, `TXFD`; never
+another) of one block as:
+
+- up to K clusters (k-means on an even sample, then every element to its
+  nearest centre; K at most the block's elements / 128);
+- per cluster its mean and its first m principal directions, f16, m the
+  fewest (at most M) whose truncation takes at most 40 % of the budget;
+- per element its cluster (u8) and m coefficients, quantized with a step per
+  cluster proportional to the cluster's RMS (the same relative error in dim
+  clusters as in bright ones), zig-zag integers of 1–3 bytes stored as byte
+  planes for the gzip.
+
+The budget is relative: the block's sum of squared errors over its sum of
+squared values, `E` (default 1e-5), checked on the decoded halves (the step
+shrinks until it holds). The SH transfers' values are orthonormal harmonic
+coefficients, so this is the transfer's L2 error over the sphere: what the
+sky's dot product, the sun's point evaluation and the field's reflection
+read. A zonal transfer (10 values: octahedral axes and band coefficients) is
+clustered with each value weighted by its RMS and its error counted on the
+nine harmonics it stands for. A block that cannot meet the budget, or that
+byte planes store smaller, keeps its values exactly (mode 0).
+
+```text
+mode 0   u32 0, the halves as byte planes (encoding 1)
+mode 1   u32 1, K, M, D (= 2 x words), B (coefficient bytes, 1..3)
+         K f32 steps; K x (1 + M) x D f16 (mean, then M directions), padded to 4
+         n u8 clusters; M x B planes of n bytes (byte b of zigzag(q_j))
+value    acc = mean[k][d]; acc = acc + (q_j * step_k) * dir[k][j][d] for j < M,
+         each product and sum rounded to f32; the half nearest (ties even)
+```
+
+The decode is that exact f32 arithmetic in a fixed order, so the Rust
+decoder (WASM: whole files and kind-2 pages) and the TypeScript one (`src/
+athc.ts decodeAthcCpca`: streams a chunk page fetches on its own) give the
+same halves bit for bit (`test/unit/athcCpca.test.ts`). What comes out is
+the section's words as before: attribute pools, paging by stream group,
+residency (`athcTransferResident`) and the transfer forms (`transferForm`:
+16, 64, 112, each a prefix of sections) are unchanged
+(`test/gpu/athcPaging.test.ts` pages a CPCA file like the others). Merged
+LoD nodes are blocks too and are compressed the same way. Readers before
+encoding 3 refuse such a file (`parse_v3`).
+
+```sh
+athc-convert in.athc out.athc --gzip --planes --cpca 16,48        # K 16, M 48, E 1e-5
+athc-convert in.athc out.athc --gzip --planes --cpca 16,48,3e-5   # a looser budget
+```
+
+Measured (thread BF, `research/simplify-measurements.md`): the transfer
+sections take 4–7× fewer bytes (TX 112 of the pawn's top: 157 → 28 MB); a
+relit splat through athenea's `relitSplat` on Dawn moves by a relMSE of
+4e-8 – 3e-5 (`test/gpu/athcCpcaRelight.test.ts`, opt-in); the Corvette light set 67.9 → 49.5 MB, the pawn page 281 → 84 MB, the sparrow −6 %.
 
 ### A skinned cloud (`SKIN` and the skeleton)
 
@@ -415,6 +473,6 @@ and 36 the same truncated to degree 2 (the first coefficients of each half).
 ### Not yet
 
 - 083's quantized S0 (~20 bytes: positions relative to the block's sphere,
-  8-bit log scales) and flattened SH0p, and the compressed (lossy) transfer
-  of 034: new `encoding` codes.
+  8-bit log scales) and flattened SH0p: new `encoding` codes. (034's lossy
+  transfer is encoding 3, above.)
 - The light-group sidecar `.athl` (066, 069): its own file.

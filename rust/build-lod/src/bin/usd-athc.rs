@@ -801,7 +801,9 @@ fn read_layer_colours(
         let count = positions.len() / 3;
         let sh = match colour_attr {
             // The colour as a DC that reads back to it (0.5 + SH0 dc).
-            Some(a) => p.floats(&[a])?.iter().map(|v| if *v == 0.0 { 0.0 } else { (v - 0.5) / SH0 }).collect(),
+            // (A 0 is black, dc = -0.5 / SH0: not the all-zero SH of an
+            // unbaked gaussian.)
+            Some(a) => p.floats(&[a])?.iter().map(|v| (v - 0.5) / SH0).collect(),
             None => p.floats(&["radiance:sphericalHarmonicsCoefficients", "radiance:sphericalHarmonicsCoefficientsh"])?,
         };
         if count == 0 || sh.len() % (3 * count) != 0 || sh.is_empty() {

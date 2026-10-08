@@ -482,6 +482,15 @@ pub fn run(scene: &Scene, args: &[String]) -> Result<()> {
         eprintln!("pruned over {nv} views: {} → {}", n, input.len());
         row("pruned (hidden ∧ < 0.05 px)", &input);
     }
+    // Optionally thin the opaque splats of some parts first (as `thin`).
+    if let Some(spec) = arg(args, "--thin-first") {
+        // k,grow,part[+part...]
+        let f: Vec<&str> = spec.split(',').collect();
+        let (k, grow): (usize, f32) = (f[0].parse().unwrap(), f[1].parse().unwrap());
+        let parts: Vec<u16> = f[2].split('+').map(|p| scene.parts.iter().position(|x| x == p).unwrap() as u16).collect();
+        input = thin_opaque(&input, k, grow, &parts);
+        row(&format!("+ thinned {spec}"), &input);
+    }
     greedy(&input, &ctx, &targets, |t, cut| {
         row(&format!("greedy → {t}"), &cut);
         if let Some(dir) = &save {
@@ -494,4 +503,45 @@ pub fn run(scene: &Scene, args: &[String]) -> Result<()> {
         }
     });
     Ok(())
+}
+
+/// The opaque splats of `parts` thinned 1 in k along the Morton order, their
+/// long axes scaled by `grow`.
+pub fn thin_opaque(splats: &[Splat], k: usize, grow: f32, parts: &[u16]) -> Vec<Splat> {
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for s in splats {
+        for d in 0..3 {
+            lo[d] = lo[d].min(s.p[d] as f64);
+            hi[d] = hi[d].max(s.p[d] as f64);
+        }
+    }
+    let ext = (0..3).map(|d| hi[d] - lo[d]).fold(0.0, f64::max) * 1.01 + 1e-9;
+    let mut order: Vec<(u16, u64, usize)> = splats.iter().enumerate().map(|(i, s)| (s.part, morton(s.p.map(|v| v as f64), lo, ext, [0.0; 3]), i)).collect();
+    order.sort_unstable();
+    let mut out = Vec::with_capacity(splats.len());
+    let mut run = 0usize;
+    let mut last = u16::MAX;
+    for &(part, _, i) in &order {
+        if part != last {
+            run = 0;
+            last = part;
+        }
+        let s = &splats[i];
+        if s.o < 0.99 || !parts.contains(&part) {
+            out.push(s.clone());
+            continue;
+        }
+        if run % k == 0 {
+            let mut t = s.clone();
+            let thinnest = (0..3).min_by(|&a, &b| t.s[a].total_cmp(&t.s[b])).unwrap();
+            for d in 0..3 {
+                if d != thinnest {
+                    t.s[d] *= grow;
+                }
+            }
+            out.push(t);
+        }
+        run += 1;
+    }
+    out
 }

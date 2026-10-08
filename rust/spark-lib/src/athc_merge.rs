@@ -1101,6 +1101,395 @@ pub fn cloud_of(file: &AthcFile) -> PackedCloud {
     packed_of(file)
 }
 
+// --- athenea's merge tree as the levels (thread BE) --------------------------
+
+impl MergeTree {
+    /// Each node's children, in index order.
+    pub fn children(&self) -> Vec<Vec<u32>> {
+        let mut kids: Vec<Vec<u32>> = vec![Vec::new(); self.parent.len()];
+        for (k, &p) in self.parent.iter().enumerate() {
+            if p as usize != k {
+                kids[p as usize].push(k as u32);
+            }
+        }
+        kids
+    }
+
+    /// The nodes of the cut `cut(keep)` makes (each cluster's top node),
+    /// in the order of their first leaf.
+    pub fn cut_nodes(&self, keep: usize) -> Vec<u32> {
+        let clusters = self.cut(keep);
+        // A cluster's node: its first leaf's highest ancestor whose leaves
+        // are all the cluster's (its size by leaf count).
+        let total = self.parent.len();
+        let mut size = vec![0u32; total];
+        for k in 0..self.leaves {
+            size[k] = 1;
+        }
+        for k in 0..total {
+            let p = self.parent[k] as usize;
+            if p != k {
+                size[p] += size[k];
+            }
+        }
+        clusters
+            .iter()
+            .map(|c| {
+                let mut k = c[0] as usize;
+                while size[k] < c.len() as u32 {
+                    k = self.parent[k] as usize;
+                }
+                k as u32
+            })
+            .collect()
+    }
+
+    /// The tree over the leaves `keep` says (their order kept), merges
+    /// left without leaves dropped: the new tree and each new node's old
+    /// index.
+    pub fn retain_leaves(&self, keep: &[bool]) -> (MergeTree, Vec<u32>) {
+        let total = self.parent.len();
+        let mut alive = vec![false; total];
+        alive[..self.leaves].copy_from_slice(&keep[..self.leaves]);
+        for k in 0..total {
+            let p = self.parent[k] as usize;
+            if alive[k] && p != k {
+                alive[p] = true;
+            }
+        }
+        let old: Vec<u32> = (0..total as u32).filter(|&k| alive[k as usize]).collect();
+        let mut new_of = vec![u32::MAX; total];
+        for (i, &k) in old.iter().enumerate() {
+            new_of[k as usize] = i as u32;
+        }
+        let leaves = (0..self.leaves).filter(|&k| keep[k]).count();
+        let parent = old.iter().map(|&k| new_of[self.parent[k as usize] as usize]).collect();
+        let cost = old.iter().map(|&k| self.cost[k as usize]).collect();
+        (MergeTree { leaves, parent, cost }, old)
+    }
+}
+
+/// What `levels_from_tree` made.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct TreeImport {
+    /// Splats of the output (the tree's leaves, or the cut's nodes).
+    pub splats: usize,
+    /// Groups a level, coarsest first.
+    pub groups: Vec<usize>,
+    /// Level groups that are a node of the tree (their row is the tree's
+    /// own merge), and those made here above its roots (merged by
+    /// `build_lod_from_codes`).
+    pub tree_nodes: usize,
+    pub made_here: usize,
+    pub extent: f32,
+}
+
+/// The `.athc` of athenea's merge tree (surfels-web/NOTES.md, "Merge
+/// tree"): `cloud` holds every node, its leaves then its merges, each with
+/// its own primvars (athenea merged them over the node's leaves), `tree`
+/// their parents and costs. The splats are the leaves, or with `keep` the
+/// nodes of the cut to at most that many by monotone cost
+/// (`MergeTree::cut`); each level above them is a cut of the same tree:
+/// from the level below, the tree's merges are taken cheapest first while
+/// a group holds at most eight of that level's groups (the codes' three
+/// bits) until about `o.level_ratio` times fewer are left. Every level
+/// group that is a node of the tree is written as athenea's own node (all
+/// sections), not merged again; groups above the tree's roots (it stops at
+/// n / 4096 roots, or where nothing may merge) are merged here, from
+/// their splats, as `build_lod_from_codes` merges any group.
+pub fn levels_from_tree(
+    cloud: &PackedCloud,
+    tree: &MergeTree,
+    keep: Option<usize>,
+    o: &ErrorOptions,
+    chunk_splats: u32,
+) -> Result<(AthcFile, TreeImport)> {
+    let total = tree.parent.len();
+    if cloud.block.n != total {
+        bail!("a merge tree of {} nodes for {} gaussians", total, cloud.block.n);
+    }
+    let base: Vec<u32> = match keep {
+        Some(k) if k < tree.leaves => tree.cut_nodes(k),
+        _ => (0..tree.leaves as u32).collect(),
+    };
+    let kids = tree.children();
+    let mono = tree.monotone_costs();
+    let pos = |k: u32| -> [f64; 3] {
+        let p = &cloud.block.positions[k as usize * 4..k as usize * 4 + 3];
+        [p[0] as f64, p[1] as f64, p[2] as f64]
+    };
+    let node_edge = |k: u32| -> f64 {
+        let w = &cloud.block.shape[k as usize * 4..k as usize * 4 + 4];
+        let mut s = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()].map(|v| v as f64);
+        s.sort_by(|a, b| b.total_cmp(a));
+        (12.0 * s[0] * s[1]).sqrt()
+    };
+    // The merges, cheapest first (ties: children, which come first).
+    let mut order: Vec<u32> = (tree.leaves as u32..total as u32).collect();
+    order.sort_by(|&a, &b| mono[a as usize].total_cmp(&mono[b as usize]).then(a.cmp(&b)));
+
+    // Levels, finest first: each group a tree node, or None (made here).
+    let mut levels: Vec<Vec<Vec<u32>>> = Vec::new();
+    let mut nodes: Vec<Vec<Option<u32>>> = Vec::new();
+    let mut centroids: Vec<Vec<[f64; 3]>> = Vec::new();
+    let mut edges: Vec<Vec<f64>> = Vec::new();
+    // The current level: its groups' nodes, centroids, edges.
+    let mut cur: Vec<Option<u32>> = base.iter().map(|&k| Some(k)).collect();
+    let mut cur_c: Vec<[f64; 3]> = base.iter().map(|&k| pos(k)).collect();
+    let mut cur_e: Vec<f64> = base.iter().map(|&k| node_edge(k)).collect();
+    let mut first = true;
+    let mut count_of = vec![0u32; total];
+    let mut taken = vec![false; total];
+    loop {
+        let n = cur.len();
+        let left = LOD_LEVELS as usize - levels.len() - 1;
+        if (!first && n <= o.top && levels.len() >= 2) || left == 0 {
+            if n > o.top {
+                bail!("{} groups left at the coarsest of {} levels (at most {})", n, levels.len(), o.top);
+            }
+            break;
+        }
+        first = false;
+        let target = ((n as f64 / o.level_ratio).ceil() as usize).max(1);
+        // The tree's merges over this level's tree groups.
+        for (i, g) in cur.iter().enumerate() {
+            if let Some(k) = g {
+                let _ = i;
+                count_of[*k as usize] = 1;
+                taken[*k as usize] = true;
+            }
+        }
+        let mut count = n;
+        let mut done: Vec<u32> = Vec::new();
+        for &p in &order {
+            if count <= target {
+                break;
+            }
+            let p = p as usize;
+            if taken[p] {
+                continue;
+            }
+            let ks = &kids[p];
+            if ks.is_empty() || !ks.iter().all(|&c| taken[c as usize]) {
+                continue;
+            }
+            let sum: u32 = ks.iter().map(|&c| count_of[c as usize]).sum();
+            if sum > 8 {
+                continue;
+            }
+            taken[p] = true;
+            count_of[p] = sum;
+            count -= ks.len() - 1;
+            done.push(p as u32);
+        }
+        // Each group of this level under its highest taken ancestor.
+        let mut group_of: Vec<u32> = vec![u32::MAX; n];
+        let mut next: Vec<Option<u32>> = Vec::new();
+        let mut members: Vec<Vec<u32>> = Vec::new();
+        let mut slot = std::collections::HashMap::new();
+        for (i, g) in cur.iter().enumerate() {
+            let Some(mut k) = *g else { continue };
+            while tree.parent[k as usize] != k && taken[tree.parent[k as usize] as usize] {
+                k = tree.parent[k as usize];
+            }
+            let s = *slot.entry(k).or_insert_with(|| {
+                next.push(Some(k));
+                members.push(Vec::new());
+                next.len() - 1
+            });
+            members[s].push(i as u32);
+            group_of[i] = s as u32;
+        }
+        // Groups the tree cannot merge (made here, above its roots): when
+        // the tree did less than half of this step, its groups left alone
+        // go in runs of up to `ratio` along a Morton curve.
+        let mut loose: Vec<u32> = (0..n as u32).filter(|&i| group_of[i as usize] == u32::MAX).collect();
+        if 2 * (n - count) < n - target.min(n) {
+            let mut kept_next = Vec::new();
+            let mut kept_members = Vec::new();
+            for (g, m) in next.into_iter().zip(members) {
+                if m.len() == 1 && g == cur[m[0] as usize] {
+                    loose.push(m[0]);
+                } else {
+                    kept_next.push(g);
+                    kept_members.push(m);
+                }
+            }
+            next = kept_next;
+            members = kept_members;
+        }
+        if !loose.is_empty() {
+            let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for &i in &loose {
+                for d in 0..3 {
+                    lo[d] = lo[d].min(cur_c[i as usize][d]);
+                    hi[d] = hi[d].max(cur_c[i as usize][d]);
+                }
+            }
+            let ext = (0..3).map(|d| hi[d] - lo[d]).fold(0.0, f64::max) * 1.01 + 1e-9;
+            loose.sort_by_key(|&i| morton63(cur_c[i as usize], lo, ext, [0.0; 3]));
+            let per = (o.level_ratio.round() as usize).clamp(2, 8);
+            for run in loose.chunks(per) {
+                next.push(None);
+                members.push(run.to_vec());
+            }
+        }
+        // Clean the marks for the next level.
+        for g in cur.iter().flatten() {
+            taken[*g as usize] = false;
+        }
+        for &p in &done {
+            taken[p as usize] = false;
+        }
+        let next_c: Vec<[f64; 3]> = next
+            .iter()
+            .zip(&members)
+            .map(|(g, m)| match g {
+                Some(k) => pos(*k),
+                None => {
+                    let mut c = [0.0; 3];
+                    for &i in m {
+                        for d in 0..3 {
+                            c[d] += cur_c[i as usize][d] / m.len() as f64;
+                        }
+                    }
+                    c
+                }
+            })
+            .collect();
+        let next_e: Vec<f64> = next
+            .iter()
+            .zip(&members)
+            .map(|(g, m)| match g {
+                Some(k) => node_edge(*k),
+                None => 2.0 * m.iter().map(|&i| cur_e[i as usize]).fold(0.0, f64::max),
+            })
+            .collect();
+        if next.len() >= n {
+            bail!("a level of the merge tree merged nothing ({} groups)", n);
+        }
+        levels.push(members);
+        nodes.push(next.clone());
+        centroids.push(next_c.clone());
+        edges.push(next_e.clone());
+        cur = next;
+        cur_c = next_c;
+        cur_e = next_e;
+    }
+    let h = Hierarchy { levels, centroids, edges, runs: Vec::new() };
+    let codes_by_level = level_codes(&h)?;
+    let codes: Vec<u32> = {
+        let mut out = vec![u32::MAX; base.len()];
+        for (g, members) in h.levels[0].iter().enumerate() {
+            for &e in members {
+                out[e as usize] = codes_by_level[0][g];
+            }
+        }
+        out
+    };
+    let d = h.levels.len() as u32;
+    let coarsest = LOD_LEVELS - d + 1;
+    let extent = extent_for(&h, coarsest);
+    // The splats: the base nodes' rows.
+    let base_cloud = PackedCloud { block: crate::athc_build::reorder(&cloud.block, &base), ..cloud.clone() };
+    let options = BuildOptions { coarsest_level: coarsest, max_group_fraction: 2.0, chunk_splats, ..Default::default() };
+    let lo = {
+        let mut lo = [f32::INFINITY; 3];
+        for i in 0..base_cloud.block.n {
+            for k in 0..3 {
+                lo[k] = lo[k].min(base_cloud.block.positions[i * 4 + k]);
+            }
+        }
+        lo
+    };
+    let mut out = build_lod_from_codes(&base_cloud, &options, &codes, lo, extent)?;
+    if out.levels.len() != h.levels.len() {
+        bail!("{} levels built for a tree of {}", out.levels.len(), h.levels.len());
+    }
+    // The tree's own nodes in place of the groups merged again.
+    let mut import = TreeImport { splats: base.len(), extent, ..Default::default() };
+    for (fl, (_, block)) in out.levels.iter_mut().enumerate() {
+        let l = h.levels.len() - 1 - fl;
+        let mut by_code: Vec<(u32, Option<u32>)> =
+            codes_by_level[l].iter().cloned().zip(nodes[l].iter().cloned()).collect();
+        by_code.sort_by_key(|x| x.0);
+        if by_code.len() != block.n {
+            bail!("level {} has {} groups, the tree {}", fl, block.n, by_code.len());
+        }
+        let rows: Vec<u32> = by_code.iter().map(|x| x.1.unwrap_or(u32::MAX)).collect();
+        for (i, &(code, _)) in by_code.iter().enumerate() {
+            if block.tail[i] != code {
+                bail!("level {} group {} is cell {}, not {}", fl, i, block.tail[i], code);
+            }
+        }
+        let tree_rows: Vec<u32> = rows.iter().cloned().filter(|&r| r != u32::MAX).collect();
+        import.tree_nodes += tree_rows.len();
+        import.made_here += rows.len() - tree_rows.len();
+        if tree_rows.is_empty() {
+            continue;
+        }
+        let theirs = crate::athc_build::reorder(&cloud.block, &tree_rows);
+        let mut t = 0;
+        let mut merged = AthcBlock::default();
+        for (i, &r) in rows.iter().enumerate() {
+            if r == u32::MAX {
+                merged.append(&block.slice(i, 1));
+            } else {
+                merged.append(&theirs.slice(t, 1));
+                t += 1;
+            }
+        }
+        merged.tail = block.tail.clone();
+        *block = merged;
+    }
+    // The groups' whole coverage over the splats (athenea's own W / A when
+    // the splats are its leaves or its nodes).
+    crate::athc::uncap_levels(&mut out);
+    import.groups = out.levels.iter().map(|(_, b)| b.n).collect();
+    Ok((out, import))
+}
+
+/// Each level's groups' codes (finest level first, as `h.levels`): the
+/// path of digits from the coarsest level down, children ordered along a
+/// Morton curve of their centroids.
+fn level_codes(h: &Hierarchy) -> Result<Vec<Vec<u32>>> {
+    let d = h.levels.len();
+    let top = h.levels[d - 1].len();
+    let top_bits = 32 - 3 * (d as u32 - 1);
+    if d as u32 > LOD_LEVELS || (top_bits < 32 && top as u64 > 1u64 << top_bits) {
+        bail!("{} levels with {} groups at the top do not fit 32-bit codes", d, top);
+    }
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for c in &h.centroids[0] {
+        for k in 0..3 {
+            lo[k] = lo[k].min(c[k]);
+            hi[k] = hi[k].max(c[k]);
+        }
+    }
+    let ext = (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max) * 1.01 + 1e-9;
+    let mort = |p: &[f64; 3]| morton63(*p, lo, ext, [0.0; 3]);
+    let mut code: Vec<Vec<u32>> = h.levels.iter().map(|l| vec![0u32; l.len()]).collect();
+    let mut tops: Vec<u32> = (0..top as u32).collect();
+    tops.sort_by_key(|&g| mort(&h.centroids[d - 1][g as usize]));
+    for (k, &g) in tops.iter().enumerate() {
+        code[d - 1][g as usize] = k as u32;
+    }
+    for l in (1..d).rev() {
+        for g in 0..h.levels[l].len() {
+            let mut kids = h.levels[l][g].clone();
+            if kids.len() > 8 {
+                bail!("a group of level {} has {} children", l, kids.len());
+            }
+            kids.sort_by_key(|&c| mort(&h.centroids[l - 1][c as usize]));
+            for (k, &c) in kids.iter().enumerate() {
+                code[l - 1][c as usize] = (code[l][g] << 3) | k as u32;
+            }
+        }
+    }
+    Ok(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,4 +1599,105 @@ mod tests {
         assert_eq!(t.dfs_leaves(), vec![0, 1, 2, 3]);
         assert!(MergeTree::from_parts(4, &[4, 4, 5, 5, 6, 6, 3], &[0.0; 7]).is_err());
     }
+    /// A hand-built merge tree in athenea's layout over the folded sheet:
+    /// leaves in file order, pairs of neighbours merged level by level
+    /// until 57 roots (more than a level's top: the levels above them are
+    /// made here), each merge a row of its own marked by its colour.
+    fn hand_tree() -> (PackedCloud, MergeTree) {
+        let file = folded();
+        let mut cloud = packed_of(&file);
+        let n = cloud.block.n;
+        let mut parent: Vec<i32> = (0..n as i32).collect();
+        let mut cost = vec![0.0f32; n];
+        let mut cur: Vec<u32> = (0..n as u32).collect();
+        let mut depth = 0;
+        while cur.len() > 64 {
+            depth += 1;
+            let mut next = Vec::new();
+            for pair in cur.chunks(2) {
+                if pair.len() == 1 {
+                    next.push(pair[0]);
+                    continue;
+                }
+                let k = parent.len() as u32;
+                let (a, b) = (pair[0] as usize, pair[1] as usize);
+                let mut row = cloud.block.slice(a, 1);
+                for d in 0..3 {
+                    row.positions[d] = 0.5 * (cloud.block.positions[a * 4 + d] + cloud.block.positions[b * 4 + d]);
+                }
+                let grow = 0.5 * 2f32.ln();
+                let w = &mut row.shape;
+                w[1] = crate::athc::pack_halves(low_half(w[1]) + grow, high_half(w[1]) + grow);
+                w[2] = crate::athc::pack_halves(low_half(w[2]), 0.123);
+                w[3] = crate::athc::pack_halves(0.123, 0.123);
+                cloud.block.append(&row);
+                parent[a] = k as i32;
+                parent[b] = k as i32;
+                parent.push(k as i32);
+                cost.push(depth as f32 + 0.001 * (k % 7) as f32);
+                next.push(k);
+            }
+            cur = next;
+        }
+        let tree = MergeTree::from_parts(n, &parent, &cost).unwrap();
+        (cloud, tree)
+    }
+
+    fn marked(b: &AthcBlock, i: usize) -> bool {
+        (low_half(b.shape[i * 4 + 3]) - 0.123).abs() < 1e-3
+    }
+
+    #[test]
+    fn levels_from_athenea_tree_use_its_nodes() {
+        let (cloud, tree) = hand_tree();
+        let o = options(&folded());
+        for keep in [None, Some(2000)] {
+            let (out, import) = levels_from_tree(&cloud, &tree, keep, &o, 1 << 16).unwrap();
+            let splats = match keep {
+                None => tree.leaves,
+                Some(k) => tree.cut(k).len(),
+            };
+            assert_eq!(out.header.count as usize, splats);
+            assert_eq!(import.splats, splats);
+            assert!(import.tree_nodes > 0 && import.made_here > 0, "{import:?}");
+            // Every group the tree has is its row (marked); the rest merged here.
+            let mut marks = 0;
+            for (_, b) in &out.levels {
+                marks += (0..b.n).filter(|&i| marked(b, i)).count();
+            }
+            // (Over a cut, groups made here average marked nodes: marked too.)
+            if keep.is_none() {
+                assert_eq!(marks, import.tree_nodes);
+            } else {
+                assert!(marks >= import.tree_nodes);
+            }
+            // A cut's splats are the tree's nodes (marked where merged).
+            if keep.is_some() {
+                let s = out.splats();
+                assert!((0..s.n).any(|i| marked(&s, i)));
+            }
+            // A valid LoD tree: every splat under one finest group.
+            let vt = crate::athc::VirtualTree::of_file(&out, false).unwrap();
+            assert_eq!(vt.count as usize, splats);
+            // And it goes through v3 with its LoD sizes.
+            let sized = crate::athc_lod_error::with_lod_sizes(&out, &Default::default());
+            let bytes = crate::athc_v3::write_v3(&sized, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+            assert_eq!(crate::athc_v3::read_v3(&bytes).unwrap().levels.len(), out.levels.len());
+        }
+    }
+
+    #[test]
+    fn retains_and_cuts_tree_nodes() {
+        // leaves 0..4; 4 = (0, 1); 5 = (2, 3); 6 = (4, 5).
+        let t = MergeTree::from_parts(4, &[4, 4, 5, 5, 6, 6, 6], &[0.0, 0.0, 0.0, 0.0, 1.0, 3.0, 2.0]).unwrap();
+        let mut c = t.cut_nodes(3);
+        c.sort();
+        assert_eq!(c, vec![2, 3, 4]);
+        assert_eq!(t.cut_nodes(1), vec![6]);
+        let (r, old) = t.retain_leaves(&[true, false, false, false]);
+        assert_eq!(r.leaves, 1);
+        assert_eq!(old, vec![0, 4, 6]);
+        assert_eq!(r.parent, vec![1, 2, 2]);
+    }
+
 }

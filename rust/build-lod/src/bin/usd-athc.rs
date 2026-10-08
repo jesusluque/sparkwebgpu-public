@@ -17,7 +17,23 @@
 //!          [--drop-backs THICKNESS] [--box x0,y0,z0,x1,y1,z1]
 //!          [--surfel-nodes auto|on|off]
 //! usd-athc in.usdc --list            the prim's attributes, their types and lengths
+//! usd-athc --tree tree.usdc out.athc [--keep-splats N [--error]] [--lod-sizes] [the options above
+//!          that do not reduce: --transfer, --max-sh, --chunk, --no-*, --gzip, --v2, --json, --clip]
 //! ```
+//!
+//! `--tree` reads athenea's merge tree (`athenea decimate --tree`,
+//! surfels-web/NOTES.md "Merge tree"): one cloud, constant
+//! `athenea:splat:lodTree`, its leaves then its merges (children before
+//! parents), each node with its own primvars already merged by athenea,
+//! `athenea:splat:lodParent` (int, a root its own index) and
+//! `athenea:splat:lodCost` (float, 0 for a leaf, not monotone). The splats
+//! are its leaves, or with `--keep-splats N` the nodes of its cut to at most
+//! N by the max cost over each subtree (`MergeTree::cut`); the `.athc`
+//! levels above them are cuts of the same tree, at most eight groups of a
+//! level in one (`athc_merge::levels_from_tree`), each written as athenea's
+//! own node, not merged again; only the levels above its roots are merged
+//! here. `--lod-sizes` (any conversion) writes the merged nodes' LoD sizes
+//! by error (`athc_lod_error`, the v3 section LODS).
 //!
 //! For the web: `--add` appends more clouds of the same streams (one file for
 //! several of athenea's per-material clouds; `--add more.usdc::TEXT,TEXT`
@@ -109,6 +125,8 @@ use spark_lib::athc_build::{
     build_lod, cell_for_target, crop_box_kept, drop_hidden_backs_kept, lod_order, pack_streams, pack_streams_kept,
     reduce_cells_runs, reduce_thin_runs, BuildOptions, CloudStreams, LobeStreams, SurfelNodes, TransferKeep, SH0,
 };
+use spark_lib::athc_lod_error::{with_lod_sizes, LodSizeOptions};
+use spark_lib::athc_merge::{levels_from_tree, ErrorOptions, ErrorView, MergeTree};
 use spark_lib::athl::SplatSources;
 use spark_lib::athc_skin::{AthcSkeleton, SkinClip};
 use spark_lib::athc_v3::{gzip, parse_v3, write_v3_skinned, COMPRESSION_GZIP, COMPRESSION_NONE};
@@ -1081,6 +1099,130 @@ fn write_athl(
     }))
 }
 
+/// `--tree`: athenea's merge tree to a `.athc` (see the module).
+fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    for f in ["--add", "--cell", "--target", "--thin", "--drop-backs", "--box", "--light-layer", "--only-prim", "--exclude-prim"] {
+        if flag(f) {
+            bail!("{f} is not supported with --tree (the tree fixes the splats and their merges)");
+        }
+    }
+    // `usd-athc --tree tree.usdc out.athc`, or `usd-athc tree.usdc out.athc --tree tree.usdc`.
+    let output = match paths {
+        [out] => out,
+        [input, out] if input == tree_path => out,
+        [input, _] => bail!("--tree {tree_path}: the cloud is the tree's, not {input}"),
+        _ => bail!("usage: usd-athc --tree tree.usdc out.athc [--keep-splats N [--error]]"),
+    };
+    let prim_path = arg(args, "--prim").unwrap_or("/World/Splats");
+    let t = std::time::Instant::now();
+    let data = read_layer(tree_path)?;
+    let prim = Prim::read(data.as_ref(), prim_path)?;
+    if !prim.bool("athenea:splat:lodTree") {
+        eprintln!("warning: {tree_path} does not say athenea:splat:lodTree = true");
+    }
+    let parent: Vec<i32> = prim.ints("athenea:splat:lodParent")?.into_iter().map(|v| v as i32).collect();
+    let cost = prim.floats(&["athenea:splat:lodCost"])?;
+    let total = parent.len();
+    // The leaves: the nodes nothing merged into (all before the merges).
+    let mut has_kids = vec![false; total];
+    for (k, &p) in parent.iter().enumerate() {
+        if p as usize != k && (p as usize) < total {
+            has_kids[p as usize] = true;
+        }
+    }
+    let leaves = has_kids.iter().position(|&h| h).unwrap_or(total);
+    if has_kids[leaves..].iter().any(|&h| !h) {
+        bail!("{tree_path}: a leaf after the first merge (leaves first, then merges)");
+    }
+    let tree = MergeTree::from_parts(leaves, &parent, &cost)?;
+    let fps = time_codes_per_second(data.as_ref());
+    let rig = {
+        let k = prim.skin_influences(total)? as u32;
+        let has_gradients = matches!(prim.get("athenea:splat:jointWeightGradients"),
+            Some(Value::HalfVec(h)) if k > 1 && h.len() == total * 2 * (k as usize - 1));
+        prim.skeleton(arg(args, "--clip").unwrap_or("default"), fps, k, if has_gradients { k - 1 } else { 0 })?
+    };
+    let constants = prim.constants();
+    let up = up_axis(data.as_ref());
+    let streams = prim.streams()?;
+    if streams.count != total {
+        bail!("{tree_path}: {} gaussians, {} lodParent", streams.count, total);
+    }
+    let transfer = match arg(args, "--transfer").unwrap_or("full") {
+        "full" => TransferKeep::Full,
+        "none" => TransferKeep::None,
+        n => TransferKeep::Count(n.parse().context("--transfer")?),
+    };
+    let mut options = BuildOptions {
+        transfer,
+        shadow_bits: !flag("--no-shadow"),
+        material: !flag("--no-material"),
+        normals: !flag("--no-normals"),
+        curvature: !flag("--no-curvature"),
+        ..Default::default()
+    };
+    if let Some(m) = arg(args, "--max-sh") {
+        options.max_rest = m.parse().context("--max-sh")?;
+    }
+    if let Some(c) = arg(args, "--chunk") {
+        options.chunk_splats = c.parse().context("--chunk")?;
+    }
+    let (mut packed, kept) = pack_streams_kept(&streams, &options)?;
+    drop(streams);
+    // Leaves validation dropped (opacity under 1/255) leave the tree; a merge
+    // has to stay (its row stands for its leaves).
+    let (tree, old) = if kept.len() < total {
+        let mut keep = vec![false; total];
+        for &k in &kept {
+            keep[k as usize] = true;
+        }
+        if let Some(k) = (leaves..total).find(|&k| !keep[k]) {
+            bail!("{tree_path}: merge node {k} is not a valid gaussian (opacity under 1/255?)");
+        }
+        tree.retain_leaves(&keep)
+    } else {
+        (tree, (0..total as u32).collect())
+    };
+    if old.len() != kept.len() || old.iter().zip(&kept).any(|(a, b)| a != b) {
+        let rows: Vec<u32> = old.iter().map(|o| kept.binary_search(o).unwrap() as u32).collect();
+        packed.block = spark_lib::athc_build::reorder(&packed.block, &rows);
+    }
+    let keep: Option<usize> = arg(args, "--keep-splats").map(|v| v.parse()).transpose().context("--keep-splats")?;
+    let o = ErrorOptions::new(ErrorView::around(packed.bounds_min, packed.bounds_max));
+    let (mut file, import) = levels_from_tree(&packed, &tree, keep, &o, options.chunk_splats)?;
+    if flag("--lod-sizes") {
+        file = with_lod_sizes(&file, &LodSizeOptions::default());
+    }
+    let build_s = t.elapsed().as_secs_f32();
+    let compression = if flag("--gzip") { COMPRESSION_GZIP } else { COMPRESSION_NONE };
+    let bytes = if flag("--v2") { file.write()? } else { write_v3_skinned(&file, compression, rig.as_ref())? };
+    std::fs::write(output, &bytes)?;
+    let report = json!({
+        "tree": tree_path,
+        "prim": prim_path,
+        "output": output,
+        "nodes": total,
+        "leaves": leaves,
+        "dropped": total - kept.len(),
+        "keepSplats": keep,
+        "import": import,
+        "format": if flag("--v2") { "athc v2" } else if compression == COMPRESSION_GZIP { "athc v3 gzip" } else { "athc v3" },
+        "bytes": bytes.len(),
+        "splats": file.header.count,
+        "levels": file.levels.iter().map(|(r, b)| json!([r, b.n])).collect::<Vec<_>>(),
+        "lodSizes": file.levels.iter().any(|(_, b)| !b.lod_size.is_empty()),
+        "constants": constants,
+        "upAxis": up,
+        "seconds": build_s,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if let Some(j) = arg(args, "--json") {
+        std::fs::write(j, serde_json::to_string_pretty(&report)?)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
@@ -1113,6 +1255,8 @@ fn main() -> Result<()> {
         "--fake-layer",
         "--emit",
         "--dump-layers",
+        "--tree",
+        "--keep-splats",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -1124,6 +1268,9 @@ fn main() -> Result<()> {
         } else if !a.starts_with("--") {
             paths.push(a.clone());
         }
+    }
+    if let Some(tree) = arg(&args, "--tree") {
+        return tree_main(&args, tree, &paths);
     }
     let Some(input) = paths.first() else {
         bail!("usage: usd-athc in.usdc out.athc [--prim P] [--transfer full|112|84|64|36|16|9|none] [--no-shadow] [--no-material] [--no-normals] [--no-curvature] [--max-sh N] [--chunk N] [--gzip] [--v2] [--json out.json] | usd-athc in.usdc --list");
@@ -1423,6 +1570,9 @@ fn main() -> Result<()> {
     // v3 keeps the merged levels' whole coverage (athc::coverage_ratios);
     // a v2 file is written capped at 0.99, as athenea's.
     spark_lib::athc::uncap_levels(&mut file);
+    if flag("--lod-sizes") {
+        file = with_lod_sizes(&file, &LodSizeOptions::default());
+    }
     let build_s = t.elapsed().as_secs_f32() - read_s;
     let compression = if flag("--gzip") {
         COMPRESSION_GZIP
@@ -1550,6 +1700,37 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../test/fixtures/athc/tx_cloud.usdc"
     );
+
+    #[test]
+    fn reads_athenea_merge_tree() {
+        let tree = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/merge_tree.usda");
+        let dir = std::env::temp_dir().join(format!("usd-athc-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (keep, splats) in [(None, 128), (Some(40), 40)] {
+            let out = dir.join("tree.athc").to_string_lossy().to_string();
+            let mut args: Vec<String> = ["--tree", tree, &out, "--lod-sizes"].iter().map(|s| s.to_string()).collect();
+            if let Some(k) = keep {
+                args.extend(["--keep-splats".to_string(), k.to_string(), "--error".to_string()]);
+            }
+            tree_main(&args, tree, std::slice::from_ref(&out)).unwrap();
+            let file = spark_lib::athc_v3::read_v3(&std::fs::read(&out).unwrap()).unwrap();
+            assert_eq!(file.header.count, splats);
+            // Every level group is one of the tree's merges, as athenea wrote
+            // it: its centre is a merge's centre (both sheets' merges sit on
+            // their grids' run midpoints), its colour its sheet's.
+            let data = read_layer(tree).unwrap();
+            let s = Prim::read(data.as_ref(), "/World/Splats").unwrap().streams().unwrap();
+            for (_, b) in &file.levels {
+                assert!(b.lod_size.iter().all(|&v| v > 0.0));
+                for i in 0..b.n {
+                    let p = &b.positions[i * 4..i * 4 + 3];
+                    let hit = (128..s.count).any(|k| (0..3).all(|d| (s.positions[3 * k + d] - p[d]).abs() < 1e-6));
+                    assert!(hit, "group {i} at {p:?} is no merge of the tree");
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn reports_the_layers_up_axis() {

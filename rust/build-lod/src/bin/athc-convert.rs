@@ -40,7 +40,8 @@
 //!                         normal and thickness error of the splats under it, monotone), the v3
 //!                         section LODS that Spark's traversal reads in place of the geometric
 //!                         size; a file that has them keeps them (recomputed after a cut) unless
-//!                         --no-lod-sizes
+//!                         --no-lod-sizes; --lod-size-opts k=v,... (lambda, material, normal,
+//!                         thick, shape, v0, gamma, hi) over LodSizeOptions::default()
 
 use anyhow::{bail, Context, Result};
 use spark_lib::athl::{cloud_hash, splat_weights, sparse_layers, validate, virtual_values_weighted, AthlFile};
@@ -68,7 +69,7 @@ fn main() -> Result<()> {
         .iter()
         .enumerate()
         .filter(|&(i, a)| {
-            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
+            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || args[i - 1] == "--lod-size-opts" || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
         })
         .map(|(_, a)| a)
         .collect();
@@ -179,7 +180,8 @@ fn main() -> Result<()> {
             b.lod_size.clear();
         }
     } else if flag("--lod-sizes") || had_lod_sizes {
-        file = with_lod_sizes(&file, &LodSizeOptions::default());
+        let o = LodSizeOptions::parse(&text("--lod-size-opts").unwrap_or_default())?;
+        file = with_lod_sizes(&file, &o);
         println!("LoD sizes by error for {} merged nodes", file.levels.iter().map(|(_, b)| b.n).sum::<usize>());
     }
     for c in file.chunks.iter_mut() {

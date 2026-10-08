@@ -27,8 +27,11 @@
 //! traversal spends the splats where the error is.
 //!
 //! Measured on the CPU (`athc_measure trav`, research/simplify-measurements.md
-//! § BE): on corvette-v6e-light the relMSE at a budget of 150k / 300k / 600k
-//! drops by 14 / 13 / 29 % from the geometric sizes. A size that is the error
+//! § BE): on corvette-v6e-light (an error-driven tree, thread BC) the relMSE
+//! at a budget of 150k / 300k / 600k drops by 14 / 13 / 29 % from the
+//! geometric sizes (the same error with ~28% fewer splats), on the pawn by
+//! 9 / 17 / 35 %; on the octree of corvette-v5-light it is mixed (-2 / +14 /
+//! -11 %) and on the sparrow even (its feathers saturate the factor). A size that is the error
 //! alone, `k sqrt(A eps)` with eps BC's merge cost (`level_error_sizes`),
 //! was twice as bad: B / W grows with the log of the splats merged, so fine
 //! nodes shrank three times against coarse ones, and coarse nodes of faint
@@ -80,6 +83,30 @@ pub struct LodSizeOptions {
     pub gamma: f64,
     /// At most this many times the geometric size.
     pub hi: f64,
+}
+
+impl LodSizeOptions {
+    /// `key=value,...` over the defaults: lambda, material, normal, thick,
+    /// shape, v0, gamma, hi.
+    pub fn parse(spec: &str) -> anyhow::Result<Self> {
+        let mut o = Self::default();
+        for kv in spec.split(',').filter(|s| !s.is_empty()) {
+            let (k, v) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("LoD size option {kv}: key=value"))?;
+            let v: f64 = v.parse()?;
+            match k {
+                "lambda" => o.lambda = v,
+                "material" => o.lambda_material = v,
+                "normal" => o.lambda_normal = v,
+                "thick" => o.lambda_thick = v,
+                "shape" => o.shape = v,
+                "v0" => o.v0 = v,
+                "gamma" => o.gamma = v,
+                "hi" => o.hi = v,
+                _ => anyhow::bail!("unknown LoD size option {k}"),
+            }
+        }
+        Ok(o)
+    }
 }
 
 impl Default for LodSizeOptions {

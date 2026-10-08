@@ -638,11 +638,9 @@ async function openAthcV3(
   }
   if (keepLinear) {
     for (const page of pages) {
-      new DataView(page.buffer, page.byteOffset).setUint32(
-        152,
-        ATHV_KEEP_LINEAR,
-        true,
-      );
+      // Or'd: a merged page may also say it carries LoD sizes (bit 1).
+      const view = new DataView(page.buffer, page.byteOffset);
+      view.setUint32(152, view.getUint32(152, true) | ATHV_KEEP_LINEAR, true);
     }
   }
   return {

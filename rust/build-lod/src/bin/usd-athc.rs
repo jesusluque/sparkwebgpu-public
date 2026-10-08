@@ -1192,7 +1192,7 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     let o = ErrorOptions::new(ErrorView::around(packed.bounds_min, packed.bounds_max));
     let (mut file, import) = levels_from_tree(&packed, &tree, keep, &o, options.chunk_splats)?;
     if flag("--lod-sizes") {
-        file = with_lod_sizes(&file, &LodSizeOptions::default());
+        file = with_lod_sizes(&file, &LodSizeOptions::parse(arg(args, "--lod-size-opts").unwrap_or(""))?);
     }
     let build_s = t.elapsed().as_secs_f32();
     let compression = if flag("--gzip") { COMPRESSION_GZIP } else { COMPRESSION_NONE };
@@ -1257,6 +1257,7 @@ fn main() -> Result<()> {
         "--dump-layers",
         "--tree",
         "--keep-splats",
+        "--lod-size-opts",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -1571,7 +1572,7 @@ fn main() -> Result<()> {
     // a v2 file is written capped at 0.99, as athenea's.
     spark_lib::athc::uncap_levels(&mut file);
     if flag("--lod-sizes") {
-        file = with_lod_sizes(&file, &LodSizeOptions::default());
+        file = with_lod_sizes(&file, &LodSizeOptions::parse(arg(&args, "--lod-size-opts").unwrap_or(""))?);
     }
     let build_s = t.elapsed().as_secs_f32() - read_s;
     let compression = if flag("--gzip") {

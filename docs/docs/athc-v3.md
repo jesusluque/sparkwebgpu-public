@@ -144,6 +144,7 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 |---|---|---|---|---|
 | S0 | `CORE` | 1 | 36 | positions, shape, tail (as three arrays) |
 | S0p | `SHRS` | 1 | 4 · shWords | rest harmonics |
+| S0l | `LODS` | 1 | 4 | a merged node's LoD size by error, f32 (0 in a chunk: geometric); flag bit 6 (sparkwebGPU's, below) |
 | S0s | `SKIN` | 1 | 4 · (influences + gradientWords) | a skinned cloud's rig (sparkwebGPU's, below) |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
 | S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
@@ -246,6 +247,33 @@ Paged (`PagedSplats`), a skinned cloud is drawn in its bind pose for now:
 --planes` keeps the skeleton: `write_v3_smallest_with`), and `file_bytes`
 counts the skeleton blob.
 
+### LoD sizes by error (`LODS`)
+
+Spark's traversal (spark-rs `lod_tree.rs`, the same code for WebGL and
+`WgpuLod`) refines the node with the largest `size / distance` first under
+its splat budget, and stops at a pixel. The decoder's size is geometric
+(splat_encode `encode_lod_tree`: twice the mean scale, grown for a LoD
+opacity past 1). With header flag bit 6 a file carries, in a tier-1 section
+right after the harmonics, one f32 for every element: for a level group the
+size the decoder writes into the LoD tree in place of the geometric one, 0
+(every chunk element) for a splat that keeps its own. sparkwebGPU writes it
+as the geometric size scaled up by the group's error against all the splats
+under it (`athc_lod_error.rs level_lod_sizes`: colour and material
+variance, normal spread, thickness; `clamp(((v + v0) / v0)^0.5, 1, 4)`),
+made monotone up the tree, so a group that looks like its splats keeps its
+size and Spark's one-pixel limit and `lodScale` mean what they did, and
+the budget goes where the error is. Measured with `athc_measure trav`
+(research/simplify-measurements.md § BE): -13 to -29% relMSE at equal
+budget on corvette-v6e-light, -9 to -35% on the pawn.
+
+`athc-convert in out --lod-sizes [--lod-size-opts k=v,...]` adds them to any
+file (no rebuild); a file that has them keeps them, recomputed after a cut,
+unless `--no-lod-sizes`; `usd-athc --lod-sizes` writes them at conversion. A
+merged ATHV page carries its nodes' sizes after its group ranges, f32 each,
+with bit 1 of its decode flags (word 152, `ATHV_LOD_SIZES`); the browser
+fetches `LODS` with the levels and never with a chunk. A v2 file never holds
+them, and a reader before them refuses the flag.
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only
@@ -323,6 +351,7 @@ cargo run -p build-lod --bin athc-convert -- in.athc out.athc --gzip --planes   
 # splats) where the normals spread (athc::truncate_creases):
 cargo run -p build-lod --bin athc-convert -- hd.athc light.athc --gzip --planes --keep-splats 200000 --creases 0.03 --crease-depth 1
 #   --rebuild-frame SEED: build the levels again in an octree frame turned and shifted by SEED
+#   --lod-sizes: the merged nodes' LoD sizes by error (LODS, above)
 ```
 
 The WASM decoder reads a v3 file whole (`new SplatMesh({ url })`) as it reads
@@ -343,7 +372,25 @@ cargo run --release -p build-lod --bin usd-athc -- M_Pawn_Body_W.usdc body.athc 
 #   --transfer full|112|84|64|36|16|9|none   which of the transfer's values to keep
 #   --no-shadow --no-material --no-normals --max-sh N --chunk N --prim /World/Splats
 cargo run --release -p build-lod --bin usd-athc -- cloud.usdc --list   # attributes, types, lengths
+# athenea's merge tree (`athenea decimate --tree`): its leaves as the splats, or
+# the cut to N by max-subtree cost, the levels its own nodes (below)
+cargo run --release -p build-lod --bin usd-athc -- --tree tree.usdc out.athc [--keep-splats N --error] --lod-sizes --gzip
 ```
+
+**A merge tree** (`--tree`, surfels-web/NOTES.md "Merge tree"): one cloud
+with the constant `lodTree`, its leaves then its merges (children before
+parents), every node with its own primvars already merged by athenea,
+`lodParent` (a root its own index) and `lodCost` (not monotone). The splats
+are the leaves, or with `--keep-splats N` the nodes of the cut to at most N
+by the max cost over each subtree. Each level above is a cut of the same
+tree: from the level below, the tree's merges are taken cheapest first
+while a group holds at most eight of that level's groups (the codes' three
+bits), until about four times fewer are left
+(`athc_merge::levels_from_tree`). A group that is a node of the tree is
+written as athenea's row (every section), not merged again; above the
+tree's roots the groups are merged here. Leaves the validation drops leave
+the tree; a merge it would drop is refused. Fixture:
+`test/fixtures/athc/merge_tree.usda` (`merge_tree.py`).
 
 | USD attribute (`primvars:athenea:splat:` for the athenea ones) | `.athc` |
 |---|---|

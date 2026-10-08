@@ -795,6 +795,78 @@ pub fn cut_values(original: &AthcFile, ranges: &[[u32; 2]], per_splat: &[f32], c
     (values, sums)
 }
 
+/// For an additive cloud (a light catcher: athenea's `kLightCatcherMark`),
+/// each splat's share of its light that athenea's raster keeps: its
+/// gaussians composite among themselves as any layer does
+/// (`lampTransmittance`, splat_blend.slang), so where n of them overlap the
+/// light is the patch's coverage `1 - prod(1 - a_j)`, not their sum
+/// `sum(a_j)` that an additive draw adds. Measured at each splat's centre
+/// over its neighbours (alpha capped at 0.99, below 1/255 skipped, as the
+/// raster does): `coverage / sum`. Multiplying a splat's light by it makes
+/// the additive sum the composite wherever the light is smooth over a few
+/// splats, from any view (a flat layer's overlap is the same on screen).
+pub fn additive_shares(file: &AthcFile) -> Vec<f32> {
+    use crate::athc::decode_quaternion;
+    let s = file.splats();
+    let n = file.header.count as usize;
+    // Each splat's centre, inverse covariance and opacity.
+    let mut inv = Vec::with_capacity(n);
+    let mut reach = 0f32;
+    for i in 0..n {
+        let w = &s.shape[4 * i..4 * i + 4];
+        let sc = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()];
+        reach = reach.max(sc[0].max(sc[1]).max(sc[2]));
+        let [x, y, z, q] = decode_quaternion(w[0]);
+        let r = [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - q * z), 2.0 * (x * z + q * y)],
+            [2.0 * (x * y + q * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - q * x)],
+            [2.0 * (x * z - q * y), 2.0 * (y * z + q * x), 1.0 - 2.0 * (x * x + y * y)],
+        ];
+        // R diag(1/s^2) R^T
+        let mut m = [[0f32; 3]; 3];
+        for a in 0..3 {
+            for b in 0..3 {
+                m[a][b] = (0..3).map(|k| r[a][k] * r[b][k] / (sc[k] * sc[k]).max(1e-20)).sum();
+            }
+        }
+        inv.push(m);
+    }
+    // Neighbours within 3 of the largest axis.
+    let cell = (3.0 * reach).max(1e-6);
+    let key = |p: &[f32]| [0, 1, 2].map(|k| (p[k] / cell).floor() as i32);
+    let mut grid: std::collections::HashMap<[i32; 3], Vec<u32>> = std::collections::HashMap::new();
+    for i in 0..n {
+        grid.entry(key(&s.positions[4 * i..4 * i + 3])).or_default().push(i as u32);
+    }
+    (0..n)
+        .map(|i| {
+            let p = &s.positions[4 * i..4 * i + 3];
+            let c = key(p);
+            let (mut sum, mut through) = (0f32, 1f32);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for &j in grid.get(&[c[0] + dx, c[1] + dy, c[2] + dz]).map_or(&[][..], |v| &v[..]) {
+                            let j = j as usize;
+                            let q = &s.positions[4 * j..4 * j + 4];
+                            let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+                            let m = &inv[j];
+                            let e: f32 = (0..3).map(|a| (0..3).map(|b| d[a] * m[a][b] * d[b]).sum::<f32>()).sum();
+                            let a = (q[3].min(1.0) * (-0.5 * e).exp()).min(0.99);
+                            if a < 1.0 / 255.0 {
+                                continue;
+                            }
+                            sum += a;
+                            through *= 1.0 - a;
+                        }
+                    }
+                }
+            }
+            if sum > 0.0 { (1.0 - through) / sum } else { 1.0 }
+        })
+        .collect()
+}
+
 impl AthlFile {
     /// The layers of one group and kind, dense over the virtual elements
     /// (`components` each; 0 where no block is kept), or None without any.
@@ -1083,6 +1155,41 @@ mod tests {
             }
         }
         assert!(worst < 3e-3, "crease cut elements vs their colours {worst}");
+    }
+
+    #[test]
+    fn additive_shares_turn_a_sum_into_the_coverage() {
+        use crate::athc_build::*;
+        // A flat grid of opaque splats 4 cm apart, 4.2 cm wide: about six
+        // overlap at every point (athenea's ground light catcher).
+        let mut st = CloudStreams { linear: true, coefficients: 1, ..Default::default() };
+        for i in 0..40 {
+            for j in 0..40 {
+                st.count += 1;
+                st.positions.extend_from_slice(&[i as f32 * 0.04, j as f32 * 0.04, 0.0]);
+                st.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                st.scales.extend_from_slice(&[0.042, 0.042, 0.0042]);
+                st.opacities.push(1.0);
+                st.sh.extend_from_slice(&[0.0, 0.0, 0.0]);
+            }
+        }
+        let o = BuildOptions::default();
+        let file = build_lod(&pack_streams(&st, &o).unwrap(), &o).unwrap();
+        let k = additive_shares(&file);
+        // Inside the grid: coverage ~1 over a sum of 2 pi (4.2 / 4)^2 ~ 6.9.
+        let splats = file.splats();
+        let inner: Vec<f32> = (0..k.len())
+            .filter(|&i| (0..2).all(|a| (0.4..1.2).contains(&splats.positions[4 * i + a])))
+            .map(|i| k[i])
+            .collect();
+        assert!(inner.len() > 300);
+        let mean = inner.iter().sum::<f32>() / inner.len() as f32;
+        assert!((0.12..0.17).contains(&mean), "inner share {mean}");
+        // A lone splat keeps its light.
+        let lone = CloudStreams { count: 1, positions: vec![0.0; 3], rotations: vec![0.0, 0.0, 0.0, 1.0],
+            scales: vec![0.042, 0.042, 0.0042], opacities: vec![0.5], sh: vec![0.0; 3], coefficients: 1, linear: true, ..Default::default() };
+        let one = build_lod(&pack_streams(&lone, &o).unwrap(), &o).unwrap();
+        assert!((additive_shares(&one)[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]

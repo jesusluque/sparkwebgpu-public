@@ -354,6 +354,16 @@ athc-convert car.athc light.athc --gzip --keep-splats 1000000 --creases 0.03 \
   (`test/gpu/additive.test.ts`). The page switches the relight off for it
   (`host.disable(relight.id, mesh)`: per-asset settings take the SplatMesh)
   so only the lamps light it, and hides it with the ground.
+  athenea's raster composites a catcher's gaussians among themselves
+  (`lampTransmittance`, splat_blend.slang): the light is the patch's
+  coverage, not the sum of its ~6 overlapping footprints that an additive
+  draw adds. `usd-athc --light-additive` multiplies each splat's light by
+  its share `coverage / sum` at its centre (`athl::additive_shares`; merged
+  nodes keep the plain mean, their LoD opacity is already a coverage).
+  Measured on the Corvette's floor against the per-pixel expectation from
+  the data: additive sum 4.41e-2 predicted, 4.50e-2 drawn; composite
+  7.04e-3 predicted, 5.78e-3 drawn with the shares. A layer can also be
+  read from athenea's native cloud: `--light-layer g=file.usdc#athenea:splat:lightLayer:g`.
 - **Sidecar forms.** athenea's `corvette.lights.usda` writes states as
   `double athenea:lightState:target:<group>` (any prim under `LightStates`
   is a state; none: every group off) and the radiance as

@@ -234,7 +234,7 @@ pub fn run(args: &[String]) -> Result<()> {
             p.input_splats,
             n,
             p.hidden,
-            p.decimate.as_ref().map_or("not decimated".to_string(), |d| format!("decimated {} opaque into {} runs", d.candidates, d.runs - (p.input_splats - p.hidden - d.candidates))),
+            p.decimate.as_ref().map_or("not decimated".to_string(), |d| format!("decimated {} opaque into {} runs", d.candidates, d.runs)),
             input_bytes[k] as f64 / 1e6,
             bytes.len() as f64 / 1e6
         );
@@ -273,9 +273,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 carried.splat_count,
                 carried.cloud_hash
             );
-            let v = verify_layers(&s.file, &athl, &bytes, &written)?;
+            let v = verify_layers(&s.file, &athl, &bytes, &written, &p.track)?;
             println!(
-                "  alignment (read back): {} splats at an input splat's place, layer values max |d| {:.2e} (largest value {:.3e}); {} merged runs; hash ok",
+                "  alignment (read back): {} single-source splats found at their input splat's place, layer values max |d| {:.2e} (largest value {:.3e}); {} merged runs; hash ok",
                 v.0, v.1, v.2, v.3
             );
             entry["athl"] = json!({ "input": ai, "output": ao, "inputBytes": raw.len(), "bytes": written.len(),
@@ -356,10 +356,16 @@ pub fn run(args: &[String]) -> Result<()> {
 
 /// Reads the written cloud and layers back and checks them against the
 /// input's: the hash, the element counts, and for every output splat that
-/// sits exactly where an input splat sat (same centre and opacity bits),
-/// every layer's value against that splat's. Returns (splats matched, the
-/// largest difference, the largest value, splats with no match: decimated runs).
-fn verify_layers(input: &AthcFile, athl_in: &AthlFile, athc_out: &[u8], athl_out: &[u8]) -> Result<(usize, f32, f32, usize)> {
+/// stands for one input splat, that splat found by its place (same centre
+/// and opacity bits) and every layer's value checked against its. Returns
+/// (splats checked, the largest difference, the largest value, merged runs).
+fn verify_layers(
+    input: &AthcFile,
+    athl_in: &AthlFile,
+    athc_out: &[u8],
+    athl_out: &[u8],
+    track: &spark_lib::athl::SplatSources,
+) -> Result<(usize, f32, f32, usize)> {
     use spark_lib::athc::VirtualTree;
     let file = super::read_any(athc_out)?;
     let athl = AthlFile::read(athl_out)?;
@@ -386,9 +392,13 @@ fn verify_layers(input: &AthcFile, athl_in: &AthlFile, athc_out: &[u8], athl_out
         .collect();
     let (mut matched, mut unmatched, mut worst, mut top) = (0, 0, 0f32, 0f32);
     for j in 0..b.n {
-        let Some(&i) = at.get(&key(&b, j)) else {
+        // A decimated run's splat sits at its kept member's place but holds the run's mean.
+        if track.offsets[j + 1] - track.offsets[j] != 1 {
             unmatched += 1;
             continue;
+        }
+        let Some(&i) = at.get(&key(&b, j)) else {
+            bail!("output splat {j} (a single source) is at no input splat's place");
         };
         matched += 1;
         for ((c, before), after) in &dense {

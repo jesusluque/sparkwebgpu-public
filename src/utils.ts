@@ -434,9 +434,17 @@ export function encodeExtSplat(
   extA[i4 + 2] = floatBitsToUint(z);
   extA[i4 + 3] = toHalf(opacity);
   extB[i4] = toHalf(r) | (toHalf(g) << 16);
-  extB[i4 + 1] = toHalf(b) | (toHalf(Math.log(scaleX)) << 16);
-  extB[i4 + 2] = toHalf(Math.log(scaleY)) | (toHalf(Math.log(scaleZ)) << 16);
+  extB[i4 + 1] = toHalf(b) | (toHalf(extLnScale(scaleX)) << 16);
+  extB[i4 + 2] =
+    toHalf(extLnScale(scaleY)) | (toHalf(extLnScale(scaleZ)) << 16);
   extB[i4 + 3] = encodeQuatOctXy1010R12(quatX, quatY, quatZ, quatW);
+}
+
+// A surfel's flat axis (a scale of exactly 0) as the finite f16 sentinel
+// -65504 (core/ext.slang kSurfelLnScale, athc.rs SURFEL_LN): exp() takes it
+// back to exactly 0, where ln 0 = -Infinity would be an f16 infinity.
+export function extLnScale(scale: number): number {
+  return scale > 0 ? Math.max(Math.log(scale), -65504) : -65504;
 }
 
 export function decodeExtSplat(

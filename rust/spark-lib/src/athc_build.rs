@@ -880,6 +880,7 @@ fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         shadow_bits: pick(&b.shadow_bits),
         curvature: pick(&b.curvature),
         skin: pick(&b.skin),
+        lod_size: Vec::new(),
     }
 }
 

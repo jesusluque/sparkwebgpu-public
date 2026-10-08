@@ -10,7 +10,7 @@ use spark_lib::{
     gsplat::GsplatArray,
     tsplat::{TsplatArray, Tsplat},
     splat_encode::{
-        decode_ext_rgb, decode_ext_splat_center, decode_ext_splat_opacity, decode_ext_splat_quat, decode_ext_splat_rgb, decode_ext_splat_scale, encode_ext_rgb, encode_ext_splat, encode_ext_splat_center, encode_ext_splat_opacity, encode_ext_splat_quat, encode_ext_splat_rgb, encode_ext_splat_rgba, encode_ext_splat_scale, encode_lod_tree, get_splat_tex_size
+        decode_ext_rgb, decode_ext_splat_center, decode_ext_splat_opacity, decode_ext_splat_quat, decode_ext_splat_rgb, decode_ext_splat_scale, encode_ext_rgb, encode_ext_splat, encode_ext_splat_center, encode_ext_splat_opacity, encode_ext_splat_quat, encode_ext_splat_rgb, encode_ext_splat_rgba, encode_ext_splat_scale, encode_lod_tree, set_lod_tree_size, get_splat_tex_size
     },
 };
 use wasm_bindgen::JsValue;
@@ -33,6 +33,8 @@ pub struct ExtSplatsData {
     pub lod_tree: Option<Uint32Array>,
     child_counts: Option<Vec<u16>>,
     child_starts: Option<Vec<u32>>,
+    /// LoD sizes by error (spark-lib athc_lod_error), 0: geometric.
+    lod_sizes: Option<Vec<f32>>,
     buffer_a: Vec<u32>,
     buffer_b: Vec<u32>,
     buffer_base: usize,
@@ -62,6 +64,7 @@ impl ExtSplatsData {
             lod_tree: None,
             child_counts: None,
             child_starts: None,
+            lod_sizes: None,
             buffer_a: Vec::new(),
             buffer_b: Vec::new(),
             buffer_base: 0,
@@ -427,7 +430,7 @@ impl SplatReceiver for ExtSplatsData {
             const MAX_SPLAT_CHUNK: usize = 65536;
             self.ensure_buffers(MAX_SPLAT_CHUNK);
             self.lod_tree = Some(Uint32Array::new_with_length((self.num_splats * 4) as u32));
-            let Self { buffer_a, buffer_b, ext_arrays, lod_tree, child_counts, child_starts, .. } = self;
+            let Self { buffer_a, buffer_b, ext_arrays, lod_tree, child_counts, child_starts, lod_sizes, .. } = self;
             let lod_tree = lod_tree.as_mut().unwrap();
             let child_counts = child_counts.as_ref().unwrap();
             let child_starts = child_starts.as_ref().unwrap();
@@ -448,6 +451,9 @@ impl SplatReceiver for ExtSplatsData {
                     let child_count = child_counts[base + i];
                     let child_start = child_starts[base + i];
                     encode_lod_tree(&mut buffer_a[i4..i4 + 4], &center, opacity, &scale, child_count, child_start);
+                    if let Some(size) = lod_sizes.as_ref().map(|v| v[base + i]).filter(|&v| v > 0.0) {
+                        set_lod_tree_size(&mut buffer_a[i4..i4 + 4], size);
+                    }
                 }
                 lod_tree.subarray((base * 4) as u32, ((base + count) * 4) as u32).copy_from(buffer_a);
                 base += count;
@@ -455,6 +461,7 @@ impl SplatReceiver for ExtSplatsData {
 
             self.child_starts = None;
             self.child_counts = None;
+            self.lod_sizes = None;
         }
 
         self.buffer_a = Vec::new();
@@ -833,6 +840,11 @@ impl SplatReceiver for ExtSplatsData {
                 }
             }
         }
+    }
+
+    fn set_lod_size(&mut self, base: usize, count: usize, size: &[f32]) {
+        let sizes = self.lod_sizes.get_or_insert_with(|| vec![0.0; self.num_splats]);
+        sizes[base..base + count].copy_from_slice(&size[..count]);
     }
 
     fn set_child_count(&mut self, base: usize, count: usize, child_count: &[u16]) {

@@ -53,6 +53,10 @@ pub enum SectionId {
     Core,
     /// The rest harmonics, `shWords` words.
     Sh,
+    /// sparkwebGPU's LoD sizes by error (`athc_lod_error`), one f32 an
+    /// element (0 in a chunk: a splat keeps its geometric size). What the
+    /// traversal reads, so tier 1, right after the harmonics.
+    LodSize,
     /// sparkwebGPU's skin (`athc_skin`): influences then weight gradients,
     /// what a skeleton needs to carry the splats -- geometry, so tier 1.
     Skin,
@@ -77,6 +81,7 @@ impl SectionId {
         u32::from_le_bytes(*match self {
             Self::Core => b"CORE",
             Self::Sh => b"SHRS",
+            Self::LodSize => b"LODS",
             Self::Skin => b"SKIN",
             Self::TransferDirect => b"TXDI",
             Self::TransferIndirect => b"TXIN",
@@ -87,9 +92,10 @@ impl SectionId {
         })
     }
 
-    pub const ALL: [SectionId; 9] = [
+    pub const ALL: [SectionId; 10] = [
         Self::Core,
         Self::Sh,
+        Self::LodSize,
         Self::Skin,
         Self::Material,
         Self::Shadow,
@@ -107,6 +113,7 @@ impl SectionId {
         match self {
             Self::Core => "CORE",
             Self::Sh => "SHRS",
+            Self::LodSize => "LODS",
             Self::Skin => "SKIN",
             Self::Material => "MATL",
             Self::Shadow => "SHAD",
@@ -121,7 +128,7 @@ impl SectionId {
     /// materials, 3 relit (shadow bits and transfer).
     pub fn tier(self) -> u32 {
         match self {
-            Self::Core | Self::Sh | Self::Skin => 1,
+            Self::Core | Self::Sh | Self::LodSize | Self::Skin => 1,
             Self::Material => 2,
             _ => 3,
         }
@@ -196,7 +203,7 @@ impl Want {
         let [direct, indirect, _] = transfer_split_words(x.transfer_count);
         let words = self.transfer_values.div_ceil(2);
         match id {
-            SectionId::Core | SectionId::Sh | SectionId::Skin => true,
+            SectionId::Core | SectionId::Sh | SectionId::LodSize | SectionId::Skin => true,
             SectionId::Material => self.material,
             SectionId::Shadow | SectionId::Curvature => self.transfer_values > 0,
             SectionId::TransferDirect => words > 0,
@@ -287,6 +294,7 @@ pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Sec
     [
         (SectionId::Core, 9),
         (SectionId::Sh, h.sh_words),
+        (SectionId::LodSize, if h.has(crate::athc::FLAG_LOD_SIZE) { 1 } else { 0 }),
         (SectionId::Skin, x.skin_words()),
         (SectionId::Material, material),
         (SectionId::Shadow, x.shadow_words),
@@ -330,6 +338,15 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
             put_words(&mut out, &block.tail);
         }
         SectionId::Sh => put_words(&mut out, &block.sh),
+        SectionId::LodSize => {
+            if block.lod_size.len() == block.n {
+                for v in &block.lod_size {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            } else {
+                out.resize(4 * block.n, 0);
+            }
+        }
         SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {
             let w = x.transfer_words as usize;
             let from = tx_from as usize;
@@ -693,6 +710,16 @@ pub fn write_v3_full(
             to.skin = from.skin.clone();
         }
     }
+    // So do the LoD sizes (athc_lod_error), the levels' alone.
+    if file.levels.iter().any(|(_, b)| !b.lod_size.is_empty()) {
+        if file.levels.iter().any(|(_, b)| !b.lod_size.is_empty() && b.lod_size.len() != b.n) {
+            bail!(".athc v3: LoD sizes must be one for every group of a level");
+        }
+        v2.header.flags |= crate::athc::FLAG_LOD_SIZE;
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.lod_size = if from.lod_size.is_empty() { vec![0.0; from.n] } else { from.lod_size.clone() };
+        }
+    }
     // So do merged opacities past 0.99 (athc::coverage_ratios), which the
     // v2 writer caps as athenea's files hold them.
     if file.over_capped() {
@@ -944,6 +971,12 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
                 block.tail = v[8 * n..9 * n].to_vec();
             }
             SectionId::Sh => block.sh = v,
+            // All 0 (a chunk's): none.
+            SectionId::LodSize => {
+                if v.iter().any(|&w| w != 0) {
+                    block.lod_size = v.into_iter().map(f32::from_bits).collect();
+                }
+            }
             SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {
                 parts.push((s.words as usize, v))
             }

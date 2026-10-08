@@ -35,10 +35,17 @@
 //!                         parts seen from the same orbit spends the splats where the error is;
 //!                         --keep-splats is then a floor); --error-curve prints splats left and
 //!                         the dearest merge after each pass
+//!   --lod-sizes           write each merged node's LoD size by its error (athc_lod_error::
+//!                         level_lod_sizes: the geometric size scaled up by the colour, material,
+//!                         normal and thickness error of the splats under it, monotone), the v3
+//!                         section LODS that Spark's traversal reads in place of the geometric
+//!                         size; a file that has them keeps them (recomputed after a cut) unless
+//!                         --no-lod-sizes
 
 use anyhow::{bail, Context, Result};
 use spark_lib::athl::{cloud_hash, splat_weights, sparse_layers, validate, virtual_values_weighted, AthlFile};
 use spark_lib::athc_build::{build_lod, packed_of, BuildOptions};
+use spark_lib::athc_lod_error::{with_lod_sizes, LodSizeOptions};
 use spark_lib::athc_merge::{error_cut_to, error_levels, ErrorOptions, ErrorView};
 use spark_lib::athc::{cut_sources, truncate_creases, truncate_levels, uncap_levels, AthcFile, VirtualTree};
 use spark_lib::athc_v3::{
@@ -70,6 +77,7 @@ fn main() -> Result<()> {
     };
     let bytes = std::fs::read(input)?;
     let mut file = read_any(&bytes)?;
+    let had_lod_sizes = file.levels.iter().any(|(_, b)| !b.lod_size.is_empty());
     let text = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let athl_io = match (text("--athl"), text("--athl-out")) {
         (Some(i), Some(o)) => Some((i, o)),
@@ -165,6 +173,17 @@ fn main() -> Result<()> {
         println!("kept {} levels: {} splats (of {})", k, file.header.count, before);
     } else if flag("--coverage") {
         uncap_levels(&mut file);
+    }
+    if flag("--no-lod-sizes") {
+        for (_, b) in file.levels.iter_mut() {
+            b.lod_size.clear();
+        }
+    } else if flag("--lod-sizes") || had_lod_sizes {
+        file = with_lod_sizes(&file, &LodSizeOptions::default());
+        println!("LoD sizes by error for {} merged nodes", file.levels.iter().map(|(_, b)| b.n).sum::<usize>());
+    }
+    for c in file.chunks.iter_mut() {
+        c.lod_size.clear();
     }
     let all = value("--encoding").transpose()?.map(|e| e as u32);
     let encoding = move |_: SectionId| all.unwrap_or(0);

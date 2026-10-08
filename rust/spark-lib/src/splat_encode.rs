@@ -505,6 +505,11 @@ pub fn encode_lod_tree(buffer: &mut [u32], center: &[f32], opacity: f32, scale: 
     buffer[3] = child_start;
 }
 
+/// A LoD tree node's size replaced (`encode_lod_tree`'s word 1, high half).
+pub fn set_lod_tree_size(buffer: &mut [u32], size: f32) {
+    buffer[1] = (buffer[1] & 0xffff) | ((f16::from_f32(size).to_bits() as u32) << 16);
+}
+
 pub fn decode_lod_tree_children(buffer: &[u32]) -> (u16, u32) {
     let child_count = (buffer[2] & 0xffff) as u16;
     let child_start = buffer[3];

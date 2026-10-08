@@ -125,6 +125,9 @@ pub struct SplatProps<'a> {
 #[allow(unused)]
 pub trait SplatReceiver: 'static {
     fn init_splats(&mut self, init: &SplatInit) -> anyhow::Result<()> { Ok(()) }
+    /// LoD tree nodes' sizes in place of their geometric size (`athc_lod_error`):
+    /// splats base .. base + count, 0 for a node that keeps its own.
+    fn set_lod_size(&mut self, base: usize, count: usize, size: &[f32]) {}
     fn finish(&mut self) -> anyhow::Result<()> { Ok(()) }
     fn debug(&self, value: usize) { println!("debug: {}", value); }
     fn set_encoding(&mut self, encoding: &SetSplatEncoding) -> anyhow::Result<()> { Ok(()) }

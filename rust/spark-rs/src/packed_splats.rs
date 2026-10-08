@@ -7,7 +7,7 @@ use js_sys::{Object, Reflect, Uint32Array};
 use spark_lib::gsplat::GsplatArray;
 use spark_lib::{
     csplat::CsplatArray, decoder::{SetSplatEncoding, SplatEncoding, SplatGetter, SplatInit, SplatProps, SplatPropsMut, SplatReceiver, copy_getter_to_receiver}, splat_encode::{
-        decode_packed_splat_center, decode_packed_splat_opacity, decode_packed_splat_quat, decode_packed_splat_rgb, decode_packed_splat_scale, decode_sh1_internal_words, decode_sh2_internal_words, decode_sh3_internal_words, encode_lod_tree, encode_packed_splat, encode_packed_splat_center, encode_packed_splat_opacity, encode_packed_splat_quat, encode_packed_splat_rgb, encode_packed_splat_rgba, encode_packed_splat_scale, encode_sh1_array, encode_sh2_array, encode_sh3_array, get_decode_sh1_scale, get_decode_sh2_scale, get_decode_sh3_scale, get_splat_tex_size
+        decode_packed_splat_center, decode_packed_splat_opacity, decode_packed_splat_quat, decode_packed_splat_rgb, decode_packed_splat_scale, decode_sh1_internal_words, decode_sh2_internal_words, decode_sh3_internal_words, encode_lod_tree, set_lod_tree_size, encode_packed_splat, encode_packed_splat_center, encode_packed_splat_opacity, encode_packed_splat_quat, encode_packed_splat_rgb, encode_packed_splat_rgba, encode_packed_splat_scale, encode_sh1_array, encode_sh2_array, encode_sh3_array, get_decode_sh1_scale, get_decode_sh2_scale, get_decode_sh3_scale, get_splat_tex_size
     }, tsplat::{Tsplat, TsplatArray}
 };
 use wasm_bindgen::JsValue;
@@ -29,6 +29,8 @@ pub struct PackedSplatsData {
     pub lod_tree: Option<Uint32Array>,
     child_counts: Option<Vec<u16>>,
     child_starts: Option<Vec<u32>>,
+    /// LoD sizes by error (spark-lib athc_lod_error), 0: geometric.
+    lod_sizes: Option<Vec<f32>>,
     pub encoding: SplatEncoding,
     buffer: Vec<u32>,
     buffer_base: usize,
@@ -57,6 +59,7 @@ impl PackedSplatsData {
             lod_tree: None,
             child_counts: None,
             child_starts: None,
+            lod_sizes: None,
             encoding,
             buffer: Vec::new(),
             buffer_base: 0,
@@ -396,7 +399,7 @@ impl SplatReceiver for PackedSplatsData {
             const MAX_SPLAT_CHUNK: usize = 65536;
             self.ensure_buffer(MAX_SPLAT_CHUNK);
             self.lod_tree = Some(Uint32Array::new_with_length((self.num_splats * 4) as u32));
-            let Self { buffer, packed, lod_tree, child_counts, child_starts, .. } = self;
+            let Self { buffer, packed, lod_tree, child_counts, child_starts, lod_sizes, .. } = self;
             let lod_tree = lod_tree.as_mut().unwrap();
             let child_counts = child_counts.as_ref().unwrap();
             let child_starts = child_starts.as_ref().unwrap();
@@ -415,6 +418,9 @@ impl SplatReceiver for PackedSplatsData {
                     let child_count = child_counts[base + i];
                     let child_start = child_starts[base + i];
                     encode_lod_tree(&mut buffer[i4..i4 + 4], &center, opacity, &scale, child_count, child_start);
+                    if let Some(size) = lod_sizes.as_ref().map(|v| v[base + i]).filter(|&v| v > 0.0) {
+                        set_lod_tree_size(&mut buffer[i4..i4 + 4], size);
+                    }
                 }
                 lod_tree.subarray((base * 4) as u32, ((base + count) * 4) as u32).copy_from(buffer);
                 base += count;
@@ -422,6 +428,7 @@ impl SplatReceiver for PackedSplatsData {
 
             self.child_starts = None;
             self.child_counts = None;
+            self.lod_sizes = None;
         }
 
         let mut empty_buffer = Vec::new();
@@ -746,6 +753,11 @@ impl SplatReceiver for PackedSplatsData {
                 }
             }
         }
+    }
+
+    fn set_lod_size(&mut self, base: usize, count: usize, size: &[f32]) {
+        let sizes = self.lod_sizes.get_or_insert_with(|| vec![0.0; self.num_splats]);
+        sizes[base..base + count].copy_from_slice(&size[..count]);
     }
 
     fn set_child_count(&mut self, base: usize, count: usize, child_count: &[u16]) {

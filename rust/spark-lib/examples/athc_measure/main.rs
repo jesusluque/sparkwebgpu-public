@@ -13,6 +13,7 @@ mod cmp;
 mod merge;
 mod pose;
 mod raster;
+mod trav;
 
 use std::time::Instant;
 
@@ -49,6 +50,7 @@ fn main() -> Result<()> {
         "surfel" => surfel(&scene, width),
         "merge" => merge::run(&scene, &args),
         "cmp" => cmp::run(&scene, &args),
+        "trav" => trav::run(&scene, &args),
         "bytes" => bytes(&scene),
         "overlap" => overlap(&scene),
         "thin" => thin(&scene, &args),

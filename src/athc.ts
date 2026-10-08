@@ -94,6 +94,7 @@ export type AthcSection = {
   id:
     | "CORE"
     | "SHRS"
+    | "LODS"
     | "SKIN"
     | "MATL"
     | "SHAD"
@@ -196,6 +197,10 @@ export function athcNeeds(
   switch (id) {
     case "CORE":
     case "SHRS":
+      return true;
+    // The levels' LoD sizes by error (athc_lod_error.rs): what the
+    // traversal reads. A chunk's are 0 (geometric): see sectionsFor.
+    case "LODS":
       return true;
     // A skinned cloud's rig (athc_skin.rs): read whole-file only for now;
     // a paged skinned cloud is drawn in its bind pose.
@@ -480,11 +485,9 @@ export async function openAthc(
   const keepLinear = options.keepLinear ?? false;
   if (keepLinear) {
     for (const page of pages) {
-      new DataView(page.buffer, page.byteOffset).setUint32(
-        152,
-        ATHV_KEEP_LINEAR,
-        true,
-      );
+      // Or'd: a merged page may also say it carries LoD sizes (bit 1).
+      const view = new DataView(page.buffer, page.byteOffset);
+      view.setUint32(152, view.getUint32(152, true) | ATHV_KEEP_LINEAR, true);
     }
   }
   return {
@@ -575,13 +578,19 @@ async function readSections(
   });
 }
 
-function sectionsFor(layout: AthcV3Layout, want: AthcWant, core: boolean) {
+function sectionsFor(
+  layout: AthcV3Layout,
+  want: AthcWant,
+  core: boolean,
+  levels = false,
+) {
   return layout.sections
     .map((s) => s.id)
     .filter(
       (id) =>
         athcNeeds(layout, id, want) &&
-        (core || (id !== "CORE" && id !== "SHRS")),
+        (core || (id !== "CORE" && id !== "SHRS")) &&
+        (levels || id !== "LODS"),
     );
 }
 
@@ -599,7 +608,7 @@ async function openAthcV3(
   };
   const keepLinear = options.keepLinear ?? false;
   const flags = keepLinear ? ATHV_KEEP_LINEAR : 0;
-  const ids = sectionsFor(layout, levelsWant, true);
+  const ids = sectionsFor(layout, levelsWant, true, true);
   // One Range request a level block.
   const levels = await Promise.all(
     layout.blocks

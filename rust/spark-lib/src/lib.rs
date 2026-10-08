@@ -38,6 +38,10 @@ pub mod athc_build;
 pub mod athc_skin;
 #[cfg(feature = "athc")]
 pub mod athl;
+#[cfg(feature = "athc")]
+pub mod athc_prune;
+#[cfg(feature = "athc")]
+pub mod cpu_raster;
 pub mod decoder;
 pub mod splat_encode;
 pub mod ordering;

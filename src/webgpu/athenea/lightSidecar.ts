@@ -230,6 +230,8 @@ function groupOf(
     }
   }
   const t = get("temperatureK");
+  const athenea =
+    get("radiance") === undefined && get("emissionLuminance") !== undefined;
   const ies = p.properties.get("shaping:ies:file")?.value;
   return {
     name: p.name,
@@ -244,7 +246,10 @@ function groupOf(
     // athenea bakes a group white, per unit of emissionLuminance: its
     // emissionColor goes in the weight (corvette-lights NOTES.md).
     color: rgb(get("color")) ?? rgb(get("emissionColor")) ?? [1, 1, 1],
-    temperatureK: typeof t === "number" ? t : null,
+    // athenea's own weight (and its Cycles reference) is emissionLuminance
+    // times emissionColor alone: its temperatureK waits for the lamp curves
+    // (v2), so a group written that way is not tinted by it.
+    temperatureK: typeof t === "number" && !athenea ? t : null,
     startTemperatureK: num(
       get("startTemperatureK"),
       technology === "halogen" ? 1000 : 4300,

@@ -276,6 +276,9 @@ describe("light sidecar (066/067)", () => {
       "noche_frenando",
     ]);
     expect(c7.groups[4].color).toEqual([0.381, 0.003, 0]); // baked white
+    // cruce's temperatureK (5500) does not tint: athenea weighs by
+    // emissionLuminance x emissionColor alone until the lamp curves (v2).
+    expect(c7.groups[0].temperatureK).toBeNull();
     expect(c7.states[0].targets).toEqual({});
     expect(c7.states[3].targets).toEqual({ cruce: 1, largas: 1, pilotos: 1 });
     expect(c7.rules.map((r) => r.when)).toEqual(["cruce", "!cruce"]);

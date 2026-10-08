@@ -289,7 +289,11 @@ export class PluginHost {
     return { attributes: pool?.columns.map((c) => c.spec.name) ?? [] };
   }
 
-  /** Switches a plugin on or off for `asset`, or for all assets without their own setting. */
+  /**
+   * Switches a plugin on or off for `asset` (a drawn WgpuSplatMesh, or the
+   * object it draws: a SplatMesh), or for all assets without their own
+   * setting.
+   */
   setActive(id: string, active: boolean, asset?: object) {
     let map = this.global;
     if (asset) {
@@ -340,8 +344,12 @@ export class PluginHost {
   ): { reason: InactiveReason; detail?: string } | null {
     const device = this.deviceReason(plugin);
     if (device) return device;
+    // A setting for the drawn mesh, or for its object (the SplatMesh a page
+    // holds: SparkWebGPU may make a new WgpuSplatMesh for the same one).
+    const object = asset && (asset as Partial<WgpuSplatMesh>).object;
     const on =
       (asset && this.perAsset.get(asset)?.get(plugin.id)) ??
+      (object && this.perAsset.get(object)?.get(plugin.id)) ??
       this.global.get(plugin.id) ??
       plugin.enabled ??
       true;

@@ -90,6 +90,7 @@ const {
   GEN_CULL,
   GEN_COV_TRANSFORM,
   GEN_LOD_FADE,
+  GEN_ADDITIVE,
 } = kernelsGenerate;
 const {
   DRAW_EXT,
@@ -147,6 +148,12 @@ export interface WgpuSplatMesh {
   lodFaded?: boolean;
   /** Dyno generator and modifiers run in the generate kernel. */
   dyno?: WgpuDyno;
+  /**
+   * Additive splats (light added, nothing covered; generate's
+   * GEN_ADDITIVE). Default: the object's `additive` (SplatMesh.additive).
+   * Ext accumulator and Gaussian splats only; ignored otherwise.
+   */
+  additive?: boolean;
 }
 
 export interface WgpuSplatRendererOptions {
@@ -1171,6 +1178,9 @@ export class WgpuSplatRenderer {
     if (source.format === "ext") flags |= GEN_SRC_EXT;
     if (out.lod) flags |= GEN_USE_LOD;
     if (out.lod && mesh.lodFaded) flags |= GEN_LOD_FADE;
+    const additive =
+      mesh.additive ?? (mesh.object as { additive?: boolean }).additive;
+    if (additive && !out.packed) flags |= GEN_ADDITIVE;
     if (source.lodOpacity) flags |= GEN_LOD_OPACITY;
     if (this.options.sortRadial) flags |= GEN_SORT_RADIAL;
     if (dyno && mesh.dyno?.generator) flags |= GEN_DYNO_SOURCE;

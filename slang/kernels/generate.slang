@@ -39,6 +39,7 @@ static const uint GEN_COV_TRANSFORM = 1024u; // covBasis transforms the CovSplat
                                          // (else the similarity, before it)
 static const uint GEN_CULL = 2048u;      // drop splats the draw would skip
 static const uint GEN_LOD_FADE = 65536u; // lodIndices carry a fade in their top byte (LodFade)
+static const uint GEN_ADDITIVE = 131072u; // additive splats (ext, not cov): a.w's high half 1.0
 static const uint GEN_LOD_INDEX_MASK = 0x00FFFFFFu;
 
 struct GenerateParams {
@@ -197,6 +198,11 @@ void generate(uint3 tid: SV_DispatchThreadID) {
                 packSplatExtCov(a, b, center, c.rgba, c.xxyyzz, c.xyxzyz);
             } else {
                 packSplatExt(a, b, center, s.scales, s.quaternion, s.rgba);
+                // The draw reads a non-zero high half as additive
+                // (splat_shape.slang): light added, nothing covered.
+                if (hasFlag(GEN_ADDITIVE)) {
+                    a.w |= 0x3C000000u;
+                }
             }
         }
         outSplats[2u * o] = a;

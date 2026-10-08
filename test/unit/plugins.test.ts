@@ -290,6 +290,23 @@ describe("presets", () => {
     host.register(tintPlugin()).register(fadePlugin());
   });
 
+  it("takes a per-asset setting from the drawn mesh's object", () => {
+    const host = new PluginHost({ tier: 1 });
+    const tint = tintPlugin();
+    host.register(tint);
+    const object = {};
+    const drawn = { ...mesh(), object } as unknown as WgpuSplatMesh;
+    const again = { ...mesh(), object } as unknown as WgpuSplatMesh;
+    expect(host.isActive(tint.id, drawn)).toBe(true);
+    host.disable(tint.id, object);
+    expect(host.isActive(tint.id, drawn)).toBe(false);
+    expect(host.isActive(tint.id, again)).toBe(false);
+    expect(host.isActive(tint.id, mesh())).toBe(true);
+    // The drawn mesh's own setting wins.
+    host.enable(tint.id, drawn);
+    expect(host.isActive(tint.id, drawn)).toBe(true);
+  });
+
   it("gives each mesh its colour variant once loaded, defaults otherwise", async () => {
     const host = new PluginHost({ tier: 1 });
     const tint = tintPlugin([0.5, 0.5, 0.5, 1]);

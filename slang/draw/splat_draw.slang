@@ -74,7 +74,7 @@ SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
     if (!projectSplat(splatIndex, s)) {
         return o;
     }
-    o.rgba = s.rgba;
+    o.rgba = markedRgba(s);
     o.splatUv = corner * s.adjustedStdDev;
     o.adjustedStdDev = s.adjustedStdDev;
     o.splatIndex = splatIndex;
@@ -126,7 +126,7 @@ void projectSplats(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
             continue;
         }
         projectedOut[o] = asuint(s.clipCenter);
-        projectedOut[o + 1u] = asuint(s.rgba);
+        projectedOut[o + 1u] = asuint(markedRgba(s));
         projectedOut[o + 2u] = asuint(float4(s.axis1, s.axis2));
         projectedOut[o + 3u] = uint4(asuint(s.adjustedStdDev), splatIndex, 1u, 0u);
     }
@@ -159,6 +159,10 @@ SplatVertex projectedSplatVertex(uint vertexId, uint instanceId) {
 // `v.position` is the fragment's SV_Position. B: the blend plugins.
 float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     float4 rgba = v.rgba;
+    // An additive splat (alpha's sign, markedRgba): its light is added,
+    // premultiplied, and its alpha written 0 so nothing behind is covered.
+    const bool additive = rgba.a < 0.0;
+    rgba.a = abs(rgba.a);
     float z2 = dot(v.splatUv, v.splatUv);
     if (z2 > v.adjustedStdDev * v.adjustedStdDev) {
         discard;
@@ -172,7 +176,8 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     if (hasFlag(DRAW_ENCODE_LINEAR)) {
         rgba.rgb = srgbToLinear(rgba.rgb);
     }
-    return hasFlag(DRAW_PREMULTIPLIED) ? float4(rgba.rgb * rgba.a, rgba.a) : rgba;
+    const float cover = additive ? 0.0 : rgba.a;
+    return hasFlag(DRAW_PREMULTIPLIED) ? float4(rgba.rgb * rgba.a, cover) : float4(rgba.rgb, cover);
 }
 
 [shader("vertex")]

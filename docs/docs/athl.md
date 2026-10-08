@@ -345,11 +345,15 @@ athc-convert car.athc light.athc --gzip --keep-splats 1000000 --creases 0.03 \
   value past it; `--light-floor` first zeroes splats fainter than it (the
   bake's grainy faint indirect).
 - **The floor.** The lamps' light on the ground comes as an additive cloud
-  (`catcher_layer_<group>.usdc`), built as its own part with its `.athl`
-  (`additive: true` in the scene). The renderer has no additive blend yet,
-  so the page leaves it out (premultiplied blend with the fragment's alpha
-  written 0 would add it; a per-splat flag through generate, the draw and
-  the tile rasterizer).
+  (athenea's `ground_base.usdc`, black, and `ground_<group>.usdc`), built as
+  its own part with its `.athl` (`additive: true` in the scene). Additive
+  splats (`SplatMesh.additive`, WebGPU, ext accumulator, Gaussian splats):
+  generate's `GEN_ADDITIVE` marks the splat (the high half of its alpha
+  word), the draw writes its premultiplied light with alpha 0 and the tile
+  rasterizer leaves the transmittance: light added, nothing covered
+  (`test/gpu/additive.test.ts`). The page switches the relight off for it
+  (`host.disable(relight.id, mesh)`: per-asset settings take the SplatMesh)
+  so only the lamps light it, and hides it with the ground.
 - **Sidecar forms.** athenea's `corvette.lights.usda` writes states as
   `double athenea:lightState:target:<group>` (any prim under `LightStates`
   is a state; none: every group off) and the radiance as

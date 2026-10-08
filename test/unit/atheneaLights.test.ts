@@ -20,6 +20,17 @@ const CORVETTE = readFileSync(
   "utf8",
 );
 
+// athenea's sidecar for the real Corvette (~/tools/assets/CorvetteC7/usd,
+// the per-group bakes' source): states as target:<group> attributes, the
+// radiance as emissionLuminance, materials and bindings around them.
+const C7 = readFileSync(
+  new URL(
+    "../fixtures/athenea-lights/corvette-c7.lights.usda",
+    import.meta.url,
+  ),
+  "utf8",
+);
+
 const SHOW = `#usda 1.0
 (
     doc = """A sidecar with every behaviour:
@@ -242,6 +253,43 @@ describe("light sidecar (066/067)", () => {
     w = rig.evaluate(7);
     expect(w.weights[4 * 3 + 3]).toBe(4);
     expect(w.weights[4 * 3]).toBe(4); // white, 1 nit a unit
+  });
+
+  it("reads athenea's Corvette C7 sidecar (target:<group> states, emissionLuminance)", () => {
+    const c7 = parseLightSidecar(C7);
+    expect(c7.groups.map((g) => g.name)).toEqual([
+      "cruce",
+      "largas",
+      "drl",
+      "pilotos",
+      "tubo_trasero",
+    ]);
+    expect(c7.groups.map((g) => g.radiance)).toEqual([
+      10000, 5000, 1500, 500, 1000,
+    ]);
+    expect(c7.states.map((s) => s.name)).toEqual([
+      "aparcado",
+      "diurno",
+      "noche_ciudad",
+      "noche_carretera",
+      "frenando",
+      "noche_frenando",
+    ]);
+    expect(c7.groups[4].color).toEqual([0.381, 0.003, 0]); // baked white
+    expect(c7.states[0].targets).toEqual({});
+    expect(c7.states[3].targets).toEqual({ cruce: 1, largas: 1, pilotos: 1 });
+    expect(c7.rules.map((r) => r.when)).toEqual(["cruce", "!cruce"]);
+    const rig = new LightRig(c7, 0);
+    rig.setState("noche_frenando", 0);
+    const w = rig.evaluate(10);
+    expect([...w.targets]).toEqual([1, 0, 0, 4, 1]);
+    expect(w.weights[4 * 3 + 3]).toBe(4); // the level
+    expect(w.weights[4 * 3]).toBe(4 * 500); // x the luminance, white
+    // High beam alone is held off; the DRL goes out with the low beam.
+    rig.setState(null, 11);
+    rig.setLevel("largas", 1, 11);
+    rig.setLevel("drl", 1, 11);
+    expect([...rig.evaluate(20).targets]).toEqual([0, 0, 1, 0, 0]);
   });
 
   const show = parseLightSidecar(SHOW);

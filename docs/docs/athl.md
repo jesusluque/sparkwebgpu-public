@@ -299,6 +299,58 @@ per unit radiance) taken as that group's indirect + emission layer, no
 polygons. The converter `rust/build-lod` would then build the `.athl` from
 those clouds (same splats, same order): `sparse_layers` + `virtual_values`.
 
+## From athenea's per-group clouds (the real Corvette)
+
+athenea bakes the interim of 069: a base cloud with every lamp off and, per
+group, a cloud of the **same gaussians in the same order** baked with only
+that group lit at `emission_luminance` 1 and the dome black (its linear
+colour, `0.5 + SH0 · dc`, is the group's light per unit of luminance,
+through the lenses, the emitter baked white: the sidecar's `emissionColor`
+is the group's colour in `w_k`). `usd-athc` builds the
+`.athl` beside the `.athc`:
+
+```sh
+usd-athc base_tx.usdc car.athc --transfer 16 --gzip --drop-backs 0.008 \
+    --light-layer cruce=layer_cruce.usdc ... --lights-usda corvette.lights.usda \
+    [--athl car.lights.athl] [--light-threshold 1e-4] [--light-floor 0] [--light-verify NAME]
+athc-convert car.athc light.athc --gzip --keep-splats 1000000 --creases 0.03 \
+    --athl car.lights.athl --athl-out light.lights.athl
+```
+
+- **Alignment.** Every step that selects, reorders or merges splats reports
+  what it did (`pack_streams_kept`, `drop_hidden_backs_kept`, `crop_box_kept`,
+  `reduce_thin_runs` / `reduce_cells_runs`, `lod_order`), and
+  `athl::SplatSources` composes them: each built splat is a weighted mean
+  of source splats (weights as the colour was merged), so a layer follows
+  the cloud exactly. Prim masks (`--only-prim`, `--exclude-prim`) are
+  applied to the layer as to the base; a layer is refused if its positions
+  differ from the base's. `--light-verify NAME` compares a layer with the
+  file's own colours (give the base as its own layer: 0 difference).
+  `athc-convert --athl` carries layers through a LoD cut: each element the
+  weighted mean of the original splats under it (`athc::cut_sources`,
+  `CreaseCut::sources`), merged nodes with the original weights
+  (`virtual_values_weighted`), the cloud hash re-stamped.
+- **Scale.** The values are stored times the group's radiance from the
+  sidecar (`radiance`, or athenea's `emissionLuminance`), with GRPS
+  `radiance` set to it, so the plugin's `w / radiance` gives the same light
+  and f16 keeps the faint bounce (per unit of 10 000 nits it would be
+  subnormal). No polygons, no profile, tint 1: kind 0 is all of the group.
+- **Sparsity.** `--light-threshold` (radiance units) drops blocks with no
+  value past it; `--light-floor` first zeroes splats fainter than it (the
+  bake's grainy faint indirect).
+- **The floor.** The lamps' light on the ground comes as an additive cloud
+  (`catcher_layer_<group>.usdc`), built as its own part with its `.athl`
+  (`additive: true` in the scene). The renderer has no additive blend yet,
+  so the page leaves it out (premultiplied blend with the fragment's alpha
+  written 0 would add it; a per-splat flag through generate, the draw and
+  the tile rasterizer).
+- **Sidecar forms.** athenea's `corvette.lights.usda` writes states as
+  `double athenea:lightState:target:<group>` (any prim under `LightStates`
+  is a state; none: every group off) and the radiance as
+  `athenea:lightGroup:emissionLuminance`; both are read.
+- `scripts/build-corvette-lights.mjs` does the detailed and light sets in one
+  command (`corvette.html?set=lights`).
+
 ## Open issues
 
 - **Specular direct**: LTC with the GGX lobe needs athenea's fitted tables

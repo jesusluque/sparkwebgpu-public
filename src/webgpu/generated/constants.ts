@@ -140,6 +140,10 @@ export const drawSplatShape = {
   DRAW_DISK_CLIP: 128,
   DRAW_ADDITIVE_ONLY: 256,
   DRAW_NO_ADDITIVE: 512,
+  DRAW_FAINT: 1024,
+  FAINT_ALPHA: 4,
+  FAINT_MIN_BLUR: 0.15,
+  SURFEL_FILTER_INV_SQUARE: 2,
 } as const;
 
 /** slang/fx/bridge.slang */
@@ -262,4 +266,5 @@ export const tilesTileRaster = {
   RANGE_ROUNDS: 8,
   TILE_DEPTH_TEST: 1,
   TILE_CLAMP: 2,
+  TILE_SPLAT_WORDS: 3,
 } as const;

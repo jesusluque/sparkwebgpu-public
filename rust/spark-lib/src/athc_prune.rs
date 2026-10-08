@@ -13,7 +13,7 @@
 //! - [`decimate_opaque`]: an opaque surface baked ~5x oversampled (every point
 //!   under five discs, AY § 2.2) thinned to one splat in `ratio` along Morton
 //!   runs that stay on one panel (normals within 30 degrees, near, the same
-//!   material), the kept splat's two long axes grown so the run stays
+//!   material up to roughness jitter), the kept splat's two long axes grown so the run stays
 //!   covered, its colour, transfer, curvature, open directions and skin the
 //!   run's merge (`athc_build`'s, as the LoD merges them).
 //! - [`select`]: what is kept, every section following the splats.
@@ -326,7 +326,12 @@ pub fn decimate_opaque(
         let s = scales_of(&src.shape[i * 4..i * 4 + 4]);
         s[0].max(s[1]).max(s[2])
     };
+    // The same material: the same transmission and flags (bits 16..), metallic
+    // and roughness within 0.1 (a bake's roughness jitters a step or two).
     let material = |i: usize| if pbr_per > 0 { src.pbr[i * pbr_per] } else { 0 };
+    let same_material = |a: u32, b: u32| {
+        a >> 16 == b >> 16 && (a & 255).abs_diff(b & 255) <= 26 && ((a >> 8) & 255).abs_diff((b >> 8) & 255) <= 26
+    };
     // Runs along the Morton order, each closed early where the next splat
     // leaves the first's panel.
     let mut order: Vec<u32> = Vec::with_capacity(n);
@@ -348,7 +353,7 @@ pub fn decimate_opaque(
                 (Some(x), Some(y)) => x[0] * y[0] + x[1] * y[1] + x[2] * y[2] >= d.min_cos,
                 _ => true,
             };
-            if dd > ra || !facing || material(b) != ma {
+            if dd > ra || !facing || !same_material(material(b), ma) {
                 break;
             }
             order.push(b as u32);

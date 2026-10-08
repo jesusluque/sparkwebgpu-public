@@ -20,7 +20,7 @@
 // with alpha 1 - T, which composited with the quad draw's blend
 // (one, one-minus-src-alpha) gives the back-to-front result.
 //
-// Default limits only: no subgroups, 256 invocations, 6.5 KiB of workgroup
+// Default limits only: no subgroups, 256 invocations, 8.5 KiB of workgroup
 // memory, at most 7 storage buffers a kernel.
 
 import core.math;
@@ -36,7 +36,7 @@ import plugins.blend_term;
 static const uint TILE_SIZE = 16;
 static const uint TILE_THREADS = TILE_SIZE * TILE_SIZE;
 // Splats a tile's workgroup loads at a time: 128 keeps its workgroup memory
-// at 6.5 KiB, for more workgroups in flight.
+// at 8.5 KiB (6.5 before the surfels' rows), for more workgroups in flight.
 static const uint TILE_BATCH = 128;
 // tileRanges covers GpuSorter's dispatch blocks: 128 threads x 8 keys.
 static const uint RANGE_WG = 128;
@@ -59,8 +59,12 @@ struct TileParams {
 
 StructuredBuffer<uint> ordering;     // back-to-front accumulator indices
 StructuredBuffer<uint> sortCount;    // the depth sort's draw args: [1] slots
-RWStructuredBuffer<uint4> tileSplats; // 2 per slot: center, axes, colour
-RWStructuredBuffer<uint4> tileExtra;  // per slot: stdDev^2, alpha, depth, view depth
+// Per slot, TILE_SPLAT_WORDS: [0] center, u1  [1] u2, r, g  [2] unused; a
+// surfel's (negative stdDev^2): [0] its centre in surfel pixels, rows.x.xy
+// [1] rows.y.xy, r, g  [2] rows.w, 0.
+static const uint TILE_SPLAT_WORDS = 3u;
+RWStructuredBuffer<uint4> tileSplats;
+RWStructuredBuffer<uint4> tileExtra;  // per slot: stdDev^2 (< 0: a surfel), alpha, depth, b
 RWStructuredBuffer<uint2> tileRects;  // per slot: tile x0 | y0 << 16, x1 | y1 << 16
 RWStructuredBuffer<uint> tileCounts;  // per slot tiles, scanned in place to offsets
 RWStructuredBuffer<uint> keysOut;
@@ -106,13 +110,17 @@ float segmentMin(float2 p, float2 e, float2 u1, float2 u2) {
 // least uvRadius2 over the box of its centres (relative to the splat's
 // centre) is within stdDev^2. A box missing the centre has it on an edge.
 // Most of a large or thin splat's bounding rectangle can miss it.
+// A surfel touches every tile of its rectangle (surfelQuad's box).
 bool tileTouched(uint i, uint2 tile) {
-    uint4 a = tileSplats[2u * i];
-    uint4 b = tileSplats[2u * i + 1u];
+    float stdDev2 = asfloat(tileExtra[i].x);
+    if (stdDev2 < 0.0) {
+        return true;
+    }
+    uint4 a = tileSplats[TILE_SPLAT_WORDS * i];
+    uint4 b = tileSplats[TILE_SPLAT_WORDS * i + 1u];
     float2 center = asfloat(a.xy);
     float2 u1 = asfloat(a.zw);
     float2 u2 = asfloat(b.xy);
-    float stdDev2 = asfloat(tileExtra[i].x);
     float2 last = float2(float(tileParams.width), float(tileParams.height)) - 1.0;
     float2 lo = float2(tile * TILE_SIZE) + 0.5 - center;
     float2 hi = min(float2(tile * TILE_SIZE + TILE_SIZE - 1u), last) + 0.5 - center;
@@ -155,9 +163,36 @@ void tilePreprocess(uint3 tid: SV_DispatchThreadID) {
     uint2 rect = uint2(0xffffffffu, 0u); // no tiles
     SplatShape s;
     uint splatIndex = i < sortCount[1] ? ordering[i] : 0xffffffffu;
-    // 2DGS quads are drawn in perspective; the host keeps those on the
-    // hardware path, and a flat splat here is skipped.
-    if (splatIndex != 0xffffffffu && projectSplat(splatIndex, s) && !s.flat) {
+    bool drawn = splatIndex != 0xffffffffu && projectSplat(splatIndex, s);
+    if (drawn && s.surfel) {
+        // The pixels whose centres the quad draw's surfelQuad covers
+        // (edges included: a centre on the snapped edge is outside the
+        // ellipse and the filter's disc, and draws nothing).
+        float2 size = float2(float(tileParams.width), float(tileParams.height));
+        float2 lo, hi;
+        surfelQuad(s.rows, s.adjustedStdDev, lo, hi);
+        float2 first = max(ceil(float2(lo.x, size.y - hi.y) - 0.5), float2(0.0));
+        float2 last = min(floor(float2(hi.x, size.y - lo.y) - 0.5), size - 1.0);
+        if (all(first <= last)) {
+            uint2 t0 = uint2(first) / TILE_SIZE;
+            uint2 t1 = uint2(last) / TILE_SIZE;
+            rect = uint2(t0.x | (t0.y << 16u), t1.x | (t1.y << 16u));
+            float3 rgb = s.rgba.rgb;
+            if (hasFlag(DRAW_ENCODE_LINEAR)) {
+                rgb = srgbToLinear(rgb);
+            }
+            const SurfelRows r = s.rows;
+            const uint o = TILE_SPLAT_WORDS * i;
+            tileSplats[o] = asuint(float4(r.x.z, r.y.z, r.x.xy));
+            tileSplats[o + 1u] = asuint(float4(r.y.xy, rgb.rg));
+            tileSplats[o + 2u] = asuint(float4(r.w, 0.0));
+            tileExtra[i] = uint4(
+                asuint(-s.adjustedStdDev * s.adjustedStdDev),
+                asuint(markedRgba(s).a),
+                asuint(s.clipCenter.z / s.clipCenter.w),
+                asuint(rgb.b));
+        }
+    } else if (drawn) {
         float2 size = float2(float(tileParams.width), float(tileParams.height));
         float2 ndc = s.clipCenter.xy / s.clipCenter.w;
         float2 center = float2(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y) * size;
@@ -185,8 +220,8 @@ void tilePreprocess(uint3 tid: SV_DispatchThreadID) {
                 if (hasFlag(DRAW_ENCODE_LINEAR)) {
                     rgb = srgbToLinear(rgb);
                 }
-                tileSplats[2u * i] = uint4(asuint(center.x), asuint(center.y), asuint(u1.x), asuint(u1.y));
-                tileSplats[2u * i + 1u] = uint4(asuint(u2.x), asuint(u2.y), asuint(rgb.r), asuint(rgb.g));
+                tileSplats[TILE_SPLAT_WORDS * i] = uint4(asuint(center.x), asuint(center.y), asuint(u1.x), asuint(u1.y));
+                tileSplats[TILE_SPLAT_WORDS * i + 1u] = uint4(asuint(u2.x), asuint(u2.y), asuint(rgb.r), asuint(rgb.g));
                 tileExtra[i] = uint4(
                     asuint(s.adjustedStdDev * s.adjustedStdDev),
                     asuint(markedRgba(s).a),
@@ -260,8 +295,9 @@ void tileRanges(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
 }
 
 // A batch of a tile's splats, front first, shared by its pixels.
-groupshared float4 sGeom0[TILE_BATCH]; // center, u1
-groupshared float4 sGeom1[TILE_BATCH]; // u2, stdDev^2, alpha
+groupshared float4 sGeom0[TILE_BATCH]; // center, u1 (a surfel's: centre, rows.x.xy)
+groupshared float4 sGeom1[TILE_BATCH]; // u2 (rows.y.xy), stdDev^2, alpha
+groupshared float3 sGeom2[TILE_BATCH]; // a surfel's rows.w
 groupshared float4 sColor[TILE_BATCH]; // rgb, ndc depth
 groupshared float sViewDepth[TILE_BATCH];
 groupshared Atomic<uint> sDone;
@@ -298,8 +334,9 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         uint batch = min(TILE_BATCH, end - range.x);
         if (t < batch) {
             uint slot = sortedVals[end - 1u - t];
-            uint4 a = splatsIn[2u * slot];
-            uint4 b = splatsIn[2u * slot + 1u];
+            uint4 a = splatsIn[TILE_SPLAT_WORDS * slot];
+            uint4 b = splatsIn[TILE_SPLAT_WORDS * slot + 1u];
+            sGeom2[t] = asfloat(splatsIn[TILE_SPLAT_WORDS * slot + 2u].xyz);
             uint4 e = extraIn[slot];
             sGeom0[t] = asfloat(a);
             sGeom1[t] = float4(asfloat(b.xy), asfloat(e.xy));
@@ -316,10 +353,20 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
             for (uint j = 0; j < batch; j++) {
                 float4 g0 = sGeom0[j];
                 float4 g1 = sGeom1[j];
-                float2 d = p - g0.xy;
-                float2 uv = float2(dot(d, g0.zw), dot(d, g1.xy));
-                float z2 = dot(uv, uv);
-                if (z2 > g1.z) {
+                float2 uv;
+                float z2;
+                float stdDev2 = g1.z;
+                if (stdDev2 < 0.0) {
+                    // A surfel, as the quad draw's fragment (y up).
+                    stdDev2 = -stdDev2;
+                    float2 d = surfelOffset(float2(p.x, size.y - p.y), g0.xy);
+                    z2 = surfelRadius2(d, float3(g0.zw, 0.0), float3(g1.xy, 0.0), sGeom2[j], uv);
+                } else {
+                    float2 d = p - g0.xy;
+                    uv = float2(dot(d, g0.zw), dot(d, g1.xy));
+                    z2 = dot(uv, uv);
+                }
+                if (z2 > stdDev2) {
                     continue;
                 }
                 // Additive (a negative alpha, markedRgba): adds its light,

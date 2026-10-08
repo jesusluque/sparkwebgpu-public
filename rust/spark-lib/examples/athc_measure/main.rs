@@ -43,10 +43,12 @@ fn main() -> Result<()> {
     match cmd {
         "stats" => stats(&scene, width),
         "visibility" => visibility(&scene, &args),
-        "levels" => levels(&scene, asset),
+        "levels" => levels(&scene, &args),
         "surfel" => surfel(&scene, width),
         "merge" => merge::run(&scene, &args),
         "bytes" => bytes(&scene),
+        "overlap" => overlap(&scene),
+        "thin" => thin(&scene, &args),
         "render" => {
             let cam = scene.camera(width, 1.0, 0.0, 0.0);
             let img = render(&scene.splats, &cam, None);
@@ -299,7 +301,7 @@ fn surfel(scene: &Scene, width: usize) -> Result<()> {
 }
 
 /// The LoD tree, level by level.
-fn levels(scene: &Scene, _asset: &str) -> Result<()> {
+fn levels(scene: &Scene, _args: &[String]) -> Result<()> {
     println!("## {} — LoD levels\n", scene.name);
     for (pi, lv) in scene.level_data.iter().enumerate() {
         let Some(lv) = lv else { continue };
@@ -327,21 +329,44 @@ fn levels(scene: &Scene, _asset: &str) -> Result<()> {
     }
     // Image space: each level as the whole cloud, from the distance where its
     // cell is one pixel at 1920 px, against the splats.
-    println!("### image error of a whole level vs the splats, camera where the level's cell is ~1 px\n");
-    println!("| level | splats | distance (m) | relMSE | Δcoverage |\n|---|---|---|---|---|");
+    println!("### image error of a whole level vs the splats, default camera at the width (px) where the level's cell is ~1 px, against the splats supersampled 4×\n");
+    println!("| level | splats | width (px) | level: relMSE | level: Δcoverage | all splats at that width: relMSE | Δcoverage |\n|---|---|---|---|---|---|---|");
     let finest = scene.cut_levels.len();
     for k in 0..finest {
         let (level, cell, cut) = &scene.cut_levels[k];
         if cut.len() < 1000 {
             continue;
         }
+        // The default view at the resolution where the level's cell is one pixel.
         let cam0 = scene.camera(1920, 1.0, 0.0, 0.0);
-        let d = (cell * cam0.fx).max(0.05 * cam0.distance_to(scene.center));
-        let scale = d / cam0.distance_to(scene.center);
-        let cam = scene.camera(1920, scale, 0.0, 0.0);
-        let full = render(&scene.splats, &cam, None);
+        let px = cell * cam0.fx / cam0.distance_to(scene.center) / 1920.0;
+        let w = ((1.0 / px / 16.0).round() as usize * 16).max(16);
+        if !(48..=3840).contains(&w) {
+            continue;
+        }
+        let cam = scene.camera(w, 1.0, 0.0, 0.0);
+        let d = cam.distance_to(scene.center);
+        // Reference: the splats supersampled 4x (the splats at w alone lose
+        // whatever falls under 1/255 a pixel).
+        let reference = render(&scene.splats, &scene.camera(4 * w, 1.0, 0.0, 0.0), None).downsample(4);
+        let plain = render(&scene.splats, &cam, None);
+        let full = reference;
         let img = render(cut, &cam, None);
-        println!("| {} | {} | {:.2} | {:.2e} | {:.2e} |", level, cut.len(), d * scene.unit, img.rel_mse(&full), img.alpha_diff(&full));
+        if let Some(dir) = arg(_args, "--save") {
+            img.save_png(&format!("{dir}/{}-level{}-cut.png", scene.name, level), 0.6)?;
+            full.save_png(&format!("{dir}/{}-level{}-full.png", scene.name, level), 0.6)?;
+        }
+        let _ = d;
+        println!(
+            "| {} | {} | {} | {:.2e} | {:.2e} | {:.2e} | {:.2e} |",
+            level,
+            cut.len(),
+            w,
+            img.rel_mse(&full),
+            img.alpha_diff(&full),
+            plain.rel_mse(&full),
+            plain.alpha_diff(&full)
+        );
     }
     Ok(())
 }
@@ -400,6 +425,150 @@ fn bytes(scene: &Scene) -> Result<()> {
             println!("| {} | {:.2} | {:.2} | {:.1} |", sec.id.name(), sp as f64 / 1e6, lv as f64 / 1e6, sp as f64 / splats as f64);
         }
         println!();
+    }
+    Ok(())
+}
+
+/// How deep each surface is covered: at each splat's centre, the summed
+/// alpha of the other splats of its part facing the same way (within 25°),
+/// as their gaussians fall there in their own plane.
+fn overlap(scene: &Scene) -> Result<()> {
+    println!("## {} — coverage depth (Σ alpha of the others at each centre)\n", scene.name);
+    println!("| part | p10 | median | p90 | mean | splats with depth > 2 |\n|---|---|---|---|---|---|");
+    for (pi, part) in scene.parts.iter().enumerate() {
+        let ids: Vec<usize> = (0..scene.splats.len()).filter(|&i| scene.splats[i].part == pi as u16).collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let sp = &scene.splats;
+        let mut longs: Vec<f32> = ids.iter().map(|&i| sp[i].long()).collect();
+        longs.sort_by(|a, b| a.total_cmp(b));
+        let cell = 3.0 * longs[longs.len() * 9 / 10].max(1e-9);
+        let key = |p: [f32; 3]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64, (p[2] / cell).floor() as i64);
+        let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<u32>> = std::collections::HashMap::new();
+        for &i in &ids {
+            grid.entry(key(sp[i].p)).or_default().push(i as u32);
+        }
+        let depth: Vec<f32> = raster::par_chunks(ids.len(), |r| {
+            r.map(|k| {
+                let i = ids[k];
+                let a = &sp[i];
+                let (x, y, z) = key(a.p);
+                let mut sum = 0.0f32;
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            let Some(v) = grid.get(&(x + dx, y + dy, z + dz)) else { continue };
+                            for &j in v {
+                                let j = j as usize;
+                                if j == i {
+                                    continue;
+                                }
+                                let b = &sp[j];
+                                if a.has_normal() && b.has_normal() && dot(a.n, b.n) < 0.906 {
+                                    continue;
+                                }
+                                // b's gaussian at a's centre, in b's frame
+                                let d = sub(a.p, b.p);
+                                let ax = b.axes();
+                                let mut q = 0.0;
+                                for t in 0..3 {
+                                    let u = dot(d, ax[t]) / b.s[t].max(1e-4 * b.long());
+                                    q += u * u;
+                                }
+                                if q < 9.0 {
+                                    sum += b.o.min(1.0) * (-0.5 * q).exp();
+                                }
+                            }
+                        }
+                    }
+                }
+                sum
+            })
+            .collect::<Vec<f32>>()
+        })
+        .concat();
+        let mut d = depth.clone();
+        d.sort_by(|a, b| a.total_cmp(b));
+        let mean = d.iter().map(|v| *v as f64).sum::<f64>() / d.len() as f64;
+        let over2 = d.iter().filter(|v| **v > 2.0).count();
+        println!("| {} | {:.2} | {:.2} | {:.2} | {:.2} | {} |", part, d[d.len() / 10], d[d.len() / 2], d[d.len() * 9 / 10], mean, pct(over2, d.len()));
+    }
+    println!();
+    Ok(())
+}
+
+/// Opaque splats thinned 1 in k along the Morton order (per part), their
+/// two long axes scaled by `grow`: the error of emitting fewer, larger discs.
+fn thin(scene: &Scene, args: &[String]) -> Result<()> {
+    let width: usize = arg(args, "--width").map(|s| s.parse().unwrap()).unwrap_or(1920);
+    let views2 = scene.test_views(2 * width);
+    let views = scene.test_views(width);
+    let refs: Vec<Image> = views2.iter().map(|(_, c)| render(&scene.splats, c, None).downsample(2)).collect();
+    let n = scene.splats.len();
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for s in &scene.splats {
+        for d in 0..3 {
+            lo[d] = lo[d].min(s.p[d]);
+            hi[d] = hi[d].max(s.p[d]);
+        }
+    }
+    let ext = (0..3).map(|d| hi[d] - lo[d]).fold(0.0, f32::max) * 1.01;
+    let morton = |p: [f32; 3]| -> u64 {
+        let q = [0, 1, 2].map(|d| (((p[d] - lo[d]) / ext).clamp(0.0, 0.999_999) * 2_097_152.0) as u64);
+        let mut c = 0u64;
+        for b in 0..21 {
+            for (k, v) in q.iter().enumerate() {
+                c |= ((v >> b) & 1) << (3 * b + k);
+            }
+        }
+        c
+    };
+    let only: Option<Vec<String>> = arg(args, "--only").map(|s| s.split(',').map(|x| x.to_string()).collect());
+    let mut order: Vec<(u16, u64, usize)> = scene.splats.iter().enumerate().map(|(i, s)| (s.part, morton(s.p), i)).collect();
+    order.sort_unstable();
+    println!("## {} — opaque splats thinned 1 in k (Morton order), long axes ×grow\n", scene.name);
+    let names: Vec<String> = views.iter().map(|(n, _)| n.clone()).collect();
+    println!("| k | grow | splats | % | {} | mean | mean Δcoverage |\n|---|---|---|---|{}---|---|", names.join(" | "), "---|".repeat(names.len()));
+    for (k, grow) in [(1usize, 1.0f32), (2, 1.0), (2, 1.2), (2, 1.41), (3, 1.0), (3, 1.3), (3, 1.73), (4, 1.5), (4, 1.7), (4, 2.0), (6, 1.7), (6, 2.0), (8, 2.0), (8, 2.4)] {
+        let mut out = Vec::with_capacity(n);
+        let mut run = 0usize;
+        let mut last_part = u16::MAX;
+        for &(part, _, i) in &order {
+            if part != last_part {
+                run = 0;
+                last_part = part;
+            }
+            let s = &scene.splats[i];
+            if s.o < 0.99 || only.as_ref().is_some_and(|o| !o.contains(&scene.parts[s.part as usize])) {
+                out.push(s.clone());
+                continue;
+            }
+            if run % k == 0 {
+                let mut t = s.clone();
+                let thinnest = (0..3).min_by(|&a, &b| t.s[a].total_cmp(&t.s[b])).unwrap();
+                for d in 0..3 {
+                    if d != thinnest {
+                        t.s[d] *= grow;
+                    }
+                }
+                out.push(t);
+            }
+            run += 1;
+        }
+        let imgs: Vec<Image> = views.iter().map(|(_, c)| render(&out, c, None)).collect();
+        let errs: Vec<f64> = imgs.iter().zip(&refs).map(|(a, r)| a.rel_mse(r)).collect();
+        let dcov = imgs.iter().zip(&refs).map(|(a, r)| a.alpha_diff(r)).sum::<f64>() / refs.len() as f64;
+        println!(
+            "| {} | {} | {} | {:.1}% | {} | {:.2e} | {:.2e} |",
+            k,
+            grow,
+            out.len(),
+            100.0 * out.len() as f64 / n as f64,
+            errs.iter().map(|e| format!("{e:.2e}")).collect::<Vec<_>>().join(" | "),
+            errs.iter().sum::<f64>() / errs.len() as f64,
+            dcov
+        );
     }
     Ok(())
 }

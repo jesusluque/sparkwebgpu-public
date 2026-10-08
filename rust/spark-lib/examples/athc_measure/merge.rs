@@ -99,11 +99,85 @@ struct Ctx {
     fx: f64,
     near: f64,
     lambda: f64,
+    /// 0 Runnalls + colour, 1 plane ISE (alpha, colour, normal)
+    kind: u32,
+    mu_n: f64,
+}
+
+/// A cluster's opacity (W / two-axis area) and unit normal.
+fn opacity_of(s: &[f64; 6], w: f64) -> f64 {
+    let (vals, _) = eigen(s);
+    let mut v = vals.map(|x| x.max(1e-30).sqrt());
+    v.sort_by(|a, b| b.total_cmp(a));
+    w / (v[0] * v[1]).max(1e-30)
+}
+
+/// 2D (in the plane e1, e2) covariance of a 3D one.
+fn plane_cov(s: &[f64; 6], e: &[[f64; 3]; 2]) -> [f64; 3] {
+    let m = |u: &[f64; 3], v: &[f64; 3]| {
+        u[0] * (s[0] * v[0] + s[3] * v[1] + s[4] * v[2]) + u[1] * (s[3] * v[0] + s[1] * v[1] + s[5] * v[2]) + u[2] * (s[4] * v[0] + s[5] * v[1] + s[2] * v[2])
+    };
+    [m(&e[0], &e[0]), m(&e[0], &e[1]), m(&e[1], &e[1])]
+}
+
+/// ∫ exp(-x'A⁻¹x/2) exp(-(x-d)'B⁻¹(x-d)/2) over the plane.
+fn overlap(a: &[f64; 3], b: &[f64; 3], d: [f64; 2], floor: f64) -> f64 {
+    let fa = [a[0] + floor, a[1], a[2] + floor];
+    let fb = [b[0] + floor, b[1], b[2] + floor];
+    let da = (fa[0] * fa[2] - fa[1] * fa[1]).max(1e-300);
+    let db = (fb[0] * fb[2] - fb[1] * fb[1]).max(1e-300);
+    let c = [fa[0] + fb[0], fa[1] + fb[1], fa[2] + fb[2]];
+    let dc = (c[0] * c[2] - c[1] * c[1]).max(1e-300);
+    let q = (c[2] * d[0] * d[0] - 2.0 * c[1] * d[0] * d[1] + c[0] * d[1] * d[1]) / dc;
+    std::f64::consts::TAU * (da * db / dc).sqrt() * (-0.5 * q).exp()
+}
+
+fn cost_ise(a: &Cl, b: &Cl, ctx: &Ctx) -> f64 {
+    let m = add(a, b);
+    let (mu, s) = mean_cov(&m);
+    let (vals, cols) = eigen(&s);
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&x, &y| vals[y].total_cmp(&vals[x]));
+    let e = [cols[order[0]], cols[order[1]]];
+    let floor = 1e-4 * vals[order[0]].max(1e-30);
+    let parts = [(a, 1.0f64), (b, 1.0), (&m, -1.0)];
+    let mut g = Vec::with_capacity(3);
+    for (c, sign) in parts {
+        let (cm, cs) = mean_cov(c);
+        let o = opacity_of(&cs, c.w).min(1.0);
+        let col = c.c.map(|v| v / c.w);
+        let nl = (c.n[0].powi(2) + c.n[1].powi(2) + c.n[2].powi(2)).sqrt();
+        let n = if nl > 0.0 { c.n.map(|v| v / nl) } else { [0.0; 3] };
+        let d = [cm[0] - mu[0], cm[1] - mu[1], cm[2] - mu[2]];
+        let pd = [d[0] * e[0][0] + d[1] * e[0][1] + d[2] * e[0][2], d[0] * e[1][0] + d[1] * e[1][1] + d[2] * e[1][2]];
+        g.push((plane_cov(&cs, &e), pd, sign * o, col, n));
+    }
+    let mut err = 0.0;
+    for x in 0..3 {
+        for y in 0..3 {
+            let (ax, px, ox, cx, nx) = &g[x];
+            let (ay, py, oy, cy, ny) = &g[y];
+            let k = overlap(ax, ay, [py[0] - px[0], py[1] - px[1]], floor);
+            let ch = 1.0 + ctx.lambda * (cx[0] * cy[0] + cx[1] * cy[1] + cx[2] * cy[2]) + ctx.mu_n * (nx[0] * ny[0] + nx[1] * ny[1] + nx[2] * ny[2]);
+            err += ox * oy * k * ch;
+        }
+    }
+    let r = ((mu[0] - ctx.center[0]).powi(2) + (mu[1] - ctx.center[1]).powi(2) + (mu[2] - ctx.center[2]).powi(2)).sqrt();
+    let z = (ctx.eye_dist - r).max(ctx.near);
+    err.max(0.0) * (ctx.fx / z).powi(2)
 }
 
 fn cost(a: &Cl, b: &Cl, ctx: &Ctx) -> f64 {
     if a.key != b.key {
         return f64::INFINITY;
+    }
+    if ctx.kind == 1 {
+        let na = (a.n[0].powi(2) + a.n[1].powi(2) + a.n[2].powi(2)).sqrt();
+        let nb = (b.n[0].powi(2) + b.n[1].powi(2) + b.n[2].powi(2)).sqrt();
+        if na > 0.0 && nb > 0.0 && (a.n[0] * b.n[0] + a.n[1] * b.n[1] + a.n[2] * b.n[2]) / (na * nb) < 0.5 {
+            return f64::INFINITY;
+        }
+        return cost_ise(a, b, ctx);
     }
     let na = (a.n[0].powi(2) + a.n[1].powi(2) + a.n[2].powi(2)).sqrt();
     let nb = (b.n[0].powi(2) + b.n[1].powi(2) + b.n[2].powi(2)).sqrt();
@@ -337,16 +411,20 @@ pub fn run(scene: &Scene, args: &[String]) -> Result<()> {
         fx: cam0.fx as f64,
         near: cam0.near as f64 * 10.0,
         lambda,
+        kind: if arg(args, "--cost") == Some("ise") { 1 } else { 0 },
+        mu_n: arg(args, "--mu").map(|s| s.parse().unwrap()).unwrap_or(1.0),
     };
     let views = scene.test_views(width);
     let t0 = Instant::now();
-    let refs: Vec<Image> = views.iter().map(|(_, c)| render(&scene.splats, c, None)).collect();
+    // References: the full cloud supersampled 2x (box filtered).
+    let views2 = scene.test_views(2 * width);
+    let refs: Vec<Image> = views2.iter().map(|(_, c)| render(&scene.splats, c, None).downsample(2)).collect();
     let nfull = normal_coloured(&scene.splats);
-    let nrefs: Vec<Image> = views.iter().map(|(_, c)| render(&nfull, c, None)).collect();
+    let nrefs: Vec<Image> = views2.iter().map(|(_, c)| render(&nfull, c, None).downsample(2)).collect();
     eprintln!("reference renders {:.1}s", t0.elapsed().as_secs_f32());
     println!("## {} — greedy pairwise merge (λ = {lambda}) vs the octree LoD\n", scene.name);
     let names: Vec<String> = views.iter().map(|(n, _)| n.clone()).collect();
-    println!("relMSE against the full cloud ({} splats), per view: {}\n", n, names.join(" · "));
+    println!("relMSE against the full cloud ({} splats) supersampled 2×, per view: {}\n", n, names.join(" · "));
     println!("| method | splats | % of full | {} | mean | normals: mean relMSE |\n|---|---|---|{}---|---|", names.join(" | "), "---|".repeat(names.len()));
     let row = |label: &str, cut: &[Splat]| {
         let errs: Vec<f64> = views.iter().zip(&refs).map(|((_, c), r)| render(cut, c, None).rel_mse(r)).collect();
@@ -363,6 +441,7 @@ pub fn run(scene: &Scene, args: &[String]) -> Result<()> {
             nmean
         );
     };
+    row("full cloud (at 1×)", &scene.splats);
     // The octree cuts.
     for (level, _cell, cut) in &scene.cut_levels {
         if cut.len() * 50 < n || cut.len() >= n {
@@ -400,8 +479,12 @@ pub fn run(scene: &Scene, args: &[String]) -> Result<()> {
     greedy(&input, &ctx, &targets, |t, cut| {
         row(&format!("greedy → {t}"), &cut);
         if let Some(dir) = &save {
-            let img = render(&cut, &views[0].1, None);
-            let _ = img.save_png(&format!("{dir}/{}-greedy-{t}.png", scene.name), 0.6);
+            for v in [0usize, 3] {
+                let img = render(&cut, &views[v].1, None);
+                let _ = img.save_png(&format!("{dir}/{}-greedy-{t}-v{v}.png", scene.name), 0.6);
+                let _ = img.diff_png(&refs[v], &format!("{dir}/{}-greedy-{t}-v{v}-diff.png", scene.name));
+                let _ = refs[v].save_png(&format!("{dir}/{}-full-v{v}.png", scene.name), 0.6);
+            }
         }
     });
     Ok(())

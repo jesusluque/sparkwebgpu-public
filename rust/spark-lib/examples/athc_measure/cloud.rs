@@ -113,6 +113,15 @@ pub fn block_splats(b: &AthcBlock, linear: bool, part: u16, out: &mut Vec<Splat>
         }
         let c = c.map(|v| v.max(0.0));
         let n = if b.normals.is_empty() { [0.0; 3] } else { athc::unpack_normal(b.normals[i]) };
+        // ATHC_PROXY=lit: the colour times the transfer's first (DC) value,
+        // a white-dome diffuse proxy that sees the baked occlusion.
+        let c = if lit() && !b.transfer.is_empty() {
+            let tw = b.transfer.len() / b.n;
+            let t0 = athc::low_half(b.transfer[i * tw]).max(0.0);
+            c.map(|v| v * t0)
+        } else {
+            c
+        };
         let mut key = (part as u32) << 8;
         if pbr_words > 0 {
             let w = b.pbr[i * pbr_words];
@@ -124,6 +133,10 @@ pub fn block_splats(b: &AthcBlock, linear: bool, part: u16, out: &mut Vec<Splat>
         }
         out.push(Splat { p: [p[0], p[1], p[2]], o: p[3], q, s, c, n, part, key });
     }
+}
+
+pub fn lit() -> bool {
+    std::env::var("ATHC_PROXY").map(|v| v == "lit").unwrap_or(false)
 }
 
 pub fn read_athc(path: &str) -> Result<AthcFile> {

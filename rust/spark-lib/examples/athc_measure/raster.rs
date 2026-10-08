@@ -168,6 +168,27 @@ impl Image {
         }
         s / n.max(1) as f64
     }
+    /// Box-filtered down by k (a supersampled reference).
+    pub fn downsample(&self, k: usize) -> Image {
+        let (w, h) = (self.w / k, self.h / k);
+        let mut out = Image { w, h, rgb: vec![[0.0; 3]; w * h], t: vec![0.0; w * h] };
+        let inv = 1.0 / (k * k) as f32;
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * w + x;
+                for dy in 0..k {
+                    for dx in 0..k {
+                        let i = (y * k + dy) * self.w + x * k + dx;
+                        for c in 0..3 {
+                            out.rgb[o][c] += self.rgb[i][c] * inv;
+                        }
+                        out.t[o] += self.t[i] * inv;
+                    }
+                }
+            }
+        }
+        out
+    }
     /// |difference| ×20 as a grey image, for looking only.
     pub fn diff_png(&self, other: &Image, path: &str) -> anyhow::Result<()> {
         let mut buf = Vec::with_capacity(self.w * self.h);
@@ -209,6 +230,8 @@ struct Proj {
 
 const TILE: usize = 16;
 const BLUR: f32 = 0.3;
+/// Spark's default minAlpha (WgpuSplatRenderer).
+pub const MIN_ALPHA: f32 = 0.5 / 255.0;
 
 fn project(s: &Splat, cam: &Camera) -> Option<(Proj, f32, f32)> {
     let d = sub(s.p, cam.eye);
@@ -242,10 +265,10 @@ fn project(s: &Splat, cam: &Camera) -> Option<(Proj, f32, f32)> {
     }
     let (alpha, e, maxstd) = if s.o <= 1.0 {
         let al = s.o * (det0 / det).sqrt();
-        if al < 1.0 / 255.0 {
+        if al < MIN_ALPHA {
             return None;
         }
-        (al, 0.0, 8f32.sqrt().min((2.0 * (255.0 * al).ln()).max(0.0).sqrt()))
+        (al, 0.0, 8f32.sqrt().min((2.0 * (al / MIN_ALPHA).ln()).max(0.0).sqrt()))
     } else {
         let dd = (1.0 + std::f32::consts::E * s.o.ln()).sqrt().min(5.0);
         let e = ((dd * dd - 1.0) / std::f32::consts::E).exp();
@@ -381,7 +404,7 @@ pub fn render(splats: &[Splat], cam: &Camera, track: Option<&Track>) -> Image {
                                     }
                                     let g = (-power).exp();
                                     let alpha = if p.e > 0.0 { 1.0 - (1.0 - g.min(0.9999)).powf(p.e) } else { p.a * g }.min(0.99);
-                                    if alpha < 1.0 / 255.0 {
+                                    if alpha < MIN_ALPHA {
                                         continue;
                                     }
                                     let k = tr * alpha;

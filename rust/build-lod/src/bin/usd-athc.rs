@@ -778,22 +778,32 @@ fn read_layer_colours(
     let mut max = 0f32;
     let mut negative = 0usize;
     let mut unbaked = 0usize;
-    for (file, (mask, offset)) in files.iter().zip(masks) {
+    for (spec, (mask, offset)) in files.iter().zip(masks) {
+        // `file.usdc#attribute`: a linear colour attribute (athenea's native
+        // `athenea:splat:lightLayer:<group>`) in place of the SH.
+        let (file, colour_attr) = match spec.split_once('#') {
+            Some((f, a)) => (f, Some(a.trim_start_matches("primvars:"))),
+            None => (*spec, None),
+        };
         let data = read_layer(file)?;
-        let p = Prim::read_some(
-            data.as_ref(),
-            prim_path,
-            Some(&[
-                "positions",
-                "positionsh",
-                "radiance:sphericalHarmonicsCoefficients",
-                "radiance:sphericalHarmonicsCoefficientsh",
-                "athenea:splat:linear",
-            ]),
-        )?;
+        let mut wanted = vec![
+            "positions",
+            "positionsh",
+            "radiance:sphericalHarmonicsCoefficients",
+            "radiance:sphericalHarmonicsCoefficientsh",
+            "athenea:splat:linear",
+        ];
+        if let Some(a) = colour_attr {
+            wanted.push(a);
+        }
+        let p = Prim::read_some(data.as_ref(), prim_path, Some(&wanted))?;
         let positions = p.floats(&["positions", "positionsh"])?;
         let count = positions.len() / 3;
-        let sh = p.floats(&["radiance:sphericalHarmonicsCoefficients", "radiance:sphericalHarmonicsCoefficientsh"])?;
+        let sh = match colour_attr {
+            // The colour as a DC that reads back to it (0.5 + SH0 dc).
+            Some(a) => p.floats(&[a])?.iter().map(|v| if *v == 0.0 { 0.0 } else { (v - 0.5) / SH0 }).collect(),
+            None => p.floats(&["radiance:sphericalHarmonicsCoefficients", "radiance:sphericalHarmonicsCoefficientsh"])?,
+        };
         if count == 0 || sh.len() % (3 * count) != 0 || sh.is_empty() {
             bail!("{file}: {count} splats and {} SH values", sh.len());
         }
@@ -922,6 +932,10 @@ struct LayerOptions {
     /// A layer to compare with the file's own base colour (a layer that is
     /// the base cloud itself: an alignment check).
     verify: Option<String>,
+    /// An additive cloud (a light catcher): each splat's light times its
+    /// share (`athl::additive_shares`), so the additive draw adds what
+    /// athenea's raster composites.
+    additive: bool,
 }
 
 /// The `.athl` of the built cloud: each layer through the splats' sources
@@ -953,6 +967,8 @@ fn write_athl(
         ..Default::default()
     };
     let mut bake = 0xcbf2_9ce4_8422_2325u64;
+    let shares = o.additive.then(|| spark_lib::athl::additive_shares(file));
+    let share_mean = shares.as_ref().map(|k| k.iter().map(|v| *v as f64).sum::<f64>() / k.len().max(1) as f64);
     let mut reports = Vec::new();
     for (k, (name, values, check)) in layers.iter().enumerate() {
         let per = track.gather(values, 3)?;
@@ -984,7 +1000,19 @@ fn write_athl(
             }
         }
         let lit = scaled.chunks(3).filter(|p| p.iter().any(|v| *v != 0.0)).count();
-        let virt = virtual_values(file, &tree, &scaled, 3)?;
+        let mut virt = virtual_values(file, &tree, &scaled, 3)?;
+        // An additive cloud: its splats' light times their share (they add
+        // where athenea's composite among themselves). A merged node draws
+        // its children's coverage already (its LoD opacity), so it keeps
+        // their plain mean light.
+        if let Some(k) = &shares {
+            let base = tree.splat_base as usize * 3;
+            for (i, ki) in k.iter().enumerate() {
+                for c in 0..3 {
+                    virt[base + 3 * i + c] *= ki;
+                }
+            }
+        }
         let sparse = sparse_layers(k as u16, KIND_INDIRECT, 3, &virt, o.threshold)?;
         let blocks: usize = sparse.iter().map(|l| l.blocks.len()).sum();
         let total = (athl.element_count as usize).div_ceil(spark_lib::athl::BLOCK_SPLATS as usize);
@@ -1023,6 +1051,7 @@ fn write_athl(
         "splatBase": tree.splat_base,
         "threshold": o.threshold,
         "floor": o.floor,
+        "additiveShareMean": share_mean,
         "groups": reports,
     }))
 }
@@ -1274,6 +1303,18 @@ fn main() -> Result<()> {
                 }
             }
             std::fs::write(std::path::Path::new(dir).join(format!("{name}.f32")), out)?;
+            // The geometry once: x y z, scale x y z, opacity.
+            let geometry = std::path::Path::new(dir).join("geometry.f32");
+            if !geometry.exists() {
+                let mut g = Vec::with_capacity(streams.count * 28);
+                for i in 0..streams.count {
+                    let o = streams.opacities.get(i).copied().unwrap_or(1.0);
+                    for v in streams.positions[3 * i..3 * i + 3].iter().chain(&streams.scales[3 * i..3 * i + 3]).chain([&o]) {
+                        g.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                std::fs::write(geometry, g)?;
+            }
         }
         layers.push((name.to_string(), values, check));
     }
@@ -1374,6 +1415,7 @@ fn main() -> Result<()> {
                 threshold: arg(&args, "--light-threshold").map_or(Ok(1e-4), |v| v.parse()).context("--light-threshold")?,
                 floor: arg(&args, "--light-floor").map_or(Ok(0.0), |v| v.parse()).context("--light-floor")?,
                 verify: arg(&args, "--light-verify").map(str::to_string),
+                additive: flag("--light-additive"),
             };
             let report = write_athl(&file, &bytes, track, &layers, sidecar.as_deref(), &opts, &athl_path)?;
             Some(report)

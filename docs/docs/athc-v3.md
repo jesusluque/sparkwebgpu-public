@@ -253,7 +253,7 @@ athc-convert in.athc out.athc --gzip --planes --cpca 16,48,3e-5   # a looser bud
 Measured (thread BF, `research/simplify-measurements.md`): the transfer
 sections take 4–7× fewer bytes (TX 112 of the pawn's top: 157 → 28 MB); a
 relit splat through athenea's `relitSplat` on Dawn moves by a relMSE of
-3e-7 – 3e-5 (`test/gpu/athcCpcaRelight.test.ts`, opt-in).
+4e-8 – 3e-5 (`test/gpu/athcCpcaRelight.test.ts`, opt-in); the Corvette light set 67.9 → 49.5 MB, the pawn page 281 → 84 MB, the sparrow −6 %.
 
 ### A skinned cloud (`SKIN` and the skeleton)
 

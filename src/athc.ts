@@ -18,7 +18,12 @@
 // the pager's (WgpuSplatPager.streamsToFetch); a page that did not fetch a
 // stream group fetches it later on its own (fetchAthcStreams), one Range.
 
-import { athc_layout, athc_prefix_bytes, athc_skeleton } from "spark-rs";
+import {
+  athc_decode_cpca,
+  athc_layout,
+  athc_prefix_bytes,
+  athc_skeleton,
+} from "spark-rs";
 import { workerPool } from "./SplatWorker";
 import * as wasm from "./wasm";
 import type { AttribFormat, AttributeSpec } from "./webgpu/attributes/schema";
@@ -936,27 +941,42 @@ export function decodeAthcCpca(
   }
   const out = new Uint8Array(n * d * 2);
   const outView = new DataView(out.buffer);
-  const coef = new Float64Array(m);
+  // Halves stored straight where the engine has Float16Array (it rounds to
+  // nearest even, as the Rust decoder's f16::from_f32).
+  const F16 = (
+    globalThis as unknown as { Float16Array?: Float32ArrayConstructor }
+  ).Float16Array;
+  const out16 = F16 ? new F16(out.buffer) : null;
+  // Float32Array stores round to float32: the coefficient (q x step) and
+  // each partial sum; Math.fround rounds each product before its sum.
+  const coef = new Float32Array(m);
+  const acc = new Float32Array(d);
   const f = Math.fround;
   for (let e = 0; e < n; e++) {
     const c = bytes[idsAt + e];
     if (c >= k)
       throw new Error(`.athc v3: a CPCA element in cluster ${c} of ${k}`);
+    const step = steps[c];
     for (let j = 0; j < m; j++) {
       let z = 0;
       for (let i = 0; i < b; i++) {
         z += bytes[planesAt + (j * b + i) * n + e] * 2 ** (8 * i);
       }
-      const q = z & 1 ? -(z + 1) / 2 : z / 2;
-      coef[j] = f(q * steps[c]);
+      coef[j] = (z & 1 ? -(z + 1) / 2 : z / 2) * step;
     }
     const base = c * per;
-    for (let v = 0; v < d; v++) {
-      let acc = basis[base + v];
-      for (let j = 0; j < m; j++) {
-        acc = f(acc + f(coef[j] * basis[base + d + j * d + v]));
-      }
-      outView.setUint16((e * d + v) * 2, toHalf(acc), true);
+    for (let v = 0; v < d; v++) acc[v] = basis[base + v];
+    for (let j = 0; j < m; j++) {
+      const cj = coef[j];
+      const row = base + d + j * d;
+      for (let v = 0; v < d; v++) acc[v] = acc[v] + f(cj * basis[row + v]);
+    }
+    const at = e * d;
+    if (out16) {
+      for (let v = 0; v < d; v++) out16[at + v] = acc[v];
+    } else {
+      for (let v = 0; v < d; v++)
+        outView.setUint16((at + v) * 2, toHalf(acc[v]), true);
     }
   }
   return out;
@@ -975,11 +995,12 @@ export function decodeAthcSection(
 ): Uint8Array {
   if (encoding === 0) return bytes;
   if (encoding === ATHC_ENCODING_CPCA) {
-    return decodeAthcCpca(
-      bytes,
-      n,
-      arrays.reduce((t, w) => t + w, 0),
-    );
+    const words = arrays.reduce((t, w) => t + w, 0);
+    // The WASM decoder where it is up (the same halves, several times
+    // faster: a TX 112 chunk of 65 536 in ~35 ms rather than ~200).
+    return wasm.isInitialized()
+      ? athc_decode_cpca(bytes, n, words)
+      : decodeAthcCpca(bytes, n, words);
   }
   if (encoding !== 1 && encoding !== 2) {
     throw new Error(`.athc v3: section encoding ${encoding}`);

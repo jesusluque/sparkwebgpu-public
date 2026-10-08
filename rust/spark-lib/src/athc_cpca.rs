@@ -441,12 +441,13 @@ fn clusters_of(x: &[f32], d: usize, k: usize, ids: &[u8]) -> Vec<Cluster> {
 /// The f32 reconstruction both decoders compute (see the module's comment).
 #[inline]
 fn reconstruct(mean: &[f32], dirs: &[f32], coef: &[f32], d: usize, out: &mut [f32]) {
-    for v in 0..d {
-        let mut acc = mean[v];
-        for (j, &c) in coef.iter().enumerate() {
-            acc += c * dirs[j * d + v];
+    // Direction by direction (each value's sums in the same order as one
+    // value at a time; this way round they vectorize).
+    out[..d].copy_from_slice(&mean[..d]);
+    for (j, &c) in coef.iter().enumerate() {
+        for (o, &b) in out[..d].iter_mut().zip(&dirs[j * d..(j + 1) * d]) {
+            *o += c * b;
         }
-        out[v] = acc;
     }
 }
 

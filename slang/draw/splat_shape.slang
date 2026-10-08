@@ -161,6 +161,27 @@ void surfelBox(SurfelRows r, float stdDev, out float2 lo, out float2 hi) {
     }
 }
 
+// A surfel's quad on screen, in pixels from the bottom-left corner (y up):
+// surfelBox, its corners snapped outwards to a sixteenth of a pixel. The
+// raster's snap of vertex positions (any 4+ subpixel bits) leaves those
+// where they are, so the quad's interpolated offset is exact (unsnapped it
+// is off by up to a 512th of a pixel, which a disc near edge-on turns into
+// ~2e-3 of alpha); and the tile rasterizer covers the same pixels.
+void surfelQuad(SurfelRows rows, float adjustedStdDev, out float2 lo, out float2 hi) {
+    float2 boxLo, boxHi;
+    surfelBox(rows, adjustedStdDev, boxLo, boxHi);
+    const float2 c = float2(rows.x.z, rows.y.z);
+    const float2 middle = 0.5 * float2(params.renderWidth, params.renderHeight);
+    lo = floor((middle + (c + boxLo) / params.focalAdjustment) * 16.0) / 16.0;
+    hi = ceil((middle + (c + boxHi) / params.focalAdjustment) * 16.0) / 16.0;
+}
+
+// The offset in surfel pixels from a surfel's centre `c` of the screen
+// point `p` (pixels from the bottom-left, y up), as surfelRadius2 takes it.
+float2 surfelOffset(float2 p, float2 c) {
+    return (p - 0.5 * float2(params.renderWidth, params.renderHeight)) * params.focalAdjustment - c;
+}
+
 // The surfel pixels per unit of ndc: scaledRenderSize / 2.
 float2 surfelPixelScale() {
     return 0.5 * float2(params.renderWidth, params.renderHeight) * params.focalAdjustment;

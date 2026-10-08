@@ -691,7 +691,10 @@ const PCT = {
   "spark-renderer:plain": 0.82,
   "spark-renderer:cov": 0.82,
   "spark-renderer:accum-ext": 0.8,
-  "spark-renderer:2dgs": 0.85,
+  // Surfels are exact 2DGS discs with Huang's screen filter in WebGPU
+  // (wt-surfel-draw), WebGL's 2DGS quads have none: edge-on and small
+  // discs differ by design (4.08% measured).
+  "spark-renderer:2dgs": 6.2,
   "spark-renderer:source": 0.82,
   "spark-renderer:msaa-target": 0.85,
   "spark-renderer:views": 1.82,
@@ -727,7 +730,7 @@ const MEAN = {
   "spark-renderer:plain": 0.57,
   "spark-renderer:cov": 0.59,
   "spark-renderer:accum-ext": 0.54,
-  "spark-renderer:2dgs": 0.74,
+  "spark-renderer:2dgs": 2.35, // exact surfels vs WebGL's 2DGS quads: 1.56 measured
   "spark-renderer:source": 0.57,
   "spark-renderer:msaa-target": 0.57,
   "spark-renderer:views": 1.13,

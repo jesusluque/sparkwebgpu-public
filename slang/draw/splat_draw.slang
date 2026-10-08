@@ -81,16 +81,9 @@ SplatVertex emptySplatVertex() {
 // depth (as the 3D quads), the offset from the centre as splatUv.
 void surfelCorner(inout SplatVertex o, float2 corner, SurfelRows rows, float adjustedStdDev, float ndcDepth) {
     float2 lo, hi;
-    surfelBox(rows, adjustedStdDev, lo, hi);
+    surfelQuad(rows, adjustedStdDev, lo, hi);
     const float2 c = float2(rows.x.z, rows.y.z);
-    // The corner outwards onto a sixteenth of a pixel, which the raster's
-    // snap of vertex positions leaves where it is (any 4+ subpixel bits):
-    // else the interpolated offset is off by up to a 512th of a pixel,
-    // which a disc near edge-on turns into ~2e-3 of alpha.
-    const float2 size = float2(params.renderWidth, params.renderHeight);
-    const float2 fb = 0.5 * size + (c + lerp(lo, hi, corner * 0.5 + 0.5)) / params.focalAdjustment;
-    const float2 snapped = (corner > float2(0.0) ? ceil(fb * 16.0) : floor(fb * 16.0)) / 16.0;
-    const float2 d = (snapped - 0.5 * size) * params.focalAdjustment - c;
+    const float2 d = surfelOffset(corner > float2(0.0) ? hi : lo, c);
     const float w = rows.w.z;
     const float2 ndc = (c + d) / surfelPixelScale();
     o.position = float4(ndc * w, ndcDepth * w, w);

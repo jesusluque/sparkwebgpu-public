@@ -222,8 +222,8 @@ export interface WgpuSplatRendererOptions {
    * Project each sorted splat once, in a compute pass after the sort
    * (draw/splat_draw.slang projectSplats), and have the quads' vertices read
    * that record, instead of projecting it in each of its four vertices.
-   * Same image. Applies to the GPU sort's quad draw (not 2DGS, attribute
-   * draw stages or the tile rasterizer) while the records (64 B a splat)
+   * Same image. Applies to the GPU sort's quad draw, surfels included (not
+   * attribute draw stages or the tile rasterizer) while the records (64 B a splat)
    * fit one storage binding. Default false: on an Apple GPU (Chrome) the
    * draw took as long either way (the quads' raster, not their vertex
    * shading, is what costs; docs/docs/webgpu-performance-audit.md), and the
@@ -285,7 +285,7 @@ export interface WgpuSplatRendererOptions {
    * quads blended back to front. "tiles" (experimental): a compute tile
    * rasterizer (TileRasterizer) blending each 16 x 16 tile front to back,
    * stopping where transmittance drops under 1/255, then composited. Needs
-   * the GPU sort; 2DGS, draw stages and renderInPass stay on hardware.
+   * the GPU sort; draw stages and renderInPass stay on hardware.
    * "auto": whichever of the two the GPU draws faster, timed with timestamp
    * queries and re-probed now and then (AutoRasterizer); hardware without
    * the timestamp-query feature. stats.rasterizer says which drew.

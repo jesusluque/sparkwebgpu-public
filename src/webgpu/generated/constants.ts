@@ -263,4 +263,5 @@ export const tilesTileRaster = {
   RANGE_ROUNDS: 8,
   TILE_DEPTH_TEST: 1,
   TILE_CLAMP: 2,
+  TILE_SPLAT_WORDS: 3,
 } as const;

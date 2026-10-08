@@ -301,10 +301,44 @@ describe.skipIf(!device)("surfels", () => {
     expect(diff).toBeGreaterThan(1e-3);
   });
 
+  it("draws an additive surfel: its light, covering nothing", async () => {
+    const a = new Uint32Array(4);
+    const b = new Uint32Array(4);
+    encodeSurfel(
+      [a, b],
+      0,
+      [0, 0, 0],
+      0.22,
+      0.13,
+      [0, 0, 0, 1],
+      [1, 0.5, 0.25, 0.9],
+    );
+    // generate's GEN_ADDITIVE mark: alpha word's high half 1.0.
+    a[3] = (a[3] & 0xffff) | (0x3c00 << 16);
+    const words = new Uint32Array(8);
+    words.set(a, 0);
+    words.set(b, 4);
+    const center = new THREE.Vector3(0, 0, -2.5);
+    const px = await renderOne(
+      words,
+      tilt(1, center),
+      center,
+      DRAW_EXT | DRAW_2DGS,
+    );
+    let lit = 0;
+    for (let i = 0; i < SIZE * SIZE; i++) {
+      if (px[4 * i] > 0) {
+        lit++;
+        expect(px[4 * i + 3]).toBe(0);
+      }
+    }
+    expect(lit).toBeGreaterThan(50);
+  });
+
   // A mixed cloud: surfels at every angle among 3D splats.
   const W = 160;
   const H = 96;
-  function mixed(count: number) {
+  function mixed(count: number, surfelsOnly = false) {
     const a = new Uint32Array(count * 4);
     const b = new Uint32Array(count * 4);
     let s = 11;
@@ -320,7 +354,7 @@ describe.skipIf(!device)("surfels", () => {
       const sc = big ? 0.15 + 0.2 * rnd() : 0.01 + 0.05 * rnd();
       const center = [2 * rnd() - 1, 2 * rnd() - 1, 2 * rnd() - 1];
       const rgba = [rnd(), rnd(), rnd(), 0.2 + 0.8 * rnd()];
-      if (i % 2 === 0) {
+      if (surfelsOnly || i % 2 === 0) {
         encodeSurfel([a, b], i, center, sc, sc * (0.2 + rnd()), q, rgba);
       } else {
         encodeExtSplat(
@@ -356,6 +390,8 @@ describe.skipIf(!device)("surfels", () => {
   async function renderMixed(
     options: WgpuSplatRendererOptions,
     stats?: (s: WgpuSplatRenderer["stats"]) => void,
+    count = 6000,
+    surfelsOnly = false,
   ): Promise<Float32Array> {
     const color = d.createTexture({
       size: [W, H],
@@ -384,7 +420,7 @@ describe.skipIf(!device)("surfels", () => {
       alwaysGenerate: true,
       ...options,
     });
-    splats.add(mixed(6000));
+    splats.add(mixed(count, surfelsOnly));
     for (let frame = 0; frame < 3; frame++) {
       const enc = d.createCommandEncoder();
       enc
@@ -461,13 +497,39 @@ describe.skipIf(!device)("surfels", () => {
     expect(compare(vertex, ewa).mean).toBeGreaterThan(1e-4);
   });
 
-  it("tiles draw a mixed cloud as the quads do", async () => {
-    const hw = await renderMixed({ rasterizer: "hardware" });
-    const tiles = await renderMixed({ rasterizer: "tiles" }, (s) =>
-      expect(s.rasterizer).toBe("tiles"),
+  it("tiles draw surfels as the quads do", async () => {
+    // A few surfels, mostly apart: each pixel blends once or twice, so the
+    // quads' half-float blend rounds about as the tiles' single store.
+    const hw = await renderMixed(
+      { rasterizer: "hardware" },
+      undefined,
+      60,
+      true,
     );
-    const { mean, max } = compare(hw, tiles);
-    if (process.env.SURFEL_LOG) console.log("tiles", mean * 255, max * 255);
-    expect(max).toBeLessThan(0.5 / 255);
+    const tiles = await renderMixed(
+      { rasterizer: "tiles" },
+      (s) => expect(s.rasterizer).toBe("tiles"),
+      60,
+      true,
+    );
+    const sparse = compare(hw, tiles);
+    // A dense mixed cloud: the quads round to half floats at every blend.
+    const dense = compare(
+      await renderMixed({ rasterizer: "hardware" }),
+      await renderMixed({ rasterizer: "tiles" }),
+    );
+    if (process.env.SURFEL_LOG)
+      console.log(
+        "tiles sparse",
+        sparse.mean * 255,
+        sparse.max * 255,
+        "dense",
+        dense.mean * 255,
+        dense.max * 255,
+      );
+    expect(sparse.max).toBeLessThan(0.5 / 255);
+    // As tiles.test.ts's float target.
+    expect(dense.mean).toBeLessThan(0.25 / 255);
+    expect(dense.max).toBeLessThan(4 / 255);
   });
 });

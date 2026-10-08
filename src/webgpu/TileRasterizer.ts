@@ -103,7 +103,8 @@ export class TileRasterizer {
     for (const b of [this.tileSplats, this.tileExtra, this.tileRects])
       b?.destroy();
     for (const b of this.scanLevels) b.destroy();
-    this.tileSplats = createStorage(this.device, n * 32, "tile splats");
+    // TILE_SPLAT_WORDS uint4 a slot (a surfel needs the third).
+    this.tileSplats = createStorage(this.device, n * 48, "tile splats");
     this.tileExtra = createStorage(this.device, n * 16, "tile extra");
     this.tileRects = createStorage(this.device, n * 8, "tile rects");
     this.scanLevels = createScanLevels(this.device, n, "tile counts");

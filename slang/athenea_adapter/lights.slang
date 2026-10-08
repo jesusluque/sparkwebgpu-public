@@ -312,6 +312,13 @@ public struct AtheneaLightsColour : ISplatColour {
             n = unpackNormal(readAttribU(atheneaLightsPool, normalId, i.index, 0u));
         }
         const float3 dir = normalize(x - i.viewObject);
+        // A thin sheet of glass the relight drew at athenea's sheet alpha
+        // (kSheetAlpha 0.1, its colour scaled by alphaOwn / 0.1 to keep
+        // alpha x colour): athenea adds the lamps before that scale
+        // (splat_project: colour += lampLight, then colour *= alphaOwn /
+        // alpha), so the sheet's own lamp light is scaled the same way.
+        const float own = max(min(i.splat.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
+        const float sheetScale = (rgba.a == 0.1 && i.splat.rgba.a != rgba.a && own < 0.1) ? own / 0.1 : 1.0;
         for (uint g = 0; g < groups; ++g) {
             const float3 w = atheneaLights.weights[g].rgb;
             if (all(w == float3(0.0))) {
@@ -330,7 +337,7 @@ public struct AtheneaLightsColour : ISplatColour {
             if ((terms & kLightsField) != 0u) {
                 add += athlField(g, v, dir);
             }
-            light += w * add;
+            light += sheetScale * w * add;
         }
         return float4(pow(max(light, float3(0.0)), float3(1.0 / 2.2)), rgba.a);
     }

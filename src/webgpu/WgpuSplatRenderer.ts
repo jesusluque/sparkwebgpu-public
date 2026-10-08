@@ -101,6 +101,8 @@ const {
   DRAW_ENCODE_LINEAR,
   DRAW_PREMULTIPLIED,
   DRAW_DISK_CLIP,
+  DRAW_ADDITIVE_ONLY,
+  DRAW_NO_ADDITIVE,
 } = drawSplatShape;
 
 /** A portal disk in view space that clips the splats (WgpuSplatRenderer.diskClip). */
@@ -361,6 +363,8 @@ export class WgpuSplatRenderer {
     rasterizer: "hardware" as RasterPath,
     /** rasterizer "auto": its choice and timings. */
     auto: null as AutoRasterizerState | null,
+    /** The last draw drew additive splats as a layer of their own. */
+    additiveLayer: false,
   };
   options: Required<WgpuSplatRendererOptions>;
   /** What the device allows; consulted for the sort path and sizes. */
@@ -401,6 +405,9 @@ export class WgpuSplatRenderer {
   private stale = false;
   private dirty = true;
   private drawUniform: GPUBuffer;
+  private additiveUniform?: GPUBuffer;
+  private additiveLayer?: GPUTexture;
+  private additiveAdd = new Map<string, GPURenderPipeline>();
   /** Single-sample copies of multisampled targets' depth (render()). */
   private depthResolve?: DepthResolve;
   /** The projector's records (projectOnce), PROJECTED_BYTES a slot. */
@@ -919,6 +926,29 @@ export class WgpuSplatRenderer {
       this.generateAll(encoder, camera, cameraPos, cameraDir);
       readback = this.sortPending ? null : this.copyMetric(encoder, total);
     }
+    // Additive splats as a layer of their own (drawAdditiveLayer), drawn
+    // now without the scene's depth (three's pass has not run yet), added
+    // in three's pass before the other splats.
+    const additiveLayer =
+      gpu &&
+      !target.layer &&
+      !this.written.packed &&
+      this.meshes.some((m) => this.isAdditive(m));
+    this.stats.additiveLayer = additiveLayer;
+    const pixelKernels = this.plugins?.pixelKernels(this.device) ?? null;
+    if (additiveLayer) {
+      this.drawAdditiveLayer(
+        encoder,
+        target,
+        undefined,
+        null,
+        camera,
+        target.linear && !target.layer,
+        projected ? "splatVertexProjected" : "splatVertex",
+        projected,
+        pixelKernels,
+      );
+    }
     const version = this.mappingVersion;
     this.submit(encoder);
     if (readback) this.sortFrom(readback, total, version);
@@ -934,7 +964,17 @@ export class WgpuSplatRenderer {
       target.width,
       target.height,
       target.linear && !target.layer,
+      additiveLayer ? DRAW_NO_ADDITIVE : 0,
     );
+    if (additiveLayer) {
+      this.addAdditiveLayer(
+        pass,
+        target.format,
+        target.extraFormats ?? [],
+        target.depthFormat ?? null,
+        target.sampleCount,
+      );
+    }
     const depthFormat = this.options.depthTest ? target.depthFormat : null;
     const pixel = this.plugins?.pixelKernels(this.device) ?? null;
     const module = pixel?.draw ?? drawModule;
@@ -1178,9 +1218,7 @@ export class WgpuSplatRenderer {
     if (source.format === "ext") flags |= GEN_SRC_EXT;
     if (out.lod) flags |= GEN_USE_LOD;
     if (out.lod && mesh.lodFaded) flags |= GEN_LOD_FADE;
-    const additive =
-      mesh.additive ?? (mesh.object as { additive?: boolean }).additive;
-    if (additive && !out.packed) flags |= GEN_ADDITIVE;
+    if (this.isAdditive(mesh) && !out.packed) flags |= GEN_ADDITIVE;
     if (source.lodOpacity) flags |= GEN_LOD_OPACITY;
     if (this.options.sortRadial) flags |= GEN_SORT_RADIAL;
     if (dyno && mesh.dyno?.generator) flags |= GEN_DYNO_SOURCE;
@@ -1523,8 +1561,18 @@ export class WgpuSplatRenderer {
       linear && !layer,
     );
     this.tiles?.poll();
-    const either = gpu && !variant && !this.options.enable2DGS;
+    // Additive splats are drawn as a layer of their own (drawAdditiveLayer):
+    // the quad draw only. A draw variant (attribute targets) draws the rest;
+    // the layer has the colour alone.
+    const additiveLayer =
+      gpu &&
+      !layer &&
+      !this.written.packed &&
+      this.meshes.some((m) => this.isAdditive(m));
+    const either =
+      gpu && !variant && !this.options.enable2DGS && !additiveLayer;
     const path = either ? this.rasterPath() : "hardware";
+    this.stats.additiveLayer = additiveLayer;
     // Times the draw for rasterizer "auto" (options.profile times it anyway).
     let drawEnd: GPURenderPassTimestampWrites | undefined;
     if (either && this.autoTimer && !this.options.profile) {
@@ -1549,6 +1597,29 @@ export class WgpuSplatRenderer {
         ? this.encodeProject(encoder, gpuSorted as number, drawParams)
         : null;
     const vertex = projected ? "splatVertexProjected" : "splatVertex";
+    if (additiveLayer) {
+      this.drawAdditiveLayer(
+        encoder,
+        target,
+        depthView,
+        depthFormat,
+        camera,
+        linear,
+        vertex,
+        projected,
+        pixel,
+      );
+      // The layer's light added to the frame (its own coverage dropped).
+      const composite = encoder.beginRenderPass({
+        label: "additive splats add",
+        colorAttachments: [
+          { view: target.createView(), loadOp: "load", storeOp: "store" },
+        ],
+      });
+      this.addAdditiveLayer(composite, target.format, [], null, 1);
+      composite.end();
+      this.writeDrawParams(camera, size.x, size.y, linear, DRAW_NO_ADDITIVE);
+    }
     const timestampWrites = this.timestampWrites("draw") ?? drawEnd;
     const rp =
       variant?.pipeline ??
@@ -1686,11 +1757,166 @@ export class WgpuSplatRenderer {
   }
 
   // The draw uniforms for this camera and target size.
+  /** Whether `mesh`'s splats are additive (WgpuSplatMesh.additive). */
+  private isAdditive(mesh: WgpuSplatMesh): boolean {
+    return Boolean(
+      mesh.additive ?? (mesh.object as { additive?: boolean }).additive,
+    );
+  }
+
+  /**
+   * The additive splats' layer (athenea's light catcher): drawn alone into
+   * a cleared float target, blended among themselves as any splats (each
+   * covers the additive splats behind it), and that layer added to the
+   * frame before the other splats are drawn over it. A light catcher lies
+   * on the floor under everything else, so the rest covering the sum is
+   * athenea's blend (splat_blend.slang's lampTransmittance).
+   */
+  private drawAdditiveLayer(
+    encoder: GPUCommandEncoder,
+    target: { width: number; height: number },
+    depthView: GPUTextureView | undefined,
+    depthFormat: GPUTextureFormat | null,
+    camera: THREE.Camera,
+    linear: boolean,
+    vertex: string,
+    projected: GPUBuffer | null,
+    pixel: { draw?: KernelModule; buffers?: Record<string, GPUBuffer> } | null,
+  ) {
+    const size = [target.width, target.height];
+    const format: GPUTextureFormat = "rgba16float";
+    if (
+      !this.additiveLayer ||
+      this.additiveLayer.width !== size[0] ||
+      this.additiveLayer.height !== size[1]
+    ) {
+      this.additiveLayer?.destroy();
+      this.additiveLayer = this.device.createTexture({
+        label: "additive splats layer",
+        size,
+        format,
+        usage:
+          GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+    }
+    this.additiveUniform ??= createUniform(
+      this.device,
+      UniformWriter.for(drawModule).data.byteLength,
+      "splat draw params (additive layer)",
+    );
+    this.writeDrawParams(
+      camera,
+      size[0],
+      size[1],
+      linear,
+      DRAW_ADDITIVE_ONLY,
+      this.additiveUniform,
+    );
+    const rp = this.pipeline(format, depthFormat, false, pixel?.draw, vertex);
+    const groups = createBindGroups(this.device, rp, {
+      ordering: this.sorter.ordering,
+      ...(projected ? { projected } : {}),
+      splats: this.accumulator as GPUBuffer,
+      params: this.additiveUniform,
+      ...pixel?.buffers,
+    });
+    const pass = encoder.beginRenderPass({
+      label: "additive splats",
+      colorAttachments: [
+        {
+          view: this.additiveLayer.createView(),
+          loadOp: "clear",
+          clearValue: [0, 0, 0, 0],
+          storeOp: "store",
+        },
+      ],
+      depthStencilAttachment: depthView
+        ? depthTestAttachment(depthView, depthFormat)
+        : undefined,
+    });
+    pass.setPipeline(rp.pipeline);
+    groups.forEach((g, i) => pass.setBindGroup(i, g));
+    pass.drawIndirect(this.sorter.drawArgs, 0);
+    pass.end();
+  }
+
+  /**
+   * Adds the additive layer's light (drawAdditiveLayer's texture) in `pass`:
+   * a full-screen draw blending one, one into the colour, its alpha and
+   * the other attachments untouched (renderInPass draws it in three's
+   * pass, before the splats).
+   */
+  private addAdditiveLayer(
+    pass: GPURenderPassEncoder,
+    format: GPUTextureFormat,
+    extraFormats: GPUTextureFormat[],
+    depthFormat: GPUTextureFormat | null,
+    samples: number,
+  ) {
+    if (!this.additiveLayer) return;
+    const key = [format, ...extraFormats, depthFormat, samples].join("/");
+    let add = this.additiveAdd.get(key);
+    if (!add) {
+      const module = this.device.createShaderModule({
+        label: "additive layer add",
+        code: /* wgsl */ `
+@group(0) @binding(0) var layer: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  return vec4f(textureLoad(layer, vec2u(p.xy), 0).rgb, 0.0);
+}`,
+      });
+      add = this.device.createRenderPipeline({
+        label: "additive layer add",
+        layout: "auto",
+        vertex: { module, entryPoint: "vs" },
+        fragment: {
+          module,
+          entryPoint: "fs",
+          targets: [
+            {
+              format,
+              blend: {
+                color: { srcFactor: "one", dstFactor: "one" },
+                alpha: { srcFactor: "zero", dstFactor: "one" },
+              },
+            },
+            ...extraFormats.map((f) => ({ format: f, writeMask: 0 })),
+          ],
+        },
+        depthStencil: depthFormat
+          ? {
+              format: depthFormat,
+              depthWriteEnabled: false,
+              depthCompare: "always",
+            }
+          : undefined,
+        multisample: { count: samples },
+        primitive: { topology: "triangle-list" },
+      });
+      this.additiveAdd.set(key, add);
+    }
+    pass.setPipeline(add);
+    pass.setBindGroup(
+      0,
+      this.device.createBindGroup({
+        layout: add.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: this.additiveLayer.createView() }],
+      }),
+    );
+    pass.draw(3);
+  }
+
   private writeDrawParams(
     camera: THREE.Camera,
     width: number,
     height: number,
     linear: boolean,
+    extraFlags = 0,
+    buffer: GPUBuffer = this.drawUniform,
   ) {
     this.lastDrawSize = { width, height };
     const view = camera.matrixWorldInverse;
@@ -1740,9 +1966,10 @@ export class WgpuSplatRenderer {
         (disk ? DRAW_DISK_CLIP : 0) |
         ((camera as THREE.OrthographicCamera).isOrthographicCamera
           ? DRAW_ORTHOGRAPHIC
-          : 0),
+          : 0) |
+        extraFlags,
     });
-    this.device.queue.writeBuffer(this.drawUniform, 0, params.data);
+    this.device.queue.writeBuffer(buffer, 0, params.data);
     return params.data;
   }
 
@@ -1753,6 +1980,8 @@ export class WgpuSplatRenderer {
     this.ordering?.destroy();
     this.projected?.destroy();
     this.drawUniform.destroy();
+    this.additiveUniform?.destroy();
+    this.additiveLayer?.destroy();
     this.emptyBuffer.destroy();
     this.sorter.destroy();
     this.srgb?.dispose();

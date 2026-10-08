@@ -54,6 +54,13 @@ struct SplatVertex {
 
 static const float2 CORNERS[4] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0), float2(1.0, 1.0) };
 
+// Whether this pass leaves the splat out (DRAW_ADDITIVE_ONLY /
+// DRAW_NO_ADDITIVE; alpha's sign is the additive mark, markedRgba).
+bool layerDrops(float markedAlpha) {
+    const bool additive = markedAlpha < 0.0;
+    return (hasFlag(DRAW_ADDITIVE_ONLY) && !additive) || (hasFlag(DRAW_NO_ADDITIVE) && additive);
+}
+
 // The stages as plain functions, for draw variants to call (slangc hangs
 // calling an entry point from another).
 SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
@@ -75,6 +82,10 @@ SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
         return o;
     }
     o.rgba = markedRgba(s);
+    if (layerDrops(o.rgba.a)) {
+        o.rgba = float4(0.0);
+        return o;
+    }
     o.splatUv = corner * s.adjustedStdDev;
     o.adjustedStdDev = s.adjustedStdDev;
     o.splatIndex = splatIndex;
@@ -149,6 +160,10 @@ SplatVertex projectedSplatVertex(uint vertexId, uint instanceId) {
     float4 axes = asfloat(projected[b + 2u]);
     float adjustedStdDev = asfloat(e.x);
     o.rgba = asfloat(projected[b + 1u]);
+    if (layerDrops(o.rgba.a)) {
+        o.rgba = float4(0.0);
+        return o;
+    }
     o.splatUv = corner * adjustedStdDev;
     o.adjustedStdDev = adjustedStdDev;
     o.splatIndex = e.y;
@@ -176,7 +191,9 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     if (hasFlag(DRAW_ENCODE_LINEAR)) {
         rgba.rgb = srgbToLinear(rgba.rgb);
     }
-    const float cover = additive ? 0.0 : rgba.a;
+    // In its own layer (DRAW_ADDITIVE_ONLY) an additive splat covers the
+    // additive splats behind it: the layer is their composite.
+    const float cover = additive && !hasFlag(DRAW_ADDITIVE_ONLY) ? 0.0 : rgba.a;
     return hasFlag(DRAW_PREMULTIPLIED) ? float4(rgba.rgb * rgba.a, cover) : float4(rgba.rgb, cover);
 }
 

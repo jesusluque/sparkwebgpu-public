@@ -1,8 +1,8 @@
 // Additive splats (SplatMesh.additive / WgpuSplatMesh.additive, generate's
-// GEN_ADDITIVE): their light is added and nothing behind them is covered,
-// in the quad draw and in the tile rasterizer. A dark splat behind a lit one
-// shows through it unchanged; the lit one's own light is the same as drawn
-// normally (c x alpha), only the cover is gone.
+// GEN_ADDITIVE), athenea's light catcher: drawn as a layer of their own
+// (the quad draw; the tile rasterizer hands such a frame to it), blended
+// among themselves as any splats, the layer's light added to the frame
+// with nothing covered, and the other splats drawn over it.
 
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
@@ -83,11 +83,12 @@ describe.skipIf(!device)("additive splats", () => {
   camera.updateProjectionMatrix();
   camera.updateMatrixWorld();
 
-  /** The centre pixel of the scene: `back` (normal), `front` (additive or not). */
-  async function render(
-    options: WgpuSplatRendererOptions,
-    parts: { back?: boolean; front?: boolean; additive?: boolean },
-  ) {
+  const FRONT = { z: 0.5, r: 0.3, c: [0.9, 0.5, 0.1], a: 0.8 };
+  const BACK = { z: -0.5, r: 0.6, c: [0.05, 0.4, 0.05], a: 0.9 };
+  type Part = typeof FRONT & { additive?: boolean };
+
+  /** The centre pixel of the scene drawn from `parts`. */
+  async function render(options: WgpuSplatRendererOptions, parts: Part[]) {
     const renderer = {
       backend: {
         isWebGPUBackend: true,
@@ -103,10 +104,9 @@ describe.skipIf(!device)("additive splats", () => {
       hdr: true,
       ...options,
     });
-    if (parts.back) splats.add(splat(-0.5, 0.6, [0.05, 0.4, 0.05], 0.9));
-    if (parts.front) {
-      const mesh = splats.add(splat(0.5, 0.3, [0.9, 0.5, 0.1], 0.8));
-      mesh.additive = parts.additive ?? false;
+    for (const p of parts) {
+      const mesh = splats.add(splat(p.z, p.r, p.c, p.a));
+      mesh.additive = p.additive ?? false;
     }
     for (let f = 0; f < 3; f++) {
       const enc = d.createCommandEncoder();
@@ -131,25 +131,39 @@ describe.skipIf(!device)("additive splats", () => {
     return px;
   }
 
+  // The tile rasterizer hands a frame with additive splats to the quads.
   for (const rasterizer of ["hardware", "tiles"] as const) {
-    it(`adds light and covers nothing (${rasterizer})`, async () => {
+    it(`adds its light, blends with its own kind, is covered by the rest (${rasterizer})`, async () => {
       const o: WgpuSplatRendererOptions = { rasterizer };
-      const normal = await render(o, { front: true });
-      const added = await render(o, { front: true, additive: true });
-      // Drawn normally: B (1 - a) + c a; additive: B + c a.
-      const c = [0.9, 0.5, 0.1];
-      const a = (normal[0] - B[0]) / (c[0] - B[0]);
-      expect(a).toBeGreaterThan(0.3);
+      const add = (p: Part) => ({ ...p, additive: true });
+      // Each one's coverage at the centre, from its normal draw over B.
+      const coverage = async (p: Part) => {
+        const px = await render(o, [p]);
+        return (px[0] - B[0]) / (p.c[0] - B[0]);
+      };
+      const a1 = await coverage(FRONT);
+      const a2 = await coverage(BACK);
+      expect(a1).toBeGreaterThan(0.3);
+      expect(a2).toBeGreaterThan(0.3);
+      // Alone: B + c a (nothing covered).
+      const alone = await render(o, [add(FRONT)]);
       for (let k = 0; k < 3; k++)
-        expect(added[k]).toBeCloseTo(B[k] + c[k] * a, 2);
-      // A splat behind shows through unchanged, plus the light.
-      const back = await render(o, { back: true });
-      const both = await render(o, { back: true, front: true, additive: true });
+        expect(alone[k]).toBeCloseTo(B[k] + FRONT.c[k] * a1, 2);
+      // Two additive ones blend among themselves (athenea's light catcher:
+      // the front covers the back), then add: B + c1 a1 + (1 - a1) c2 a2.
+      const pair = await render(o, [add(FRONT), add(BACK)]);
       for (let k = 0; k < 3; k++)
-        expect(both[k]).toBeCloseTo(back[k] + c[k] * a, 2);
-      // Not additive, the front one covers it.
-      const covered = await render(o, { back: true, front: true });
-      expect(covered[1]).toBeLessThan(both[1] - 0.05);
+        expect(pair[k]).toBeCloseTo(
+          B[k] + FRONT.c[k] * a1 + (1 - a1) * BACK.c[k] * a2,
+          2,
+        );
+      // A normal splat covers the layer: front over (B + c2 a2).
+      const covered = await render(o, [FRONT, add(BACK)]);
+      for (let k = 0; k < 3; k++)
+        expect(covered[k]).toBeCloseTo(
+          (B[k] + BACK.c[k] * a2) * (1 - a1) + FRONT.c[k] * a1,
+          2,
+        );
     });
   }
 });

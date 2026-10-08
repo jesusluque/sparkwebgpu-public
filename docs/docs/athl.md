@@ -355,15 +355,24 @@ athc-convert car.athc light.athc --gzip --keep-splats 1000000 --creases 0.03 \
   (`host.disable(relight.id, mesh)`: per-asset settings take the SplatMesh)
   so only the lamps light it, and hides it with the ground.
   athenea's raster composites a catcher's gaussians among themselves
-  (`lampTransmittance`, splat_blend.slang): the light is the patch's
-  coverage, not the sum of its ~6 overlapping footprints that an additive
-  draw adds. `usd-athc --light-additive` multiplies each splat's light by
-  its share `coverage / sum` at its centre (`athl::additive_shares`; merged
-  nodes keep the plain mean, their LoD opacity is already a coverage).
-  Measured on the Corvette's floor against the per-pixel expectation from
-  the data: additive sum 4.41e-2 predicted, 4.50e-2 drawn; composite
-  7.04e-3 predicted, 5.78e-3 drawn with the shares. A layer can also be
-  read from athenea's native cloud: `--light-layer g=file.usdc#athenea:splat:lightLayer:g`.
+  (`lampTransmittance`, splat_blend.slang), so the renderer draws additive
+  splats as a layer of their own: a pass of them alone (DRAW_ADDITIVE_ONLY)
+  into a cleared float texture, blended as any splats; that layer's light
+  added to the frame (alpha untouched); the other splats drawn over it
+  (DRAW_NO_ADDITIVE). In three's pass (renderInPass) the layer is drawn
+  before it, without the scene's depth, and added in it before the splats.
+  A frame with additive splats takes the quad draw (not the tiles).
+  Against athenea's day render, lamp-only, front floor: 0.86 of athenea
+  (2.14 summed); at pixel (63, 719) 0.0935 against athenea's 0.104 and
+  0.091 predicted from the data by its blend. `usd-athc --light-additive`
+  (`athl::additive_shares`, coverage / sum at each splat's centre) is the
+  view-independent approximation for a renderer without the layer; unused.
+  A layer can also be read from athenea's native cloud:
+  `--light-layer g=file.usdc#athenea:splat:lightLayer:g`.
+- **Glass.** athenea adds the lamps to a thin sheet's colour before
+  scaling it to the sheet alpha (`colour += lampLight; colour *= alphaOwn /
+  alpha`); the lights plugin scales a sheet's lamp light the same way
+  (the headlight glow was 4x athenea's, now 1.4x on the light set).
 - **Sidecar forms.** athenea's `corvette.lights.usda` writes states as
   `double athenea:lightState:target:<group>` (any prim under `LightStates`
   is a state; none: every group off) and the radiance as

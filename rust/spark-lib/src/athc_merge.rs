@@ -470,6 +470,9 @@ impl MergeTree {
                 out[id[t] as usize].push(k as u32);
             }
         }
+        for c in out.iter_mut() {
+            c.reverse();
+        }
         out
     }
 
@@ -766,7 +769,7 @@ fn hierarchy(base: Vec<Cl>, first: Option<Pool>, o: &ErrorOptions, max_levels: u
 
 /// The most groups a level may keep with `left` levels to go above it.
 fn must_reach(o: &ErrorOptions, left: usize) -> usize {
-    (o.top as f64 * 6f64.powi(left as i32)).min(1e15) as usize
+    (o.top as f64 * 3f64.powi(left as i32)).min(1e15) as usize
 }
 
 /// Codes for the base elements: the path of digits from the coarsest
@@ -1096,4 +1099,115 @@ fn widen_own(b: &mut AthcBlock, fill: f32) {
 /// The packed cloud an `.athc`'s splats are (for callers that build).
 pub fn cloud_of(file: &AthcFile) -> PackedCloud {
     packed_of(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::athc::VirtualTree;
+    use crate::athc_build::{build_lod, pack_streams, CloudStreams};
+
+    /// A folded sheet: a 60 x 60 grid of discs on the floor (normal +z,
+    /// red) and another up a wall (normal -y, blue), meeting at y = 0.
+    fn folded() -> AthcFile {
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let step = 0.01f32;
+        for face in 0..2 {
+            for a in 0..60 {
+                for b in 0..60 {
+                    let (u, v) = (a as f32 * step, (b as f32 + 0.5) * step);
+                    if face == 0 {
+                        s.positions.extend_from_slice(&[u, v, 0.0]);
+                        s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                        s.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+                        s.sh.extend_from_slice(&[1.5, -1.5, -1.5]);
+                    } else {
+                        s.positions.extend_from_slice(&[u, 0.0, v]);
+                        s.rotations.extend_from_slice(&[std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2]);
+                        s.normals.extend_from_slice(&[0.0, -1.0, 0.0]);
+                        s.sh.extend_from_slice(&[-1.5, -1.5, 1.5]);
+                    }
+                    s.scales.extend_from_slice(&[1.2 * step, 1.2 * step, 0.1 * step]);
+                    s.opacities.push(1.0);
+                    s.count += 1;
+                }
+            }
+        }
+        let p = pack_streams(&s, &BuildOptions::default()).unwrap();
+        build_lod(&p, &BuildOptions::default()).unwrap()
+    }
+
+    fn options(file: &AthcFile) -> ErrorOptions {
+        let mut o = ErrorOptions::new(ErrorView::around(file.header.bounds_min, file.header.bounds_max));
+        o.threads = 1;
+        o
+    }
+
+    fn face_of(file: &AthcFile, i: u32) -> bool {
+        unpack_normal(file.splats().normals[i as usize])[2] > 0.5
+    }
+
+    #[test]
+    fn cuts_by_error_without_crossing_the_fold() {
+        let file = folded();
+        let (cut, tree) = error_cut(&file, 1200, &options(&file)).unwrap();
+        assert_eq!(cut.header.count, 1200);
+        // Every original splat in exactly one cluster, no cluster on both faces.
+        let mut seen = vec![0u32; file.header.count as usize];
+        for list in &tree.sources {
+            let face = face_of(&file, list[0]);
+            for &i in list {
+                seen[i as usize] += 1;
+                assert_eq!(face_of(&file, i), face, "a cluster straddles the fold");
+            }
+        }
+        assert!(seen.iter().all(|&k| k == 1));
+        // A tree Spark can page, eight children at most, through v3 and back.
+        let v = VirtualTree::of_file(&cut, true).unwrap();
+        assert!(v.child_count.iter().take(v.merged as usize).all(|&c| (1..=8).contains(&c) || v.synth_root));
+        let bytes = crate::athc_v3::write_v3_full(&cut, crate::athc_v3::COMPRESSION_NONE, false, &|_| 0, None).unwrap();
+        let back = crate::athc_v3::read_v3(&bytes).unwrap();
+        assert_eq!(back.header.count, 1200);
+        // The merged splats keep the mass of what they stand for (coverage).
+        let w0: f64 = crate::athl::splat_weights(&file).iter().map(|&w| w as f64).sum();
+        let w1: f64 = crate::athl::splat_weights(&cut).iter().map(|&w| w as f64).sum();
+        assert!((w1 / w0 - 1.0).abs() < 0.02, "mass {w0} -> {w1}");
+    }
+
+    #[test]
+    fn levels_by_error_keep_every_splat() {
+        let file = folded();
+        let (out, tree) = error_levels(&file, &options(&file)).unwrap();
+        assert_eq!(out.header.count, file.header.count);
+        let mut order: Vec<u32> = tree.sources.iter().map(|l| l[0]).collect();
+        order.sort();
+        assert!(order.iter().enumerate().all(|(k, &i)| k as u32 == i));
+        let v = VirtualTree::of_file(&out, true).unwrap();
+        let first_merged = if v.synth_root { 1 } else { 0 };
+        for k in first_merged..v.level_base[v.level_base.len() - 1] as usize {
+            assert!((1..=8).contains(&v.child_count[k]), "node {k}: {} children", v.child_count[k]);
+        }
+        // The finest groups stay on one face.
+        let n = out.header.count as usize;
+        for g in 0..out.starts.len() {
+            let end = out.starts.get(g + 1).map_or(n, |&s| s as usize);
+            let faces: Vec<bool> = (out.starts[g] as usize..end).map(|k| face_of(&file, tree.sources[k][0])).collect();
+            assert!(faces.iter().all(|&f| f == faces[0]));
+        }
+    }
+
+    #[test]
+    fn cuts_a_merge_tree_by_its_monotone_costs() {
+        // leaves 0..4; 4 = (0, 1) at 1.0; 5 = (2, 3) at 3.0; 6 = (4, 5) at 2.0
+        // (cheaper than its child: athenea's costs are not monotone).
+        let t = MergeTree::from_parts(4, &[4, 4, 5, 5, 6, 6, 6], &[0.0, 0.0, 0.0, 0.0, 1.0, 3.0, 2.0]).unwrap();
+        assert_eq!(t.monotone_costs()[6], 3.0);
+        let mut c = t.cut(3);
+        c.sort();
+        assert_eq!(c, vec![vec![0, 1], vec![2], vec![3]]);
+        assert_eq!(t.cut(2).len(), 2);
+        assert_eq!(t.cut(1), vec![vec![0, 1, 2, 3]]);
+        assert_eq!(t.dfs_leaves(), vec![0, 1, 2, 3]);
+        assert!(MergeTree::from_parts(4, &[4, 4, 5, 5, 6, 6, 3], &[0.0; 7]).is_err());
+    }
 }

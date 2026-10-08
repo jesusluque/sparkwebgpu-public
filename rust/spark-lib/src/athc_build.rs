@@ -412,19 +412,19 @@ pub struct PackedCloud {
     pub skin_gradient_words: u32,
 }
 
-fn half_safe(v: f32) -> f32 {
+pub(crate) fn half_safe(v: f32) -> f32 {
     v.clamp(SURFEL_LN, -SURFEL_LN)
 }
 
 /// A shape word's three scales (a surfel's flat axis exactly 0).
-fn scales_of(sh: &[u32]) -> [f32; 3] {
+pub(crate) fn scales_of(sh: &[u32]) -> [f32; 3] {
     [f16_of(sh[1] & 0xffff).exp(), f16_of(sh[1] >> 16).exp(), f16_of(sh[2] & 0xffff).exp()]
 }
 
 /// A gaussian's area: its two widest scales multiplied, the mass athenea's
 /// merges weigh (`opacity x area`). Not s0 s1 s2 / min(s), which is the same
 /// for a 3D gaussian and 0 for a surfel (whose thinnest is exactly 0).
-fn disc_area(s: [f32; 3]) -> f32 {
+pub(crate) fn disc_area(s: [f32; 3]) -> f32 {
     let mut t = s;
     t.sort_by(|a, b| b.total_cmp(a));
     t[0] * t[1]
@@ -432,7 +432,7 @@ fn disc_area(s: [f32; 3]) -> f32 {
 fn f16_bits(v: f32) -> u32 {
     f16::from_f32(v).to_bits() as u32
 }
-fn f16_of(bits: u32) -> f32 {
+pub(crate) fn f16_of(bits: u32) -> f32 {
     f16::from_bits(bits as u16).to_f32()
 }
 fn saturate(v: f32) -> f32 {
@@ -850,7 +850,7 @@ pub fn morton30(unit: [f32; 3]) -> u32 {
 }
 
 /// The block's elements in `order`.
-fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
+pub(crate) fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
     let pick = |v: &Vec<u32>| -> Vec<u32> {
         if v.is_empty() {
             return Vec::new();
@@ -1265,7 +1265,7 @@ fn finalize(m: &[f32], groups: usize, l: &MomentLayout, sh_words: usize) -> Athc
 
 /// `lodExtrasMerge`: 0 the first gaussian's words, 1 f16 pairs averaged by
 /// opacity, 2 bits set where half the weight has them.
-fn extras_merge(
+pub(crate) fn extras_merge(
     source: &[u32],
     words: usize,
     mode: u32,
@@ -1379,7 +1379,7 @@ fn half_at(words: &[u32], k: usize) -> f32 {
 /// frame (`frames`: what it holds once oriented, `athc::orient_merged`).
 /// Averaging the stored halves instead mixes frames that turn: a curved
 /// panel's or a merged disc's lobes and curvature pointed anywhere.
-fn frame_merge(
+pub(crate) fn frame_merge(
     source: &[u32],
     words: usize,
     zonal: bool,
@@ -1464,7 +1464,7 @@ fn frame_merge(
 
 /// The transfer of `cloud`'s groups: zonal lobes in each one's frame
 /// (`frame_merge`), the world's harmonics by opacity (`extras_merge`).
-fn merge_transfer(transfer_count: u32, splats: &AthcBlock, starts: &[u32], frames: &AthcBlock) -> Vec<u32> {
+pub(crate) fn merge_transfer(transfer_count: u32, splats: &AthcBlock, starts: &[u32], frames: &AthcBlock) -> Vec<u32> {
     let words = splats.transfer.len() / splats.n;
     if transfer_count == 10 {
         frame_merge(&splats.transfer, words, true, starts, splats, frames)

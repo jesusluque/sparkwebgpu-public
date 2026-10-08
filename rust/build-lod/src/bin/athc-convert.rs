@@ -19,8 +19,39 @@
 //!                         the output: each element of a cut the weighted mean of the original
 //!                         splats under it, merged nodes as before; the cloud hash re-stamped
 //!   --athl-threshold T    a block is kept when a value passes T (default 0: any light)
+//!
+//! Pruning and decimating (thread BB, `spark_lib::athc_prune`), every section
+//! following the kept splats (transfer, curvature, lobes, skin, attributes)
+//! and the levels built again over them:
+//!   athc-convert in.athc out.athc --drop-hidden --camera ...      one file
+//!   athc-convert --scene OUTDIR a.athc b.athc ... --drop-hidden   files that hide each other,
+//!                         each written to OUTDIR under its own name
+//!   --drop-hidden         drop what no view of an orbit sees (CPU raster, Spark's rules): a
+//!                         splat whose centre stays under --hidden-t (0.02) of transmittance and
+//!                         that adds under --hidden-px (0.02) px over all views
+//!   --camera ex,ey,ez,tx,ty,tz,ux,uy,uz,hfov[,aspect]   the scene's camera (degrees; aspect 16/9)
+//!   --views N             directions at its distance (800), a quarter as many at half of it and
+//!                         a quarter close up (a tenth of it outside the scene's box, 100 degrees)
+//!   --vis-width W         px (800)          --sphere   views from below too (default: upper half)
+//!   --clips-json J        a skinned cloud: the clips of J (sparrow.json), only what every
+//!                         sampled pose hides is dropped (--pose-samples 6, --pose-views 48,
+//!                         --pose-width 640)
+//!   --occluder X.athc     in the scene, hiding others, not written (repeatable)
+//!   --keep PART           written but not pruned (repeatable)
+//!   --decimate PART=K[:GROW][@FILTER]   thin PART's opaque splats to about 1 in K along Morton
+//!                         runs on one panel, long axes x GROW (0.75 sqrt K); @coat: only coated
+//!                         ones; @near:REF.athc[,MM]: only those on REF's surface (within MM, 5),
+//!                         a material picked in a file of many by another bake's part
+//!   --athl PART=IN.athl   (scene) carry PART's light layers; with one file --athl/--athl-out
+//!   --check [--check-width W] [--check-dir D]   held-out views (and poses), AY's relMSE in
+//!                         float (1920); D: the views as PPM, for looking only
+//!   --report R.json       what was done, a file at a time
+//!   PART: a file's name up to its first '-' or '.' (paint-t16-gz.athc: paint)
 
 use anyhow::{bail, Context, Result};
+
+#[path = "athc-convert/prune.rs"]
+mod prune;
 use spark_lib::athl::{cloud_hash, cut_values, sparse_layers, validate, virtual_values_weighted, AthlFile};
 use spark_lib::athc_build::{build_lod, packed_of, BuildOptions};
 use spark_lib::athc::{cut_sources, truncate_creases, truncate_levels, uncap_levels, AthcFile, VirtualTree};
@@ -38,6 +69,9 @@ fn read_any(bytes: &[u8]) -> Result<AthcFile> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--scene" || a == "--drop-hidden" || a.starts_with("--decimate")) {
+        return prune::run(&args);
+    }
     let flag = |f: &str| args.iter().any(|a| a == f);
     // Paths: what is neither a flag nor a --keep-* flag's value.
     let paths: Vec<&String> = args

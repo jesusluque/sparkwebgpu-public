@@ -630,6 +630,7 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
     let mut dropped = 0;
     let mut kept: Vec<u32> = Vec::with_capacity(n);
     let mut values = vec![0.0f32; transfer_count as usize];
+    let mut turned = 0usize;
     for i in 0..n {
         let p = [
             s.positions[i * 3],
@@ -645,6 +646,27 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
             [1.0; 3]
         } else {
             [s.scales[i * 3], s.scales[i * 3 + 1], s.scales[i * 3 + 2]]
+        };
+        let q_in = if s.rotations.is_empty() {
+            [0.0, 0.0, 0.0, 1.0]
+        } else {
+            [s.rotations[i * 4], s.rotations[i * 4 + 1], s.rotations[i * 4 + 2], s.rotations[i * 4 + 3]]
+        };
+        // athenea's merged gaussians keep the moments' axis order: the
+        // normal can come first or second. Turned so it is the third, the
+        // curvature carried into the new first two axes.
+        let normal_in = if s.normals.is_empty() {
+            None
+        } else {
+            Some([s.normals[i * 3], s.normals[i * 3 + 1], s.normals[i * 3 + 2]])
+        };
+        let curv_in = if curvature { Some([s.curvature[i * 3], s.curvature[i * 3 + 1], s.curvature[i * 3 + 2]]) } else { None };
+        let (q_in, sc, curv_in) = match normal_third(q_in, sc, normal_in, curv_in) {
+            Some((q, sc, k)) => {
+                turned += 1;
+                (q, sc, k)
+            }
+            None => (q_in, sc, curv_in),
         };
         // A scale of exactly 0 is a surfel's flat axis (2DGS): kept as the
         // most negative half, which exp() decodes back to 0.
@@ -670,16 +692,7 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
             lo[k] = lo[k].min(p[k]);
             hi[k] = hi[k].max(p[k]);
         }
-        let q = if s.rotations.is_empty() {
-            [0.0, 0.0, 0.0, 1.0]
-        } else {
-            [
-                s.rotations[i * 4],
-                s.rotations[i * 4 + 1],
-                s.rotations[i * 4 + 2],
-                s.rotations[i * 4 + 3],
-            ]
-        };
+        let q = q_in;
         let q_len = q.iter().map(|v| v * v).sum::<f32>().sqrt();
         let q = if q_len > 1e-8 {
             q
@@ -783,8 +796,7 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
                 b.skin.push(s.weight_gradients[at] as u32 | (s.weight_gradients[at + 1] as u32) << 16);
             }
         }
-        if curvature {
-            let k = &s.curvature[i * 3..i * 3 + 3];
+        if let Some(k) = curv_in {
             let safe = |v: f32| if v.is_finite() { half_safe(v) } else { 0.0 };
             b.curvature.extend_from_slice(&[
                 pack_halves(safe(k[0]), safe(k[1])),
@@ -797,6 +809,12 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
     }
     if skin_out_of_range > 0 {
         eprintln!("warning: {skin_out_of_range} splats name a joint past the skeleton or a weight outside [0, 1]");
+    }
+    if turned > 0 {
+        eprintln!(
+            "{turned} gaussians turned so their normal is the third axis{}",
+            if zonal { " (warning: their transferZonal lobes are not turned)" } else { "" }
+        );
     }
     Ok((
         PackedCloud {
@@ -813,6 +831,77 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
         },
         kept,
     ))
+}
+
+/// A gaussian turned (the same gaussian) so that its third axis is its
+/// normal, pointing the same way -- what Spark's relight and athenea's own
+/// raster (splat_project) read as the normal, the first two axes the plane
+/// the curvature is in. athenea's merges (`decimate`, the merge tree) keep
+/// the moments' axis order, so a merged disc's normal is often its first or
+/// second axis, and its curvature was projected into a plane that holds the
+/// normal: carried into the new first two axes here (U S U^T), the tangent
+/// that projection lost given the curvature of the one it kept (isotropic;
+/// research/surfels-a.md). A surfel's flat axis is put third; else the axis
+/// nearest the normal, or without one the thinnest. `None` when the
+/// gaussian already is so.
+pub fn normal_third(
+    q: [f32; 4],
+    sc: [f32; 3],
+    normal: Option<[f32; 3]>,
+    curvature: Option<[f32; 3]>,
+) -> Option<([f32; 4], [f32; 3], Option<[f32; 3]>)> {
+    use glam::{Mat3, Quat, Vec3};
+    let l = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if l.is_nan() || l <= 1.0e-8 {
+        return None;
+    }
+    let m = axes_of_quaternion(q.map(|v| v / l));
+    let a = [0, 1, 2].map(|k| Vec3::new(m[0][k], m[1][k], m[2][k]));
+    let n = normal.map(Vec3::from_array).filter(|n| n.length_squared() > 1.0e-20).map(|n| n.normalize());
+    // A surfel's flat axis is its normal (surfels-web/NOTES.md).
+    let flat: Vec<usize> = (0..3).filter(|&k| sc[k] == 0.0).collect();
+    let third = match (flat.as_slice(), n) {
+        ([k], _) => *k,
+        (_, Some(n)) => (0..3).max_by(|&x, &y| a[x].dot(n).abs().total_cmp(&a[y].dot(n).abs())).unwrap(),
+        _ => shortest(sc),
+    };
+    let mut axes = a;
+    let mut s = sc;
+    if third != 2 {
+        let t = (third + 1) % 3;
+        axes = [a[t], a[(t + 1) % 3], a[(t + 2) % 3]];
+        s = [sc[t], sc[(t + 1) % 3], sc[(t + 2) % 3]];
+    }
+    let mut flipped = false;
+    if let Some(n) = n {
+        if axes[2].dot(n) < 0.0 {
+            axes[2] = -axes[2];
+            axes[0] = -axes[0];
+            flipped = true;
+        }
+    }
+    if third == 2 && !flipped {
+        return None;
+    }
+    let curvature = curvature.map(|[uu, uv, vv]| {
+        // The shape operator in the world, from the old first two axes.
+        let (u, v, w) = (a[0], a[1], a[2]);
+        // The tangent the old plane missed (the old third axis) gets the
+        // curvature of the one it kept: an isotropic guess, measured far
+        // nearer than leaving it flat.
+        let fill = match third {
+            0 => vv,
+            1 => uu,
+            _ => 0.0,
+        };
+        let apply = |x: Vec3| {
+            u * (uu * u.dot(x) + uv * v.dot(x)) + v * (uv * u.dot(x) + vv * v.dot(x)) + w * (fill * w.dot(x))
+        };
+        let (nu, nv) = (axes[0], axes[1]);
+        [nu.dot(apply(nu)), nu.dot(apply(nv)), nv.dot(apply(nv))]
+    });
+    let r = Quat::from_mat3(&Mat3::from_cols(axes[0], axes[1], axes[2])).normalize();
+    Some((r.to_array(), s, curvature))
 }
 
 fn normalize4(q: [f32; 4]) -> [f32; 4] {
@@ -2297,8 +2386,10 @@ mod tests {
             let sh = &cloud.block.shape[i * 4..i * 4 + 4];
             [f16_of(sh[1] & 0xffff).exp(), f16_of(sh[1] >> 16).exp(), f16_of(sh[2] & 0xffff).exp()]
         };
+        // One flat axis each, turned third (`normal_third`).
         assert_eq!(sc(0)[2], 0.0);
-        assert_eq!(sc(1)[1], 0.0);
+        assert_eq!(sc(1)[2], 0.0);
+        assert_eq!(sc(1).iter().filter(|&&v| v == 0.0).count(), 1);
         assert!(sc(2).iter().all(|&v| v > 0.0));
     }
 
@@ -2819,6 +2910,25 @@ mod tests {
             }
         }
         assert!(build_lod(&cut, &o).is_ok());
+    }
+
+    #[test]
+    fn turns_a_merged_disc_so_its_normal_is_the_third_axis() {
+        // A disc whose normal (+y) is its FIRST axis, as athenea's merges
+        // leave them: axes x' = y, y' = z, z' = x (a cyclic turn), its
+        // flat scale first, and a curvature projected into (x', y').
+        let m = glam::Mat3::from_cols(glam::Vec3::Y, glam::Vec3::Z, glam::Vec3::X);
+        let q = glam::Quat::from_mat3(&m).to_array();
+        let (q2, s2, k2) = normal_third(q, [0.0, 0.2, 0.1], Some([0.0, 1.0, 0.0]), Some([0.0, 0.0, 2.0])).unwrap();
+        let a = axes_of_quaternion(q2);
+        let third = [a[0][2], a[1][2], a[2][2]];
+        assert!((third[1] - 1.0).abs() < 1e-5, "third axis {third:?}");
+        assert_eq!(s2[2], 0.0);
+        // The kept tangent (z, 2 /m) carried, the lost one (x) filled alike.
+        let k = k2.unwrap();
+        assert!((k[0] - 2.0).abs() < 1e-4 && k[1].abs() < 1e-4 && (k[2] - 2.0).abs() < 1e-4, "{k:?}");
+        // One already so is left alone.
+        assert!(normal_third(q2, s2, Some([0.0, 1.0, 0.0]), Some(k)).is_none());
     }
 
     #[test]

@@ -366,6 +366,18 @@ impl Scene {
                         (CamSpec { eye: [0.38, -0.48, 0.2], target: [0.0, 0.02, 0.03], up: [0.0, 0.0, 1.0], hfov: 2.0 * ((v / 2.0).tan() * aspect).atan(), aspect }, true)
                     }
                     "pawn" => (CamSpec { eye: [0.0, 0.048, 0.18], target: [0.0, 0.048, 0.0], up: [0.0, 1.0, 0.0], hfov: 39.6f32.to_radians(), aspect: 1.0 }, true),
+                    // athenea's matx shader ball (surfels-web/a camera.json):
+                    // 50 mm over 24.576 mm, 512 x 512, Y-up, metres.
+                    "shaderball" => (
+                        CamSpec {
+                            eye: [2.602763, 2.989512, 5.72887],
+                            target: [2.602763 - 6.6 * 0.401934, 2.989512 - 6.6 * 0.309017, 5.72887 - 6.6 * 0.86195],
+                            up: [0.0, 1.0, 0.0],
+                            hfov: 2.0 * (12.288f32 / 50.0).atan(),
+                            aspect: 1.0,
+                        },
+                        false,
+                    ),
                     _ => bail!("unknown camera {kind}"),
                 };
                 (dir, files, cam, below)

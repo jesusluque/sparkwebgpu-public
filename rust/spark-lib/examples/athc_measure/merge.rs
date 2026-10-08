@@ -256,6 +256,12 @@ fn quat_from_cols(c: [[f64; 3]; 3]) -> [f32; 4] {
     [q.x as f32, q.y as f32, q.z as f32, q.w as f32]
 }
 
+/// A covariance as (quaternion x y z w, scales).
+pub fn orient(cov: &[f64; 6]) -> ([f32; 4], [f32; 3]) {
+    let (vals, cols) = eigen(cov);
+    (quat_from_cols(cols), vals.map(|v| v.max(1e-18).sqrt() as f32))
+}
+
 fn to_splat(c: &Cl, orig: &[Splat]) -> Splat {
     if c.members == 1 {
         return orig[c.orig as usize].clone();

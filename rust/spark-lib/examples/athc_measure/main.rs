@@ -10,6 +10,7 @@
 
 mod cloud;
 mod merge;
+mod pose;
 mod raster;
 
 use std::time::Instant;
@@ -49,6 +50,8 @@ fn main() -> Result<()> {
         "bytes" => bytes(&scene),
         "overlap" => overlap(&scene),
         "thin" => thin(&scene, &args),
+        "posevis" => pose::run(&scene, &args),
+        "noise" => noise(&scene),
         "render" => {
             let cam = scene.camera(width, 1.0, 0.0, 0.0);
             let img = render(&scene.splats, &cam, None);
@@ -570,5 +573,80 @@ fn thin(scene: &Scene, args: &[String]) -> Result<()> {
             dcov
         );
     }
+    Ok(())
+}
+
+/// Splat-to-splat noise of the colour (with ATHC_PROXY=lit: of the baked
+/// transfer's DC): each splat's luminance against the weighted mean of its
+/// neighbours within 1.5 sigma that face the same way.
+fn noise(scene: &Scene) -> Result<()> {
+    println!("## {} — splat-to-splat colour deviation (proxy {})\n", scene.name, if cloud::lit() { "lit" } else { "albedo" });
+    println!("| part | median |Δ|/mean | p90 | splats with > 20% |\n|---|---|---|---|");
+    for (pi, part) in scene.parts.iter().enumerate() {
+        let ids: Vec<usize> = (0..scene.splats.len()).filter(|&i| scene.splats[i].part == pi as u16).collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let sp = &scene.splats;
+        let mut longs: Vec<f32> = ids.iter().map(|&i| sp[i].long()).collect();
+        longs.sort_by(|a, b| a.total_cmp(b));
+        let cell = 1.5 * longs[longs.len() * 9 / 10].max(1e-9);
+        let key = |p: [f32; 3]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64, (p[2] / cell).floor() as i64);
+        let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<u32>> = std::collections::HashMap::new();
+        for &i in &ids {
+            grid.entry(key(sp[i].p)).or_default().push(i as u32);
+        }
+        let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let dev: Vec<f32> = raster::par_chunks(ids.len(), |r| {
+            r.filter_map(|k| {
+                let i = ids[k];
+                let a = &sp[i];
+                let (x, y, z) = key(a.p);
+                let (mut sw, mut sl) = (0.0f32, 0.0f32);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            let Some(v) = grid.get(&(x + dx, y + dy, z + dz)) else { continue };
+                            for &j in v {
+                                let j = j as usize;
+                                if j == i {
+                                    continue;
+                                }
+                                let b = &sp[j];
+                                if a.has_normal() && b.has_normal() && dot(a.n, b.n) < 0.966 {
+                                    continue;
+                                }
+                                let d = dist(a.p, b.p) / a.long().max(1e-9);
+                                if d > 1.5 {
+                                    continue;
+                                }
+                                let w = (-0.5 * d * d).exp();
+                                sw += w;
+                                sl += w * lum(b.c);
+                            }
+                        }
+                    }
+                }
+                if sw < 1.0 {
+                    return None;
+                }
+                let m = sl / sw;
+                if m <= 1e-6 {
+                    return None;
+                }
+                Some((lum(a.c) - m).abs() / m)
+            })
+            .collect::<Vec<f32>>()
+        })
+        .concat();
+        if dev.is_empty() {
+            continue;
+        }
+        let mut d = dev.clone();
+        d.sort_by(|a, b| a.total_cmp(b));
+        let over = d.iter().filter(|v| **v > 0.2).count();
+        println!("| {} | {:.3} | {:.3} | {} |", part, d[d.len() / 2], d[d.len() * 9 / 10], pct(over, d.len()));
+    }
+    println!();
     Ok(())
 }

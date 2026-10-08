@@ -7,8 +7,9 @@
 //! here is encoding 0, the v2 words as they are, so v2 -> v3 -> v2 gives the
 //! same file byte for byte. Quantized encodings (083's 20-byte S0) and
 //! per-section gzip are the format's room to grow: gzip is implemented
-//! (`compression` 1, what a browser's DecompressionStream reads), smaller
-//! encodings are not yet.
+//! (`compression` 1, what a browser's DecompressionStream reads), and so are
+//! lossless byte-plane encodings (1, 2) and one lossy encoding of the
+//! transfer sections, clustered PCA (3, `athc_cpca`, written on request).
 
 use anyhow::{anyhow, bail, Result};
 use miniz_oxide::deflate::compress_to_vec;
@@ -40,7 +41,12 @@ pub const ENCODING_BYTE_PLANES: u32 = 1;
 /// array's row is replaced by its difference (wrapping) from the previous
 /// element's, then split as `ENCODING_BYTE_PLANES`. Lossless.
 pub const ENCODING_DELTA_PLANES: u32 = 2;
-pub const MAX_ENCODING: u32 = ENCODING_DELTA_PLANES;
+/// Clustered PCA of a transfer section (`athc_cpca`): lossy, the transfer
+/// sections only, written on request (`write_v3_cpca`, athc-convert --cpca).
+pub use crate::athc_cpca::ENCODING_CPCA;
+/// The lossless encodings are 0 ..= this.
+pub const MAX_LOSSLESS_ENCODING: u32 = ENCODING_DELTA_PLANES;
+pub const MAX_ENCODING: u32 = ENCODING_CPCA;
 
 /// Sections, in the order they sit in every block (tier order). Within the
 /// relight tier the shadow bits come first and the transfer in the order of
@@ -393,6 +399,10 @@ pub fn encode_section(raw: &[u8], n: usize, arrays: &[u32], encoding: u32) -> Ve
     if encoding == ENCODING_V2_WORDS {
         return raw.to_vec();
     }
+    if encoding == ENCODING_CPCA {
+        let words = arrays.iter().sum::<u32>() as usize;
+        return crate::athc_cpca::encode_cpca(raw, n, words, &crate::athc_cpca::CpcaOptions::default()).0;
+    }
     let mut out = Vec::with_capacity(raw.len());
     let mut at = 0;
     for &w in arrays {
@@ -431,6 +441,9 @@ pub fn decode_section(stored: &[u8], n: usize, arrays: &[u32], encoding: u32) ->
     }
     if encoding > MAX_ENCODING {
         bail!(".athc v3: section encoding {}", encoding);
+    }
+    if encoding == ENCODING_CPCA {
+        return crate::athc_cpca::decode_cpca(stored, n, arrays.iter().sum::<u32>() as usize);
     }
     let total: usize = arrays.iter().map(|&w| 4 * w as usize * n).sum();
     if stored.len() != total {
@@ -677,6 +690,56 @@ pub fn write_v3_full(
     encoding: &dyn Fn(SectionId) -> u32,
     skeleton: Option<&crate::athc_skin::AthcSkeleton>,
 ) -> Result<Vec<u8>> {
+    write_v3_impl(file, compression, legacy, encoding, skeleton, None).map(|(out, _)| out)
+}
+
+/// What CPCA did to one transfer section over the file (`write_v3_cpca`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct CpcaSectionStats {
+    pub id: SectionId,
+    /// Blocks in CPCA, and kept exactly.
+    pub blocks: usize,
+    pub exact_blocks: usize,
+    /// Elements in CPCA blocks; the largest clusters and directions of a block.
+    pub elements: usize,
+    pub max_clusters: usize,
+    pub max_coeffs: usize,
+    /// Sums of squared error and of squared values over every block.
+    pub err2: f64,
+    pub ref2: f64,
+}
+
+impl CpcaSectionStats {
+    pub fn rel_mse(&self) -> f64 {
+        if self.ref2 > 0.0 { self.err2 / self.ref2 } else { 0.0 }
+    }
+}
+
+/// `write_v3_full` with the transfer sections in CPCA (`athc_cpca`,
+/// encoding 3, lossy within `cpca.rel_mse` a block) and every other section
+/// in the encoding `encoding` gives it. Returns the file and, a transfer
+/// section, what CPCA did.
+pub fn write_v3_cpca(
+    file: &AthcFile,
+    compression: u32,
+    encoding: &dyn Fn(SectionId) -> u32,
+    cpca: &crate::athc_cpca::CpcaOptions,
+    skeleton: Option<&crate::athc_skin::AthcSkeleton>,
+) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
+    let pick = |id: SectionId| if id.is_transfer() { ENCODING_CPCA } else { encoding(id) };
+    let o = crate::athc_cpca::CpcaOptions { gzip: compression == COMPRESSION_GZIP, ..*cpca };
+    write_v3_impl(file, compression, false, &pick, skeleton, Some(&o))
+}
+
+fn write_v3_impl(
+    file: &AthcFile,
+    compression: u32,
+    legacy: bool,
+    encoding: &dyn Fn(SectionId) -> u32,
+    skeleton: Option<&crate::athc_skin::AthcSkeleton>,
+    cpca: Option<&crate::athc_cpca::CpcaOptions>,
+) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
+    let mut cpca_stats: Vec<CpcaSectionStats> = Vec::new();
     // The v2 writer settles flags, counts and the extra header; the
     // curvature (no v2 holds it) comes back from the cloud as it was.
     let mut v2 = AthcFile::read(&file.write()?)?;
@@ -739,6 +802,9 @@ pub fn write_v3_full(
         if s.encoding > MAX_ENCODING {
             bail!(".athc v3: no section encoding {}", s.encoding);
         }
+        if s.encoding == ENCODING_CPCA && !s.id.is_transfer() {
+            bail!(".athc v3: CPCA is for the transfer's sections, not {}", s.id.name());
+        }
     }
     let blocks: Vec<(u32, u32, u32, &AthcBlock)> = v2
         .levels
@@ -770,7 +836,34 @@ pub fn write_v3_full(
             if s.id.is_transfer() {
                 tx_from += s.words;
             }
-            let encoded = encode_section(&raw, block.n, &section_arrays(s.id, s.words, &h, &x), s.encoding);
+            let encoded = if s.encoding == ENCODING_CPCA {
+                let o = cpca.copied().unwrap_or(crate::athc_cpca::CpcaOptions {
+                    gzip: compression == COMPRESSION_GZIP,
+                    ..Default::default()
+                });
+                let (payload, st) = crate::athc_cpca::encode_cpca(&raw, block.n, s.words as usize, &o);
+                let k = match cpca_stats.iter().position(|c| c.id == s.id) {
+                    Some(k) => k,
+                    None => {
+                        cpca_stats.push(CpcaSectionStats { id: s.id, blocks: 0, exact_blocks: 0, elements: 0, max_clusters: 0, max_coeffs: 0, err2: 0.0, ref2: 0.0 });
+                        cpca_stats.len() - 1
+                    }
+                };
+                let c = &mut cpca_stats[k];
+                if st.cpca {
+                    c.blocks += 1;
+                    c.elements += st.n;
+                    c.max_clusters = c.max_clusters.max(st.clusters);
+                    c.max_coeffs = c.max_coeffs.max(st.coeffs);
+                } else {
+                    c.exact_blocks += 1;
+                }
+                c.err2 += st.err2;
+                c.ref2 += st.ref2;
+                payload
+            } else {
+                encode_section(&raw, block.n, &section_arrays(s.id, s.words, &h, &x), s.encoding)
+            };
             let stored = if compression == COMPRESSION_GZIP { gzip(&encoded) } else { encoded };
             spans.push(SectionSpan { offset: at + (data.len() - begin) as u64, stored: stored.len() as u32, raw: raw.len() as u32 });
             data.extend_from_slice(&stored);
@@ -833,7 +926,7 @@ pub fn write_v3_full(
     out.resize(data_start as usize, 0);
     out.extend_from_slice(&data);
     debug_assert_eq!(out.len() as u64 % PAGE, 0);
-    Ok(out)
+    Ok((out, cpca_stats))
 }
 
 fn u32_at(b: &[u8], at: usize) -> Result<u32> {
@@ -1295,7 +1388,7 @@ mod tests {
     fn v2_to_v3_and_back_is_the_same_file() {
         for (name, v2) in [("two_cards", TWO_CARDS), ("every_stream", EVERY)] {
             for compression in [COMPRESSION_NONE, COMPRESSION_GZIP] {
-                for encoding in 0..=MAX_ENCODING {
+                for encoding in 0..=MAX_LOSSLESS_ENCODING {
                     let file = AthcFile::read(v2).unwrap();
                     let v3 = write_v3_encoded(&file, compression, &|_| encoding).unwrap();
                     assert_eq!(&v3[..4], b"ATH3");
@@ -1394,10 +1487,48 @@ mod tests {
     }
 
     #[test]
+    fn cpca_changes_the_transfer_alone_and_pages_like_the_rest() {
+        const TX: &[u8] = include_bytes!("../../../test/fixtures/athc/pawn_top_tx.cpca.athc");
+        const TX_REF: &[u8] = include_bytes!("../../../test/fixtures/athc/pawn_top_tx.cpca.ref.athc");
+        // The fixture reads as its losslessly written decode.
+        let (cpca, reference) = (read_v3(TX).unwrap(), read_v3(TX_REF).unwrap());
+        assert_eq!(cpca.write().unwrap(), reference.write().unwrap());
+        assert!(parse_v3(TX).unwrap().sections.iter().all(|s| s.encoding == ENCODING_CPCA || !s.id.is_transfer()));
+        // Written again: only the transfer moves, within the budget.
+        let o = crate::athc_cpca::CpcaOptions { clusters: 8, coeffs: 48, rel_mse: 1e-4, force: true, gzip: true };
+        let (v3, stats) = write_v3_cpca(&reference, COMPRESSION_GZIP, &|_| ENCODING_BYTE_PLANES, &o, None).unwrap();
+        assert_eq!(stats.iter().map(|s| s.id).collect::<Vec<_>>(), [SectionId::TransferDirect, SectionId::TransferIndirect, SectionId::TransferField]);
+        assert!(stats.iter().all(|s| s.blocks > 0 && s.rel_mse() <= 1e-4), "{stats:?}");
+        let back = read_v3(&v3).unwrap();
+        let blocks = |f: &AthcFile| f.levels.iter().map(|(_, b)| b.clone()).chain(f.chunks.iter().cloned()).collect::<Vec<_>>();
+        for (a, b) in blocks(&reference).iter().zip(blocks(&back).iter()) {
+            assert_eq!(a.transfer.len(), b.transfer.len());
+            let strip = |x: &AthcBlock| AthcBlock { transfer: Vec::new(), ..x.clone() };
+            assert_eq!(strip(a), strip(b));
+        }
+        // A kind-2 page of a CPCA block, every transfer form: the prefix.
+        let layout = parse_v3(&v3).unwrap();
+        let headers = layout.v2_headers();
+        let b = layout.blocks.iter().find(|b| b.kind == 1).unwrap();
+        let chunk = &back.chunks[0];
+        for values in transfer_forms(layout.extra.transfer_count) {
+            let want = Want { material: true, transfer_values: values };
+            let picks = wanted_sections(&layout.sections, &layout.extra, want);
+            let page = athv_sections_page(&headers, 65536, b.n, 0, values, &parts(&v3, &layout, b, &picks));
+            let (_, _, block, _) = read_sections_page(&page).unwrap();
+            let (keep, tw) = (values.div_ceil(2) as usize, layout.extra.transfer_words as usize);
+            let expect: Vec<u32> = (0..chunk.n).flat_map(|e| chunk.transfer[e * tw..e * tw + keep].to_vec()).collect();
+            assert_eq!(block.transfer, expect, "{values}");
+        }
+        // CPCA is for the transfer only.
+        assert!(write_v3_encoded(&reference, COMPRESSION_NONE, &|_| ENCODING_CPCA).is_err());
+    }
+
+    #[test]
     fn a_page_of_sections_is_the_chunk_it_keeps() {
         let file = AthcFile::read(EVERY).unwrap();
         for (compression, encoding) in
-            [COMPRESSION_NONE, COMPRESSION_GZIP].into_iter().flat_map(|c| (0..=MAX_ENCODING).map(move |e| (c, e)))
+            [COMPRESSION_NONE, COMPRESSION_GZIP].into_iter().flat_map(|c| (0..=MAX_LOSSLESS_ENCODING).map(move |e| (c, e)))
         {
             let v3 = write_v3_encoded(&file, compression, &|_| encoding).unwrap();
             let layout = parse_v3(&v3).unwrap();
@@ -1531,7 +1662,7 @@ mod tests {
                     state as u8
                 })
                 .collect();
-            for encoding in 0..=MAX_ENCODING {
+            for encoding in 0..=MAX_LOSSLESS_ENCODING {
                 let stored = encode_section(&raw, n, &arrays, encoding);
                 assert_eq!(stored.len(), raw.len());
                 assert_eq!(decode_section(&stored, n, &arrays, encoding).unwrap(), raw, "{n} {arrays:?} {encoding}");
@@ -1539,6 +1670,7 @@ mod tests {
         }
         assert!(decode_section(&[0; 8], 1, &[1], 1).is_err());
         assert!(decode_section(&[0; 4], 1, &[1], 3).is_err());
+        assert!(decode_section(&[0; 4], 1, &[1], MAX_ENCODING + 1).is_err());
     }
 
     #[test]

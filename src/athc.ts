@@ -22,7 +22,12 @@ import { athc_layout, athc_prefix_bytes, athc_skeleton } from "spark-rs";
 import { workerPool } from "./SplatWorker";
 import * as wasm from "./wasm";
 import type { AttribFormat, AttributeSpec } from "./webgpu/attributes/schema";
-import { AttribPool, attribWords } from "./webgpu/attributes/schema";
+import {
+  AttribPool,
+  attribWords,
+  fromHalf,
+  toHalf,
+} from "./webgpu/attributes/schema";
 
 export const ATHC_MAGIC = 0x43485441; // "ATHC"
 export const ATH3_MAGIC = 0x33485441; // "ATH3"
@@ -884,10 +889,83 @@ function sectionArrays(layout: AthcV3Layout, section: AthcSection): number[] {
     : [section.words];
 }
 
+/** Section encoding 3: clustered PCA of a transfer section (athc_cpca.rs). */
+export const ATHC_ENCODING_CPCA = 3;
+
+/**
+ * A CPCA section (athc_cpca.rs decode_cpca) back to its words: the same
+ * halves as the Rust decoder, bit for bit (every product and sum rounded to
+ * float32 in the same order, then to a half, round to nearest even).
+ */
+export function decodeAthcCpca(
+  bytes: Uint8Array,
+  n: number,
+  words: number,
+): Uint8Array {
+  const d = 2 * words;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const u32 = (at: number) => {
+    if (at + 4 > bytes.length) {
+      throw new Error(".athc v3: a CPCA section too short");
+    }
+    return view.getUint32(at, true);
+  };
+  const mode = u32(0);
+  if (mode === 0) return decodeAthcSection(bytes.subarray(4), n, [words], 1);
+  if (mode !== 1) throw new Error(`.athc v3: CPCA mode ${mode}`);
+  const [k, m, dd, b] = [u32(4), u32(8), u32(12), u32(16)];
+  if (dd !== d || k < 1 || k > 256 || m < 1 || m > d || b < 1 || b > 3) {
+    throw new Error(
+      `.athc v3: a CPCA section of ${k} clusters, ${m} of ${dd} values (${d} expected), ${b} bytes`,
+    );
+  }
+  const basisAt = 20 + 4 * k;
+  const per = (1 + m) * d;
+  const idsAt = Math.ceil((basisAt + 2 * k * per) / 4) * 4;
+  const planesAt = idsAt + n;
+  if (bytes.length !== planesAt + m * b * n) {
+    throw new Error(
+      `.athc v3: a CPCA section of ${bytes.length} bytes, not ${planesAt + m * b * n}`,
+    );
+  }
+  const steps = new Float32Array(k);
+  for (let c = 0; c < k; c++) steps[c] = view.getFloat32(20 + 4 * c, true);
+  const basis = new Float32Array(k * per);
+  for (let i = 0; i < k * per; i++) {
+    basis[i] = fromHalf(view.getUint16(basisAt + 2 * i, true));
+  }
+  const out = new Uint8Array(n * d * 2);
+  const outView = new DataView(out.buffer);
+  const coef = new Float64Array(m);
+  const f = Math.fround;
+  for (let e = 0; e < n; e++) {
+    const c = bytes[idsAt + e];
+    if (c >= k)
+      throw new Error(`.athc v3: a CPCA element in cluster ${c} of ${k}`);
+    for (let j = 0; j < m; j++) {
+      let z = 0;
+      for (let i = 0; i < b; i++) {
+        z += bytes[planesAt + (j * b + i) * n + e] * 2 ** (8 * i);
+      }
+      const q = z & 1 ? -(z + 1) / 2 : z / 2;
+      coef[j] = f(q * steps[c]);
+    }
+    const base = c * per;
+    for (let v = 0; v < d; v++) {
+      let acc = basis[base + v];
+      for (let j = 0; j < m; j++) {
+        acc = f(acc + f(coef[j] * basis[base + d + j * d + v]));
+      }
+      outView.setUint16((e * d + v) * 2, toHalf(acc), true);
+    }
+  }
+  return out;
+}
+
 /**
  * A section's bytes as stored (after the gunzip) back to its words
  * (athc_v3.rs decode_section): encoding 1 byte planes, 2 byte planes of the
- * 16-bit lanes' differences.
+ * 16-bit lanes' differences, 3 clustered PCA of a transfer section.
  */
 export function decodeAthcSection(
   bytes: Uint8Array,
@@ -896,6 +974,13 @@ export function decodeAthcSection(
   encoding: number,
 ): Uint8Array {
   if (encoding === 0) return bytes;
+  if (encoding === ATHC_ENCODING_CPCA) {
+    return decodeAthcCpca(
+      bytes,
+      n,
+      arrays.reduce((t, w) => t + w, 0),
+    );
+  }
   if (encoding !== 1 && encoding !== 2) {
     throw new Error(`.athc v3: section encoding ${encoding}`);
   }

@@ -97,7 +97,7 @@ export const reflection = {
       "group": 0,
       "binding": 10,
       "kind": "uniform",
-      "bytes": 272,
+      "bytes": 288,
       "fields": [
         {
           "name": "count",
@@ -233,92 +233,120 @@ export const reflection = {
           "components": 1
         },
         {
-          "name": "pad0",
+          "name": "threadFirst",
           "offset": 76,
           "size": 4,
           "scalar": "uint32",
           "components": 1
         },
         {
-          "name": "encoding",
+          "name": "cpcaScratch",
           "offset": 80,
-          "size": 16,
-          "scalar": "float32",
-          "components": 4
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
         },
         {
-          "name": "row0",
+          "name": "cpcaWords",
+          "offset": 84,
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
+        },
+        {
+          "name": "pad1",
+          "offset": 88,
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
+        },
+        {
+          "name": "pad2",
+          "offset": 92,
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
+        },
+        {
+          "name": "encoding",
           "offset": 96,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "row1",
+          "name": "row0",
           "offset": 112,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "row2",
+          "name": "row1",
           "offset": 128,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "eyeObject",
+          "name": "row2",
           "offset": 144,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "eyeWorld",
+          "name": "eyeObject",
           "offset": 160,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "view0",
+          "name": "eyeWorld",
           "offset": 176,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "view1",
+          "name": "view0",
           "offset": 192,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "view2",
+          "name": "view1",
           "offset": 208,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "focal",
+          "name": "view2",
           "offset": 224,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "viewport",
+          "name": "focal",
           "offset": 240,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "filter",
+          "name": "viewport",
           "offset": 256,
+          "size": 16,
+          "scalar": "float32",
+          "components": 4
+        },
+        {
+          "name": "filter",
+          "offset": 272,
           "size": 16,
           "scalar": "float32",
           "components": 4

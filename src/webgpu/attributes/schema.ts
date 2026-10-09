@@ -7,6 +7,7 @@
 // AttribPool.from() makes a pool of either on this side.
 
 import type { AttribValues } from "../../defines";
+import type { CpcaTable } from "../athenea/cpcaResident";
 import { coreAttrib } from "../generated/constants";
 
 export type AttribFormat =
@@ -300,6 +301,11 @@ export class AttribPool {
    * PagedAttribPool): renderers bind it instead of uploading pack().
    */
   gpuBuffer?: GPUBuffer;
+  /**
+   * The cluster table of a `transferCpca` attribute (the TX transfer kept as
+   * clustered PCA on the GPU: src/webgpu/athenea/cpcaResident.ts).
+   */
+  cpca?: CpcaTable;
 
   constructor(public count: number) {}
 

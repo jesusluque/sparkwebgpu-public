@@ -869,7 +869,7 @@ function assembleRows(
 }
 
 /** gzip (RFC 1952) as the browser reads it. */
-async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
+export async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
   const stream = new Blob([bytes as BlobPart])
     .stream()
     .pipeThrough(new DecompressionStream("gzip"));

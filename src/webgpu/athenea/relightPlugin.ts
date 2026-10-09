@@ -43,12 +43,14 @@
 import * as THREE from "three";
 import type { WgpuSplatMesh, WgpuSplatRenderer } from "../WgpuSplatRenderer";
 import { ATTRIB_NONE, type AttribPool } from "../attributes/schema";
+import cpcaModule from "../generated/athenea_adapter/cpca";
 import relightModule from "../generated/athenea_adapter/relight";
 import { atheneaAdapterRelight } from "../generated/constants";
 import { createStorage, upload } from "../gpuBuffers";
 import type { PluginFrame, SplatPlugin } from "../plugins/types";
 import { UniformWriter } from "../uniforms";
 import { AtheneaSky, ENV, type SkyImage } from "./AtheneaSky";
+import { type CpcaTable, TRANSFER_CPCA } from "./cpcaResident";
 import {
   type AtheneaLightRecord,
   LIGHT_NORMALIZE,
@@ -200,6 +202,20 @@ export interface AtheneaRelightOptions {
    * not undone for the lights).
    */
   frame?: THREE.Object3D | null;
+  /**
+   * How the TX transfer is kept on the GPU: "words", its halves (default);
+   * "cpca", as the file's clustered PCA (.athc v3 encoding 3): the pool
+   * holds `transferCpca` (a cluster entry and quantized coefficients a
+   * section) and a table of the clusters beside it, and the pass rebuilds
+   * the halves a batch of splats at a time before relighting them
+   * (slang/athenea_adapter/cpca.slang). Read by the plugin's demand
+   * (requires.reads: a paged pool loads `transferCpca`), so fixed when the
+   * plugin is made. A pool without `transferCpca` is relit from its
+   * `transfer` as before.
+   */
+  transferResident?: "words" | "cpca";
+  /** Splats a CPCA batch rebuilds at once (its scratch: this x the transfer's words). */
+  cpcaBatch?: number;
 }
 
 export interface AtheneaRelightDebug {
@@ -229,7 +245,7 @@ const DEBUG_VIEWS: Record<string, number> = {
 };
 
 type RelightState = Required<
-  Omit<AtheneaRelightOptions, "hdri" | "frame" | "debug">
+  Omit<AtheneaRelightOptions, "hdri" | "frame" | "debug" | "transferResident">
 > & {
   debug?: AtheneaRelightDebug;
   hdri: SkyImage | null;
@@ -256,8 +272,17 @@ export interface AtheneaRelightPlugin extends SplatPlugin {
   setCatcher(asset: object, catcher: boolean): void;
   /** The prepared dome (after the first frame). */
   readonly sky: AtheneaSky | null;
-  /** Dispatches so far. */
-  readonly stats: { relit: number; viewless: number; skies: number };
+  /** Dispatches so far (cpca: the CPCA batches rebuilt). */
+  readonly stats: {
+    relit: number;
+    viewless: number;
+    skies: number;
+    cpca: number;
+  };
+  /** How the transfer is kept (AtheneaRelightOptions.transferResident). */
+  readonly transferResident: "words" | "cpca";
+  /** For tests: `mesh`'s relit records (relight.slang kRelightStride a splat). */
+  relitBufferOf(mesh: WgpuSplatMesh): GPUBuffer | null;
 }
 
 interface PoolOnGpu {
@@ -267,6 +292,8 @@ interface PoolOnGpu {
   ids: Record<string, number>;
   transferCount: number;
   shadowWords: number;
+  /** The transfer as clusters (transferCpca), and its table on the GPU. */
+  cpca: { table: CpcaTable; buffer: GPUBuffer | null; version: number } | null;
 }
 
 interface MeshState {
@@ -288,7 +315,18 @@ const STREAMS = [
   "transfer",
   "shadowBits",
   "curvature",
+  TRANSFER_CPCA,
 ] as const;
+
+/** What the plugin asks a pool for: the transfer's words or its clusters. */
+function streamsFor(resident: "words" | "cpca"): string[] {
+  return STREAMS.filter((s) =>
+    resident === "cpca" ? s !== "transfer" : s !== TRANSFER_CPCA,
+  );
+}
+
+/** Splats a CPCA batch rebuilds by default (a page). */
+export const CPCA_BATCH = 65536;
 
 /** Bytes of the draw's per-slot record (relight_colour.slang atheneaPixel). */
 const PIXEL_RECORD_BYTES = 48;
@@ -382,15 +420,18 @@ export function atheneaRelightPlugin(
     footprintPixel: false,
     cullBacks: false,
     cullBacksFacing: CULL_BACKS_FACING,
+    cpcaBatch: CPCA_BATCH,
     frame: null,
   };
+  const transferResident = initial.transferResident ?? "words";
+  const streams = streamsFor(transferResident);
   const linear = new WeakMap<object, boolean>();
   const iors = new WeakMap<object, number>();
   const catchers = new WeakMap<object, boolean>();
   const isCatcher = (mesh: WgpuSplatMesh) =>
     keysOf(mesh).some((k) => catchers.get(k) === true);
   const states = new WeakMap<WgpuSplatMesh, MeshState>();
-  const stats = { relit: 0, viewless: 0, skies: 0 };
+  const stats = { relit: 0, viewless: 0, skies: 0, cpca: 0 };
   let renderer: WgpuSplatRenderer | null = null;
   let sky: AtheneaSky | null = null;
   let lightsBuffer: GPUBuffer | null = null;
@@ -484,9 +525,35 @@ export function atheneaRelightPlugin(
     device.queue.writeBuffer(lightsBuffer, 0, words);
     const of = new Uint32Array(Math.max(list.length, 1)).fill(ENV.kEnvNone);
     if (envLights) of[0] = 0;
+    envOfLightWords = of;
     envOfLight?.destroy();
-    envOfLight = upload(device, of, "relight envOfLight");
+    envOfLight = createStorage(
+      device,
+      Math.max(4 * (scratchBase() + scratchWords), of.byteLength),
+      "relight envOfLight",
+    );
+    device.queue.writeBuffer(envOfLight, 0, of);
     lightsVersion += 1;
+  };
+
+  // envOfLight is also the CPCA scratch (relight.slang kRelightCpca): its
+  // lights' map, then from scratchBase() the transfers cpca.slang rebuilt
+  // for a batch, which the pass hands athenea as its transfer buffer.
+  let envOfLightWords = new Uint32Array(1);
+  const retired: GPUBuffer[] = [];
+  let scratchWords = 0;
+  const scratchBase = () => Math.ceil(envOfLightWords.length / 4) * 4;
+  const ensureScratch = (device: GPUDevice, words: number) => {
+    if (words <= scratchWords && envOfLight) return;
+    scratchWords = Math.max(words, scratchWords);
+    // This frame's pass may have bound it already: destroyed next frame.
+    if (envOfLight) retired.push(envOfLight);
+    envOfLight = createStorage(
+      device,
+      4 * (scratchBase() + scratchWords),
+      "relight envOfLight",
+    );
+    device.queue.writeBuffer(envOfLight, 0, envOfLightWords);
   };
 
   const poolOf = (
@@ -502,6 +569,13 @@ export function atheneaRelightPlugin(
       }
     }
     if (previous?.owned) previous.buffer.destroy();
+    previous?.cpca?.buffer?.destroy();
+    const cpcaOf = (ids: Record<string, number>) =>
+      transferResident === "cpca" &&
+      ids[TRANSFER_CPCA] !== ATTRIB_NONE &&
+      pool.cpca
+        ? { table: pool.cpca, buffer: null, version: -1 }
+        : null;
     const components = (name: string) =>
       pool.column(name)?.spec.components ?? 0;
     if (pool.gpuBuffer) {
@@ -517,11 +591,10 @@ export function atheneaRelightPlugin(
         ids,
         transferCount: components("transfer"),
         shadowWords: components("shadowBits"),
+        cpca: cpcaOf(ids),
       };
     }
-    const { layout, words } = pool.pack((s) =>
-      (STREAMS as readonly string[]).includes(s.name),
-    );
+    const { layout, words } = pool.pack((s) => streams.includes(s.name));
     const ids: Record<string, number> = {};
     for (const s of STREAMS) {
       const k = layout.specs.findIndex((spec) => spec.name === s);
@@ -534,6 +607,7 @@ export function atheneaRelightPlugin(
       ids,
       transferCount: components("transfer"),
       shadowWords: components("shadowBits"),
+      cpca: cpcaOf(ids),
     };
   };
 
@@ -616,8 +690,19 @@ export function atheneaRelightPlugin(
     const pool = state.pool;
     const ids = pool?.ids ?? {};
     const id = (name: string) => ids[name] ?? ATTRIB_NONE;
-    const transferCount =
-      id("transfer") === ATTRIB_NONE ? 0 : (pool?.transferCount ?? 0);
+    const cpca = pool?.cpca ?? null;
+    if (cpca && cpca.version !== cpca.table.version) {
+      cpca.buffer?.destroy();
+      cpca.buffer = upload(device, cpca.table.pack(), "relight cpca table");
+      cpca.version = cpca.table.version;
+    }
+    // The transfer the pass reads: the pool's, or the clusters' rebuilt.
+    const transferId = cpca ? id(TRANSFER_CPCA) : id("transfer");
+    const transferCount = cpca
+      ? cpca.table.transferCount
+      : id("transfer") === ATTRIB_NONE
+        ? 0
+        : (pool?.transferCount ?? 0);
     const shadowWords =
       id("shadowBits") === ATTRIB_NONE ? 0 : (pool?.shadowWords ?? 0);
     const kTransfer =
@@ -671,6 +756,7 @@ export function atheneaRelightPlugin(
       (footprintPixelOn ? C.kRelightFootprintPixel : 0) |
       (options.cullBacks ? C.kRelightCullBacks : 0) |
       (options.debug?.noCells ? C.kRelightNoCells : 0) |
+      (cpca && transferCount > 0 ? C.kRelightCpca : 0) |
       (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
     const e = world.elements;
     const row = (k: number) => [e[k], e[k + 4], e[k + 8], e[k + 12]];
@@ -685,7 +771,7 @@ export function atheneaRelightPlugin(
       emission: id("emission"),
       pbr: id("pbr"),
       lobes: id("lobes"),
-      transfer: id("transfer"),
+      transfer: transferId,
       shadowBits: id("shadowBits"),
       transferCount,
       shadowWords,
@@ -694,6 +780,7 @@ export function atheneaRelightPlugin(
       curvature: id("curvature"),
       footprint: options.footprint,
       listBase: source.count * C.kRelightStride,
+      cpcaWords: cpca ? cpca.table.transferWords : 0,
       encoding: source.encoding,
       row0: row(0),
       row1: row(1),
@@ -709,6 +796,11 @@ export function atheneaRelightPlugin(
       ],
     });
     emptyPool ??= upload(device, new Uint32Array([0, 0, 4, 0]), "relight pool");
+    const batch = Math.max(256, Math.ceil(options.cpcaBatch / 256) * 256);
+    if (cpca && transferCount > 0) {
+      ensureScratch(device, batch * cpca.table.transferWords);
+      params.set("cpcaScratch", scratchBase());
+    }
     const buffers = {
       relightSrc: source.src,
       relightPool: pool?.buffer ?? emptyPool,
@@ -747,13 +839,64 @@ export function atheneaRelightPlugin(
       stats.relit += 1;
       return;
     }
+    // An entry over `threads` threads (a list's or the cloud's): at once,
+    // or with the transfer rebuilt from its clusters a batch at a time.
+    const run = (entry: string, threads: number, listCount: number) => {
+      if (!(cpca && transferCount > 0 && cpca.buffer)) {
+        r.registry.get(relightModule, entry).dispatch(pass, {
+          grid: relightGrid(threads),
+          buffers,
+          uniforms: params.data,
+        });
+        return;
+      }
+      const table = cpca.table;
+      const sec = table.sections.map((s) => [
+        2 * s.words,
+        2 * s.firstWord,
+        s.half,
+        s.cpca ? 1 : 0,
+      ]);
+      const decode = UniformWriter.for(cpcaModule, "cpcaParams").setAll({
+        count: source.count,
+        listCount,
+        listBase: source.count * C.kRelightStride,
+        attribute: transferId,
+        scratchBase: scratchBase(),
+        scratchWords: table.transferWords,
+        sections: sec.length,
+        section0: sec[0] ?? [0, 0, 0, 0],
+        section1: sec[1] ?? [0, 0, 0, 0],
+        section2: sec[2] ?? [0, 0, 0, 0],
+      });
+      const decodeBuffers = {
+        cpcaPool: buffers.relightPool,
+        cpcaTable: cpca.buffer as GPUBuffer,
+        cpcaList: state.relit,
+        cpcaOut: envOfLight as GPUBuffer,
+      };
+      for (let first = 0; first < threads; first += batch) {
+        const n = Math.min(batch, threads - first);
+        decode.set("threadFirst", first);
+        decode.set("batch", n);
+        r.registry.get(cpcaModule, "atheneaCpcaDecode").dispatch(pass, {
+          grid: relightGrid(n),
+          buffers: decodeBuffers,
+          uniforms: decode.data,
+        });
+        params.set("threadFirst", first);
+        r.registry.get(relightModule, `${entry}Cpca`).dispatch(pass, {
+          grid: relightGrid(n),
+          buffers,
+          uniforms: params.data,
+        });
+        stats.cpca += 1;
+      }
+      params.set("threadFirst", 0);
+    };
     const kept = kTransfer >= 2 && envLights > 0;
     if (kept && state.viewlessKey !== placed) {
-      r.registry.get(relightModule, "atheneaRelightViewless").dispatch(pass, {
-        grid: relightGrid(source.count),
-        buffers,
-        uniforms: params.data,
-      });
+      run("atheneaRelightViewless", source.count, 0);
       state.viewlessKey = placed;
       stats.viewless += 1;
     }
@@ -764,6 +907,7 @@ export function atheneaRelightPlugin(
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
+    let listCount = 0;
     if (list) {
       const listKey = `${identity(list)}|${list.length}`;
       if (state.listKey !== listKey) {
@@ -777,6 +921,7 @@ export function atheneaRelightPlugin(
         state.listKey = listKey;
       }
       params.set("listCount", list.length);
+      listCount = list.length;
     }
     const entry =
       kTransfer === 2
@@ -784,11 +929,15 @@ export function atheneaRelightPlugin(
         : kTransfer === 1
           ? "atheneaRelightFirst"
           : "atheneaRelightPlain";
-    r.registry.get(relightModule, entry).dispatch(pass, {
-      grid: relightGrid(list ? list.length : source.count),
-      buffers,
-      uniforms: params.data,
-    });
+    if (entry === "atheneaRelightPlain") {
+      r.registry.get(relightModule, entry).dispatch(pass, {
+        grid: relightGrid(list ? list.length : source.count),
+        buffers,
+        uniforms: params.data,
+      });
+    } else {
+      run(entry, list ? list.length : source.count, listCount);
+    }
     state.relitKey = key;
     stats.relit += 1;
   };
@@ -799,7 +948,7 @@ export function atheneaRelightPlugin(
     hdr: true,
     minTier: 2,
     // A pager brings the streams it reads (WgpuSplatPager.attributePlan).
-    requires: { reads: STREAMS },
+    requires: { reads: streams },
     slang: {
       module: "athenea_adapter.relight_colour",
       colour: "AtheneaRelightColour",
@@ -807,6 +956,8 @@ export function atheneaRelightPlugin(
     },
     options,
     stats,
+    transferResident,
+    relitBufferOf: (mesh) => states.get(mesh)?.relit ?? null,
     // AtheneaRelightBlend shades only the splats the pass marks, which it
     // does with pixelDetail alone (kRelightSlope): without it the draw is
     // the plain one, with no record read per fragment.
@@ -935,6 +1086,7 @@ export function atheneaRelightPlugin(
       renderer = null;
     },
     onFrame(frame) {
+      for (const b of retired.splice(0)) b.destroy();
       // A new accumulator layout clears the draw's records (the pass), so
       // the relit meshes' must be written again.
       const was = dirty || layoutOf(frame.renderer) !== pixelLayout;

@@ -223,11 +223,12 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     rgba.a = abs(rgba.a);
     float2 uv = v.splatUv;
     const float stdDev = abs(v.adjustedStdDev);
-    const float z2 = v.adjustedStdDev < 0.0 ? surfelRadius2(v.splatUv, v.surfelX, v.surfelY, v.surfelW, uv) : dot(uv, uv);
+    float fade = 0.0;
+    const float z2 = v.adjustedStdDev < 0.0 ? surfelRadius2(v.splatUv, v.surfelX, v.surfelY, v.surfelW, uv, fade) : dot(uv, uv);
     if (z2 > stdDev * stdDev) {
         discard;
     }
-    rgba.a = splatAlpha(rgba.a, z2);
+    rgba.a = splatAlpha(rgba.a, z2 + fade);
     if (rgba.a < params.minAlpha) {
         discard;
     }

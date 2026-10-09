@@ -84,7 +84,7 @@ mod prune;
 use spark_lib::athl::{cloud_hash, splat_weights, sparse_layers, validate, virtual_values_weighted, AthlFile};
 use spark_lib::athc_build::{build_lod, packed_of, BuildOptions};
 use spark_lib::athc_lod_error::{with_lod_sizes, LodSizeOptions};
-use spark_lib::athc_merge::{error_cut_to, error_levels, ErrorOptions, ErrorView};
+use spark_lib::athc_merge::{error_cut_to, error_levels, CostKind, ErrorOptions, ErrorView};
 use spark_lib::athc::{cut_sources, truncate_creases, truncate_levels, uncap_levels, AthcFile, VirtualTree};
 use spark_lib::athc_v3::{
     parse_v3, read_v3, read_v3_skeleton, write_v3_cpca, write_v3_encoded, write_v3_full, write_v3_smallest_with, SectionId, ATH3_MAGIC, COMPRESSION_GZIP, COMPRESSION_NONE,
@@ -157,6 +157,28 @@ fn main() -> Result<()> {
         o.widen = num("--error-widen", o.widen as f64)? as f32;
         o.level_ratio = num("--error-ratio", o.level_ratio)?;
         o.threads = num("--error-threads", o.threads as f64)? as usize;
+        match text("--error-kind").as_deref() {
+            None | Some("screen") => {}
+            Some("seen") => o.kind = CostKind::Seen,
+            Some(k) => bail!("--error-kind screen|seen, not {k}"),
+        }
+        o.gloss = num("--error-gloss", o.gloss)?;
+        o.gloss_cone = num("--error-gloss-cone", o.gloss_cone)?;
+        o.flat = num("--error-flat", o.flat)?;
+        o.seen_colour = num("--error-colour", o.seen_colour)?;
+        o.seen_material = num("--error-seen-material", o.seen_material)?;
+        o.edge = num("--error-edge", o.edge)?;
+        o.pass_fraction = num("--error-pass-fraction", o.pass_fraction)?;
+        if flag("--error-mutual") {
+            o.matching = false;
+        }
+        match text("--error-surfels").as_deref() {
+            None | Some("auto") => {}
+            Some("on") => o.surfels = spark_lib::athc_build::SurfelNodes::On,
+            Some("off") => o.surfels = spark_lib::athc_build::SurfelNodes::Off,
+            Some(k) => bail!("--error-surfels auto|on|off, not {k}"),
+        }
+        o.surfel_min = num("--error-surfel-min", o.surfel_min as f64)? as u32;
         let t = std::time::Instant::now();
         let before = file.header.count;
         let (out, tree) = match cut_to {

@@ -1353,6 +1353,15 @@ pub fn spread_translucent(block: &mut AthcBlock, i: usize, area: f64) {
     }
     let o = &mut block.positions[i * 4 + 3];
     if !sheet {
+        // A node already covered past 1 (Spark's LoD opacity, the ratio
+        // `coverage_ratios` gave it) keeps it: relight.slang's
+        // coveredGlassAlpha draws that coverage wider than a gaussian, which
+        // is what closes the gaps between a level's cells on a closed solid
+        // (the pawn's glass head, thread AU). Composited to under 1 it let
+        // 5-45% more of the room through from 1-3 m (thread BL).
+        if *o >= 1.0 {
+            return;
+        }
         let mean = (*o as f64 * before / area).clamp(0.0, 1.0);
         *o = (1.0 - (1.0 - mean).powf(area / before)) as f32;
         return;
@@ -2231,6 +2240,26 @@ impl<T: SplatReceiver> ChunkReceiver for AthcDecoder<T> {
 mod tests {
     use super::*;
     use crate::decoder::SplatInit;
+
+    #[test]
+    fn merged_solid_glass_keeps_a_coverage_past_one() {
+        // One solid glass node (transmission 1, not thin), 1 cm x 1 cm x 1 mm,
+        // whose splats' areas sum to four times its own.
+        let mut b = AthcBlock { n: 1, positions: vec![0.0, 0.0, 0.0, 1.5], shape: vec![0, 0, 0, 0], pbr: vec![255 << 16], ..Default::default() };
+        b.shape[1] = pack_halves(ln_scale(0.01), ln_scale(0.01));
+        b.shape[2] = pack_halves(ln_scale(0.001), 0.0);
+        let area = 4.0 * two_axis_area(&b.shape) as f64;
+        let shape = b.shape.clone();
+        // A coverage past 1 (Spark's LoD opacity, relight's coveredGlassAlpha) is kept.
+        spread_translucent(&mut b, 0, area);
+        assert_eq!(b.positions[3], 1.5);
+        // Under 1 its splats composite over their overlap: less than their sum, its size kept.
+        b.positions[3] = 0.4;
+        spread_translucent(&mut b, 0, area);
+        let o = b.positions[3];
+        assert!(o < 0.4 && o > 0.3, "{o}");
+        assert_eq!(b.shape, shape);
+    }
 
     const TWO_CARDS: &[u8] = include_bytes!("../../../test/fixtures/athc/two_cards.athc");
 

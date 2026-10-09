@@ -12,6 +12,16 @@ export { FxChain } from "./FxChain";
 export type { FxStep } from "./FxChain";
 export { TextureBridge, bridgeFormats } from "./TextureBridge";
 export type { BridgeOptions } from "./TextureBridge";
+export {
+  ProgressiveAccumulator,
+  halton,
+  jitterOffset,
+} from "./ProgressiveAccumulator";
+export type {
+  AccumulateFrame,
+  AccumulateMode,
+  ProgressiveOptions,
+} from "./ProgressiveAccumulator";
 export * from "./types";
 export { Invert } from "./effects/Invert";
 export { Crop } from "./effects/Crop";

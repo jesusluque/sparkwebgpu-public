@@ -175,10 +175,25 @@ describe.skipIf(!device)("WgpuSplatRenderer", () => {
       expect(px[0 + 2]).toBeLessThan(10); // corner stays clear
       // Three frames from the same camera: one generate, then redraws.
       expect(splats.stats.generated).toBe(1);
+      const content = splats.contentVersion;
       camera.position.x += 0.1;
       camera.updateMatrixWorld();
       splats.render(camera);
       expect(splats.stats.generated).toBe(2);
+      // A camera move is not a content change (ProgressiveAccumulator).
+      expect(splats.contentVersion).toBe(content);
+      // A sub-pixel jitter with the unjittered projection named: no generate.
+      const base = camera.projectionMatrix.clone();
+      camera.userData.unjitteredProjectionMatrix = base;
+      camera.projectionMatrix.elements[8] += 0.01;
+      splats.render(camera);
+      expect(splats.stats.generated).toBe(2);
+      camera.projectionMatrix.copy(base);
+      camera.userData.unjitteredProjectionMatrix = undefined;
+      splats.markDirty();
+      splats.render(camera);
+      expect(splats.stats.generated).toBe(3);
+      expect(splats.contentVersion).toBe(content + 1);
 
       // minSortIntervalMs: a moved camera regenerates but draws the last
       // order; the next still frame sorts.
@@ -190,10 +205,10 @@ describe.skipIf(!device)("WgpuSplatRenderer", () => {
       camera.position.x += 0.1;
       camera.updateMatrixWorld();
       splats.render(camera);
-      expect([splats.stats.generated, sorts.mock.calls.length]).toEqual([3, 0]);
+      expect([splats.stats.generated, sorts.mock.calls.length]).toEqual([4, 0]);
       expect([splats.sortStale, deferred]).toEqual([true, 1]);
       splats.render(camera);
-      expect([splats.stats.generated, sorts.mock.calls.length]).toEqual([3, 1]);
+      expect([splats.stats.generated, sorts.mock.calls.length]).toEqual([4, 1]);
       expect(splats.sortStale).toBe(false);
       splats.dispose();
     },

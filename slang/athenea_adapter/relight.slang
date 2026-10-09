@@ -63,6 +63,7 @@ public static const uint kRelightDebugNormal = 1024u;    // debug view: the shad
 public static const uint kRelightDebugFootprint = 2048u; // debug view: the footprint's spread, the coat roughness
 public static const uint kRelightCullBacks = 4096u;      // opaque splats whose stored face looks away are not drawn
 public static const uint kRelightFootprintPixel = 8192u; // the footprint prefilter knows the frame: its pixel term
+public static const uint kRelightCpca = 16384u;          // the transfer is rebuilt in envOfLight's scratch (cpca.slang)
 public static const uint kRelightGroup = 256;
 /// Five uint4 a splat in `relit`: the colour (asuint float4: linear rgb,
 /// alpha, -1 to keep the splat's alpha, -2 to keep its whole rgba), the
@@ -94,7 +95,11 @@ public struct AtheneaRelightParams {
     public float footprint;        ///< the footprint prefilter's gain (0: none; footprintRoughness)
     public uint  listCount;        ///< > 0: relight only these splats, the list at listBase (below)
     public uint  listBase;         ///< uint4 index in `relit` of the list (four splat indices each)
-    public uint  pad0;
+    public uint  threadFirst;      ///< the dispatch's first thread (a batch of the list or of the cloud)
+    public uint  cpcaScratch;      ///< kRelightCpca: where the batch's transfer starts in envOfLight, words
+    public uint  cpcaWords;        ///< kRelightCpca: words a slot of it
+    public uint  pad1;
+    public uint  pad2;
     public float4 encoding;        ///< packed src: rgbMin, rgbMax, lnScaleMin, lnScaleMax
     public float4 row0;            ///< object to world, rows of a 3x4
     public float4 row1;
@@ -139,8 +144,17 @@ float4 rowOf(uint k) {
     return k == 0u ? relightParams.row0 : (k == 1u ? relightParams.row1 : relightParams.row2);
 }
 
-/// Where a gaussian's transfer starts in the pool, in halves.
+/// The thread's slot in its batch (threadFirst on): where cpca.slang left
+/// its transfer in envOfLight under kRelightCpca.
+static uint gSlot = 0u;
+
+/// Where a gaussian's transfer starts in the pool, in halves (under
+/// kRelightCpca, in envOfLight's scratch: the buffer the kCpca variants
+/// hand athenea as its transfer).
 uint transferBaseOf(uint i) {
+    if (hasFlag(kRelightCpca)) {
+        return (relightParams.cpcaScratch + gSlot * relightParams.cpcaWords) * 2u;
+    }
     return attribBase(relightPool, attribDesc(relightPool, relightParams.transfer), i) * 2u;
 }
 
@@ -171,7 +185,7 @@ uint shadowWords() {
 }
 
 /// The surface splat_project's relitToward builds, from this mesh's buffers.
-SplatSurface surfaceOf(uint i, Gsplat g, float3x3 r, float3 cloudNormal, float3 colour) {
+SplatSurface surfaceOf<let kCpca : int>(uint i, Gsplat g, float3x3 r, float3 cloudNormal, float3 colour) {
     const float4 w0 = relightParams.row0;
     const float4 w1 = relightParams.row1;
     const float4 w2 = relightParams.row2;
@@ -211,7 +225,11 @@ SplatSurface surfaceOf(uint i, Gsplat g, float3x3 r, float3 cloudNormal, float3 
     const uint count = transferCount();
     surface.transferCount = count;
     surface.transferBase = count != 0u ? transferBaseOf(i) : 0u;
-    splatTransferFrame(surface, relightPool, r, w0, w1, w2);
+    if (kCpca != 0) {
+        splatTransferFrame(surface, envOfLight, r, w0, w1, w2);
+    } else {
+        splatTransferFrame(surface, relightPool, r, w0, w1, w2);
+    }
     const uint words = shadowWords();
     surface.hasShadowBits = words != 0u && words < 8u && count >= 9u;
     surface.shadowBits = surface.hasShadowBits ? uint2(poolWord(relightParams.shadowBits, i, 0u),
@@ -233,7 +251,7 @@ uint firstDome() {
 }
 
 /// splat_project's splatTransferViewless, a splat: the kept terms, or zero.
-uint4 viewless(uint i, Gsplat g) {
+uint4 viewless<let kCpca : int>(uint i, Gsplat g) {
     const uint dome = firstDome();
     const uint count = transferCount();
     if (count < 9u || count == kTransferZonalCount || dome == kEnvNone || hasFlag(kRelightLit) ||
@@ -259,8 +277,13 @@ uint4 viewless(uint i, Gsplat g) {
     float3 front;
     float3 coupling;
     float  sunShare;
-    transferViewless<2>(s, relightPool, relightPool, envSh, envSun, dome, hasFlag(kRelightIndirect), front, coupling,
-                        sunShare);
+    if (kCpca != 0) {
+        transferViewless<2>(s, envOfLight, relightPool, envSh, envSun, dome, hasFlag(kRelightIndirect), front,
+                            coupling, sunShare);
+    } else {
+        transferViewless<2>(s, relightPool, relightPool, envSh, envSun, dome, hasFlag(kRelightIndirect), front,
+                            coupling, sunShare);
+    }
     return uint4(packHalves(front.x, front.y), packHalves(front.z, coupling.x),
                  packHalves(coupling.y, coupling.z), packHalves(sunShare, float(dome + 1u)));
 }
@@ -473,7 +496,7 @@ public float coveredGlassAlpha(float a, float n) {
 /// -1 where the splat keeps its own, -2 where it keeps its whole captured
 /// colour (its transfer is not resident). `pixel`: what the draw reads per
 /// pixel (splat_project's slope and sharp records).
-float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
+float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixel pixel) {
     pixel = noPixel();
     const Gsplat g = readSplat(i);
     if (!isActive(g.flags)) {
@@ -491,7 +514,7 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     const bool hasNormals = hasAttr(relightParams.normalOct);
     const float3 cloudNormal = splatShadingNormal(r, g.scales, g.center, relightParams.eyeObject.xyz, hasNormals,
                                                   hasNormals ? poolWord(relightParams.normalOct, i, 0u) : 0u);
-    SplatSurface surface = surfaceOf(i, g, r, cloudNormal, colour);
+    SplatSurface surface = surfaceOf<kCpca>(i, g, r, cloudNormal, colour);
     SplatSlope slope = noSlope();
     if (kTransfer >= 2 && hasFlag(kRelightCache) && surface.transferCount != kTransferZonalCount &&
         dot(cloudNormal, storedFacing(r, g.scales, i)) > 0.0) {
@@ -557,11 +580,20 @@ float4 relitColour<let kTransfer : int>(uint i, out RelightPixel pixel) {
     }
     // No shadow was measured: relightParams' shadow lights are 0, and the
     // factors are never read (iesValues stands in for the buffer).
-    float3 light = relitSplat<kTransfer>(surface, normalize(relightParams.eyeWorld.xyz - surface.position),
-                                         relightLights, relightParams.lightCount, 0xFFFFFFFFu, 0xFFFFFFFFu,
-                                         iesValues, 0u, 0u, envTexels, envSh, envOfLight, relightParams.envLights,
-                                         relightParams.envBaseSide, envSun, relightPool, relightPool,
-                                         hasFlag(kRelightIndirect), slope);
+    float3 light;
+    if (kCpca != 0) {
+        light = relitSplat<kTransfer>(surface, normalize(relightParams.eyeWorld.xyz - surface.position),
+                                      relightLights, relightParams.lightCount, 0xFFFFFFFFu, 0xFFFFFFFFu, iesValues,
+                                      0u, 0u, envTexels, envSh, envOfLight, relightParams.envLights,
+                                      relightParams.envBaseSide, envSun, envOfLight, relightPool,
+                                      hasFlag(kRelightIndirect), slope);
+    } else {
+        light = relitSplat<kTransfer>(surface, normalize(relightParams.eyeWorld.xyz - surface.position),
+                                      relightLights, relightParams.lightCount, 0xFFFFFFFFu, 0xFFFFFFFFu, iesValues,
+                                      0u, 0u, envTexels, envSh, envOfLight, relightParams.envLights,
+                                      relightParams.envBaseSide, envSun, relightPool, relightPool,
+                                      hasFlag(kRelightIndirect), slope);
+    }
     float alpha = -1.0;
     const bool hasPbr = hasAttr(relightParams.pbr);
     const uint pbr = hasPbr ? poolWord(relightParams.pbr, i, 0u) : 0u;
@@ -646,13 +678,14 @@ uint relightTarget(uint t) {
     return relit[relightParams.listBase + t / 4u][t % 4u];
 }
 
-void relightAt<let kTransfer : int>(uint t) {
+void relightAt<let kTransfer : int, let kCpca : int>(uint t) {
+    gSlot = t - relightParams.threadFirst;
     const uint i = relightTarget(t);
     if (i >= relightParams.count) {
         return;
     }
     RelightPixel pixel;
-    relit[i * kRelightStride] = asuint(relitColour<kTransfer>(i, pixel));
+    relit[i * kRelightStride] = asuint(relitColour<kTransfer, kCpca>(i, pixel));
     // The draw reads the slope and polish records only under a mark in the
     // centre's (kRelightSlope): without it they are left as they are.
     if (hasFlag(kRelightSlope)) {
@@ -743,7 +776,7 @@ float catcherOpacity(uint i, float3x3 r, float3 scale, float opacity) {
 // A cloud over 65 535 workgroups wide (16 776 960 splats, a 256-page pool)
 // is dispatched as rows of that many threads: the splat is x + y * row.
 public static const uint kRelightDispatchRow = 65535u * 256u;
-uint relightIndex(uint3 tid) { return tid.x + tid.y * kRelightDispatchRow; }
+uint relightIndex(uint3 tid) { return tid.x + tid.y * kRelightDispatchRow + relightParams.threadFirst; }
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -758,36 +791,61 @@ void atheneaRelightCatcher(uint3 tid: SV_DispatchThreadID) {
     relit[i * kRelightStride + kRelightPixel + 2u] = uint4(0u);
 }
 
+void viewlessAt<let kCpca : int>(uint i) {
+    gSlot = i - relightParams.threadFirst;
+    if (i >= relightParams.count) {
+        return;
+    }
+    const Gsplat g = readSplat(i);
+    relit[i * kRelightStride + 1u] = isActive(g.flags) ? viewless<kCpca>(i, g) : uint4(0u);
+}
+
 /// The kept terms (splatTransferViewless), when the sky, the lights, the
 /// cloud or its place changed.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelightViewless(uint3 tid: SV_DispatchThreadID) {
-    const uint i = relightIndex(tid);
-    if (i >= relightParams.count) {
-        return;
-    }
-    const Gsplat g = readSplat(i);
-    relit[i * kRelightStride + 1u] = isActive(g.flags) ? viewless(i, g) : uint4(0u);
+    viewlessAt<0>(relightIndex(tid));
+}
+
+/// The kept terms with the transfer rebuilt by cpca.slang (kRelightCpca).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaRelightViewlessCpca(uint3 tid: SV_DispatchThreadID) {
+    viewlessAt<1>(relightIndex(tid));
 }
 
 /// A cloud with a TX transfer (cells): everything.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelight(uint3 tid: SV_DispatchThreadID) {
-    relightAt<2>(relightIndex(tid));
+    relightAt<2, 0>(relightIndex(tid));
+}
+
+/// A TX cloud whose transfer cpca.slang rebuilt (kRelightCpca).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaRelightCpca(uint3 tid: SV_DispatchThreadID) {
+    relightAt<2, 1>(relightIndex(tid));
 }
 
 /// The first transfer (no cells).
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelightFirst(uint3 tid: SV_DispatchThreadID) {
-    relightAt<1>(relightIndex(tid));
+    relightAt<1, 0>(relightIndex(tid));
+}
+
+/// The first transfer, rebuilt by cpca.slang (kRelightCpca).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaRelightFirstCpca(uint3 tid: SV_DispatchThreadID) {
+    relightAt<1, 1>(relightIndex(tid));
 }
 
 /// No transfer: the lights and the dome's harmonics and map alone.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaRelightPlain(uint3 tid: SV_DispatchThreadID) {
-    relightAt<0>(relightIndex(tid));
+    relightAt<0, 0>(relightIndex(tid));
 }

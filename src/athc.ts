@@ -26,6 +26,13 @@ import {
 } from "spark-rs";
 import { workerPool } from "./SplatWorker";
 import * as wasm from "./wasm";
+import {
+  CpcaTable,
+  TRANSFER_CPCA,
+  cpcaFormValues,
+  cpcaPagedSections,
+  cpcaPagedSpec,
+} from "./webgpu/athenea/cpcaResident";
 import type { AttribFormat, AttributeSpec } from "./webgpu/attributes/schema";
 import {
   AttribPool,
@@ -161,8 +168,15 @@ export function isAthcV3(layout: AnyAthcLayout): layout is AthcV3Layout {
   return layout.version === 3;
 }
 
-/** What a reader keeps of the optional streams (athc_v3.rs Want). */
-export type AthcWant = { material: boolean; transferValues: number };
+/**
+ * What a reader keeps of the optional streams (athc_v3.rs Want); `cpca`,
+ * the transfer as clusters (transferCpca) rather than its halves.
+ */
+export type AthcWant = {
+  material: boolean;
+  transferValues: number;
+  cpca?: boolean;
+};
 
 export const ATHC_MATERIAL_STREAMS = [
   "normalOct",
@@ -174,7 +188,42 @@ export const ATHC_RELIGHT_STREAMS = [
   "shadowBits",
   "transfer",
   "curvature",
+  // TRANSFER_CPCA, spelled out: cpcaResident.ts imports this module.
+  "transferCpca",
 ] as const;
+
+/**
+ * A layout's attribute specs, with `transferCpca` (the transfer kept on the
+ * GPU as its clusters: src/webgpu/athenea/cpcaResident.ts) where a v3
+ * file's transfer is CPCA: a pool loads it only when asked (the relight
+ * plugin's transferResident "cpca").
+ */
+export function athcAttribSpecs(layout: AnyAthcLayout): AttributeSpec[] {
+  const specs = layout.attribSpecs as AttributeSpec[];
+  if (!isAthcV3(layout) || !layout.transferForms?.length) return specs;
+  const cpca = cpcaPagedSpec(layout, layout.transferForms);
+  return cpca ? [...specs, cpca] : specs;
+}
+
+const cpcaTables = new WeakMap<object, Map<number, CpcaTable>>();
+
+/** The cluster table of a paged v3 cloud's transfer form of `values` values. */
+export function athcCpcaTable(layout: AthcV3Layout, values: number) {
+  let byForm = cpcaTables.get(layout);
+  if (!byForm) {
+    byForm = new Map();
+    cpcaTables.set(layout, byForm);
+  }
+  let table = byForm.get(values);
+  if (!table) {
+    table = new CpcaTable(
+      cpcaPagedSections(layout.sections, Math.ceil(values / 2)),
+      values,
+    );
+    byForm.set(values, table);
+  }
+  return table;
+}
 
 /**
  * The Want of attribute `names` (the pool's specs, so the transfer's
@@ -183,16 +232,20 @@ export const ATHC_RELIGHT_STREAMS = [
  */
 export function athcWantOf(
   layout: AnyAthcLayout,
-  specs: readonly Pick<AttributeSpec, "name" | "components">[],
+  specs: readonly Pick<AttributeSpec, "name" | "components" | "cpcaForms">[],
 ): AthcWant {
   const has = (n: string) => specs.some((s) => s.name === n);
   const transfer = specs.find((s) => s.name === "transfer");
+  const cpca = specs.find((s) => s.name === TRANSFER_CPCA);
   const relight = ATHC_RELIGHT_STREAMS.some(has);
+  const values = Math.max(
+    transfer?.components ?? 0,
+    (cpca && cpcaFormValues(cpca)) ?? 0,
+  );
   return {
     material: ATHC_MATERIAL_STREAMS.some(has),
-    transferValues: relight
-      ? (transfer?.components ?? layout.extra.transferCount)
-      : 0,
+    transferValues: relight ? values || layout.extra.transferCount : 0,
+    ...(cpca ? { cpca: true } : {}),
   };
 }
 
@@ -256,6 +309,12 @@ export type AthcPaging = {
   keepLinear: boolean;
   /** Version 3: what the merged pages (the levels) were fetched with. */
   levelsWant?: AthcWant;
+  /**
+   * The merged nodes' transferCpca records (levelsWant.cpca), by virtual
+   * index; a merged root the decoder made is filled from its decoded
+   * transfer when page 0 arrives (athcMergedCpca).
+   */
+  cpcaMerged?: { table: CpcaTable; records: Uint32Array; root: boolean };
 };
 
 type FetchOptions = {
@@ -619,20 +678,20 @@ async function openAthcV3(
   const keepLinear = options.keepLinear ?? false;
   const flags = keepLinear ? ATHV_KEEP_LINEAR : 0;
   const ids = sectionsFor(layout, levelsWant, true, true);
+  const levelBlocks = layout.blocks.filter((b) => b.kind === 0);
   // One Range request a level block.
-  const levels = await Promise.all(
-    layout.blocks
-      .filter((b) => b.kind === 0)
-      .map(async (b) =>
-        athvSectionsPage(
-          layout,
-          0,
-          b.n,
-          flags,
-          levelsWant.transferValues,
-          await readSections(layout, b, ids, options),
-        ),
-      ),
+  const levelParts = await Promise.all(
+    levelBlocks.map((b) => readSections(layout, b, ids, options)),
+  );
+  const levels = levelBlocks.map((b, k) =>
+    athvSectionsPage(
+      layout,
+      0,
+      b.n,
+      flags,
+      levelsWant.transferValues,
+      levelParts[k],
+    ),
   );
   const { tree: treeObject, pages } = await workerPool.withWorker((worker) =>
     worker.call("athc3MergedPages", { tables: tables.slice(), levels }),
@@ -653,6 +712,18 @@ async function openAthcV3(
       view.setUint32(152, view.getUint32(152, true) | ATHV_KEEP_LINEAR, true);
     }
   }
+  let cpcaMerged: AthcPaging["cpcaMerged"];
+  if (levelsWant.cpca && levelsWant.transferValues > 0) {
+    const table = athcCpcaTable(layout, levelsWant.transferValues);
+    const records = new Uint32Array(tree.merged * table.recordWords);
+    let at = tree.synthRoot ? 1 : 0;
+    for (let k = 0; k < levelBlocks.length; k++) {
+      const payloads = await cpcaPayloads(levelParts[k]);
+      table.addBlock(records, at, levelBlocks[k].n, payloads, `l${k}`);
+      at += levelBlocks[k].n;
+    }
+    cpcaMerged = { table, records, root: tree.synthRoot };
+  }
   return {
     layout,
     tree,
@@ -661,7 +732,55 @@ async function openAthcV3(
     pageCount: tree.splatBase / ATHC_PAGE_SPLATS + layout.header.chunks,
     keepLinear,
     levelsWant,
+    cpcaMerged,
   };
+}
+
+/** A block's transfer sections as stored, after the gunzip. */
+async function cpcaPayloads(
+  parts: { section: AthcSection; stored: Uint8Array }[],
+) {
+  const out = new Map<string, { bytes: Uint8Array; encoding: number }>();
+  for (const { section, stored } of parts) {
+    if (!/^TX/.test(section.id)) continue;
+    out.set(section.id, {
+      bytes: section.compression === 1 ? await gunzip(stored) : stored,
+      encoding: section.encoding ?? 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * Merged page `page`'s transferCpca column (paging.cpcaMerged), its root's
+ * row from the page's decoded transfer (`attribs`); null for other pages.
+ */
+export function athcMergedCpca(
+  paging: AthcPaging,
+  page: number,
+  attribs: AttribPool | null,
+): AttribPool | null {
+  const merged = paging.cpcaMerged;
+  if (!merged || page >= paging.mergedPages.length) return null;
+  const { table, records } = merged;
+  const base = page * ATHC_PAGE_SPLATS;
+  const n = Math.min(ATHC_PAGE_SPLATS, paging.tree.merged - base);
+  if (page === 0 && merged.root) {
+    const transfer = attribs?.column("transfer");
+    if (!transfer) return null;
+    table.addRow(records, 0, transfer.words.subarray(0, table.transferWords));
+    merged.root = false;
+  }
+  const pool = new AttribPool(n);
+  pool.setColumn({
+    spec: table.spec(),
+    words: records.slice(
+      base * table.recordWords,
+      (base + n) * table.recordWords,
+    ),
+  });
+  pool.cpca = table;
+  return pool;
 }
 
 /** The ATHV head of a page of `n` splats at virtual index `base`. */
@@ -764,7 +883,7 @@ export async function fetchAthc3Page(
   return {
     page: bytes,
     streams: rest.length
-      ? await streamColumns(layout, block.n, rest, streams)
+      ? await streamColumns(layout, block.n, rest, streams, `c${chunk}`)
       : null,
   };
 }
@@ -793,7 +912,7 @@ export async function fetchAthcStreams(
       sectionsFor(layout, want, false),
       options,
     );
-    return streamColumns(layout, block.n, parts, specs);
+    return streamColumns(layout, block.n, parts, specs, `c${chunk}`);
   }
   // Version 2: the block's arrays, one after the other.
   const { offset, count: n } = layout.chunks[chunk];
@@ -869,7 +988,7 @@ function assembleRows(
 }
 
 /** gzip (RFC 1952) as the browser reads it. */
-async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
+export async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
   const stream = new Blob([bytes as BlobPart])
     .stream()
     .pipeThrough(new DecompressionStream("gzip"));
@@ -1040,9 +1159,27 @@ async function streamColumns(
   n: number,
   parts: { section: AthcSection; stored: Uint8Array; raw: number }[],
   specs: readonly AttributeSpec[],
+  key: string,
 ): Promise<AttribPool> {
   const raw = new Map<string, Uint32Array>();
+  // The transfer as clusters: the block's records from its payloads.
+  const cpcaSpec = specs.find((s) => s.name === TRANSFER_CPCA);
+  const cpcaValues = cpcaSpec && cpcaFormValues(cpcaSpec);
+  let cpca: AttribPool["cpca"];
+  let cpcaWords: Uint32Array | undefined;
+  if (cpcaSpec && cpcaValues) {
+    cpca = athcCpcaTable(layout, cpcaValues);
+    cpcaWords = new Uint32Array(n * cpca.recordWords);
+    cpca.addBlock(cpcaWords, 0, n, await cpcaPayloads(parts), key);
+  }
   for (const { section, stored } of parts) {
+    if (
+      cpca &&
+      /^TX/.test(section.id) &&
+      !specs.some((s) => s.name === "transfer")
+    ) {
+      continue;
+    }
     const bytes = decodeAthcSection(
       section.compression === 1 ? await gunzip(stored) : stored.slice(),
       n,
@@ -1080,6 +1217,10 @@ async function streamColumns(
     .map((s) => ({ data: raw.get(s.id) as Uint32Array, words: s.words }));
   if (tx.length) sources.set("transfer", tx);
   const pool = new AttribPool(n);
+  if (cpca && cpcaSpec && cpcaWords) {
+    pool.setColumn({ spec: { ...cpcaSpec }, words: cpcaWords });
+    pool.cpca = cpca;
+  }
   for (const spec of specs) {
     const src = sources.get(spec.name);
     if (!src) continue;

@@ -255,6 +255,16 @@ sections take 4–7× fewer bytes (TX 112 of the pawn's top: 157 → 28 MB); a
 relit splat through athenea's `relitSplat` on Dawn moves by a relMSE of
 4e-8 – 3e-5 (`test/gpu/athcCpcaRelight.test.ts`, opt-in); the Corvette light set 67.9 → 49.5 MB, the pawn page 281 → 84 MB, the sparrow −6 %.
 
+On the GPU the transfer can also stay as these clusters
+(`atheneaRelightPlugin({ transferResident: "cpca" })`, thread BP): the pool
+holds `transferCpca` (a cluster entry and the i16 coefficients a section, or
+its halves where clusters are not smaller), a table of the clusters sits
+beside it, and the relight pass rebuilds the halves a batch at a time
+(`slang/athenea_adapter/cpca.slang`), the same as the decoder's to 1e-11
+relMSE. The pawn's top (TX 112) takes 148 B a splat instead of 224 (164
+when paged, M fixed at 32), at about 6 ns a splat each relit frame; a t16
+transfer gains nothing.
+
 ### A skinned cloud (`SKIN` and the skeleton)
 
 athenea keeps a cloud a skeleton carries (`athenea mesh2splat --skinned`)

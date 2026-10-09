@@ -12,8 +12,10 @@ import { PagedSplats } from "../../src/PagedSplats";
 import { type AthcV3Layout, athvSectionsPage, isAthcV3 } from "../../src/athc";
 import { KernelRegistry } from "../../src/webgpu/KernelRegistry";
 import { WgpuSplatPager } from "../../src/webgpu/WgpuSplatPager";
+import { TRANSFER_CPCA } from "../../src/webgpu/athenea/cpcaResident";
 import { specsFromRadMeta } from "../../src/webgpu/attributes/PagedAttribPool";
 import { ATTRIB_NONE, AttribPool } from "../../src/webgpu/attributes/schema";
+import cpcaModule from "../../src/webgpu/generated/athenea_adapter/cpca";
 import athcTest from "../../src/webgpu/generated/tests/athc_adapter";
 import { UniformWriter } from "../../src/webgpu/uniforms";
 import { device, readBack, storage } from "./device";
@@ -476,5 +478,109 @@ describe.skipIf(!device)("a .athc paged by stream group", () => {
       pager.dispose();
     },
     120_000,
+  );
+  // The transfer kept as clusters (the relight plugin's transferResident
+  // "cpca"): the pager loads transferCpca in place of the transfer, by page
+  // as the transfer is, the merged page's from the levels read at open and
+  // the chunk's from its Range; cpca.slang rebuilds the decoder's halves
+  // from the pool (paged region) and the table.
+  it.each([
+    ["full", 112, 2],
+    ["indirect", 64, 2],
+    ["full", 112, 1],
+  ] as const)(
+    "pages the transfer as clusters (%s form, %i values, %i relight pages)",
+    async (form, values, pages) => {
+      const names = [
+        "normalOct",
+        "emission",
+        "pbr",
+        "lobes",
+        "shadowBits",
+        TRANSFER_CPCA,
+      ];
+      const { pager, splats } = await open(V3_CPCA, {
+        attributes: names,
+        pages: { relight: pages },
+        transferForm: form,
+      });
+      const plan = pager.attributePlan();
+      expect(plan?.specs.map((s) => s.name)).not.toContain("transfer");
+      pager.fetchPriority = [
+        { splats, chunk: 1 },
+        { splats, chunk: 0 },
+      ];
+      await settle(pager);
+      const pool = pager.attribs?.pool as AttribPool;
+      const table = pool.cpca;
+      expect(table).toBeTruthy();
+      if (!table) return;
+      expect(table.transferCount).toBe(values);
+      const cpcaId = pool.id(TRANSFER_CPCA);
+      const words = Math.ceil(values / 2);
+      const count = 2 * PAGE;
+      const sec = table.sections.map((s) => [
+        2 * s.words,
+        2 * s.firstWord,
+        s.half,
+        s.cpca ? 1 : 0,
+      ]);
+      const out = storage(count * words * 4);
+      const tableBuffer = storage(table.pack());
+      const list = storage(16);
+      registry.get(cpcaModule, "atheneaCpcaDecode").run({
+        grid: [count],
+        buffers: {
+          cpcaPool: pager.attribs?.buffer as GPUBuffer,
+          cpcaTable: tableBuffer,
+          cpcaTable4: tableBuffer,
+          cpcaList: list,
+          cpcaOut: out,
+        },
+        uniforms: UniformWriter.for(cpcaModule, "cpcaParams").setAll({
+          count,
+          listCount: 0,
+          listBase: 0,
+          threadFirst: 0,
+          batch: count,
+          attribute: cpcaId,
+          scratchBase: 0,
+          scratchWords: words,
+          sections: sec.length,
+          section0: sec[0] ?? [0, 0, 0, 0],
+          section1: sec[1] ?? [0, 0, 0, 0],
+          section2: sec[2] ?? [0, 0, 0, 0],
+        }).data,
+      });
+      const got = new Uint32Array(await readBack(out));
+      out.destroy();
+      tableBuffer.destroy();
+      list.destroy();
+      const relight = pager.attribs?.group("relight");
+      const p0 = pager.getSplatsChunk(splats, 0)?.page as number;
+      const p1 = pager.getSplatsChunk(splats, 1)?.page as number;
+      const check = (page: number, first: number, n: number) => {
+        const wholeWords = whole.column("transfer")?.words as Uint32Array;
+        const tw = 56;
+        for (let i = 0; i < n; i++) {
+          const row = (page * PAGE + i) * words;
+          for (let k = 0; k < words; k++) {
+            expect(got[row + k]).toBe(wholeWords[(first + i) * tw + k]);
+          }
+        }
+      };
+      // The chunk's page ranks first: always resident.
+      expect(relight?.resident(p1) ?? true).toBe(true);
+      check(p1, MERGED, COUNT);
+      if (pages === 2) {
+        check(p0, 0, MERGED);
+      } else {
+        expect(relight?.resident(p0)).toBe(false);
+        // Not resident: nothing rebuilt.
+        for (let k = 0; k < words; k++)
+          expect(got[p0 * PAGE * words + k]).toBe(0);
+      }
+      pager.dispose();
+    },
   );
 });

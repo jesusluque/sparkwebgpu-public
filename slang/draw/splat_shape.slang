@@ -40,6 +40,16 @@ static const uint DRAW_FAINT = 1024u;
 // takes less blur, down to FAINT_MIN_BLUR px^2.
 static const float FAINT_ALPHA = 4.0;
 static const float FAINT_MIN_BLUR = 0.15;
+// Surfels keep their mass under a pixel (with DRAW_2DGS): Huang's
+// max(G(u, v), G(d / sigma)) widens a small or edge-on disc to the filter's
+// disc at the disc's own alpha, which adds coverage (a far sheet of
+// sub-pixel surfels turns opaque; the Corvette's far view came out 7-28%
+// darker with surfel cuts). With this flag the filter's term is the
+// disc's own Gaussian, of its local affine projection, convolved with the
+// 3D path's blur at the alpha that keeps its mass (surfelFiltered): the
+// exact intersection where the disc is resolved, the 3D path's EWA where
+// it is not. Without it, Huang's filter exactly (athenea's raster).
+static const uint DRAW_SURFEL_MASS = 2048u;
 
 // A hash of a splat index in [0, 1) (athc_measure's faint_hash).
 float faintHash(uint i) {
@@ -122,11 +132,35 @@ struct SurfelRows {
 // its squared splat-space radius at pixel offset d is 2 |d|^2.
 static const float SURFEL_FILTER_INV_SQUARE = 2.0;
 
+// DRAW_SURFEL_MASS's filter: the disc's Gaussian at its local affine
+// projection (J, from the rows: surfel pixels per sigma at the centre),
+// convolved with the 3D path's blur, as the inverse of its covariance
+// C = J J^T + blur (xx, xy, yy) and w = det(J J^T) / det(C), the square of
+// the share of the disc's peak alpha that keeps its mass (0 edge-on).
+float4 surfelFiltered(float3 rx, float3 ry, float3 rw) {
+    const float2 ju = float2(rx.x, ry.x) / rw.z;
+    const float2 jv = float2(rx.y, ry.y) / rw.z;
+    const float detJ = ju.x * jv.y - ju.y * jv.x;
+    const float blur = params.blurAmount;
+    const float cxx = ju.x * ju.x + jv.x * jv.x + blur;
+    const float cxy = ju.x * ju.y + jv.x * jv.y;
+    const float cyy = ju.y * ju.y + jv.y * jv.y + blur;
+    const float det = cxx * cyy - cxy * cxy;
+    if (!(det > 0.0)) {
+        return float4(0.0);
+    }
+    return float4(cyy / det, -cxy / det, cxx / det, min(detJ * detJ / det, 1.0));
+}
+
 // The squared splat-space radius at offset `d` from a surfel's projected
 // centre (surfel pixels; rows from SurfelRows, the centre slots ignored):
 // the ray-splat intersection's |uv|^2, or the screen filter's where it is
-// less: Huang's Ghat = max(G(u, v), G(d / sigma)). `uv` is the one taken.
-float surfelRadius2(float2 d, float3 rx, float3 ry, float3 rw, out float2 uv) {
+// less: Huang's Ghat = max(G(u, v), G(d / sigma)); with DRAW_SURFEL_MASS
+// the filtered disc's (surfelFiltered) in place of G(d / sigma). `uv` is
+// the hit, or where the filter's term is taken d / sigma (with
+// DRAW_SURFEL_MASS the filtered disc's mean point). The alpha is
+// splatAlpha(a, z2 + fade): fade 0 but with DRAW_SURFEL_MASS.
+float surfelRadius2(float2 d, float3 rx, float3 ry, float3 rw, out float2 uv, out float fade) {
     const float3 x = float3(rx.xy, 0.0);
     const float3 y = float3(ry.xy, 0.0);
     const float3 hu = d.x * rw - x;
@@ -134,13 +168,34 @@ float surfelRadius2(float2 d, float3 rx, float3 ry, float3 rw, out float2 uv) {
     const float3 s = cross(hu, hv);
     const float screen = SURFEL_FILTER_INV_SQUARE * dot(d, d);
     uv = d * sqrt(SURFEL_FILTER_INV_SQUARE);
+    fade = 0.0;
     // Edge-on (s.z 0) the ray runs in the plane; and a plane met behind the
     // eye (clip w of the hit, dot(rw, s) / s.z, not positive) is not seen.
-    if (s.z == 0.0 || !(dot(rw, s) * s.z > 0.0)) {
-        return screen;
+    const bool met = s.z != 0.0 && dot(rw, s) * s.z > 0.0;
+    const float2 hit = met ? s.xy / s.z : float2(0.0);
+    const float z2 = met ? dot(hit, hit) : 1e30;
+    if (hasFlag(DRAW_SURFEL_MASS)) {
+        // max(G(u, v), G_C(d)) at the alpha that keeps the mass, the share
+        // sqrt(f.w) as `fade` (share G(z) = G(z + fade)); the cut on the
+        // radius itself, as the 3D path's. G_C covers G(u, v) where the
+        // projection is affine, so the hit only adds the perspective's far
+        // side. Edge-on, nothing. uv, the shading point: the hit where its
+        // term is taken, else the filtered disc's mean point seen at d,
+        // J^T C^-1 d (the hit where resolved, the centre under a pixel).
+        const float4 f = surfelFiltered(rx, ry, rw);
+        if (!(f.w > 0.0)) {
+            return 1e30;
+        }
+        const float2 cd = float2(f.x * d.x + f.y * d.y, f.y * d.x + f.z * d.y);
+        const float filtered = dot(d, cd);
+        fade = -log(f.w);
+        if (z2 <= filtered) {
+            uv = hit;
+            return z2;
+        }
+        uv = float2(dot(float2(rx.x, ry.x), cd), dot(float2(rx.y, ry.y), cd)) / rw.z;
+        return filtered;
     }
-    const float2 hit = s.xy / s.z;
-    const float z2 = dot(hit, hit);
     if (!(z2 < screen)) {
         return screen;
     }
@@ -151,7 +206,8 @@ float surfelRadius2(float2 d, float3 rx, float3 ry, float3 rw, out float2 uv) {
 // A surfel's quad, relative to its projected centre (surfel pixels): the
 // box of its ellipse of radius `stdDev` sigmas (the dual conic's tangents,
 // gsplat's AABB with the radius in place of 3.33), joined with the
-// filter's disc of the same radius around the centre, and held within
+// filter's disc of the same radius around the centre (DRAW_SURFEL_MASS: the
+// filtered disc's ellipse), and held within
 // maxPixelRadius of it. Where the ellipse reaches the eye's plane (no
 // ellipse on screen) the whole maxPixelRadius square: the fragment's
 // intersection decides.
@@ -166,13 +222,18 @@ void surfelBox(SurfelRows r, float stdDev, out float2 lo, out float2 hi) {
     const float cxw = dot(rx, w.xy);
     const float cyw = dot(ry, w.xy);
     const float cww = dot(w.xy, w.xy) - k * w.z * w.z;
-    const float reach = stdDev / sqrt(SURFEL_FILTER_INV_SQUARE);
+    float2 reach = float2(stdDev / sqrt(SURFEL_FILTER_INV_SQUARE));
+    if (hasFlag(DRAW_SURFEL_MASS)) {
+        // The filtered disc's box (its covariance's diagonal: J J^T + blur).
+        const float4 f = surfelFiltered(r.x, r.y, w);
+        reach = f.w > 0.0 ? stdDev * sqrt(float2(f.z, f.x) / (f.x * f.z - f.y * f.y)) : float2(0.0);
+    }
     const float most = params.maxPixelRadius;
     if (cww < 0.0) {
         const float2 mid = float2(cxw, cyw) / cww;
         const float2 ext = sqrt(max(mid * mid - float2(cxx, cyy) / cww, float2(0.0)));
-        lo = max(min(mid - ext, float2(-reach)), float2(-most));
-        hi = min(max(mid + ext, float2(reach)), float2(most));
+        lo = max(min(mid - ext, -reach), float2(-most));
+        hi = min(max(mid + ext, reach), float2(most));
     } else {
         lo = float2(-most);
         hi = float2(most);
@@ -239,9 +300,9 @@ float4 markedRgba(SplatShape s) {
 }
 
 // projectSplat's surfel: the record and the cuts, with s's centre and
-// colour set. Huang's filter adds no energy and takes none: rgba is the
-// splat's own.
-bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, bool3 zeroScales) {
+// colour set. rgba is the splat's own (with DRAW_SURFEL_MASS, under
+// minAlpha at its filtered peak, the faint path's floor).
+bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, bool3 zeroScales, uint splatIndex) {
     const float3 eu = zeroScales.x ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
     const float3 ev = zeroScales.z ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
     const float su = zeroScales.x ? scales.y : scales.x;
@@ -254,6 +315,29 @@ bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, boo
     s.rows.x = float3(hu.x - c.x * hu.z, hv.x - c.x * hv.z, c.x);
     s.rows.y = float3(hu.y - c.y * hu.z, hv.y - c.y * hv.z, c.y);
     s.rows.w = float3(hu.z, hv.z, hp.z);
+    if (hasFlag(DRAW_SURFEL_MASS)) {
+        // The faint path: under FAINT_ALPHA x minAlpha at its peak (alpha x
+        // the filtered disc's peak share), alpha raised to that floor, with
+        // the probability that keeps its mass; minAlpha added back. Without
+        // it, dropped under minAlpha there.
+        const float a = s.rgba.a;
+        const float peak = sqrt(surfelFiltered(s.rows.x, s.rows.y, s.rows.w).w);
+        const float faintTarget = FAINT_ALPHA * params.minAlpha;
+        if (!(peak > 0.0)) {
+            return false;
+        }
+        if (!(hasFlag(DRAW_FAINT) && params.falloff == 1.0 && a <= 1.0)) {
+            if (a <= 1.0 && a * peak < params.minAlpha) {
+                return false;
+            }
+        } else if (a * peak < faintTarget) {
+            const float raised = min(faintTarget / peak, 1.0);
+            if (!(faintHash(splatIndex) < a / raised)) {
+                return false;
+            }
+            s.rgba.a = min(raised + params.minAlpha / peak, 1.0);
+        }
+    }
     // As the 3D path: past the radius where the falloff's alpha is under
     // minAlpha every fragment is discarded.
     const float a = s.rgba.a;
@@ -375,7 +459,7 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
         // Exactly one zero scale: a disc (two: a line, drawn as a 3D splat).
         const uint zeros = uint(zeroScales.x) + uint(zeroScales.y) + uint(zeroScales.z);
         if (hasFlag(DRAW_2DGS) && zeros == 1u) {
-            return projectSurfel(s, viewQuaternion, scales, zeroScales);
+            return projectSurfel(s, viewQuaternion, scales, zeroScales, splatIndex);
         }
         float3x3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);
         cov3D = mul(RS, transpose(RS));

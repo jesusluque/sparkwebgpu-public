@@ -2,7 +2,9 @@
 // ray-splat intersection with Huang et al.'s screen filter
 // (draw/splat_shape.slang surfelRadius2), against a CPU reference that
 // intersects each pixel's ray with the disc's plane; and the same image on
-// the vertex path, the projector (projectOnce) and the tiles.
+// the vertex path, the projector (projectOnce) and the tiles. With
+// DRAW_SURFEL_MASS (the renderer's default) a disc under a pixel keeps its
+// mass, as the 3D path's blur does.
 
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
@@ -21,7 +23,7 @@ import {
 import { UniformWriter } from "../../src/webgpu/uniforms";
 import { device, storage } from "./device";
 
-const { DRAW_EXT, DRAW_2DGS } = drawSplatShape;
+const { DRAW_EXT, DRAW_2DGS, DRAW_SURFEL_MASS, DRAW_FAINT } = drawSplatShape;
 const SIZE = 96;
 const FOV_Y = Math.PI / 3;
 const NEAR = 0.1;
@@ -271,6 +273,100 @@ describe.skipIf(!device)("surfels", () => {
       expect(covered).toBeGreaterThan(degrees > 89 ? 2 : 10);
     });
   }
+
+  // A surfel's summed alpha (its coverage in px^2).
+  async function coverage(
+    su: number,
+    sv: number,
+    alpha: number,
+    degrees: number,
+    flags: number,
+  ) {
+    const a = new Uint32Array(4);
+    const b = new Uint32Array(4);
+    encodeSurfel([a, b], 0, [0, 0, 0], su, sv, [0, 0, 0, 1], [1, 1, 1, alpha]);
+    const decoded = decodeExtSplat([a, b], 0);
+    const words = new Uint32Array(8);
+    words.set(a, 0);
+    words.set(b, 4);
+    const center = new THREE.Vector3(0.35, -0.2, -2.5);
+    const view = tilt((degrees * Math.PI) / 180, center);
+    const px = await renderOne(words, view, center, flags);
+    let sum = 0;
+    for (let i = 0; i < SIZE * SIZE; i++) sum += px[4 * i + 3];
+    // The disc's mass: alpha 2 pi su sv in pixels at its centre, foreshortened.
+    const f = (0.5 * SIZE) / Math.tan(FOV_Y / 2) / center.length();
+    const normal = new THREE.Vector3(0, 0, 1).applyQuaternion(view);
+    const cos = Math.abs(normal.dot(center.clone().normalize()));
+    const mass =
+      decoded.opacity *
+      2 *
+      Math.PI *
+      decoded.scales.x *
+      f *
+      decoded.scales.y *
+      f *
+      cos;
+    return { sum, mass };
+  }
+
+  // The Corvette's far view came out 7-28% darker with Huang's filter on
+  // sub-pixel surfels (each one widened to the filter's disc at its own
+  // alpha: a far sheet turns opaque). With DRAW_SURFEL_MASS
+  // the coverage is the disc's mass under a pixel and the 3D path's (both
+  // blur and keep it), and Huang's exact disc above.
+  for (const degrees of [0, 60, 85]) {
+    it(`keeps a sub-pixel surfel's mass at ${degrees} degrees`, async () => {
+      const flags = DRAW_EXT | DRAW_2DGS | DRAW_SURFEL_MASS;
+      for (const size of [0.008, 0.016]) {
+        const kept = await coverage(size, 0.6 * size, 0.9, degrees, flags);
+        const ewa = await coverage(size, 0.6 * size, 0.9, degrees, DRAW_EXT);
+        const huang = await coverage(
+          size,
+          0.6 * size,
+          0.9,
+          degrees,
+          DRAW_EXT | DRAW_2DGS,
+        );
+        if (process.env.SURFEL_LOG)
+          console.log(degrees, size, kept, ewa.sum, huang.sum);
+        if (kept.mass < 0.05) continue;
+        // Measured on Dawn/Metal: within 2.4% of the disc's mass (the blur
+        // and the cuts at maxStdDev and minAlpha), 0.1% of the 3D path's;
+        // Huang's 2.9-34x.
+        expect(Math.abs(kept.sum / kept.mass - 1)).toBeLessThan(0.04);
+        expect(Math.abs(kept.sum / ewa.sum - 1)).toBeLessThan(0.01);
+        expect(huang.sum / kept.mass).toBeGreaterThan(2);
+      }
+    });
+  }
+
+  it("draws a resolved surfel as Huang's exact disc with DRAW_SURFEL_MASS", async () => {
+    const huang = await coverage(0.22, 0.13, 0.9, 30, DRAW_EXT | DRAW_2DGS);
+    const kept = await coverage(
+      0.22,
+      0.13,
+      0.9,
+      30,
+      DRAW_EXT | DRAW_2DGS | DRAW_SURFEL_MASS,
+    );
+    if (process.env.SURFEL_LOG) console.log("resolved", kept, huang.sum);
+    // Measured on Dawn/Metal: 3.8% over Huang's (161.4 px^2 against 155.5;
+    // the affine filtered disc's far side past the true projection's, for a
+    // disc 0.6 m across at 2.5 m).
+    expect(Math.abs(kept.sum / huang.sum - 1)).toBeLessThan(0.05);
+  });
+
+  it("keeps a faint sub-pixel surfel's mass on average (DRAW_FAINT)", async () => {
+    // Under minAlpha at its peak: drawn at the floor alpha by a hash of
+    // its index (here 0) with the probability that keeps its mass, or
+    // dropped without DRAW_FAINT.
+    const flags = DRAW_EXT | DRAW_2DGS | DRAW_SURFEL_MASS;
+    const dropped = await coverage(0.004, 0.003, 0.02, 0, flags);
+    expect(dropped.sum).toBe(0);
+    const faint = await coverage(0.004, 0.003, 0.02, 0, flags | DRAW_FAINT);
+    expect(faint.sum === 0 || faint.sum > faint.mass).toBe(true);
+  });
 
   it("draws a disc as a 3D splat without DRAW_2DGS (surfels: 'ewa')", async () => {
     const a = new Uint32Array(4);

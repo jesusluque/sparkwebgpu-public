@@ -355,12 +355,13 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                 float4 g1 = sGeom1[j];
                 float2 uv;
                 float z2;
+                float fade = 0.0;
                 float stdDev2 = g1.z;
                 if (stdDev2 < 0.0) {
                     // A surfel, as the quad draw's fragment (y up).
                     stdDev2 = -stdDev2;
                     float2 d = surfelOffset(float2(p.x, size.y - p.y), g0.xy);
-                    z2 = surfelRadius2(d, float3(g0.zw, 0.0), float3(g1.xy, 0.0), sGeom2[j], uv);
+                    z2 = surfelRadius2(d, float3(g0.zw, 0.0), float3(g1.xy, 0.0), sGeom2[j], uv, fade);
                 } else {
                     float2 d = p - g0.xy;
                     uv = float2(dot(d, g0.zw), dot(d, g1.xy));
@@ -372,7 +373,7 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                 // Additive (a negative alpha, markedRgba): adds its light,
                 // leaves the transmittance.
                 const bool additive = g1.w < 0.0;
-                float alpha = splatAlpha(abs(g1.w), z2);
+                float alpha = splatAlpha(abs(g1.w), z2 + fade);
                 if (alpha < params.minAlpha) {
                     continue;
                 }

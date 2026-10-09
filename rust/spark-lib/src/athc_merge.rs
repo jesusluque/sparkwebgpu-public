@@ -1607,29 +1607,36 @@ mod tests {
     }
 
     #[test]
-    fn cut_glass_keeps_its_splats_area() {
+    fn cut_glass_keeps_its_splats_coverage() {
         use crate::athc::{is_sheet, two_axis_area, SHEET_PAD};
         for thin in [true, false] {
             let file = pane(thin);
+            // A sheet: its area and reflection mass; solid glass: its
+            // optical depth, sum a (-ln(1 - o)).
             let sums = |f: &AthcFile| {
                 let b = f.splats();
                 let (mut area, mut mass) = (0.0f64, 0.0f64);
                 for i in 0..b.n {
                     assert_eq!(is_sheet(&b, i), thin);
                     let a = two_axis_area(&b.shape[i * 4..i * 4 + 4]) as f64;
-                    let o = b.positions[i * 4 + 3] as f64 - if thin { SHEET_PAD as f64 } else { 0.0 };
+                    let o = b.positions[i * 4 + 3] as f64;
                     area += a;
-                    mass += o * a;
+                    mass += if thin { (o - SHEET_PAD as f64) * a } else { -(1.0 - o).ln() * a };
                 }
                 (area, mass)
             };
             let (a0, m0) = sums(&file);
             let (cut, _) = error_cut(&file, 720, &options(&file)).unwrap();
             let (a1, m1) = sums(&cut);
-            // What a pane at kSheetAlpha lets through, and the solid
-            // glass's compositing, go with the area covered; the light it
-            // reflects with the mass.
-            assert!((a1 / a0 - 1.0).abs() < 0.02, "thin {thin}: area {a0} -> {a1}");
+            if thin {
+                // What a pane at kSheetAlpha lets through goes with the area
+                // covered; the light it reflects with the mass.
+                assert!((a1 / a0 - 1.0).abs() < 0.02, "area {a0} -> {a1}");
+            } else {
+                // Solid glass keeps its moments' size (not spilled past
+                // the pane), its splats composited.
+                assert!(a1 < 0.5 * a0, "area {a0} -> {a1}");
+            }
             assert!((m1 / m0 - 1.0).abs() < 0.02, "thin {thin}: mass {m0} -> {m1}");
         }
     }

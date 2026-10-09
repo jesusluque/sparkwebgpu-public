@@ -62,7 +62,7 @@ export type AccumulateMode = "off" | "plain" | "sample" | "hold";
 export interface ProgressiveOptions {
   /** Samples in the mean (16); 0 turns accumulation off. */
   frames?: number;
-  /** The splats' anti-alias blur in px^2 while sampling (0.1). */
+  /** The splats' anti-alias blur in px^2 while sampling (0.02: about a 4 x 4 supersampled render's 0.3 / 16). */
   blur?: number;
 }
 
@@ -122,7 +122,7 @@ export class ProgressiveAccumulator {
       this.bridge = new TextureBridge(this.gpu);
     }
     this.frames = Math.max(0, Math.floor(options.frames ?? 16));
-    this.blur = options.blur ?? 0.1;
+    this.blur = options.blur ?? 0.02;
   }
 
   /** The mean has all its samples. */
@@ -221,6 +221,7 @@ export class ProgressiveAccumulator {
       if (this.content(f) !== this.contentAtBegin) {
         this.reset();
         mode = "plain";
+        this.mode = mode;
       }
     }
     if (mode === "off" || mode === "plain") {

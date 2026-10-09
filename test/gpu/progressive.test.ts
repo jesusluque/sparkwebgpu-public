@@ -177,6 +177,7 @@ describe.skipIf(!device)("ProgressiveAccumulator", () => {
     spark.webgpu.splats.contentVersion += 1;
     accum.end(texture);
     expect(accum.samples).toBe(0);
+    expect(accum.mode).toBe("plain");
     expect(row(await read(d, texture), 8)).toBe(3);
     expect(accum.begin({ ...frame(), version: 1 })).toBe("plain");
     accum.end(texture);

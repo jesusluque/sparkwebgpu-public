@@ -98,6 +98,7 @@ const {
   DRAW_2DGS,
   DRAW_FAINT,
   DRAW_SURFEL_MASS,
+  DRAW_AA_BOX,
   DRAW_LOD_INFLATE,
   DRAW_ORTHOGRAPHIC,
   DRAW_ENCODE_LINEAR,
@@ -277,6 +278,18 @@ export interface WgpuSplatRendererOptions {
    * stays on screen. "drop": discarded, as WebGL Spark does.
    */
   faintSplats?: "keep" | "drop";
+  /**
+   * The anti-alias filter. "gaussian" (default, as WebGL Spark): each splat
+   * is convolved with a Gaussian of `blurAmount` px^2 (0.3), its alpha
+   * scaled to keep its mass. "box": the mean of the splat's Gaussian over
+   * the pixel (a square along the Gaussian's axes, separable), exact mass
+   * at any size and no ripple as a splat under a pixel moves; silhouettes
+   * and thin parts as sharp as a supersampled render box-filtered down
+   * (the Gaussian's 0.3 px^2 is 3.6 times the box's variance and spreads
+   * them). `blurAmount` is then unused; depth of field's focus blur stays
+   * Gaussian. Applies to quads, projectOnce, tiles and surfels.
+   */
+  aaFilter?: "gaussian" | "box";
   /**
    * SparkRenderer.enable2DGS: forces `surfels: "auto"`. Default false.
    */
@@ -508,6 +521,7 @@ export class WgpuSplatRenderer {
       covSplats: false,
       surfels: "auto",
       faintSplats: "keep",
+      aaFilter: "gaussian",
       enable2DGS: false,
       srgbBlend: false,
       hdr: false,
@@ -1992,6 +2006,7 @@ export class WgpuSplatRenderer {
         (o.surfels !== "ewa" || o.enable2DGS ? DRAW_2DGS : 0) |
         (o.surfels !== "huang" ? DRAW_SURFEL_MASS : 0) |
         (o.faintSplats !== "drop" ? DRAW_FAINT : 0) |
+        (o.aaFilter === "box" ? DRAW_AA_BOX : 0) |
         (o.lodInflate ? DRAW_LOD_INFLATE : 0) |
         (linear ? DRAW_ENCODE_LINEAR : 0) |
         (disk ? DRAW_DISK_CLIP : 0) |

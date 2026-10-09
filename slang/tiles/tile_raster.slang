@@ -121,6 +121,10 @@ bool tileTouched(uint i, uint2 tile) {
     float2 center = asfloat(a.xy);
     float2 u1 = asfloat(a.zw);
     float2 u2 = asfloat(b.xy);
+    if (hasFlag(DRAW_AA_BOX)) {
+        // u1, u2 are the box's axes: every tile of the rectangle.
+        return true;
+    }
     float2 last = float2(float(tileParams.width), float(tileParams.height)) - 1.0;
     float2 lo = float2(tile * TILE_SIZE) + 0.5 - center;
     float2 hi = min(float2(tile * TILE_SIZE + TILE_SIZE - 1u), last) + 0.5 - center;
@@ -207,6 +211,17 @@ void tilePreprocess(uint3 tid: SV_DispatchThreadID) {
         if (l1 > 0.0 && l2 > 0.0) {
             float2 u1 = a1 * (s.adjustedStdDev / l1);
             float2 u2 = a2 * (s.adjustedStdDev / l2);
+            float3 box = float3(0.0);
+            if (hasFlag(DRAW_AA_BOX)) {
+                // The offset along the box's axes in scaled pixels
+                // (boxFrame, boxRadius2): the axes turned by rot.
+                float2 rot;
+                box = boxFrame(normalize(s.axis1), s.box, rot);
+                const float2 n1 = a1 * (params.focalAdjustment / sqrt(l1));
+                const float2 n2 = a2 * (params.focalAdjustment / sqrt(l2));
+                u1 = rot.x * n1 + rot.y * n2;
+                u2 = rot.x * n2 - rot.y * n1;
+            }
             // Pixels whose centres fall in the ellipse inscribed in the quad
             // (the fragment discards the rest).
             float2 extent = sqrt(float2(a1.x * a1.x + a2.x * a2.x, a1.y * a1.y + a2.y * a2.y));
@@ -222,6 +237,7 @@ void tilePreprocess(uint3 tid: SV_DispatchThreadID) {
                 }
                 tileSplats[TILE_SPLAT_WORDS * i] = uint4(asuint(center.x), asuint(center.y), asuint(u1.x), asuint(u1.y));
                 tileSplats[TILE_SPLAT_WORDS * i + 1u] = uint4(asuint(u2.x), asuint(u2.y), asuint(rgb.r), asuint(rgb.g));
+                tileSplats[TILE_SPLAT_WORDS * i + 2u] = asuint(float4(box, 0.0));
                 tileExtra[i] = uint4(
                     asuint(s.adjustedStdDev * s.adjustedStdDev),
                     asuint(markedRgba(s).a),
@@ -365,7 +381,13 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                 } else {
                     float2 d = p - g0.xy;
                     uv = float2(dot(d, g0.zw), dot(d, g1.xy));
-                    z2 = dot(uv, uv);
+                    if (hasFlag(DRAW_AA_BOX)) {
+                        const float3 box = sGeom2[j];
+                        z2 = boxRadius2(uv, box.xy);
+                        uv /= max(box.xy, float2(1e-6));
+                    } else {
+                        z2 = dot(uv, uv);
+                    }
                 }
                 if (z2 > stdDev2) {
                     continue;

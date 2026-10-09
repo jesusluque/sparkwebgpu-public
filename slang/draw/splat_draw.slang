@@ -23,6 +23,7 @@ StructuredBuffer<uint> ordering;
 //   [0] clip centre (f32 x4)   [1] rgba (f32 x4)
 //   [2] axis1.xy, axis2.xy (f32, scaled pixels)
 //   [3] adjustedStdDev (f32), splat index, 1, 0; all 0 when not drawn
+//       (DRAW_AA_BOX: the box's axis sigmas, f32, in place of 1, 0)
 // A surfel's (projectSplat's surfel) holds its SurfelRows instead:
 //   [0] x.xyz, y.x   [1] y.yz, w.xy   [2] w.z, ndc depth, r, g
 //   [3] -adjustedStdDev (f32, the mark), splat index, b, a
@@ -43,7 +44,9 @@ struct VertexOut {
     float3 viewRay : TEXCOORD3;
     nointerpolation float viewDepth : TEXCOORD4;
     // A surfel's SurfelRows (adjustedStdDev < 0; splatUv is then the offset
-    // from its centre in surfel pixels).
+    // from its centre in surfel pixels). DRAW_AA_BOX, not a surfel:
+    // surfelX is SplatShape.box and splatUv the offset along the axes in
+    // scaled pixels.
     nointerpolation float3 surfelX : TEXCOORD5;
     nointerpolation float3 surfelY : TEXCOORD6;
     nointerpolation float3 surfelW : TEXCOORD7;
@@ -128,9 +131,23 @@ SplatVertex computeSplatVertex(uint vertexId, uint instanceId) {
     }
     o.splatUv = corner * s.adjustedStdDev;
     o.adjustedStdDev = s.adjustedStdDev;
+    boxCorner(o, corner, s.axis1, s.axis2, s.box);
 
     o.position = quadCorner(corner, s.clipCenter, s.axis1, s.axis2);
     return o;
+}
+
+// DRAW_AA_BOX: the corner's offset along the box's axes (scaled pixels),
+// the box's sigmas and peak share in surfelX (boxFrame of the Gaussian's
+// sigmas `sigma`, SplatShape.box) and its turn from the Gaussian's axes in
+// surfelY.
+void boxCorner(inout SplatVertex o, float2 corner, float2 axis1, float2 axis2, float2 sigma) {
+    if (hasFlag(DRAW_AA_BOX)) {
+        float2 rot;
+        o.surfelX = boxFrame(normalize(axis1), sigma, rot);
+        o.surfelY = float3(rot, 0.0);
+        o.splatUv = boxRotate(corner * float2(length(axis1), length(axis2)), rot);
+    }
 }
 
 // A quad corner's clip position from the footprint.
@@ -173,7 +190,8 @@ void projectSplats(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         projectedOut[o] = asuint(s.clipCenter);
         projectedOut[o + 1u] = asuint(markedRgba(s));
         projectedOut[o + 2u] = asuint(float4(s.axis1, s.axis2));
-        projectedOut[o + 3u] = uint4(asuint(s.adjustedStdDev), splatIndex, 1u, 0u);
+        projectedOut[o + 3u] = hasFlag(DRAW_AA_BOX) ? uint4(asuint(s.adjustedStdDev), splatIndex, asuint(s.box.xy))
+                                                     : uint4(asuint(s.adjustedStdDev), splatIndex, 1u, 0u);
     }
 }
 
@@ -210,6 +228,7 @@ SplatVertex projectedSplatVertex(uint vertexId, uint instanceId) {
     o.splatUv = corner * adjustedStdDev;
     o.adjustedStdDev = adjustedStdDev;
     o.splatIndex = e.y;
+    boxCorner(o, corner, axes.xy, axes.zw, asfloat(e.zw));
     o.position = quadCorner(corner, asfloat(projected[b]), axes.xy, axes.zw);
     return o;
 }
@@ -224,7 +243,16 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     float2 uv = v.splatUv;
     const float stdDev = abs(v.adjustedStdDev);
     float fade = 0.0;
-    const float z2 = v.adjustedStdDev < 0.0 ? surfelRadius2(v.splatUv, v.surfelX, v.surfelY, v.surfelW, uv, fade) : dot(uv, uv);
+    float z2;
+    if (v.adjustedStdDev < 0.0) {
+        z2 = surfelRadius2(v.splatUv, v.surfelX, v.surfelY, v.surfelW, uv, fade);
+    } else if (hasFlag(DRAW_AA_BOX)) {
+        // The box-filtered Gaussian; uv in sigmas for the blend terms.
+        z2 = boxRadius2(v.splatUv, v.surfelX.xy);
+        uv = v.splatUv / max(v.surfelX.xy, float2(1e-6));
+    } else {
+        z2 = dot(uv, uv);
+    }
     if (z2 > stdDev * stdDev) {
         discard;
     }

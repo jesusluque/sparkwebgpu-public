@@ -14,6 +14,7 @@ export { TextureBridge, bridgeFormats } from "./TextureBridge";
 export type { BridgeOptions } from "./TextureBridge";
 export {
   ProgressiveAccumulator,
+  centredJitter,
   halton,
   jitterOffset,
 } from "./ProgressiveAccumulator";

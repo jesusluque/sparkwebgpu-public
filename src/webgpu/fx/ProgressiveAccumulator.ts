@@ -84,6 +84,23 @@ export function jitterOffset(k: number): [number, number] {
   return [halton(k + 1, 2) - 0.5, halton(k + 1, 3) - 0.5];
 }
 
+/**
+ * Sample k's offset for a mean of `frames` samples: jitterOffset(k) less the
+ * centroid of the first `frames` offsets, so the finished mean sits on the
+ * pixel's centre (the first 4 Halton points' centroid is 0.1 px off).
+ */
+export function centredJitter(k: number, frames: number): [number, number] {
+  let cx = 0;
+  let cy = 0;
+  for (let i = 0; i < frames; i++) {
+    const [x, y] = jitterOffset(i);
+    cx += x / frames;
+    cy += y / frames;
+  }
+  const [x, y] = jitterOffset(k);
+  return [x - cx, y - cy];
+}
+
 export class ProgressiveAccumulator {
   readonly gpu: Gpu;
   readonly bridge: TextureBridge;
@@ -179,7 +196,7 @@ export class ProgressiveAccumulator {
       return this.mode;
     }
     this.mode = "sample";
-    const [dx, dy] = jitterOffset(this.samples);
+    const [dx, dy] = centredJitter(this.samples, this.frames);
     this.jitter = [dx, dy];
     const camera = f.camera;
     const projection = camera.projectionMatrix.clone();

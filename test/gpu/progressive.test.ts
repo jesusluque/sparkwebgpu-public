@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   FxChain,
   ProgressiveAccumulator,
+  centredJitter,
   halton,
   jitterOffset,
 } from "../../src/webgpu/fx";
@@ -78,6 +79,17 @@ describe.skipIf(!device)("ProgressiveAccumulator", () => {
     expect(halton(3, 2)).toBe(0.75);
     expect(halton(2, 3)).toBeCloseTo(2 / 3, 12);
     expect(jitterOffset(0)).toEqual([0, 1 / 3 - 0.5]);
+    // Centred: the finished mean's offsets average to the pixel's centre.
+    for (const n of [1, 4, 16]) {
+      let sx = 0;
+      let sy = 0;
+      for (let k = 0; k < n; k++) {
+        const [x, y] = centredJitter(k, n);
+        sx += x;
+        sy += y;
+      }
+      expect(Math.abs(sx / n) + Math.abs(sy / n)).toBeLessThan(1e-12);
+    }
     for (let k = 0; k < 64; k++) {
       const [x, y] = jitterOffset(k);
       expect(Math.abs(x)).toBeLessThan(0.5 + 1e-12);
@@ -113,8 +125,8 @@ describe.skipIf(!device)("ProgressiveAccumulator", () => {
       expect(accum.begin(frame())).toBe("sample");
       expect(spark.blurAmount).toBe(0.1);
       const [dx, dy] = jitterOf(camera, base);
-      expect(dx).toBeCloseTo(jitterOffset(k)[0], 5);
-      expect(dy).toBeCloseTo(jitterOffset(k)[1], 5);
+      expect(dx).toBeCloseTo(centredJitter(k, 16)[0], 5);
+      expect(dy).toBeCloseTo(centredJitter(k, 16)[1], 5);
       // A point in view moves by exactly the jitter on screen.
       const p = new THREE.Vector3(0.3, -0.2, 0).project(camera);
       const q = new THREE.Vector3(0.3, -0.2, 0).applyMatrix4(

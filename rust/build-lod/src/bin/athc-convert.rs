@@ -168,6 +168,7 @@ fn main() -> Result<()> {
         o.seen_colour = num("--error-colour", o.seen_colour)?;
         o.seen_material = num("--error-seen-material", o.seen_material)?;
         o.edge = num("--error-edge", o.edge)?;
+        o.pass_fraction = num("--error-pass-fraction", o.pass_fraction)?;
         if flag("--error-mutual") {
             o.matching = false;
         }

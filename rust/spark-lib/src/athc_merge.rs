@@ -10,9 +10,10 @@
 //!   longest axes (the LoD's mass), so any merge order is exact moment
 //!   matching;
 //! * candidates are each cluster's nearest neighbours along three shifted
-//!   Morton orders of the centres (each key in its own run); each pass
+//!   Morton orders of the centres; each pass
 //!   merges a greedy matching of every cluster's three cheapest candidates,
-//!   at most half of the matched pairs, cheapest first (thread BH: the pairs
+//!   at most half of the matched pairs and an eighth of the clusters,
+//!   cheapest first (thread BH: the pairs
 //!   that are each other's cheapest, NanoGS's rule, leave a regular sheet
 //!   whose cost drifts with the distance to the orbit nearly unmerged --
 //!   every cluster's cheapest is its neighbour downhill -- and the rest of
@@ -131,8 +132,9 @@ pub struct ErrorOptions {
     pub seen_colour: f64,
     pub seen_material: f64,
     pub edge: f64,
-    /// Flat merges written as surfels (`BuildOptions::surfel_nodes`; Auto:
-    /// only where the cloud brings its own).
+    /// On: a cut's flat clusters of `surfel_min` splats or more are written
+    /// as surfels (`refine_scales`). The levels above, and `error_levels`,
+    /// flatten only what the cloud brings (`SurfelNodes::Auto`).
     pub surfels: SurfelNodes,
     /// A cut's cluster of fewer splats than this stays a gaussian even where
     /// the builder flattened it.
@@ -140,6 +142,10 @@ pub struct ErrorOptions {
     /// Each pass merges a greedy matching of every cluster's cheapest
     /// candidates instead of the pairs that chose each other (`greedy_to`).
     pub matching: bool,
+    /// With `matching`, a pass merges at most this fraction of the clusters
+    /// (a matching offers about twice the pairs mutual choice does, and
+    /// half of them a pass is a coarser cheapest-first).
+    pub pass_fraction: f64,
 }
 
 /// How a merge's cost is weighed on the screen.
@@ -180,6 +186,7 @@ impl ErrorOptions {
             surfels: SurfelNodes::Auto,
             surfel_min: 4,
             matching: true,
+            pass_fraction: 0.125,
         }
     }
 }
@@ -662,15 +669,9 @@ fn greedy_to(pool: &mut Pool, target: usize, max_cost: f64, o: &ErrorOptions, ru
             list[at] = (c, j);
         };
         for sh in &shifts {
-            // Where keys are refused, each key's clusters in their own run
-            // of the order: a key scattered among another's still finds its
-            // own neighbours (and none of the window is spent on refusals).
-            let keyed = rules <= Rules::Keys;
-            let mut order: Vec<(u64, u64, u32)> = par_map(alive, o.threads, |r| {
-                r.map(|i| (if keyed { cls[i].key } else { 0 }, morton63(cls[i].m1.map(|v| v / cls[i].w), lo, ext, *sh), i as u32)).collect()
-            });
+            let mut order: Vec<(u64, u32)> =
+                par_map(alive, o.threads, |r| r.map(|i| (morton63(cls[i].m1.map(|v| v / cls[i].w), lo, ext, *sh), i as u32)).collect());
             order.sort_unstable();
-            let order: Vec<(u64, u32)> = order.into_iter().map(|(_, c, i)| (c, i)).collect();
             let found: Vec<[(f64, u32); KEEP]> = par_map(alive, o.threads, |r| {
                 r.map(|pos| {
                     let i = order[pos].1 as usize;
@@ -738,7 +739,10 @@ fn greedy_to(pool: &mut Pool, target: usize, max_cost: f64, o: &ErrorOptions, ru
         pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let need = alive - target;
         let cheap = pairs.partition_point(|p| p.0 <= max_cost);
-        let take = need.min(pairs.len().div_ceil(2)).min(cheap);
+        let mut take = need.min(pairs.len().div_ceil(2)).min(cheap);
+        if o.matching && o.pass_fraction > 0.0 {
+            take = take.min(((alive as f64 * o.pass_fraction).ceil() as usize).max(1));
+        }
         if take == 0 {
             break;
         }
@@ -1027,10 +1031,12 @@ pub struct ErrorTree {
     pub sources: Vec<Vec<u32>>,
 }
 
-fn options_for(file: &AthcFile, coarsest: u32, o: &ErrorOptions) -> BuildOptions {
+fn options_for(file: &AthcFile, coarsest: u32) -> BuildOptions {
     BuildOptions {
         coarsest_level: coarsest,
-        surfel_nodes: o.surfels,
+        // A cut's surfels are its own splats' (`refine_scales`); the levels
+        // flatten what the cloud brings.
+        surfel_nodes: SurfelNodes::Auto,
         max_group_fraction: 2.0,
         chunk_splats: file.header.chunk_splats,
         ..Default::default()
@@ -1049,7 +1055,7 @@ pub fn error_levels(file: &AthcFile, o: &ErrorOptions) -> Result<(AthcFile, Erro
     let d = h.levels.len() as u32;
     let coarsest = LOD_LEVELS - d + 1;
     let extent = extent_for(&h, coarsest);
-    let mut out = build_lod_from_codes(&cloud, &options_for(file, coarsest, o), &codes, file.header.bounds_lo, extent)?;
+    let mut out = build_lod_from_codes(&cloud, &options_for(file, coarsest), &codes, file.header.bounds_lo, extent)?;
     crate::athc::uncap_levels(&mut out);
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| codes[i as usize]);
@@ -1130,7 +1136,7 @@ pub fn error_cut_tree(file: &AthcFile, tree: &MergeTree, keep: usize, o: &ErrorO
     let d = h.levels.len() as u32;
     let coarsest = LOD_LEVELS - d + 1;
     let extent = extent_for(&h, coarsest);
-    let full = build_lod_from_codes(&cloud, &options_for(file, coarsest, o), &codes, file.header.bounds_lo, extent)?;
+    let full = build_lod_from_codes(&cloud, &options_for(file, coarsest), &codes, file.header.bounds_lo, extent)?;
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| codes[i as usize]);
     // The finest level (the clusters, in code order) becomes the splats.
@@ -1232,14 +1238,25 @@ fn refine_scales(splats: &mut AthcBlock, groups: &[Vec<u32>], clusters: &[Cl], c
                 + v[2] * (s[4] * v[0] + s[5] * v[1] + s[2] * v[2]);
             sc[k] = var.max(1e-14).sqrt();
         }
-        // A merge the builder wrote as a surfel keeps its flat axis unless it
-        // is a few splats (`surfel_min`): the builder flattens thin leaves
-        // and pairs too, and against their own cloud those are better drawn
-        // as the gaussians they are (BH: the chrome at 300k, 0.0005 with four
+        // A flat cluster of at least `surfel_min` splats is written as a
+        // surfel (`surfels` on): flat as the builder's test (`DISC_RATIO`,
+        // normals within `DISC_SPREAD`, the thin axis along them); only the
+        // cut's own splats, the levels above stay the builder's. Fewer
+        // splats stay gaussians: against their own cloud those are better
+        // drawn as what they are (BH: the chrome at 300k, 0.0005 with four
         // a surfel at least, 0.0020 with two).
         let mut lns = [low_half(w[1]), high_half(w[1]), low_half(w[2])];
-        if c.kids < o.surfel_min.max(2) {
-            lns = lns.map(|v| if crate::athc::is_flat_ln(v) { -30.0 } else { v });
+        if o.surfels == SurfelNodes::On && c.kids >= o.surfel_min.max(2) && !lns.iter().any(|&v| crate::athc::is_flat_ln(v)) {
+            let mut ord = [0usize, 1, 2];
+            ord.sort_by(|&x, &y| sc[x].total_cmp(&sc[y]));
+            let (thin, mid) = (ord[0], ord[1]);
+            let len = len3(&c.n);
+            let n = c.n.map(|v| v / len.max(1e-300));
+            let along = (a[thin][0] * n[0] + a[thin][1] * n[1] + a[thin][2] * n[2]).abs();
+            let spread_ok = len == 0.0 || (1.0 - len / c.w <= crate::athc_build::DISC_SPREAD as f64 && along >= 0.9);
+            if sc[thin] <= crate::athc_build::DISC_RATIO as f64 * sc[mid] && spread_ok {
+                lns[thin] = SURFEL_LN;
+            }
         }
         let old = lns.map(|v| v.exp() as f64);
         let area = |s: [f64; 3]| {

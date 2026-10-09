@@ -53,6 +53,7 @@ public struct AtheneaCpcaParams {
 
 StructuredBuffer<uint>              cpcaPool;
 StructuredBuffer<uint>              cpcaTable;
+StructuredBuffer<uint4>             cpcaTable4;    ///< the same buffer, a uint4 at a time
 StructuredBuffer<uint4>             cpcaList;
 RWStructuredBuffer<uint>            cpcaOut;
 ConstantBuffer<AtheneaCpcaParams>   cpcaParams;
@@ -64,6 +65,38 @@ uint recordHalf(uint base, uint h) {
 
 float lowF(uint w) { return f16tof32(w & 0xFFFFu); }
 float highF(uint w) { return f16tof32(w >> 16u); }
+
+/// A CPCA section in chunks of C uint4s (8 C values) held in registers, the
+/// coefficients read from the record for each chunk: every value's sum in
+/// athc_cpca.rs's order.
+void decodeChunks<let C : int>(uint4 sec, uint base, uint first, uint data, uint row4, uint m, float step) {
+    const uint data4 = data >> 2u;
+    for (uint c0 = 0; c0 < row4; c0 += uint(C)) {
+        float4 lo[C];
+        float4 hi[C];
+        [unroll] for (int k = 0; k < C; ++k) {
+            const uint4 w = cpcaTable4[data4 + c0 + uint(k)];
+            lo[k] = float4(lowF(w.x), lowF(w.y), lowF(w.z), lowF(w.w));
+            hi[k] = float4(highF(w.x), highF(w.y), highF(w.z), highF(w.w));
+        }
+        for (uint j = 0; j < m; ++j) {
+            const float c = float(int(recordHalf(base, sec.z + 1u + j) << 16u) >> 16) * step;
+            const uint row = data4 + (1u + j) * row4 + c0;
+            [unroll] for (int k = 0; k < C; ++k) {
+                const uint4 w = cpcaTable4[row + uint(k)];
+                lo[k] = lo[k] + c * float4(lowF(w.x), lowF(w.y), lowF(w.z), lowF(w.w));
+                hi[k] = hi[k] + c * float4(highF(w.x), highF(w.y), highF(w.z), highF(w.w));
+            }
+        }
+        [unroll] for (int k = 0; k < C; ++k) {
+            const uint at = first + 4u * (c0 + uint(k));
+            cpcaOut[at] = f32tof16(lo[k].x) | (f32tof16(hi[k].x) << 16u);
+            cpcaOut[at + 1u] = f32tof16(lo[k].y) | (f32tof16(hi[k].y) << 16u);
+            cpcaOut[at + 2u] = f32tof16(lo[k].z) | (f32tof16(hi[k].z) << 16u);
+            cpcaOut[at + 3u] = f32tof16(lo[k].w) | (f32tof16(hi[k].w) << 16u);
+        }
+    }
+}
 
 void decodeSection(uint4 sec, uint base, uint out) {
     const uint d = sec.x;
@@ -90,10 +123,37 @@ void decodeSection(uint4 sec, uint base, uint out) {
     }
     const uint m = min(head, kCpcaMaxCoefficients);
     const float step = asfloat(cpcaTable[at + 1u]);
+    // The transfers' sections: 48 values (TXIN, TXFD) and 16 (TXDI).
+    if ((dw & 7u) == 0u) {
+        decodeChunks<2>(sec, base, first, data, dw >> 2u, m, step);
+        return;
+    }
     float coef[kCpcaMaxCoefficients];
     for (uint j = 0; j < m; ++j) {
         const int q = int(recordHalf(base, sec.z + 1u + j) << 16u) >> 16;
         coef[j] = float(q) * step;
+    }
+    if ((dw & 3u) == 0u) {
+        // Eight values at a time (the table's entries start on a uint4).
+        const uint data4 = data >> 2u;
+        const uint row4 = dw >> 2u;
+        for (uint w4 = 0; w4 < row4; ++w4) {
+            const uint4 meanWords = cpcaTable4[data4 + w4];
+            float4 lo = float4(lowF(meanWords.x), lowF(meanWords.y), lowF(meanWords.z), lowF(meanWords.w));
+            float4 hi = float4(highF(meanWords.x), highF(meanWords.y), highF(meanWords.z), highF(meanWords.w));
+            for (uint j = 0; j < m; ++j) {
+                const uint4 dir = cpcaTable4[data4 + (1u + j) * row4 + w4];
+                const float c = coef[j];
+                lo = lo + c * float4(lowF(dir.x), lowF(dir.y), lowF(dir.z), lowF(dir.w));
+                hi = hi + c * float4(highF(dir.x), highF(dir.y), highF(dir.z), highF(dir.w));
+            }
+            const uint at = first + 4u * w4;
+            cpcaOut[at] = f32tof16(lo.x) | (f32tof16(hi.x) << 16u);
+            cpcaOut[at + 1u] = f32tof16(lo.y) | (f32tof16(hi.y) << 16u);
+            cpcaOut[at + 2u] = f32tof16(lo.z) | (f32tof16(hi.z) << 16u);
+            cpcaOut[at + 3u] = f32tof16(lo.w) | (f32tof16(hi.w) << 16u);
+        }
+        return;
     }
     for (uint w = 0; w < dw; ++w) {
         const uint meanWord = cpcaTable[data + w];

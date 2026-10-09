@@ -235,8 +235,8 @@ export interface AtheneaRelightDebug {
    */
   everySplat?: boolean;
   alwaysBlend?: boolean;
-  /** For A/B timings: rebuild a CPCA transfer a splat a thread (else a word a thread). */
-  cpcaPerSplat?: boolean;
+  /** For A/B timings: rebuild a CPCA transfer a word a thread (else a splat a thread). */
+  cpcaPerWord?: boolean;
 }
 
 const DEBUG_VIEWS: Record<string, number> = {
@@ -887,6 +887,7 @@ export function atheneaRelightPlugin(
       const decodeBuffers = {
         cpcaPool: buffers.relightPool,
         cpcaTable: cpca.buffer as GPUBuffer,
+        cpcaTable4: cpca.buffer as GPUBuffer,
         cpcaList: state.relit,
         cpcaOut: envOfLight as GPUBuffer,
       };
@@ -894,7 +895,7 @@ export function atheneaRelightPlugin(
         const n = Math.min(batch, threads - first);
         decode.set("threadFirst", first);
         decode.set("batch", n);
-        const perSplat = Boolean(options.debug?.cpcaPerSplat);
+        const perSplat = !options.debug?.cpcaPerWord;
         r.registry
           .get(
             cpcaModule,

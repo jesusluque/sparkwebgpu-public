@@ -150,7 +150,7 @@ export class CpcaTable {
 
   /** Bytes of pack(). */
   get bytes() {
-    return 4 * (1 + this.offsets.length + this.used);
+    return 4 * (this.headWords + this.used);
   }
 
   private reserve(words: number) {
@@ -170,7 +170,8 @@ export class CpcaTable {
     if (this.offsets.length >= CPCA_MAX_ENTRIES) {
       throw new Error("transferCpca: more than 65 536 table entries");
     }
-    const words = 4 + Math.ceil(halves.length / 4);
+    // Whole uint4s: an entry's data starts on one (cpca.slang reads them so).
+    const words = 4 + Math.ceil(halves.length / 16) * 4;
     this.reserve(words);
     const at = this.used;
     this.data[at] = head[0] >>> 0;
@@ -187,11 +188,17 @@ export class CpcaTable {
   /** [entries, where each starts (from the buffer's start), the entries]. */
   pack(): Uint32Array {
     const e = this.offsets.length;
-    const out = new Uint32Array(1 + e + this.used);
+    const head = this.headWords;
+    const out = new Uint32Array(head + this.used);
     out[0] = e;
-    for (let k = 0; k < e; k++) out[1 + k] = 1 + e + this.offsets[k];
-    out.set(this.data.subarray(0, this.used), 1 + e);
+    for (let k = 0; k < e; k++) out[1 + k] = head + this.offsets[k];
+    out.set(this.data.subarray(0, this.used), head);
     return out;
+  }
+
+  /** Words before the entries: their count and starts, to a whole uint4. */
+  private get headWords() {
+    return Math.ceil((1 + this.offsets.length) / 4) * 4;
   }
 
   /**

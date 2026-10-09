@@ -533,6 +533,7 @@ describe.skipIf(!device)("a .athc paged by stream group", () => {
         buffers: {
           cpcaPool: pager.attribs?.buffer as GPUBuffer,
           cpcaTable: tableBuffer,
+          cpcaTable4: tableBuffer,
           cpcaList: list,
           cpcaOut: out,
         },

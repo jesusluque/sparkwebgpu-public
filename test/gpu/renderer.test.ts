@@ -190,8 +190,12 @@ describe.skipIf(!device)("WgpuSplatRenderer", () => {
       expect(splats.stats.generated).toBe(2);
       camera.projectionMatrix.copy(base);
       camera.userData.unjitteredProjectionMatrix = undefined;
+      // Nothing pending on a still frame; a markDirty is (thread BV).
+      expect(splats.pending).toBe(false);
       splats.markDirty();
+      expect(splats.pending).toBe(true);
       splats.render(camera);
+      expect(splats.pending).toBe(false);
       expect(splats.stats.generated).toBe(3);
       expect(splats.contentVersion).toBe(content + 1);
 

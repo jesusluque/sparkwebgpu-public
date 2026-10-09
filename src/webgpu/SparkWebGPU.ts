@@ -122,6 +122,21 @@ export class SparkWebGPU {
   ) {}
 
   /**
+   * Whether the next render has work to pick up with nothing moved: the
+   * SparkRenderer's dirty flag (a LoD answer, a page, a mesh initialized),
+   * LoD or paging under way (WgpuLod.pending) or the splat renderer's own
+   * (WgpuSplatRenderer.pending). Cheap: a caller that skips rendering a
+   * still view (ProgressiveAccumulator's refreshEvery) polls it each frame.
+   */
+  get pending(): boolean {
+    return (
+      this.spark.dirty ||
+      (this.lod?.pending ?? false) ||
+      (this.splats?.pending ?? false)
+    );
+  }
+
+  /**
    * LoD is traversed for this camera when set (else each frame's first
    * render camera): SparkPortals drives it from the main view.
    */

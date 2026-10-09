@@ -401,6 +401,27 @@ export class WgpuLod {
   }
 
   /**
+   * LoD or paging work under way or waiting for the next update(): a
+   * traversal or worker call in flight, a mesh added or removed, trees to
+   * build, tree ranges to send, pages being fetched or waiting to be
+   * uploaded, a cut fading in. Its answer arrives through onDirty (the
+   * SparkRenderer's dirty flag) and the next render; a caller that skips
+   * rendering a still view keeps rendering while this holds.
+   */
+  get pending(): boolean {
+    return (
+      this.dirty ||
+      this.version !== this.lastVersion ||
+      this.initQueue.length > 0 ||
+      this.disposeQueue.length > 0 ||
+      this.lodUpdates.length > 0 ||
+      this.worker?.queue != null ||
+      (this.pager?.isPending() ?? false) ||
+      this.meshes.some((m) => m.fade?.active ?? false)
+    );
+  }
+
+  /**
    * Starts a LoD update for this camera if the worker is free: call once per
    * frame before WgpuSplatRenderer.render. `renderSize` is the drawing size
    * in pixels (default: the canvas).

@@ -133,6 +133,21 @@ export class FxChain {
     this.gpu.flush();
   }
 
+  /**
+   * Runs the chain over `picture` (rather than the texture's own pixels)
+   * and writes the result into `texture`, then submits: a picture made
+   * earlier in this Gpu's frame, such as ProgressiveAccumulator's mean.
+   */
+  applyPicture(
+    picture: FxBuffer,
+    texture: GPUTexture,
+    opts: BridgeOptions = {},
+  ) {
+    const out = this.active ? this.render(picture) : picture;
+    this.bridge.write(out, texture, opts);
+    this.gpu.flush();
+  }
+
   /** `apply` on a three.js RenderTarget's colour texture (WebGPURenderer). */
   applyToRenderTarget(renderer: ThreeWebGPURenderer, target: RenderTargetLike) {
     const texture = gpuTexture(renderer, target.texture);

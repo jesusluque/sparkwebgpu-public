@@ -439,7 +439,15 @@ export class WgpuSplatRenderer {
   // The signature without camera and mesh transforms, and whether only
   // those moved in the last change (minSortIntervalMs).
   private lastStructure: number[] = [];
+  private lastMeshes: number[] = [];
   private posesOnly = false;
+  /**
+   * Counts the frames whose splats changed for any reason but the camera:
+   * the mesh set, poses, colours, a source's data (LoD, paging), plugins and
+   * dynos. A still camera over an unchanged count draws the same picture
+   * (ProgressiveAccumulator keeps accumulating while it holds).
+   */
+  contentVersion = 0;
   private lastSortTime = Number.NEGATIVE_INFINITY;
   private stale = false;
   private dirty = true;
@@ -733,15 +741,23 @@ export class WgpuSplatRenderer {
       // A stage added later (attributes) has gathered nothing yet.
       this.stages.length,
     ];
+    // A sub-pixel jitter of the projection (ProgressiveAccumulator) moves
+    // the draw alone: the draw, the projector and the tiles read this
+    // frame's projection; generate's cull and metric do not need it.
+    const unjittered = camera.userData?.unjitteredProjectionMatrix as
+      | THREE.Matrix4
+      | undefined;
     const sig: number[] = [
       ...camera.matrixWorld.elements,
-      ...camera.projectionMatrix.elements,
+      ...(unjittered ?? camera.projectionMatrix).elements,
     ];
+    const poses: number[] = [];
     for (const m of this.meshes) {
       m.object.updateMatrixWorld();
-      sig.push(...m.object.matrixWorld.elements);
+      poses.push(...m.object.matrixWorld.elements);
       structure.push(...m.recolor.toArray(), m.source.version);
     }
+    sig.push(...poses);
     const equal = (a: number[], b: number[]) =>
       a.length === b.length && a.every((v, i) => v === b[i]);
     const sameStructure =
@@ -750,9 +766,13 @@ export class WgpuSplatRenderer {
       !this.options.alwaysGenerate &&
       equal(structure, this.lastStructure);
     const same = sameStructure && equal(sig, this.lastSignature);
+    if (!sameStructure || !equal(poses, this.lastMeshes)) {
+      this.contentVersion += 1;
+    }
     this.posesOnly = sameStructure;
     this.lastStructure = structure;
     this.lastSignature = sig;
+    this.lastMeshes = poses;
     this.dirty = false;
     return !same;
   }
@@ -920,6 +940,8 @@ export class WgpuSplatRenderer {
       this.submit(encoder);
       return;
     }
+    // CPU sort generates every frame; the call keeps contentVersion.
+    this.changedSince(camera, total);
     this.generateAll(encoder, camera, cameraPos, cameraDir);
     this.draw(encoder, camera, target);
     const version = this.mappingVersion;
@@ -965,6 +987,7 @@ export class WgpuSplatRenderer {
         projected = this.encodeProject(encoder, total, drawParams);
       }
     } else {
+      this.changedSince(camera, total);
       this.generateAll(encoder, camera, cameraPos, cameraDir);
       readback = this.sortPending ? null : this.copyMetric(encoder, total);
     }

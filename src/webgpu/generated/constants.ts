@@ -144,6 +144,8 @@ export const drawSplatShape = {
   FAINT_ALPHA: 4,
   FAINT_MIN_BLUR: 0.15,
   DRAW_SURFEL_MASS: 2048,
+  DRAW_AA_BOX: 4096,
+  BOX_GAUSS_SIGMA: 2,
   SURFEL_FILTER_INV_SQUARE: 2,
 } as const;
 

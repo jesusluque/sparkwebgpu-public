@@ -50,6 +50,118 @@ static const float FAINT_MIN_BLUR = 0.15;
 // exact intersection where the disc is resolved, the 3D path's EWA where
 // it is not. Without it, Huang's filter exactly (athenea's raster).
 static const uint DRAW_SURFEL_MASS = 2048u;
+// The anti-alias filter is the pixel's box (aaFilter "box"), in place of
+// the Gaussian blur of blurAmount px^2 with its alpha compensation: a
+// fragment's alpha is the mean of the splat's Gaussian over the pixel
+// (separable: a difference of erfs per axis of the box's frame, boxFrame).
+// Exact mass at any size and no ripple as a splat under a pixel moves (a
+// narrow Gaussian sampled at pixel centres has one: 2 exp(-2 pi^2 v), 0.5%
+// at v = 0.3, 28% at v = 0.1), while the edge is as sharp as a box
+// filter's, which is what a supersampled reference shows: the Gaussian's
+// 0.3 px^2 (variance 3.6x the box's 1/12) spreads a silhouette or a thin
+// part over its neighbours. Past BOX_GAUSS_SIGMA pixels a splat takes the
+// Gaussian of the same variance (s^2 + 1/12, compensated), within 1e-4.
+// Surfels (DRAW_SURFEL_MASS): the disc's affine Gaussian J J^T box-filtered
+// the same way. The focus blur of depth of field stays Gaussian.
+static const uint DRAW_AA_BOX = 4096u;
+static const float BOX_GAUSS_SIGMA = 2.0;
+
+// erf(x), Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
+float erfApprox(float x) {
+    const float t = 1.0 / (1.0 + 0.3275911 * abs(x));
+    const float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return x >= 0.0 ? y : -y;
+}
+
+// DRAW_AA_BOX along one axis: the mean of exp(-x^2 / 2 s^2) over the
+// pixel's width 2h around offset x (h: half a pixel in the units of x and
+// s). Its peak boxAxis(0, s, h) is the share of the alpha that keeps the
+// mass (sqrt(2 pi) s / 2h under a pixel, 1 when large); past
+// BOX_GAUSS_SIGMA pixels the Gaussian of variance s^2 + h^2 / 3, the box's.
+float boxAxis(float x, float s, float h) {
+    if (s >= 2.0 * BOX_GAUSS_SIGMA * h) {
+        const float v = s * s + h * h / 3.0;
+        return s * rsqrt(v) * exp(-0.5 * x * x / v);
+    }
+    if (!(s > 0.0)) {
+        return 0.0;
+    }
+    const float k = 0.7071067811865476 / s;
+    return 0.6266570686577501 * s / h * (erfApprox((x + h) * k) - erfApprox((x - h) * k));
+}
+
+// DRAW_AA_BOX: the peak of a splat's box-filtered Gaussian (axis sigmas
+// `sigma` along the box's axes, scaled pixels), and the squared radius
+// splatAlpha takes at offset `x` along those axes, relative to that peak:
+// z2 such that G(z2) = boxed / peak, a sum over the axes (an axis past
+// BOX_GAUSS_SIGMA pixels its Gaussian's x^2 / v: no erf, no log).
+float boxPeak(float2 sigma) {
+    const float h = 0.5 * params.focalAdjustment;
+    return boxAxis(0.0, sigma.x, h) * boxAxis(0.0, sigma.y, h);
+}
+float boxAxisRadius2(float x, float s, float h) {
+    if (s >= 2.0 * BOX_GAUSS_SIGMA * h) {
+        return x * x / (s * s + h * h / 3.0);
+    }
+    const float b = boxAxis(x, s, h);
+    const float p = boxAxis(0.0, s, h);
+    return b > 0.0 && p > 0.0 ? -2.0 * log(min(b / p, 1.0)) : 1e30;
+}
+float boxRadius2(float2 x, float2 sigma) {
+    const float h = 0.5 * params.focalAdjustment;
+    return boxAxisRadius2(x.x, sigma.x, h) + boxAxisRadius2(x.y, sigma.y, h);
+}
+
+// DRAW_AA_BOX's frame: the box is the pixel's square, the integral is
+// taken separable along the square's axes (the Gaussian's variances along
+// them, its correlation dropped and its mass kept: boxMass), so a splat's
+// coverage sums to its mass wherever it lies (the box's rows and columns
+// tile the screen). A long splat (a wire's) would lose its direction that
+// way: from 0.5 px along its major axis and a ratio of 1.5 the square
+// turns towards the Gaussian's own axes (fully at 1 px and 3), where the
+// box integral is exact for its shape and its mass still sums on average
+// along it; so does a splat from 0.5 px along its minor axis (fully at 1
+// px), which the box barely changes, so that its shape is kept. `e1`, `sigma`: the Gaussian's first axis and its sigmas
+// (covSigmas, scaled pixels). Returns the sigmas along the box's axes and
+// the box's peak (boxPeak of those); `rot` takes an offset along the
+// Gaussian's axes to the box's: (cos, sin).
+float3 boxFrame(float2 e1, float2 sigma, out float2 rot) {
+    const float h = 0.5 * params.focalAdjustment;
+    const float theta = atan2(e1.y, e1.x);
+    const float quarter = 0.5 * PI;
+    const float t90 = theta - quarter * round(theta / quarter);
+    const float needle = saturate((sigma.x / sigma.y - 1.5) / 1.5) * saturate((sigma.x / (2.0 * h) - 0.5) / 0.5);
+    const float w = max(needle, saturate((sigma.y / (2.0 * h) - 0.5) / 0.5));
+    // The box's first axis cos e1 + sin e2 (e2 = e1 turned -90 degrees, as
+    // projectSplat's axis2) is e1 turned by -delta: at w t90 (mod 90).
+    const float delta = theta - (sigma.y > 0.0 ? w : 1.0) * t90;
+    rot = float2(cos(delta), sin(delta));
+    const float2 r2 = rot * rot;
+    const float2 s2 = sigma * sigma;
+    const float2 boxed = sqrt(float2(r2.x * s2.x + r2.y * s2.y, r2.y * s2.x + r2.x * s2.y));
+    return float3(boxed, boxPeak(boxed));
+}
+
+// The share of a splat's alpha at its box's peak that keeps its mass:
+// boxFrame's peak times the Gaussian's area over its box frame's
+// (sigma.x sigma.y / boxed.x boxed.y, 1 on its own axes).
+float boxMass(float2 sigma, float3 box) {
+    return box.x * box.y > 0.0 ? box.z * min(sigma.x * sigma.y / (box.x * box.y), 1.0) : 0.0;
+}
+
+// An offset along a Gaussian's axes along its box's (boxFrame's rot).
+float2 boxRotate(float2 uv, float2 rot) {
+    return float2(rot.x * uv.x + rot.y * uv.y, rot.x * uv.y - rot.y * uv.x);
+}
+
+// The axis sigmas and the first axis of a 2x2 covariance (xx, xy, yy).
+float2 covSigmas(float a, float b, float d, out float2 axis) {
+    const float avg = 0.5 * (a + d);
+    const float delta = sqrt(max(0.0, avg * avg - (a * d - b * b)));
+    const float e1 = avg + delta;
+    axis = (abs(b) > 1e-6 * max(e1, 1e-30)) ? normalize(float2(b, e1 - a)) : ((a >= d) ? float2(1.0, 0.0) : float2(0.0, 1.0));
+    return sqrt(max(float2(e1, avg - delta), float2(0.0)));
+}
 
 // A hash of a splat index in [0, 1) (athc_measure's faint_hash).
 float faintHash(uint i) {
@@ -141,7 +253,7 @@ float4 surfelFiltered(float3 rx, float3 ry, float3 rw) {
     const float2 ju = float2(rx.x, ry.x) / rw.z;
     const float2 jv = float2(rx.y, ry.y) / rw.z;
     const float detJ = ju.x * jv.y - ju.y * jv.x;
-    const float blur = params.blurAmount;
+    const float blur = hasFlag(DRAW_AA_BOX) ? 0.0 : params.blurAmount;
     const float cxx = ju.x * ju.x + jv.x * jv.x + blur;
     const float cxy = ju.x * ju.y + jv.x * jv.y;
     const float cyy = ju.y * ju.y + jv.y * jv.y + blur;
@@ -187,8 +299,23 @@ float surfelRadius2(float2 d, float3 rx, float3 ry, float3 rw, out float2 uv, ou
             return 1e30;
         }
         const float2 cd = float2(f.x * d.x + f.y * d.y, f.y * d.x + f.z * d.y);
-        const float filtered = dot(d, cd);
+        float filtered = dot(d, cd);
         fade = -log(f.w);
+        if (hasFlag(DRAW_AA_BOX)) {
+            // The disc's affine Gaussian J J^T box-filtered at d, at the
+            // share of its peak (boxPeak) as the fade.
+            const float2 ju = float2(rx.x, ry.x) / rw.z;
+            const float2 jv = float2(rx.y, ry.y) / rw.z;
+            float2 e;
+            const float2 sigma = covSigmas(ju.x * ju.x + jv.x * jv.x, ju.x * ju.y + jv.x * jv.y, ju.y * ju.y + jv.y * jv.y, e);
+            float2 rot;
+            const float3 box = boxFrame(e, sigma, rot);
+            if (!(boxMass(sigma, box) > 0.0)) {
+                return 1e30;
+            }
+            fade = -2.0 * log(min(boxMass(sigma, box), 1.0));
+            filtered = boxRadius2(boxRotate(float2(dot(d, e), dot(d, float2(e.y, -e.x))), rot), box.xy);
+        }
         if (z2 <= filtered) {
             uv = hit;
             return z2;
@@ -227,6 +354,10 @@ void surfelBox(SurfelRows r, float stdDev, out float2 lo, out float2 hi) {
         // The filtered disc's box (its covariance's diagonal: J J^T + blur).
         const float4 f = surfelFiltered(r.x, r.y, w);
         reach = f.w > 0.0 ? stdDev * sqrt(float2(f.z, f.x) / (f.x * f.z - f.y * f.y)) : float2(0.0);
+        if (hasFlag(DRAW_AA_BOX) && f.w > 0.0) {
+            // The box's square, turned (boxFrame).
+            reach += 0.7072 * params.focalAdjustment;
+        }
     }
     const float most = params.maxPixelRadius;
     if (cww < 0.0) {
@@ -291,6 +422,10 @@ struct SplatShape {
     // Adds its light and covers nothing (generate's GEN_ADDITIVE: an ext,
     // non-covariance splat whose alpha word has a non-zero high half).
     bool additive;
+    // DRAW_AA_BOX (not surfels): the sigmas of the unfiltered Gaussian along
+    // axis1 and axis2 (scaled pixels); the quad's axes then reach
+    // adjustedStdDev sigmas plus the box's square (boxFrame).
+    float2 box;
 };
 
 // rgba with the additive mark as alpha's sign, for the draw's varyings and
@@ -321,7 +456,15 @@ bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, boo
         // the probability that keeps its mass; minAlpha added back. Without
         // it, dropped under minAlpha there.
         const float a = s.rgba.a;
-        const float peak = sqrt(surfelFiltered(s.rows.x, s.rows.y, s.rows.w).w);
+        float peak = sqrt(surfelFiltered(s.rows.x, s.rows.y, s.rows.w).w);
+        if (hasFlag(DRAW_AA_BOX) && peak > 0.0) {
+            const float2 ju = float2(s.rows.x.x, s.rows.y.x) / s.rows.w.z;
+            const float2 jv = float2(s.rows.x.y, s.rows.y.y) / s.rows.w.z;
+            float2 e;
+            const float2 sigma = covSigmas(ju.x * ju.x + jv.x * jv.x, ju.x * ju.y + jv.x * jv.y, ju.y * ju.y + jv.y * jv.y, e);
+            float2 rot;
+            peak = min(boxMass(sigma, boxFrame(e, sigma, rot)), 1.0);
+        }
         const float faintTarget = FAINT_ALPHA * params.minAlpha;
         if (!(peak > 0.0)) {
             return false;
@@ -372,6 +515,7 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     s.rows.y = float3(0.0);
     s.rows.w = float3(0.0);
     s.additive = false;
+    s.box = float2(0.0);
 
     float3 center, scales, xxyyzz, xyxzyz;
     float4 quaternion, rgba;
@@ -496,6 +640,10 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
         fullBlurAmount = clamp(sqr(focusRadius), params.blurAmount, sqr(params.maxPixelRadius));
     }
 
+    if (hasFlag(DRAW_AA_BOX)) {
+        return projectBoxed(s, splatIndex, a, b, d, fullBlurAmount - params.blurAmount, adjustedStdDev);
+    }
+
     // Convolve with a ~0.5-pixel Gaussian for anti-aliasing, keeping energy.
     float detOrig = a * d - b * b;
     const float a0 = a;
@@ -566,6 +714,56 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     }
     s.axis1 = eigenVec1 * scale1;
     s.axis2 = eigenVec2 * scale2;
+    return true;
+}
+
+// projectSplat's 3D path with DRAW_AA_BOX: the 2D covariance (a, b, d)
+// before any blur, `focus` the depth of field's blur past blurAmount (a
+// Gaussian, compensated); the box's peak share as the compensation, the
+// faint path as the Gaussian's (at its floor alpha with the probability
+// that keeps the mass; the box keeps its width), the quad's axes adjustedStdDev
+// sigmas plus half a pixel.
+bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d, float focus, float adjustedStdDev) {
+    const float detOrig = a * d - b * b;
+    float share = 1.0;
+    if (focus > 0.0) {
+        a += focus;
+        d += focus;
+        share = sqrt(max(0.0, detOrig / (a * d - b * b)));
+    }
+    float2 e1;
+    const float2 sigma = covSigmas(a, b, d, e1);
+    float2 rot;
+    const float peak = boxMass(sigma, boxFrame(e1, sigma, rot)) * share;
+    float alpha = s.rgba.a * peak;
+    const float faintTarget = FAINT_ALPHA * params.minAlpha;
+    if (hasFlag(DRAW_FAINT) && s.rgba.a <= 1.0 && params.falloff == 1.0 && alpha < faintTarget) {
+        if (!(alpha > 0.0) || faintHash(splatIndex) >= alpha / faintTarget) {
+            return false;
+        }
+        alpha = faintTarget + params.minAlpha;
+    }
+    if (alpha < params.minAlpha) {
+        return false;
+    }
+    s.rgba.a = alpha;
+    // As the Gaussian path: end the footprint where the falloff's alpha is
+    // under minAlpha (on the sigmas; the half pixel is added after).
+    const float f = params.falloff;
+    const float floorAlpha = (1.0 - f) * alpha;
+    if (alpha <= 1.0 && f > 0.0 && floorAlpha < params.minAlpha) {
+        adjustedStdDev = min(adjustedStdDev, sqrt(max(0.0, 2.0 * log(f * alpha / (params.minAlpha - floorAlpha)))));
+    }
+    const float h = 0.5 * params.focalAdjustment;
+    // The box's square, turned by rot, reaches h (|cos| + |sin|) on each axis.
+    const float2 reach = min(float2(params.maxPixelRadius), adjustedStdDev * sigma + h * (abs(rot.x) + abs(rot.y)));
+    if (reach.x < params.minPixelRadius && reach.y < params.minPixelRadius) {
+        return false;
+    }
+    s.adjustedStdDev = adjustedStdDev;
+    s.axis1 = e1 * reach.x;
+    s.axis2 = float2(e1.y, -e1.x) * reach.y;
+    s.box = sigma;
     return true;
 }
 

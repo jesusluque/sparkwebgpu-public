@@ -97,6 +97,7 @@ const {
   DRAW_COV,
   DRAW_2DGS,
   DRAW_FAINT,
+  DRAW_SURFEL_MASS,
   DRAW_LOD_INFLATE,
   DRAW_ORTHOGRAPHIC,
   DRAW_ENCODE_LINEAR,
@@ -256,12 +257,18 @@ export interface WgpuSplatRendererOptions {
   /**
    * Surfels (2DGS): how a splat with exactly one scale 0, as decoded, is
    * drawn. Detected per splat, so clouds may mix discs and 3D Gaussians.
-   * "auto" (default): the exact ray-splat intersection with Huang et al.'s
-   * screen filter (sigma sqrt(2)/2 px, as athenea's raster), on every path
-   * (quads, projectOnce, tiles). "ewa": as a projected 3D Gaussian of rank 2
-   * with the anti-alias blur (the 3D path; edge-on discs keep the blur).
+   * "auto" (default): the exact ray-splat intersection, on every path
+   * (quads, projectOnce, tiles), with a screen filter that keeps the disc's
+   * mass: where the intersection's term is under it, the disc's affine
+   * projection convolved with the anti-alias blur at the alpha that keeps
+   * its mass (the 3D path's), so a disc under a pixel or edge-on covers
+   * what it would as a 3D Gaussian. "huang": Huang et al.'s filter exactly,
+   * max(disc, filter of sigma sqrt(2)/2 px) at the disc's own alpha
+   * (athenea's raster), which adds coverage under a pixel (the Corvette's
+   * far view 7-28% darker with surfel cuts). "ewa": as a projected 3D
+   * Gaussian of rank 2 with the anti-alias blur (the 3D path).
    */
-  surfels?: "auto" | "ewa";
+  surfels?: "auto" | "huang" | "ewa";
   /**
    * Faint splats smaller than a pixel, whose alpha the anti-alias blur takes
    * under minAlpha. "keep" (default): they keep their mass (less blur, then
@@ -1983,6 +1990,7 @@ export class WgpuSplatRenderer {
         DRAW_PREMULTIPLIED |
         (o.covSplats ? DRAW_COV : 0) |
         (o.surfels !== "ewa" || o.enable2DGS ? DRAW_2DGS : 0) |
+        (o.surfels !== "huang" ? DRAW_SURFEL_MASS : 0) |
         (o.faintSplats !== "drop" ? DRAW_FAINT : 0) |
         (o.lodInflate ? DRAW_LOD_INFLATE : 0) |
         (linear ? DRAW_ENCODE_LINEAR : 0) |

@@ -1276,8 +1276,14 @@ pub fn uncap_levels(file: &mut AthcFile) {
 // splats composite, 1 - prod(1 - a_i), and a merge that keeps their mass in
 // one gaussian of the moments' area (0.55 on the tinted windows, a quarter
 // of their area) covers more than they did and shows more of its own light.
-// Spread to its splats' area, its opacity is their area-weighted mean and it
-// composites as they did, statistically.
+// Spreading it to its splats' area (as a sheet) is wrong though: solid glass
+// is stacked through its thickness (a lamp lens, a tinted window: the
+// splats' areas sum to 3-9 times the moments'), so the grown gaussian
+// spills past the glass, a lamp's lens light with it -- bright discs round
+// every lit lens (thread BJ: night relMSE 85-249 against 2-8). Solid glass
+// so keeps its moments' size and composites its splats over their overlap:
+// n = their area over its, its opacity 1 - (1 - mean)^n with the mean their
+// area-weighted opacity (the optical depth sum a_i (-ln(1 - o_i)) kept).
 
 /// Whether element i is glass that merges by area (`spread_translucent`):
 /// a thin sheet, or solid glass (transmission past one half).
@@ -1327,10 +1333,11 @@ pub fn translucent_areas(file: &AthcFile) -> Vec<Vec<f64>> {
     areas
 }
 
-/// Element i, merged glass whose splats' two-axis areas sum to `area`, with
-/// its long axes grown to that area and its opacity (a sheet's reflection,
-/// its opacity less `SHEET_PAD`) divided by the area gained. Anything else
-/// is left.
+/// Element i, merged glass whose splats' two-axis areas sum to `area`: a
+/// sheet with its long axes grown to that area and its reflection (its
+/// opacity less `SHEET_PAD`) divided by the area gained; solid glass with its
+/// opacity composited over the splats' overlap (see above). Anything else is
+/// left.
 pub fn spread_translucent(block: &mut AthcBlock, i: usize, area: f64) {
     if area <= 0.0 || !is_translucent(block, i) {
         return;
@@ -1344,18 +1351,19 @@ pub fn spread_translucent(block: &mut AthcBlock, i: usize, area: f64) {
     if before.is_nan() || before <= 0.0 || area <= before {
         return;
     }
+    let o = &mut block.positions[i * 4 + 3];
+    if !sheet {
+        let mean = (*o as f64 * before / area).clamp(0.0, 1.0);
+        *o = (1.0 - (1.0 - mean).powf(area / before)) as f32;
+        return;
+    }
+    *o = ((*o - SHEET_PAD).max(0.0) as f64 * before / area) as f32 + SHEET_PAD;
     let grow = (area / before).sqrt() as f32;
     for &k in &order[..2] {
         s[k] *= grow;
     }
     w[1] = pack_halves(ln_scale(s[0]), ln_scale(s[1]));
     w[2] = pack_halves(ln_scale(s[2]), high_half(w[2]));
-    let o = &mut block.positions[i * 4 + 3];
-    *o = if sheet {
-        ((*o - SHEET_PAD).max(0.0) as f64 * before / area) as f32 + SHEET_PAD
-    } else {
-        (*o as f64 * before / area) as f32
-    };
 }
 
 /// How far a merged gaussian's two long axes are widened, as a fraction of

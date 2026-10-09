@@ -10,8 +10,14 @@
 //!   longest axes (the LoD's mass), so any merge order is exact moment
 //!   matching;
 //! * candidates are each cluster's nearest neighbours along three shifted
-//!   Morton orders of the centres; a pair merges when each is the other's
-//!   cheapest, at most half of those pairs a pass, cheapest first;
+//!   Morton orders of the centres (each key in its own run); each pass
+//!   merges a greedy matching of every cluster's three cheapest candidates,
+//!   at most half of the matched pairs, cheapest first (thread BH: the pairs
+//!   that are each other's cheapest, NanoGS's rule, leave a regular sheet
+//!   whose cost drifts with the distance to the orbit nearly unmerged --
+//!   every cluster's cheapest is its neighbour downhill -- and the rest of
+//!   the cloud snowballs: the chrome shaderball cut to 30k kept 25k of its
+//!   base's leaves alone and merged the rest into 13 cm blobs);
 //! * the cost is an image-space proxy (thread AY's, λ = 128 measured best):
 //!   `A_px (B / W + λ w_i w_j / W² |Δc|² + λ_m w_i w_j / W² |Δm|²)`, B
 //!   Runnalls' bound on KL(mixture || merged) with the covariances floored
@@ -40,11 +46,17 @@
 //! those clusters are the cut cloud's splats (their whole coverage as the
 //! LoD opacity, as `truncate_levels` keeps it), and the levels above them
 //! are built as above.
+//! With `surfels` on, a cut's flat clusters of at least `surfel_min` splats
+//! are written as surfels (athenea's flat merges): drawn as discs, their
+//! relit per-pixel detail reads the exact ray-disc point, which on a mirror
+//! is most of a coarse cut's error (BH, research/simplify-measurements.md).
+//!
+//! `CostKind::Seen` is athenea's own cost (lod_pairs.slang), for comparison.
 
 use anyhow::{bail, Result};
 
-use crate::athc::{coverage_ratios, high_half, low_half, unpack_normal, AthcBlock, AthcFile, FLAG_LINEAR};
-use crate::athc_build::{build_lod_from_codes, packed_of, BuildOptions, PackedCloud, LOD_LEVELS};
+use crate::athc::{SURFEL_LN, coverage_ratios, high_half, low_half, unpack_normal, AthcBlock, AthcFile, FLAG_LINEAR};
+use crate::athc_build::{build_lod_from_codes, packed_of, BuildOptions, PackedCloud, SurfelNodes, LOD_LEVELS};
 
 /// Where the merges are seen from: an orbit at `eye_dist` around `center`,
 /// `fx` pixels per unit of tangent; nothing nearer than `near`.
@@ -104,6 +116,45 @@ pub struct ErrorOptions {
     /// A cut's clusters widened by this fraction of their own cell's edge
     /// (in quadrature, as `widen_merged`); 0 leaves the moments as they are.
     pub widen: f32,
+    /// How a merge's cost is weighed on the screen (thread BH).
+    pub kind: CostKind,
+    /// Weight of the glossy normal term `(1 - cos)(1 + F0 / alpha)`: a
+    /// mirror's highlight moves with its normal, a rough surface's barely
+    /// (athenea's lod_pairs). In `Screen`, x the pair's share like the others.
+    pub gloss: f64,
+    /// On a glossy surface (alpha under 0.1) normals further apart than
+    /// `gloss_cone` x sqrt(alpha) radians are refused (strict rules); 0: off.
+    pub gloss_cone: f64,
+    /// `Seen` only: weights of the thickness, colour (sRGB) and material
+    /// terms, and the sRGB colour distance refused as an edge (0: none).
+    pub flat: f64,
+    pub seen_colour: f64,
+    pub seen_material: f64,
+    pub edge: f64,
+    /// Flat merges written as surfels (`BuildOptions::surfel_nodes`; Auto:
+    /// only where the cloud brings its own).
+    pub surfels: SurfelNodes,
+    /// A cut's cluster of fewer splats than this stays a gaussian even where
+    /// the builder flattened it.
+    pub surfel_min: u32,
+    /// Each pass merges a greedy matching of every cluster's cheapest
+    /// candidates instead of the pairs that chose each other (`greedy_to`).
+    pub matching: bool,
+}
+
+/// How a merge's cost is weighed on the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostKind {
+    /// BC: everything x the merged gaussian's area in pixels -- the image
+    /// error of a diffuse surface. Small features are cheap to lose.
+    Screen,
+    /// athenea's lod_pairs: scale free -- the shape term per unit of mass
+    /// (Runnalls with the disc's area), weighed only by whether the merge is
+    /// seen at all (smoothstep from half a pixel to two), plus colour and
+    /// material terms independent of size. Measured (BH): on the chrome
+    /// shaderball no better than `Screen` once the passes match
+    /// (`matching`), and twice `Screen`'s albedo error on the Corvette.
+    Seen,
 }
 
 impl ErrorOptions {
@@ -119,6 +170,16 @@ impl ErrorOptions {
             top: 32,
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(12),
             widen: 0.0,
+            kind: CostKind::Screen,
+            gloss: 0.0,
+            gloss_cone: 0.0,
+            flat: 4.0,
+            seen_colour: 20.0,
+            seen_material: 4.0,
+            edge: 0.0,
+            surfels: SurfelNodes::Auto,
+            surfel_min: 4,
+            matching: true,
         }
     }
 }
@@ -132,6 +193,11 @@ struct Cl {
     c: [f64; 3],
     n: [f64; 3],
     mat: [f64; 3],
+    /// W x GGX alpha, W x F0 (what the surface reflects head on), W x the
+    /// thinnest axis over the middle one.
+    alpha: f64,
+    spec: f64,
+    thick: f64,
     key: u64,
     /// Members from the level below (at most `children` in a level step).
     kids: u32,
@@ -222,12 +288,15 @@ fn clusters_of(b: &AthcBlock, linear: bool, influences: usize, gradient_words: u
             }
             let n = if b.normals.is_empty() { [0.0; 3] } else { unpack_normal(b.normals[i]) };
             let mat = if b.pbr.is_empty() {
-                [0.0; 3]
+                [0.0, 1.0, 0.0]
             } else {
                 let per = b.pbr.len() / b.n;
                 let v = b.pbr[i * per];
                 [(v & 255) as f64 / 255.0, (((v >> 8) & 255) as f64 / 255.0).sqrt(), ((v >> 16) & 255) as f64 / 255.0]
             };
+            let alpha = mat[1].powi(4).max(1e-3);
+            let spec = 0.04 + 0.96 * mat[0];
+            let thick = sorted[2] / sorted[1].max(1e-20);
             Cl {
                 w,
                 m1: x.map(|v| w * v),
@@ -235,6 +304,9 @@ fn clusters_of(b: &AthcBlock, linear: bool, influences: usize, gradient_words: u
                 c: c.map(|v| w * v.max(0.0) as f64),
                 n: n.map(|v| w * v as f64),
                 mat: mat.map(|v| w * v),
+                alpha: w * alpha,
+                spec: w * spec,
+                thick: w * thick,
                 key: key_of(b, i, skin_per, influences),
                 kids: 1,
             }
@@ -254,6 +326,9 @@ fn add(a: &Cl, b: &Cl) -> Cl {
     for k in 0..6 {
         r.m2[k] += b.m2[k];
     }
+    r.alpha += b.alpha;
+    r.spec += b.spec;
+    r.thick += b.thick;
     r.kids += b.kids;
     r
 }
@@ -298,20 +373,62 @@ fn cost(a: &Cl, b: &Cl, o: &ErrorOptions, rules: Rules, cap: u32) -> f64 {
     if a.kids + b.kids > cap {
         return f64::INFINITY;
     }
-    if rules <= Rules::Keys && a.key != b.key {
+    let apart = a.key != b.key;
+    if rules <= Rules::Keys && apart {
         return f64::INFINITY;
     }
     let (na, nb) = (len3(&a.n), len3(&b.n));
     let unit = |v: &[f64; 3], l: f64| if l > 0.0 { v.map(|x| x / l) } else { [0.0; 3] };
     let (ua, ub) = (unit(&a.n, na), unit(&b.n, nb));
-    let cos = ua[0] * ub[0] + ua[1] * ub[1] + ua[2] * ub[2];
-    if rules == Rules::Strict && na > 0.0 && nb > 0.0 && cos < o.max_angle_cos {
+    let normals = na > 0.0 && nb > 0.0;
+    let cos = if normals { ua[0] * ub[0] + ua[1] * ub[1] + ua[2] * ub[2] } else { 1.0 };
+    if rules == Rules::Strict && normals && cos < o.max_angle_cos {
         return f64::INFINITY;
     }
+    let (alpha_a, alpha_b) = (a.alpha / a.w, b.alpha / b.w);
+    let turn = (1.0 - cos).max(0.0);
+    // A highlight is where the normal points it: on a glossy surface two
+    // normals further apart than the lobe is wide (about sqrt(alpha)) put
+    // it in two places, and their merge in one between them.
+    let gloss_min = alpha_a.min(alpha_b);
+    if rules == Rules::Strict && o.gloss_cone > 0.0 && gloss_min < 0.1 && turn > 0.5 * o.gloss_cone * o.gloss_cone * gloss_min {
+        return f64::INFINITY;
+    }
+    let alpha = 0.5 * (alpha_a + alpha_b);
+    let spec = 0.5 * (a.spec / a.w + b.spec / b.w);
+    let glossy = turn * (1.0 + spec / alpha);
+    let keyed = if apart { 1.0 } else { 0.0 };
     let m = add(a, b);
     let (mu, s) = mean_cov(&m);
     let (_, sa) = mean_cov(a);
     let (_, sb) = mean_cov(b);
+    if o.kind != CostKind::Screen {
+        let srgb = |c: &Cl| c.c.map(|v| {
+            let v = (v / c.w).max(0.0);
+            if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+        });
+        let (ca, cb) = (srgb(a), srgb(b));
+        let colour = (ca[0] - cb[0]).powi(2) + (ca[1] - cb[1]).powi(2) + (ca[2] - cb[2]).powi(2);
+        if rules == Rules::Strict && o.edge > 0.0 && colour > o.edge * o.edge {
+            return f64::INFINITY;
+        }
+        let pi = a.w / m.w;
+        let i2 = |s: &[f64; 6]| (s[0] * s[1] + s[1] * s[2] + s[0] * s[2] - s[3] * s[3] - s[5] * s[5] - s[4] * s[4]).max(1e-72);
+        let shape = (0.5 * (i2(&s).ln() - pi * i2(&sa).ln() - (1.0 - pi) * i2(&sb).ln())).max(0.0);
+        let trace = (s[0] + s[1] + s[2]).max(0.0);
+        let det = det_floor(&s, 0.0);
+        let thick = (det * trace / (i2(&s) * i2(&s))).sqrt();
+        let flat = (thick - (a.thick / a.w).max(b.thick / b.w)).max(0.0);
+        let width = trace.sqrt() * o.view.pixels(mu).sqrt();
+        let t = ((width - 0.5) / 1.5).clamp(0.0, 1.0);
+        let seen = t * t * (3.0 - 2.0 * t);
+        let d2 = |x: &[f64; 3], y: &[f64; 3]| {
+            let (u, v) = (x.map(|t| t / a.w), y.map(|t| t / b.w));
+            (u[0] - v[0]).powi(2) + (u[1] - v[1]).powi(2) + (u[2] - v[2]).powi(2)
+        };
+        let mat = d2(&a.mat, &b.mat);
+        return seen * (shape + o.flat * flat * flat + o.gloss * glossy) + o.seen_colour * (colour + keyed) + o.seen_material * mat;
+    }
     let eps = 0.01 * (s[0] + s[1] + s[2]) / 3.0;
     let bk = 0.5 * (m.w * det_floor(&s, eps).ln() - a.w * det_floor(&sa, eps).ln() - b.w * det_floor(&sb, eps).ln()) / m.w;
     let share = a.w * b.w / (m.w * m.w);
@@ -321,12 +438,11 @@ fn cost(a: &Cl, b: &Cl, o: &ErrorOptions, rules: Rules, cap: u32) -> f64 {
     };
     let col = d2(&a.c, &b.c);
     let mat = d2(&a.mat, &b.mat);
-    let nrm = if na > 0.0 && nb > 0.0 { 2.0 - 2.0 * cos } else { 0.0 };
+    let nrm = if normals { 2.0 - 2.0 * cos } else { 0.0 };
     // Merging across a key (only at a coarse level that must) costs as a
     // full colour flip would.
-    let keyed = if a.key != b.key { 1.0 } else { 0.0 };
     let apx = m.w * o.view.pixels(mu);
-    apx * (bk.max(0.0) + share * (o.lambda * (col + keyed) + o.lambda_material * mat + o.lambda_normal * nrm))
+    apx * (bk.max(0.0) + share * (o.lambda * (col + keyed) + o.lambda_material * mat + o.lambda_normal * nrm + o.gloss * glossy))
 }
 
 /// 21 bits an axis of a point in [lo, lo + ext)^3, interleaved.
@@ -531,22 +647,41 @@ fn greedy_to(pool: &mut Pool, target: usize, max_cost: f64, o: &ErrorOptions, ru
     while pool.cls.len() > target {
         let alive = pool.cls.len();
         let cls = &pool.cls;
-        let mut best: Vec<(f64, u32)> = vec![(f64::INFINITY, u32::MAX); alive];
+        // Each cluster's cheapest few candidates over the three orders.
+        const KEEP: usize = 3;
+        let mut best: Vec<[(f64, u32); KEEP]> = vec![[(f64::INFINITY, u32::MAX); KEEP]; alive];
+        let insert = |list: &mut [(f64, u32); KEEP], c: f64, j: u32| {
+            if list.iter().any(|e| e.1 == j) || !(c < list[KEEP - 1].0 || (c == list[KEEP - 1].0 && j < list[KEEP - 1].1)) {
+                return;
+            }
+            let mut at = KEEP - 1;
+            while at > 0 && (c < list[at - 1].0 || (c == list[at - 1].0 && j < list[at - 1].1)) {
+                list[at] = list[at - 1];
+                at -= 1;
+            }
+            list[at] = (c, j);
+        };
         for sh in &shifts {
-            let mut order: Vec<(u64, u32)> =
-                par_map(alive, o.threads, |r| r.map(|i| (morton63(cls[i].m1.map(|v| v / cls[i].w), lo, ext, *sh), i as u32)).collect());
+            // Where keys are refused, each key's clusters in their own run
+            // of the order: a key scattered among another's still finds its
+            // own neighbours (and none of the window is spent on refusals).
+            let keyed = rules <= Rules::Keys;
+            let mut order: Vec<(u64, u64, u32)> = par_map(alive, o.threads, |r| {
+                r.map(|i| (if keyed { cls[i].key } else { 0 }, morton63(cls[i].m1.map(|v| v / cls[i].w), lo, ext, *sh), i as u32)).collect()
+            });
             order.sort_unstable();
-            let found: Vec<(f64, u32)> = par_map(alive, o.threads, |r| {
+            let order: Vec<(u64, u32)> = order.into_iter().map(|(_, c, i)| (c, i)).collect();
+            let found: Vec<[(f64, u32); KEEP]> = par_map(alive, o.threads, |r| {
                 r.map(|pos| {
                     let i = order[pos].1 as usize;
-                    let mut b = (f64::INFINITY, u32::MAX);
+                    let mut b = [(f64::INFINITY, u32::MAX); KEEP];
                     for d in 1..=k {
                         for q in [pos.wrapping_sub(d), pos + d] {
                             if q < alive {
                                 let j = order[q].1 as usize;
                                 let c = cost(&cls[i], &cls[j], o, rules, cap);
-                                if c < b.0 || (c == b.0 && (j as u32) < b.1) {
-                                    b = (c, j as u32);
+                                if c.is_finite() {
+                                    insert(&mut b, c, j as u32);
                                 }
                             }
                         }
@@ -557,15 +692,44 @@ fn greedy_to(pool: &mut Pool, target: usize, max_cost: f64, o: &ErrorOptions, ru
             });
             for (pos, b) in found.into_iter().enumerate() {
                 let i = order[pos].1 as usize;
-                if b.0 < best[i].0 || (b.0 == best[i].0 && b.1 < best[i].1) {
-                    best[i] = b;
+                for (c, j) in b {
+                    if j != u32::MAX {
+                        insert(&mut best[i], c, j);
+                    }
                 }
             }
         }
         let mut pairs: Vec<(f64, u32, u32)> = Vec::new();
-        for (i, &(c, j)) in best.iter().enumerate() {
-            if j != u32::MAX && c.is_finite() && (i as u32) < j && best[j as usize].1 == i as u32 {
-                pairs.push((c, i as u32, j));
+        if o.matching {
+            // A greedy matching of the candidate edges, cheapest first: on
+            // a regular grid whose cost drifts with the distance to the
+            // orbit, every cluster's cheapest is its neighbour downhill and
+            // few pairs are each other's cheapest -- a sheet would merge a
+            // pair a pass while the rest of the cloud snowballs.
+            let mut edges: Vec<(f64, u32, u32)> = Vec::new();
+            for (i, list) in best.iter().enumerate() {
+                for &(c, j) in list {
+                    if j != u32::MAX {
+                        let (a, b) = if (i as u32) < j { (i as u32, j) } else { (j, i as u32) };
+                        edges.push((c, a, b));
+                    }
+                }
+            }
+            edges.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            let mut used = vec![false; alive];
+            for (c, a, b) in edges {
+                if !used[a as usize] && !used[b as usize] {
+                    used[a as usize] = true;
+                    used[b as usize] = true;
+                    pairs.push((c, a, b));
+                }
+            }
+        } else {
+            for (i, list) in best.iter().enumerate() {
+                let (c, j) = list[0];
+                if j != u32::MAX && c.is_finite() && (i as u32) < j && best[j as usize][0].1 == i as u32 {
+                    pairs.push((c, i as u32, j));
+                }
             }
         }
         if pairs.is_empty() {
@@ -863,9 +1027,10 @@ pub struct ErrorTree {
     pub sources: Vec<Vec<u32>>,
 }
 
-fn options_for(file: &AthcFile, coarsest: u32) -> BuildOptions {
+fn options_for(file: &AthcFile, coarsest: u32, o: &ErrorOptions) -> BuildOptions {
     BuildOptions {
         coarsest_level: coarsest,
+        surfel_nodes: o.surfels,
         max_group_fraction: 2.0,
         chunk_splats: file.header.chunk_splats,
         ..Default::default()
@@ -884,7 +1049,7 @@ pub fn error_levels(file: &AthcFile, o: &ErrorOptions) -> Result<(AthcFile, Erro
     let d = h.levels.len() as u32;
     let coarsest = LOD_LEVELS - d + 1;
     let extent = extent_for(&h, coarsest);
-    let mut out = build_lod_from_codes(&cloud, &options_for(file, coarsest), &codes, file.header.bounds_lo, extent)?;
+    let mut out = build_lod_from_codes(&cloud, &options_for(file, coarsest, o), &codes, file.header.bounds_lo, extent)?;
     crate::athc::uncap_levels(&mut out);
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| codes[i as usize]);
@@ -965,7 +1130,7 @@ pub fn error_cut_tree(file: &AthcFile, tree: &MergeTree, keep: usize, o: &ErrorO
     let d = h.levels.len() as u32;
     let coarsest = LOD_LEVELS - d + 1;
     let extent = extent_for(&h, coarsest);
-    let full = build_lod_from_codes(&cloud, &options_for(file, coarsest), &codes, file.header.bounds_lo, extent)?;
+    let full = build_lod_from_codes(&cloud, &options_for(file, coarsest, o), &codes, file.header.bounds_lo, extent)?;
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| codes[i as usize]);
     // The finest level (the clusters, in code order) becomes the splats.
@@ -986,7 +1151,7 @@ pub fn error_cut_tree(file: &AthcFile, tree: &MergeTree, keep: usize, o: &ErrorO
     // lost in their rounding), each axis's scale replaced where the frame
     // agrees.
     crate::athc::orient_merged(&mut splats);
-    refine_scales(&mut splats, &h.levels[0], &clusters, &codes);
+    refine_scales(&mut splats, &h.levels[0], &clusters, &codes, o);
     if o.widen > 0.0 {
         widen_own(&mut splats, o.widen);
     }
@@ -1040,7 +1205,7 @@ pub fn error_cut_tree(file: &AthcFile, tree: &MergeTree, keep: usize, o: &ErrorO
 
 /// Each merged splat's scales from its cluster's f64 covariance along the
 /// splat's own (oriented) axes, its opacity rescaled to keep the mass.
-fn refine_scales(splats: &mut AthcBlock, groups: &[Vec<u32>], clusters: &[Cl], codes: &[u32]) {
+fn refine_scales(splats: &mut AthcBlock, groups: &[Vec<u32>], clusters: &[Cl], codes: &[u32], o: &ErrorOptions) {
     // Group g of the level (in code order) is the cluster whose members'
     // code it is.
     let mut by_code: Vec<(u32, usize)> = groups.iter().enumerate().map(|(g, m)| (codes[m[0] as usize], g)).collect();
@@ -1061,15 +1226,26 @@ fn refine_scales(splats: &mut AthcBlock, groups: &[Vec<u32>], clusters: &[Cl], c
                 + v[2] * (s[4] * v[0] + s[5] * v[1] + s[2] * v[2]);
             sc[k] = var.max(1e-14).sqrt();
         }
-        let old = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()].map(|v| v as f64);
+        // A merge the builder wrote as a surfel keeps its flat axis unless it
+        // is a few splats (`surfel_min`): the builder flattens thin leaves
+        // and pairs too, and against their own cloud those are better drawn
+        // as the gaussians they are (BH: the chrome at 300k, 0.0005 with four
+        // a surfel at least, 0.0020 with two).
+        let mut lns = [low_half(w[1]), high_half(w[1]), low_half(w[2])];
+        if c.kids < o.surfel_min.max(2) {
+            lns = lns.map(|v| if crate::athc::is_flat_ln(v) { -30.0 } else { v });
+        }
+        let old = lns.map(|v| v.exp() as f64);
         let area = |s: [f64; 3]| {
             let mut t = s;
             t.sort_by(|a, b| b.total_cmp(a));
             t[0] * t[1]
         };
         let ratio = area(old) / area(sc).max(1e-30);
-        w[1] = crate::athc::pack_halves(crate::athc::ln_scale(sc[0] as f32), crate::athc::ln_scale(sc[1] as f32));
-        w[2] = crate::athc::pack_halves(crate::athc::ln_scale(sc[2] as f32), high_half(w[2]));
+        // No variance at all along an axis (a surfel of the cloud's own): flat.
+        let ln = |k: usize| if crate::athc::is_flat_ln(lns[k]) || sc[k] <= 1.000_001e-7 { SURFEL_LN } else { crate::athc::ln_scale(sc[k] as f32) };
+        w[1] = crate::athc::pack_halves(ln(0), ln(1));
+        w[2] = crate::athc::pack_halves(ln(2), high_half(w[2]));
         let p = &mut splats.positions[i * 4 + 3];
         *p = (*p as f64 * ratio) as f32;
     }
@@ -1561,6 +1737,64 @@ mod tests {
         let w0: f64 = crate::athl::splat_weights(&file).iter().map(|&w| w as f64).sum();
         let w1: f64 = crate::athl::splat_weights(&cut).iter().map(|&w| w as f64).sum();
         assert!((w1 / w0 - 1.0).abs() < 0.02, "mass {w0} -> {w1}");
+    }
+
+    /// A row of equal splats seen from an orbit off one end: every pair's
+    /// cost falls away from the orbit, so every splat's cheapest neighbour
+    /// is the one further away, and only the far end is a mutual pair.
+    fn row() -> AthcFile {
+        let mut s = CloudStreams { coefficients: 1, linear: true, ..Default::default() };
+        let step = 0.01f32;
+        for a in 0..2000 {
+            s.positions.extend_from_slice(&[a as f32 * step, 0.0, 0.0]);
+            s.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+            s.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+            s.sh.extend_from_slice(&[1.5, -1.5, -1.5]);
+            s.scales.extend_from_slice(&[1.2 * step, 1.2 * step, 0.1 * step]);
+            s.opacities.push(1.0);
+            s.count += 1;
+        }
+        let p = pack_streams(&s, &BuildOptions::default()).unwrap();
+        build_lod(&p, &BuildOptions::default()).unwrap()
+    }
+
+    fn row_cut(file: &AthcFile, matching: bool) -> Vec<usize> {
+        let mut o = options(file);
+        o.view = ErrorView::orbit([-1.0, 0.0, 0.0], 1.5, 39.6, 1920.0);
+        o.matching = matching;
+        let (_, tree) = error_cut(file, 250, &o).unwrap();
+        tree.sources.iter().map(|l| l.len()).collect()
+    }
+
+    #[test]
+    fn a_drifting_row_merges_evenly() {
+        let file = row();
+        let alone = |sizes: &[usize]| sizes.iter().filter(|&&n| n == 1).count();
+        let (mutual, matched) = (row_cut(&file, false), row_cut(&file, true));
+        assert!(alone(&mutual) > 0, "the row no longer strands splats by mutual choice");
+        assert_eq!(alone(&matched), 0);
+    }
+
+    #[test]
+    fn a_cut_writes_its_flat_merges_as_surfels() {
+        let file = folded();
+        let mut o = options(&file);
+        o.surfels = SurfelNodes::On;
+        let (cut, tree) = error_cut(&file, 1200, &o).unwrap();
+        let b = cut.splats();
+        let mut flat = (0usize, 0usize);
+        for (i, list) in tree.sources.iter().enumerate() {
+            let w = &b.shape[i * 4..i * 4 + 4];
+            let disc = [low_half(w[1]), high_half(w[1]), low_half(w[2])].iter().filter(|&&v| crate::athc::is_flat_ln(v)).count();
+            assert!(disc <= 1);
+            if list.len() < o.surfel_min as usize {
+                assert_eq!(disc, 0, "a cluster of {} written as a surfel", list.len());
+            } else {
+                flat.0 += disc;
+                flat.1 += 1;
+            }
+        }
+        assert!(flat.0 * 10 >= flat.1 * 9, "{} of {} large clusters are surfels", flat.0, flat.1);
     }
 
     #[test]

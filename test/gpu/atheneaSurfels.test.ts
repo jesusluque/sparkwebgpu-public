@@ -511,7 +511,7 @@ describe.skipIf(!wideDevice || !available)(
         const inside = (p: number) => mask[p] === 1;
         const { readdirSync } = await import("node:fs");
         const cuts = readdirSync(TREE)
-          .filter((n) => /^(ath|bc|bco)\d+$/.test(n))
+          .filter((n) => /^[a-z]+\d+$/.test(n))
           .sort(
             (a, b) =>
               Number(b.replace(/\D/g, "")) - Number(a.replace(/\D/g, "")) ||
@@ -528,7 +528,10 @@ describe.skipIf(!wideDevice || !available)(
           const img = over(await ours(cloud), grey);
           out[`chrome_${name}`] = img;
           const m = compare(img, leaves, inside);
-          if (name === "ath300000" || name === "bc300000") {
+          if (
+            (name === "ath300000" || name === "bc300000") &&
+            process.env.ATHENEA_SURFELS_VARIANTS !== "0"
+          ) {
             const variants: [string, Ours, Parameters<typeof ours>[1]][] = [
               [
                 `${name}_nocurv`,

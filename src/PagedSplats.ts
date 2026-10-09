@@ -10,6 +10,8 @@ import {
   ATHC_PAGE_SPLATS,
   type AnyAthcLayout,
   type AthcPaging,
+  athcAttribSpecs,
+  athcMergedCpca,
   athcPageCount,
   athcSplatBase,
   athcWantOf,
@@ -70,6 +72,7 @@ function withStreams<
       )
     : new AttribPool(result.numSplats);
   for (const col of streams.columns) attribs.setColumn(col);
+  if (streams.cpca) attribs.cpca = streams.cpca;
   return { ...result, extra: { ...result.extra, attribs } };
 }
 
@@ -246,7 +249,7 @@ export class PagedSplats implements SplatSource {
               offset: 0,
               bytes: 0,
             })),
-            attributes: layout.attribSpecs,
+            attributes: athcAttribSpecs(layout),
           } as RadMeta,
           chunksStart: 0,
         };
@@ -331,6 +334,8 @@ export class PagedSplats implements SplatSource {
   async fetchDecodeChunk(chunk: number) {
     let decodeBytes = undefined;
     let streams: AttribPool | null = null;
+    // A merged .athc page whose transfer is kept as clusters (cpcaMerged).
+    let mergedCpca: AthcPaging | null = null;
 
     if (this.fileType === SplatFileType.ATHC) {
       const paging = await this.getAthc();
@@ -356,6 +361,7 @@ export class PagedSplats implements SplatSource {
       } else {
         // One ATHV page: merged nodes, or an athenea v2 chunk read whole.
         decodeBytes = await fetchAthcPage(paging, chunk, this.fetchOptions());
+        if (paging.cpcaMerged) mergedCpca = paging;
       }
     } else if (this.fileType === SplatFileType.RAD) {
       const { meta, chunksStart } = await this.getRadMeta();
@@ -472,7 +478,22 @@ export class PagedSplats implements SplatSource {
         this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
         this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
         this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-        return withStreams(lodSplats, streams);
+        return withStreams(
+          lodSplats,
+          streams ??
+            (mergedCpca &&
+              athcMergedCpca(
+                mergedCpca,
+                chunk,
+                lodSplats.extra.attribs
+                  ? AttribPool.from(
+                      lodSplats.extra.attribs as Parameters<
+                        typeof AttribPool.from
+                      >[0],
+                    )
+                  : null,
+              )),
+        );
       }
 
       const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
@@ -503,7 +524,22 @@ export class PagedSplats implements SplatSource {
       this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
       this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
       this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-      return withStreams(lodSplats, streams);
+      return withStreams(
+        lodSplats,
+        streams ??
+          (mergedCpca &&
+            athcMergedCpca(
+              mergedCpca,
+              chunk,
+              lodSplats.extra.attribs
+                ? AttribPool.from(
+                    lodSplats.extra.attribs as Parameters<
+                      typeof AttribPool.from
+                    >[0],
+                  )
+                : null,
+            )),
+      );
     });
   }
 

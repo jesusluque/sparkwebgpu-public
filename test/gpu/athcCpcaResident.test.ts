@@ -192,6 +192,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           pool: AttribPool,
           resident: "words" | "cpca",
           list: Uint32Array | null,
+          perSplat = false,
         ) {
           const source = GpuSplatSource.fromExt(d, dec.ext0, dec.ext1, n);
           source.attribs = pool;
@@ -208,6 +209,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
             sun: { direction: [0.3, 0.8, 0.5], intensity: 3 },
             transferResident: resident,
             cpcaBatch: BATCH,
+            debug: { cpcaPerSplat: perSplat },
           });
           host.register(relight).attach(splats);
           const mesh = splats.add(source);
@@ -310,6 +312,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
         for (let k = 0; k < list.length; k++) list[k] = n - 1 - 3 * k;
         const al = await run(words, "words", list);
         const bl = await run(clusters, "cpca", list);
+        const bs = await run(clusters, "cpca", null, true);
         const transferBytes = n * tw * 4;
         const cpcaBytes = n * table.recordWords * 4 + table.bytes;
         const result = {
@@ -331,7 +334,9 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           cpcaTableMB: +(table.bytes / 1e6).toFixed(3),
           cpcaVsWords: +(cpcaBytes / transferBytes).toFixed(3),
           bytesPerSplat: { words: tw * 4, cpca: table.recordWords * 4 },
+          perSplatRelit: compare(a.out, bs.out, 0, all),
           frameMs: {
+            cpcaPerSplat: bs.frameMs,
             words: a.frameMs,
             cpca: b.frameMs,
             listWords: al.frameMs,

@@ -235,6 +235,8 @@ export interface AtheneaRelightDebug {
    */
   everySplat?: boolean;
   alwaysBlend?: boolean;
+  /** For A/B timings: rebuild a CPCA transfer a splat a thread (else a word a thread). */
+  cpcaPerSplat?: boolean;
 }
 
 const DEBUG_VIEWS: Record<string, number> = {
@@ -294,6 +296,8 @@ interface PoolOnGpu {
   shadowWords: number;
   /** The transfer as clusters (transferCpca), and its table on the GPU. */
   cpca: { table: CpcaTable; buffer: GPUBuffer | null; version: number } | null;
+  /** The pool's table when this was made. */
+  cpcaOf: CpcaTable | undefined;
 }
 
 interface MeshState {
@@ -563,7 +567,11 @@ export function atheneaRelightPlugin(
   ): PoolOnGpu | null => {
     const pool: AttribPool | null = mesh.source.attribs;
     if (!pool) return null;
-    if (previous && previous.version === pool.version) {
+    if (
+      previous &&
+      previous.version === pool.version &&
+      previous.cpcaOf === pool.cpca
+    ) {
       if (!pool.gpuBuffer || previous.buffer === pool.gpuBuffer) {
         return previous;
       }
@@ -592,6 +600,7 @@ export function atheneaRelightPlugin(
         transferCount: components("transfer"),
         shadowWords: components("shadowBits"),
         cpca: cpcaOf(ids),
+        cpcaOf: pool.cpca,
       };
     }
     const { layout, words } = pool.pack((s) => streams.includes(s.name));
@@ -608,6 +617,7 @@ export function atheneaRelightPlugin(
       transferCount: components("transfer"),
       shadowWords: components("shadowBits"),
       cpca: cpcaOf(ids),
+      cpcaOf: pool.cpca,
     };
   };
 
@@ -690,19 +700,24 @@ export function atheneaRelightPlugin(
     const pool = state.pool;
     const ids = pool?.ids ?? {};
     const id = (name: string) => ids[name] ?? ATTRIB_NONE;
-    const cpca = pool?.cpca ?? null;
+    // A table without a CPCA section: the records are the transfer's halves.
+    const cpca = pool?.cpca?.table.sections.some((s) => s.cpca)
+      ? pool.cpca
+      : null;
     if (cpca && cpca.version !== cpca.table.version) {
       cpca.buffer?.destroy();
       cpca.buffer = upload(device, cpca.table.pack(), "relight cpca table");
       cpca.version = cpca.table.version;
     }
     // The transfer the pass reads: the pool's, or the clusters' rebuilt.
-    const transferId = cpca ? id(TRANSFER_CPCA) : id("transfer");
-    const transferCount = cpca
-      ? cpca.table.transferCount
-      : id("transfer") === ATTRIB_NONE
-        ? 0
-        : (pool?.transferCount ?? 0);
+    const words = id("transfer") === ATTRIB_NONE && pool?.cpca;
+    const transferId = cpca || words ? id(TRANSFER_CPCA) : id("transfer");
+    const transferCount =
+      cpca || words
+        ? (pool?.cpca?.table.transferCount ?? 0)
+        : id("transfer") === ATTRIB_NONE
+          ? 0
+          : (pool?.transferCount ?? 0);
     const shadowWords =
       id("shadowBits") === ATTRIB_NONE ? 0 : (pool?.shadowWords ?? 0);
     const kTransfer =
@@ -879,11 +894,17 @@ export function atheneaRelightPlugin(
         const n = Math.min(batch, threads - first);
         decode.set("threadFirst", first);
         decode.set("batch", n);
-        r.registry.get(cpcaModule, "atheneaCpcaDecode").dispatch(pass, {
-          grid: relightGrid(n),
-          buffers: decodeBuffers,
-          uniforms: decode.data,
-        });
+        const perSplat = Boolean(options.debug?.cpcaPerSplat);
+        r.registry
+          .get(
+            cpcaModule,
+            perSplat ? "atheneaCpcaDecode" : "atheneaCpcaDecodeWords",
+          )
+          .dispatch(pass, {
+            grid: relightGrid(perSplat ? n : n * table.transferWords),
+            buffers: decodeBuffers,
+            uniforms: decode.data,
+          });
         params.set("threadFirst", first);
         r.registry.get(relightModule, `${entry}Cpca`).dispatch(pass, {
           grid: relightGrid(n),
@@ -1124,6 +1145,7 @@ export function atheneaRelightPlugin(
         options.cullBacksFacing = o.cullBacksFacing;
       if (o.debug !== undefined) options.debug = { ...o.debug };
       if (o.frame !== undefined) options.frame = o.frame;
+      if (o.cpcaBatch !== undefined) options.cpcaBatch = o.cpcaBatch;
       if (skyChanged && sky) sky.dirty = true;
       lightsDirty = true;
       dirty = true;

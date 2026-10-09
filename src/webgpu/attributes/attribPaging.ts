@@ -54,7 +54,7 @@ export const STREAM_GROUPS: readonly StreamGroupSpec[] = [
   },
   {
     name: "relight",
-    attributes: ["shadowBits", "curvature", "transfer"],
+    attributes: ["shadowBits", "curvature", "transfer", "transferCpca"],
     dataTier: 3,
     minTier: 2,
   },
@@ -167,7 +167,8 @@ export function planAttribPaging(
 ): AttribPagingPlan {
   const dropped: AttribPagingPlan["dropped"] = [];
   const wanted = (name: string) => {
-    if (demand === "all") return true;
+    // transferCpca stands for the transfer: loaded only when named.
+    if (demand === "all") return name !== "transferCpca";
     if (demand) return demand.includes(name);
     return groupOf(name)?.name !== "relight";
   };
@@ -186,6 +187,15 @@ export function planAttribPaging(
     if (s.name === "transfer") {
       const values = transferFormValues(s.components, transferForm);
       if (values !== s.components) spec = { ...s, components: values };
+    }
+    // The transfer as clusters (transferCpca): the form's record, a prefix.
+    if (s.cpcaForms?.length) {
+      const full = s.cpcaForms[s.cpcaForms.length - 1].values;
+      const values = transferFormValues(full, transferForm);
+      const words = s.cpcaForms.find((f) => f.values === values)?.words;
+      if (words !== undefined && words !== s.components) {
+        spec = { ...s, components: words };
+      }
     }
     const key = group?.name ?? CORE_GROUP;
     byGroup.set(key, [...(byGroup.get(key) ?? []), spec]);

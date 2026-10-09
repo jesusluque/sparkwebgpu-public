@@ -43,6 +43,8 @@ export interface RadAttributeMeta {
   format: string;
   components: number;
   lodMerge?: string;
+  /** transferCpca's records by transfer form (AttributeSpec.cpcaForms). */
+  cpcaForms?: readonly { values: number; words: number }[];
 }
 
 /**
@@ -52,14 +54,17 @@ export interface RadAttributeMeta {
 export function specsFromRadMeta(
   attributes: readonly RadAttributeMeta[],
 ): AttributeSpec[] {
-  return attributes.map(({ name, format, components, lodMerge }) => ({
-    name,
-    format: format as AttributeSpec["format"],
-    components,
-    lodMerge: lodMerge as LodMerge | undefined,
-    direction: lodMerge === "normalizeMean" && components === 3,
-    toDraw: true,
-  }));
+  return attributes.map(
+    ({ name, format, components, lodMerge, cpcaForms }) => ({
+      name,
+      format: format as AttributeSpec["format"],
+      components,
+      lodMerge: lodMerge as LodMerge | undefined,
+      direction: lodMerge === "normalizeMean" && components === 3,
+      toDraw: true,
+      ...(cpcaForms ? { cpcaForms } : {}),
+    }),
+  );
 }
 
 /** A paged group's residency: which page owns which slot. */
@@ -207,6 +212,8 @@ export class PagedAttribPool {
    */
   uploadPage(base: number, count: number, chunk: AttribPool | null) {
     const { layout } = this;
+    // The cluster table of a transferCpca (one a cloud, shared by its pages).
+    if (chunk?.cpca) this.pool.cpca = chunk.cpca;
     const stride = layout.strideWords;
     if (stride === 0) return;
     const rows = new Uint32Array(count * stride);
@@ -252,6 +259,7 @@ export class PagedAttribPool {
     count: number,
     chunk: AttribPool,
   ) {
+    if (chunk.cpca) this.pool.cpca = chunk.cpca;
     if (group.pageOf[slot] >= 0) this.evict(group, group.pageOf[slot]);
     if (group.slotOf[page] >= 0) this.evict(group, page);
     // A page's arrays may be longer than its splats.

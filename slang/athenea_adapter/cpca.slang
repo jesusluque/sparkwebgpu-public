@@ -140,3 +140,67 @@ void atheneaCpcaDecode(uint3 tid: SV_DispatchThreadID) {
         decodeSection(cpcaParams.section2, base, out);
     }
 }
+
+/// One word (two values) of a section's rebuilt transfer, from record `base`.
+uint decodeWord(uint4 sec, uint base, uint w) {
+    const uint dw = sec.x / 2u;
+    if (sec.w == 0u) {
+        return recordHalf(base, sec.z + 2u * w) | (recordHalf(base, sec.z + 2u * w + 1u) << 16u);
+    }
+    const uint at = cpcaTable[1u + recordHalf(base, sec.z)];
+    const uint head = cpcaTable[at];
+    const uint data = at + 4u;
+    if ((head & kCpcaExact) != 0u) {
+        return cpcaTable[data + recordHalf(base, sec.z + 1u) * dw + w];
+    }
+    const uint m = min(head, kCpcaMaxCoefficients);
+    const float step = asfloat(cpcaTable[at + 1u]);
+    const uint meanWord = cpcaTable[data + w];
+    float a0 = lowF(meanWord);
+    float a1 = highF(meanWord);
+    for (uint j = 0; j < m; ++j) {
+        const float c = float(int(recordHalf(base, sec.z + 1u + j) << 16u) >> 16) * step;
+        const uint dir = cpcaTable[data + (1u + j) * dw + w];
+        a0 = a0 + c * lowF(dir);
+        a1 = a1 + c * highF(dir);
+    }
+    return f32tof16(a0) | (f32tof16(a1) << 16u);
+}
+
+/// atheneaCpcaDecode a word a thread: batch x scratchWords threads, the
+/// slot's words side by side (more threads in flight than one a splat).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaCpcaDecodeWords(uint3 tid: SV_DispatchThreadID) {
+    const uint g = tid.x + tid.y * kCpcaDispatchRow;
+    const uint words = cpcaParams.scratchWords;
+    const uint slot = g / words;
+    const uint w = g - slot * words;
+    if (slot >= cpcaParams.batch) {
+        return;
+    }
+    const uint t = cpcaParams.threadFirst + slot;
+    uint i = t;
+    if (cpcaParams.listCount != 0u) {
+        if (t >= cpcaParams.listCount) {
+            return;
+        }
+        i = cpcaList[cpcaParams.listBase + t / 4u][t % 4u];
+    }
+    if (i >= cpcaParams.count) {
+        return;
+    }
+    const AttribDesc d = attribDesc(cpcaPool, cpcaParams.attribute);
+    const uint base = attribBase(cpcaPool, d, i);
+    if (base == ATTRIB_NONE) {
+        return;
+    }
+    uint4 sec = cpcaParams.section0;
+    if (cpcaParams.sections > 1u && w >= cpcaParams.section1.y / 2u) {
+        sec = cpcaParams.section1;
+    }
+    if (cpcaParams.sections > 2u && w >= cpcaParams.section2.y / 2u) {
+        sec = cpcaParams.section2;
+    }
+    cpcaOut[cpcaParams.scratchBase + slot * words + w] = decodeWord(sec, base, w - sec.y / 2u);
+}

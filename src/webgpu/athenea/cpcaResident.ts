@@ -119,6 +119,8 @@ export class CpcaTable {
   /** Words of the transfer it rebuilds (the decoded attribute's). */
   readonly transferWords: number;
   private offsets: number[] = [];
+  /** A block's first entry by "key:section" (a page fetched again reuses them). */
+  private blocks = new Map<string, number>();
   private data = new Uint32Array(1 << 16);
   private used = 0;
   /** Bumped when entries are added. */
@@ -202,6 +204,7 @@ export class CpcaTable {
     first: number,
     n: number,
     payloads: ReadonlyMap<string, { bytes: Uint8Array; encoding: number }>,
+    key?: string,
   ) {
     const h16 = new Uint16Array(records.buffer, records.byteOffset);
     const row = (e: number) => 2 * (first + e) * this.recordWords;
@@ -221,14 +224,26 @@ export class CpcaTable {
         }
         continue;
       }
-      if (p.encoding === 3 && this.addClusters(h16, row, n, s, p.bytes))
-        continue;
+      const blockKey = key === undefined ? undefined : `${key}:${s.id}`;
+      const known =
+        blockKey === undefined ? undefined : this.blocks.get(blockKey);
+      if (p.encoding === 3) {
+        const base = this.addClusters(h16, row, n, s, p.bytes, known);
+        if (base >= 0) {
+          if (blockKey !== undefined) this.blocks.set(blockKey, base);
+          continue;
+        }
+      }
       // Exact: the block's halves in the table, each element its row.
-      const values = halvesOf();
-      const entry = this.addEntry(
-        [CPCA_EXACT, n, d],
-        new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
-      );
+      let entry = known;
+      if (entry === undefined) {
+        const values = halvesOf();
+        entry = this.addEntry(
+          [CPCA_EXACT, n, d],
+          new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+        );
+        if (blockKey !== undefined) this.blocks.set(blockKey, entry);
+      }
       for (let e = 0; e < n; e++) {
         h16[row(e) + s.half] = entry;
         h16[row(e) + s.half + 1] = e;
@@ -237,17 +252,23 @@ export class CpcaTable {
     }
   }
 
-  /** The clusters of a mode 1 payload, where the record holds them. */
+  /**
+   * The clusters of a mode 1 payload, where the record holds them: their
+   * first entry (`known`: already in the table), or -1.
+   */
   private addClusters(
     h16: Uint16Array,
     row: (e: number) => number,
     n: number,
     s: CpcaSection,
     bytes: Uint8Array,
-  ): boolean {
+    known?: number,
+  ): number {
     const { mode, k, m, d, b } = cpcaHeader(bytes);
-    if (mode !== 1 || d !== 2 * s.words || m > s.coeffs) return false;
-    if (this.offsets.length + k > CPCA_MAX_ENTRIES) return false;
+    if (mode !== 1 || d !== 2 * s.words || m > s.coeffs) return -1;
+    if (known === undefined && this.offsets.length + k > CPCA_MAX_ENTRIES) {
+      return -1;
+    }
     const basisAt = 20 + 4 * k;
     const per = (1 + m) * d;
     const idsAt = Math.ceil((basisAt + 2 * k * per) / 4) * 4;
@@ -261,13 +282,13 @@ export class CpcaTable {
           z += bytes[planesAt + (j * b + i) * n + e] * 2 ** (8 * i);
         }
         const v = z & 1 ? -(z + 1) / 2 : z / 2;
-        if (v < -32768 || v > 32767) return false;
+        if (v < -32768 || v > 32767) return -1;
         q[e * m + j] = v;
       }
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const base = this.offsets.length;
-    for (let c = 0; c < k; c++) {
+    const base = known ?? this.offsets.length;
+    for (let c = 0; c < k && known === undefined; c++) {
       this.addEntry(
         [m, view.getUint32(20 + 4 * c, true), d],
         bytes.subarray(basisAt + 2 * c * per, basisAt + 2 * (c + 1) * per),
@@ -280,7 +301,7 @@ export class CpcaTable {
         h16[at + 1 + j] = j < m ? q[e * m + j] & 0xffff : 0;
       }
     }
-    return true;
+    return base;
   }
 
   /**
@@ -489,4 +510,69 @@ export async function athcCpcaResident(
     at += b.n;
   });
   return { table, column: cpcaColumn(table, records) };
+}
+
+/**
+ * Coefficients a paged cloud's records hold for TXIN and TXFD: its blocks
+ * are not read when the pool is laid out, and a block that uses more is
+ * kept exact in the table. The pawn's top uses at most 29.
+ */
+export const CPCA_PAGED_COEFFICIENTS = 32;
+
+/** One transfer form's record: its values and words. */
+export type CpcaForm = { values: number; words: number };
+
+/** A paged cloud's record sections for a transfer of `words` words. */
+export function cpcaPagedSections(
+  fileSections: readonly { id: string; words: number }[],
+  words: number,
+  coeffs = CPCA_PAGED_COEFFICIENTS,
+): CpcaSection[] {
+  return planCpcaSections(fileSections, words, { TXIN: coeffs, TXFD: coeffs });
+}
+
+/**
+ * The transferCpca spec of a v3 layout whose transfer sections are CPCA
+ * (encoding 3), laid out before any block is read: TXDI as its halves (a
+ * t16 cloud's clusters are rarely smaller), TXIN and TXFD as clusters of
+ * `coeffs` coefficients; `cpcaForms` is each transfer form's record (a
+ * prefix of the full one), `forms` the forms' values shortest first. Null
+ * where no record would be smaller than the halves.
+ */
+export function cpcaPagedSpec(
+  layout: {
+    sections: readonly { id: string; words: number; encoding?: number }[];
+  },
+  forms: readonly number[],
+  coeffs = CPCA_PAGED_COEFFICIENTS,
+): AttributeSpec | null {
+  const tx = layout.sections.filter((s) => /^TX(DI|IN|FD)$/.test(s.id));
+  if (!tx.some((s) => s.encoding === 3)) return null;
+  const tables = forms.map(
+    (values) =>
+      new CpcaTable(
+        cpcaPagedSections(tx, Math.ceil(values / 2), coeffs),
+        values,
+      ),
+  );
+  const full = tables[tables.length - 1];
+  if (!full.sections.some((s) => s.cpca)) return null;
+  return {
+    name: TRANSFER_CPCA,
+    format: "u32",
+    components: full.recordWords,
+    lodMerge: "first",
+    cpcaForms: tables.map((t) => ({
+      values: t.transferCount,
+      words: t.recordWords,
+    })),
+  };
+}
+
+/** The values of the transfer form whose record is the spec's words. */
+export function cpcaFormValues(spec: {
+  components: number;
+  cpcaForms?: readonly CpcaForm[];
+}): number | undefined {
+  return spec.cpcaForms?.find((f) => f.words === spec.components)?.values;
 }

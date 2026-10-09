@@ -1241,14 +1241,121 @@ pub fn coverage_ratios(file: &AthcFile) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// Every level's opacities replaced by their uncapped ratio.
+/// Every level's opacities replaced by their uncapped ratio, and every
+/// merged glass spread to its splats' area (`spread_translucent`).
 pub fn uncap_levels(file: &mut AthcFile) {
     let ratios = coverage_ratios(file);
-    for ((_, block), r) in file.levels.iter_mut().zip(ratios) {
+    let areas = translucent_areas(file);
+    for (((_, block), r), a) in file.levels.iter_mut().zip(ratios).zip(areas) {
         for (i, o) in r.into_iter().enumerate() {
             block.positions[i * 4 + 3] = o;
+            spread_translucent(block, i, a[i]);
         }
     }
+}
+
+// --- merged glass: its splats' area, not its moments' ----------------------
+//
+// splat_project draws a sheet at athenea's kSheetAlpha (0.1) whatever its
+// own opacity, its colour scaled by alphaOwn / 0.1: each gaussian of a sheet
+// takes a tenth of what is behind it (and of the sheet's own gaussians
+// behind it) over its footprint. What a sheet lets through is so set by how
+// much gaussian area covers it -- the sum of its splats' two-axis areas --
+// not by their opacity. A merged sheet with its moments' area has a quarter
+// of its splats' (the Corvette's windshield cut to a fifth by error: 0.64
+// against 2.47 m2), so it let through about three times as much of what is
+// behind it and occluded its own reflection less: thread BD measured the
+// error cut's glass 1.2-1.6 times as bright as the full cloud, where a
+// thinning that keeps the area (every fifth splat, its axes x sqrt 5) was
+// 0.84-1.02. So a merged sheet's long axes grow (both by one factor, the
+// thin one is left) until its area is its splats', its reflection divided
+// by the area gained; a sheet already as large is left as it is.
+//
+// Solid glass (transmission past one half, not thin: the Corvette's tinted
+// windows, 0.145 a splat) has the same trouble the other way round: its
+// splats composite, 1 - prod(1 - a_i), and a merge that keeps their mass in
+// one gaussian of the moments' area (0.55 on the tinted windows, a quarter
+// of their area) covers more than they did and shows more of its own light.
+// Spread to its splats' area, its opacity is their area-weighted mean and it
+// composites as they did, statistically.
+
+/// Whether element i is glass that merges by area (`spread_translucent`):
+/// a thin sheet, or solid glass (transmission past one half).
+pub fn is_translucent(block: &AthcBlock, i: usize) -> bool {
+    if block.pbr.is_empty() || block.n == 0 {
+        return false;
+    }
+    let words = block.pbr.len() / block.n;
+    ((block.pbr[i * words] >> 16) & 255) as f32 / 255.0 > 0.5
+}
+
+/// Each level's groups' sum of their glass splats' two-axis areas (0 where
+/// a group has none; `is_translucent`).
+pub fn translucent_areas(file: &AthcFile) -> Vec<Vec<f64>> {
+    let levels = file.levels.len();
+    let mut areas: Vec<Vec<f64>> = file.levels.iter().map(|(_, b)| vec![0.0; b.n]).collect();
+    if levels == 0 {
+        return areas;
+    }
+    let count = file.header.count as usize;
+    let mut g = 0usize;
+    let mut at = 0usize;
+    let finest = &mut areas[levels - 1];
+    for chunk in &file.chunks {
+        for i in 0..chunk.n {
+            while g + 1 < file.starts.len() && file.starts[g + 1] as usize <= at {
+                g += 1;
+            }
+            if g < finest.len() && at < count && is_translucent(chunk, i) {
+                finest[g] += two_axis_area(&chunk.shape[i * 4..i * 4 + 4]) as f64;
+            }
+            at += 1;
+        }
+    }
+    for l in (0..levels - 1).rev() {
+        let (parents, children) = (&file.levels[l].1.tail, &file.levels[l + 1].1.tail);
+        let mut j = 0;
+        for (i, &code) in parents.iter().enumerate() {
+            let mut a = 0.0;
+            while j < children.len() && children[j] >> 3 == code {
+                a += areas[l + 1][j];
+                j += 1;
+            }
+            areas[l][i] = a;
+        }
+    }
+    areas
+}
+
+/// Element i, merged glass whose splats' two-axis areas sum to `area`, with
+/// its long axes grown to that area and its opacity (a sheet's reflection,
+/// its opacity less `SHEET_PAD`) divided by the area gained. Anything else
+/// is left.
+pub fn spread_translucent(block: &mut AthcBlock, i: usize, area: f64) {
+    if area <= 0.0 || !is_translucent(block, i) {
+        return;
+    }
+    let sheet = is_sheet(block, i);
+    let w = &mut block.shape[i * 4..i * 4 + 4];
+    let mut s = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()];
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+    let before = (s[order[0]] * s[order[1]]) as f64;
+    if before.is_nan() || before <= 0.0 || area <= before {
+        return;
+    }
+    let grow = (area / before).sqrt() as f32;
+    for &k in &order[..2] {
+        s[k] *= grow;
+    }
+    w[1] = pack_halves(ln_scale(s[0]), ln_scale(s[1]));
+    w[2] = pack_halves(ln_scale(s[2]), high_half(w[2]));
+    let o = &mut block.positions[i * 4 + 3];
+    *o = if sheet {
+        ((*o - SHEET_PAD).max(0.0) as f64 * before / area) as f32 + SHEET_PAD
+    } else {
+        (*o as f64 * before / area) as f32
+    };
 }
 
 /// How far a merged gaussian's two long axes are widened, as a fraction of

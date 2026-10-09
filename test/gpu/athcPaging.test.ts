@@ -124,6 +124,10 @@ const V3 = fixture("every_stream.v3.athc");
 // The same, its sections as byte planes (encoding 1) and delta planes (2).
 const V3_PLANES = fixture("every_stream.planes.athc");
 const V3_DELTA = fixture("every_stream.delta.athc");
+// Its transfer sections as clustered PCA (encoding 3; athc-convert --cpca
+// 4,48,1e-3 --cpca-force): every_stream's transfer is of rank one, so the
+// CPCA here is exact and the values are the same as the others'.
+const V3_CPCA = fixture("every_stream.cpca.athc");
 const MERGED = 9;
 const COUNT = 300;
 
@@ -255,6 +259,7 @@ describe.skipIf(!device)("a .athc paged by stream group", () => {
     ["v3 (sections, gzip)", V3],
     ["v3 (byte planes)", V3_PLANES],
     ["v3 (delta planes)", V3_DELTA],
+    ["v3 (cpca)", V3_CPCA],
     ["v2", V2],
   ])(
     "keeps the relight streams of the first-ranked page, %s",

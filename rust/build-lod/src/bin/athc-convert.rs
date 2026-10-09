@@ -15,6 +15,11 @@
 //!                         in an octree frame turned and shifted by SEED (0: world-aligned)
 //!   --planes              each section in the encoding that stores it smallest (athc_v3 write_v3_smallest)
 //!   --encoding E          encoding E (0 words, 1 byte planes, 2 delta planes) for every section
+//!   --cpca K,M[,E]        the transfer's sections as clustered PCA (athc_cpca, encoding 3, lossy):
+//!                         per block at most K clusters (<= 256) of at most M directions, within
+//!                         a relative squared error E of each block's values (default 1e-5); the
+//!                         other sections as --planes / --encoding say. Merged nodes included.
+//!                         --cpca-force: CPCA wherever it meets E, even where byte planes are smaller
 //!   --athl IN --athl-out OUT   carry the cloud's light layers (`.athl`, usd-athc --light-layer) to
 //!                         the output: each element of a cut the weighted mean of the original
 //!                         splats under it, merged nodes as before; the cloud hash re-stamped
@@ -82,8 +87,9 @@ use spark_lib::athc_lod_error::{with_lod_sizes, LodSizeOptions};
 use spark_lib::athc_merge::{error_cut_to, error_levels, CostKind, ErrorOptions, ErrorView};
 use spark_lib::athc::{cut_sources, truncate_creases, truncate_levels, uncap_levels, AthcFile, VirtualTree};
 use spark_lib::athc_v3::{
-    parse_v3, read_v3, read_v3_skeleton, write_v3_encoded, write_v3_full, write_v3_smallest_with, SectionId, ATH3_MAGIC, COMPRESSION_GZIP, COMPRESSION_NONE,
+    parse_v3, read_v3, read_v3_skeleton, write_v3_cpca, write_v3_encoded, write_v3_full, write_v3_smallest_with, SectionId, ATH3_MAGIC, COMPRESSION_GZIP, COMPRESSION_NONE,
 };
+use spark_lib::athc_cpca::CpcaOptions;
 
 fn read_any(bytes: &[u8]) -> Result<AthcFile> {
     if bytes.len() >= 4 && u32::from_le_bytes(bytes[..4].try_into().unwrap()) == ATH3_MAGIC {
@@ -104,7 +110,7 @@ fn main() -> Result<()> {
         .iter()
         .enumerate()
         .filter(|&(i, a)| {
-            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || args[i - 1] == "--lod-size-opts" || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
+            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--cpca" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || args[i - 1] == "--lod-size-opts" || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
         })
         .map(|(_, a)| a)
         .collect();
@@ -235,7 +241,8 @@ fn main() -> Result<()> {
         for (_, b) in file.levels.iter_mut() {
             b.lod_size.clear();
         }
-    } else if flag("--lod-sizes") || had_lod_sizes {
+    } else if flag("--lod-sizes") || had_lod_sizes && !(flag("--cpca") && keep.is_none() && lists.is_none() && !flag("--rebuild-frame")) {
+        // (--cpca alone changes the transfer only: the sizes stay as stored.)
         let o = LodSizeOptions::parse(&text("--lod-size-opts").unwrap_or_default())?;
         file = with_lod_sizes(&file, &o);
         println!("LoD sizes by error for {} merged nodes", file.levels.iter().map(|(_, b)| b.n).sum::<usize>());
@@ -279,7 +286,26 @@ fn main() -> Result<()> {
         file.write()?
     } else {
         let compression = if flag("--gzip") { COMPRESSION_GZIP } else { COMPRESSION_NONE };
-        if flag("--planes") {
+        if let Some(c) = text("--cpca") {
+            let o = CpcaOptions { force: flag("--cpca-force"), ..CpcaOptions::parse(&c)? };
+            let chosen = if flag("--planes") {
+                let (_, chosen) = write_v3_smallest_with(&file, compression, skeleton.as_ref())?;
+                chosen
+            } else {
+                Vec::new()
+            };
+            let pick = |id: SectionId| chosen.iter().find(|(s, _)| *s == id).map_or(encoding(id), |&(_, e)| e);
+            let t = std::time::Instant::now();
+            let (out, stats) = write_v3_cpca(&file, compression, &pick, &o, skeleton.as_ref())?;
+            for st in &stats {
+                println!(
+                    "cpca {}: {} blocks ({} exact), {} elements, up to {} clusters x {} directions, relMSE {:.3e}",
+                    st.id.name(), st.blocks, st.exact_blocks, st.elements, st.max_clusters, st.max_coeffs, st.rel_mse()
+                );
+            }
+            println!("cpca: {:.1}s", t.elapsed().as_secs_f32());
+            out
+        } else if flag("--planes") {
             let (out, chosen) = write_v3_smallest_with(&file, compression, skeleton.as_ref())?;
             println!("encodings: {:?}", chosen);
             out

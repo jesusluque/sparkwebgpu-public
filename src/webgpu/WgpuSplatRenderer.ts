@@ -717,6 +717,18 @@ export class WgpuSplatRenderer {
   }
 
   /**
+   * Work the next render would do even with nothing moved: a markDirty()
+   * (an upload, a LoD cut, a plugin), dyno output that changed at the last
+   * render, a stale sort or alwaysGenerate. A cheap poll for a caller that
+   * skips rendering a still view (ProgressiveAccumulator's refreshEvery).
+   */
+  get pending(): boolean {
+    return (
+      this.dirty || this.dynoDirty || this.stale || this.options.alwaysGenerate
+    );
+  }
+
+  /**
    * Whether the last render drew an order sorted for an earlier pose
    * (minSortIntervalMs): render again once nothing moves to sort it.
    */

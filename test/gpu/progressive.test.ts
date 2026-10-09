@@ -229,4 +229,122 @@ describe.skipIf(!device)("ProgressiveAccumulator", () => {
     accum.dispose();
     texture.destroy();
   });
+
+  it("holds without drawing, drawing on refresh or pending work (refreshEvery)", async () => {
+    const d = device as GPUDevice;
+    const texture = makeTexture(d);
+    const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
+    camera.position.set(0, 0, 5);
+    camera.updateMatrixWorld();
+    const base = camera.projectionMatrix.clone();
+    const spark = {
+      blurAmount: 0.3,
+      webgpu: { splats: { contentVersion: 0 }, pending: false },
+    };
+    const accum = new ProgressiveAccumulator(d, {
+      frames: 4,
+      refreshEvery: 5,
+    });
+    const frame = () => ({ camera, width: W, height: H, spark });
+    const at = async (x: number) => (await read(d, texture))[(2 * W + x) * 4];
+    // One frame as the page runs it: draws unless idle.
+    const step = (level = 1) => {
+      const mode = accum.begin(frame());
+      if (mode !== "idle") draw(d, texture, camera, base, level);
+      accum.end(texture);
+      return mode;
+    };
+    const converge = () => {
+      expect(step()).toBe("plain");
+      for (let k = 0; k < 4; k++) expect(step()).toBe("sample");
+    };
+    converge();
+    const mean = await at(9);
+    expect(mean).toBeGreaterThan(0);
+    expect(mean).toBeLessThan(1);
+
+    // Held: idle frames draw nothing and show the mean again (the texture
+    // holds something else meanwhile); every 5th frame draws, as "hold".
+    const modes: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      // Whatever the target held before: idle frames overwrite it.
+      draw(d, texture, camera, base, 9);
+      modes.push(step(7));
+      expect(await at(9)).toBeCloseTo(mean, 6);
+      expect(await at(8)).toBe(1);
+    }
+    expect(modes.join(" ")).toBe(
+      "idle idle idle idle hold idle idle idle idle hold",
+    );
+    expect(accum.holdStats).toEqual({ idle: 8, refreshed: 2, pending: 0 });
+
+    // Pending work (a LoD answer, a page): drawn at once, every frame it lasts.
+    spark.webgpu.pending = true;
+    expect(step()).toBe("hold");
+    expect(step()).toBe("hold");
+    spark.webgpu.pending = false;
+    expect(step()).toBe("idle");
+    expect(accum.holdStats.pending).toBe(2);
+
+    // What it brought changes the splats while the frame draws: that frame
+    // stands as drawn, the mean starts over.
+    spark.webgpu.pending = true;
+    expect(accum.begin(frame())).toBe("hold");
+    draw(d, texture, camera, base, 3);
+    spark.webgpu.splats.contentVersion += 1;
+    spark.webgpu.pending = false;
+    accum.end(texture);
+    expect(accum.mode).toBe("plain");
+    expect(accum.samples).toBe(0);
+    expect(await at(8)).toBe(3);
+    expect(step()).toBe("plain");
+    for (let k = 0; k < 4; k++) expect(step()).toBe("sample");
+    expect(step()).toBe("idle");
+
+    // A late change that sets no pending flag (a mesh added to the scene)
+    // lands with the next refresh frame at the latest.
+    for (let i = 0; i < 3; i++) expect(step()).toBe("idle");
+    expect(accum.begin(frame())).toBe("hold");
+    draw(d, texture, camera, base);
+    spark.webgpu.splats.contentVersion += 1;
+    accum.end(texture);
+    expect(step()).toBe("plain");
+    for (let k = 0; k < 4; k++) expect(step()).toBe("sample");
+    expect(step()).toBe("idle");
+
+    // The camera moves with no render to update its world matrix: begin()
+    // still sees it at once.
+    camera.position.x += 0.01;
+    expect(step(5)).toBe("plain");
+    expect(await at(8)).toBe(5);
+    for (let k = 0; k < 4; k++) expect(step()).toBe("sample");
+    expect(step()).toBe("idle");
+    // The page's version and reset(): at once too.
+    expect(accum.begin({ ...frame(), version: 2 })).toBe("plain");
+    accum.end(texture);
+    for (let k = 0; k < 4; k++) {
+      expect(accum.begin({ ...frame(), version: 2 })).toBe("sample");
+      accum.end(texture);
+    }
+    expect(accum.begin({ ...frame(), version: 2 })).toBe("idle");
+    accum.end(texture);
+    accum.reset();
+    expect(accum.begin({ ...frame(), version: 2 })).toBe("plain");
+    accum.end(texture);
+
+    // refreshEvery 0 (the default): a held frame always draws.
+    const every = new ProgressiveAccumulator(d, { frames: 1 });
+    expect(every.refreshEvery).toBe(0);
+    every.begin(frame());
+    every.end(texture);
+    every.begin(frame());
+    every.end(texture);
+    for (let i = 0; i < 3; i++) {
+      expect(every.begin(frame())).toBe("hold");
+      every.end(texture);
+    }
+    every.dispose();
+    accum.dispose();
+    texture.destroy();
+  });
 });

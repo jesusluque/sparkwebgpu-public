@@ -25,6 +25,18 @@
 // size, the splats' contentVersion (mesh set, poses, LoD and paging, plugins,
 // dynos -- anything animated never holds still) and `version`, which the
 // page bumps for whatever else is in view (a dome, a GUI), or reset().
+//
+// Holding without drawing (`refreshEvery`, off by default): once the mean is
+// complete, begin() answers "idle" and the page skips renderer.render: end()
+// shows the mean through the chain again and nothing else runs on the GPU.
+// A full frame ("hold") is still drawn every `refreshEvery` frames, and on
+// any frame where the splats have work to pick up (SparkWebGPU.pending: a
+// LoD answer, a page, a mesh initialized, a markDirty), so whatever arrives
+// late still lands and, through contentVersion, starts the mean over.
+//
+//   const mode = accum.begin({ camera, width, height, spark });
+//   if (mode !== "idle") renderer.render(scene, camera);  // into target
+//   accum.endRenderTarget(renderer, target);
 
 import type * as THREE from "three";
 import accumulateModule from "../generated/fx/accumulate";
@@ -46,7 +58,11 @@ export interface AccumulateFrame {
    */
   spark?: {
     blurAmount: number;
-    webgpu?: { splats?: { contentVersion: number } | null } | null;
+    webgpu?: {
+      splats?: { contentVersion: number } | null;
+      /** Work the next render would pick up (SparkWebGPU.pending). */
+      pending?: boolean;
+    } | null;
   } | null;
   /** Anything else in view; bump it on a change (or call reset()). */
   version?: number;
@@ -55,15 +71,23 @@ export interface AccumulateFrame {
 /**
  * What a frame is: "off" (frames 0), "plain" (something changed: the
  * ordinary frame), "sample" (jittered and folded into the mean) or "hold"
- * (the mean has all its samples; the ordinary frame is drawn, the mean shown).
+ * (the mean has all its samples; the ordinary frame is drawn, the mean shown)
+ * or "idle" (refreshEvery: the mean has all its samples and nothing is
+ * pending; draw nothing, end() shows the mean).
  */
-export type AccumulateMode = "off" | "plain" | "sample" | "hold";
+export type AccumulateMode = "off" | "plain" | "sample" | "hold" | "idle";
 
 export interface ProgressiveOptions {
   /** Samples in the mean (16); 0 turns accumulation off. */
   frames?: number;
   /** The splats' anti-alias blur in px^2 while sampling (0.02: about a 4 x 4 supersampled render's 0.3 / 16). */
   blur?: number;
+  /**
+   * Holding, draw the scene only every this many frames, or when the splats
+   * have work pending; the frames between are "idle" (nothing drawn, the
+   * mean shown). 0 (the default) draws every frame.
+   */
+  refreshEvery?: number;
 }
 
 /** The radical inverse of `i` in `base`, in [0, 1). */
@@ -108,6 +132,12 @@ export class ProgressiveAccumulator {
   readonly chain: FxChain | null;
   frames: number;
   blur: number;
+  /** See ProgressiveOptions.refreshEvery. */
+  refreshEvery: number;
+  /** Frames since the last one drawn while holding. */
+  idleFrames = 0;
+  /** Counts of held frames: idle, and drawn (by refresh, by pending work). */
+  readonly holdStats = { idle: 0, refreshed: 0, pending: 0 };
   /** Samples in the mean. */
   samples = 0;
   /** What the last begin() decided. */
@@ -140,6 +170,7 @@ export class ProgressiveAccumulator {
     }
     this.frames = Math.max(0, Math.floor(options.frames ?? 16));
     this.blur = options.blur ?? 0.02;
+    this.refreshEvery = Math.max(0, Math.floor(options.refreshEvery ?? 0));
   }
 
   /** The mean has all its samples. */
@@ -151,6 +182,7 @@ export class ProgressiveAccumulator {
   reset() {
     this.restart = true;
     this.samples = 0;
+    this.idleFrames = 0;
   }
 
   private content(f: AccumulateFrame): number {
@@ -170,6 +202,8 @@ export class ProgressiveAccumulator {
       this.mode = "off";
       return this.mode;
     }
+    // The pose as set now: an idle frame has no render to update it.
+    f.camera.updateWorldMatrix(true, false);
     const sig = [
       ...f.camera.matrixWorld.elements,
       ...f.camera.projectionMatrix.elements,
@@ -188,11 +222,25 @@ export class ProgressiveAccumulator {
     this.restart = false;
     if (!still) {
       this.samples = 0;
+      this.idleFrames = 0;
       this.mode = "plain";
       return this.mode;
     }
     if (this.samples >= this.frames) {
       this.mode = "hold";
+      if (this.refreshEvery > 0) {
+        this.idleFrames += 1;
+        if (f.spark?.webgpu?.pending) {
+          this.holdStats.pending += 1;
+        } else if (this.idleFrames >= this.refreshEvery) {
+          this.holdStats.refreshed += 1;
+        } else {
+          this.holdStats.idle += 1;
+          this.mode = "idle";
+          return this.mode;
+        }
+        this.idleFrames = 0;
+      }
       return this.mode;
     }
     this.mode = "sample";
@@ -219,6 +267,7 @@ export class ProgressiveAccumulator {
    * After rendering into `texture` (the frame's linear target): restores the
    * camera, folds a sample into the mean, and leaves the mean (or the frame
    * as drawn) in the texture, through the chain when there is one. Submits.
+   * After an "idle" begin() nothing was drawn: the mean is shown again.
    */
   end(texture: GPUTexture) {
     const f = this.frame;

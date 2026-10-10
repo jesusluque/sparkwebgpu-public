@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import { encodeExtSplat } from "../../src/utils";
 import {
   COMPACT_PIECE,
+  CompactRelitPath,
   compactToSource,
   decodeCompactSplat,
   encodeCompact,
@@ -26,6 +27,7 @@ import {
   compactRun,
   compare,
   placeCamera,
+  readImage,
   referenceRun,
 } from "./compactHarness";
 import { wideDevice } from "./device";
@@ -414,5 +416,76 @@ describe.skipIf(!wideDevice || !process.env.COMPACT_SINGLE)("one splat", () => {
     process.stderr.write(
       `REF\n${rows(ref.image as Float32Array)}\nGOT\n${rows(got.image as Float32Array)}\n`,
     );
+  });
+});
+
+// A draw list (setDrawList): the cull walks the listed gaussians only (a
+// LoD cut chosen on the host), the list growing the frame buffer (and the
+// projections redone), and every gaussian listed draws what no list draws.
+describe.skipIf(!wideDevice)("the compact path's draw list", () => {
+  const d = wideDevice as GPUDevice;
+  it("draws the listed gaussians", async () => {
+    const s = syntheticCloud();
+    const cloud = encodeCompact({
+      count: N,
+      ...s,
+      basis: packJointBasis(syntheticJointBasis(256, 5)),
+      clusters: 256,
+    });
+    const W = 160;
+    const H = 120;
+    const { camera } = placeCamera(
+      W,
+      H,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(3, -2, 1),
+      40,
+      1,
+    );
+    const color = d.createTexture({
+      size: [W, H],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const view = color.createView();
+    const path = new CompactRelitPath(d, { hdri: sky() });
+    path.setCloud(cloud);
+    const frame = async () => {
+      const enc = d.createCommandEncoder();
+      path.render(enc, camera, view, "rgba16float", W, H, {
+        clear: { r: 0, g: 0, b: 0, a: 0 },
+      });
+      path.registry.submit(enc.finish());
+      await d.queue.onSubmittedWorkDone();
+    };
+    await frame();
+    expect(await path.drawnCount()).toBe(N);
+    const all = await readImage(d, color);
+    const evens = new Uint32Array(Math.ceil(N / 2)).map((_, k) => 2 * k);
+    path.setDrawList(evens);
+    await frame();
+    expect(await path.drawnCount()).toBe(evens.length);
+    // Every gaussian listed (the frame buffer grows): the same image.
+    path.setDrawList(new Uint32Array(N).map((_, k) => k));
+    await frame();
+    expect(await path.drawnCount()).toBe(N);
+    const listed = await readImage(d, color);
+    let diff = 0;
+    let sum = 0;
+    for (let k = 0; k < all.length; k++) {
+      diff += (all[k] - listed[k]) ** 2;
+      sum += all[k] ** 2;
+    }
+    process.stderr.write(`DRAWLIST relMSE ${diff / sum}\n`);
+    // Equal sort keys land in either order (the atomic append): ~1e-5 to
+    // 2e-4 between runs; a lost projection or list would be ~1.
+    expect(diff / sum).toBeLessThan(2e-3);
+    // Nothing listed: cleared, nothing drawn.
+    path.setDrawList(new Uint32Array(0));
+    await frame();
+    const empty = await readImage(d, color);
+    expect(empty.every((v) => v === 0)).toBe(true);
+    path.dispose();
+    color.destroy();
   });
 });

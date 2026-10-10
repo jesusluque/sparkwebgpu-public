@@ -206,6 +206,53 @@ export function packNormal16(n: [number, number, number]): number {
   return (q(px) | (q(py) << 16)) >>> 0;
 }
 
+/**
+ * Distinct runs of `width` words (materials, shadow masks), found by a
+ * numeric hash: no string a run, which on a phone's heap is hundreds of MB
+ * for a few million gaussians.
+ */
+export class WordDictionary {
+  /** The entries' words, entry after entry. */
+  readonly words: number[] = [];
+  private byHash = new Map<number, number[]>();
+  constructor(readonly width: number) {}
+  get size(): number {
+    return this.words.length / this.width;
+  }
+  private hash(src: ArrayLike<number>, at: number): number {
+    let a = 0x811c9dc5;
+    let b = 0x9e3779b9;
+    for (let k = 0; k < this.width; k++) {
+      const v = src[at + k] >>> 0;
+      a = Math.imul(a ^ v, 0x01000193);
+      b = Math.imul(b ^ (v + k), 0x85ebca6b) ^ (b >>> 13);
+    }
+    return (a >>> 0) * 2 ** 21 + ((b >>> 0) & 0x1fffff);
+  }
+  /** The entry holding src[at .. at + width), or -1. */
+  find(src: ArrayLike<number>, at: number): number {
+    const list = this.byHash.get(this.hash(src, at));
+    if (!list) return -1;
+    for (const e of list) {
+      let same = true;
+      for (let k = 0; k < this.width && same; k++)
+        same = this.words[e * this.width + k] === src[at + k] >>> 0;
+      if (same) return e;
+    }
+    return -1;
+  }
+  /** Adds src[at .. at + width) as a new entry (not checked): its index. */
+  add(src: ArrayLike<number>, at: number): number {
+    const e = this.size;
+    for (let k = 0; k < this.width; k++) this.words.push(src[at + k] >>> 0);
+    const h = this.hash(src, at);
+    const list = this.byHash.get(h);
+    if (list) list.push(e);
+    else this.byHash.set(h, [e]);
+    return e;
+  }
+}
+
 /** Byte planes in one word buffer, each 64-byte aligned. */
 class PlaneWriter {
   words = 0;
@@ -366,46 +413,41 @@ export function encodeCompact(input: CompactInput): CompactCloud {
     }
   }
   // Materials: every distinct (pbr, lobes).
-  const materialOf = new Map<string, number>();
-  const materialWords: number[] = [];
+  const materialOf = new WordDictionary(4);
+  const w4 = new Uint32Array(4);
   for (let i = 0; i < n; i++) {
-    const w = [
-      input.pbr[i],
-      input.lobes[3 * i],
-      input.lobes[3 * i + 1],
-      input.lobes[3 * i + 2],
-    ];
-    const key = w.join(",");
-    let m = materialOf.get(key);
-    if (m === undefined) {
-      m = materialOf.size;
-      if (m > 0xffff) throw new Error("compact: over 65536 materials");
-      materialOf.set(key, m);
-      materialWords.push(...w);
+    w4[0] = input.pbr[i];
+    w4[1] = input.lobes[3 * i];
+    w4[2] = input.lobes[3 * i + 1];
+    w4[3] = input.lobes[3 * i + 2];
+    let m = materialOf.find(w4, 0);
+    if (m < 0) {
+      if (materialOf.size > 0xffff)
+        throw new Error("compact: over 65536 materials");
+      m = materialOf.add(w4, 0);
     }
     material[i] = m;
   }
+  const materialWords = materialOf.words;
   // The shadowBits dictionary: each piece's distinct masks.
   const codebooks: number[] = [];
   const pieceStart = new Uint32Array(pieces);
   let entries = 0;
   for (let p = 0; p < pieces; p++) {
-    const seen = new Map<string, number>();
+    const seen = new WordDictionary(8);
     const start = codebooks.length;
     pieceStart[p] = start;
     const last = Math.min((p + 1) * COMPACT_PIECE, n);
     for (let i = p * COMPACT_PIECE; i < last; i++) {
-      const w = input.shadowBits.subarray(8 * i, 8 * i + 8);
-      const key = w.join(",");
-      let k = seen.get(key);
-      if (k === undefined) {
-        k = seen.size;
-        if (k > 0xffff) throw new Error("compact: over 65536 masks a piece");
-        seen.set(key, k);
-        for (const x of w) codebooks.push(x);
+      let k = seen.find(input.shadowBits, 8 * i);
+      if (k < 0) {
+        if (seen.size > 0xffff)
+          throw new Error("compact: over 65536 masks a piece");
+        k = seen.add(input.shadowBits, 8 * i);
       }
       shadow[i] = k;
     }
+    for (const x of seen.words) codebooks.push(x);
     entries += seen.size;
   }
   for (let i = 0; i < n; i++) {
@@ -626,6 +668,11 @@ export class CompactRelitPath {
   private pipelineFormat = "";
   private projectedKey = "";
   private frameKey = "";
+  /** The projections' words at the head of the frame buffer. */
+  private projWords = 0;
+  /** The draw list (setDrawList): entries, or -1 for every gaussian. */
+  private listCount = -1;
+  private listVersion = 0;
 
   constructor(
     readonly device: GPUDevice,
@@ -693,12 +740,53 @@ export class CompactRelitPath {
       cloud.data.byteLength,
     );
     const words = cloud.layout.clusters * K.kCompactProjWords;
+    this.projWords = words;
+    this.listCount = -1;
     if (this.frame.size < words * 4) {
       this.frame.destroy();
       this.frame = createStorage(this.device, words * 4, "compact projections");
     }
     this.capacity ||= cloud.layout.count;
     this.projectedKey = "";
+  }
+
+  /**
+   * The gaussians to cull, sort and draw (indices into the cloud), as a LoD
+   * cut chosen on the host each frame (WgpuLod's traversal over the cloud's
+   * tree); null: every gaussian. The list lives after the projections in
+   * the frame buffer (4 B an entry), which grows to hold it.
+   */
+  setDrawList(indices: Uint32Array | null) {
+    this.listVersion += 1;
+    if (!indices) {
+      this.listCount = -1;
+      return;
+    }
+    const need = (this.projWords + indices.length) * 4;
+    if (this.frame.size < need) {
+      this.frame.destroy();
+      const words = this.projWords + Math.ceil(indices.length * 1.25) + 64;
+      this.frame = createStorage(this.device, words * 4, "compact projections");
+      // The projections went with the old buffer.
+      this.projectedKey = "";
+    }
+    if (indices.length > 0) {
+      this.device.queue.writeBuffer(
+        this.frame,
+        this.projWords * 4,
+        indices.buffer,
+        indices.byteOffset,
+        indices.byteLength,
+      );
+    }
+    this.listCount = indices.length;
+  }
+
+  /** Gaussians the cull walks: the draw list's, else the cloud's. */
+  get listed(): number {
+    return this.listCount >= 0
+      ? this.listCount
+      : (this.cloud?.layout.count ?? 0);
   }
 
   private flags() {
@@ -710,7 +798,8 @@ export class CompactRelitPath {
       (l?.curvature ? K.kCompactCurvature : 0) |
       (o.faint ? K.kCompactFaint : 0) |
       (o.plain ? K.kCompactPlain : 0) |
-      (o.cullBacks ? K.kCompactCullBacks : 0)
+      (o.cullBacks ? K.kCompactCullBacks : 0) |
+      (this.listCount >= 0 ? K.kCompactDrawList : 0)
     );
   }
 
@@ -745,8 +834,9 @@ export class CompactRelitPath {
     const near = (camera as THREE.PerspectiveCamera).near ?? 0.01;
     const far = (camera as THREE.PerspectiveCamera).far ?? 1000;
     return UniformWriter.for(compactModule, "compactParams").setAll({
-      count: cloud.layout.count,
+      count: this.listed,
       flags: this.flags(),
+      drawList: this.projWords,
       chunkTable: W.chunkTable,
       pieceTable: W.pieceTable,
       posX: W.posX,
@@ -868,7 +958,21 @@ export class CompactRelitPath {
     const params = this.params(camera, width, height);
     // Nothing moved and the light is the same: the records in the sort's
     // buffers are this frame's, and only the draw runs.
-    const key = `${new Uint32Array(params.data).join()}|${this.sky.version}|${this.projectedKey}|${this.capacity}`;
+    const key = `${new Uint32Array(params.data).join()}|${this.sky.version}|${this.projectedKey}|${this.capacity}|${this.listVersion}`;
+    if (this.listed === 0) {
+      // Nothing listed: the target is only cleared (or left).
+      if (o.clear) {
+        encoder
+          .beginRenderPass({
+            colorAttachments: [
+              { view, loadOp: "clear", clearValue: o.clear, storeOp: "store" },
+            ],
+          })
+          .end();
+      }
+      this.frameKey = "";
+      return;
+    }
     const still =
       key === this.frameKey && !this.sky.dirty && this.projectedKey !== "";
     if (still && this.pipeline && this.pipelineFormat === format) {
@@ -876,7 +980,7 @@ export class CompactRelitPath {
       return;
     }
     this.prepareLight(encoder, params, profiler);
-    this.frameKey = `${new Uint32Array(params.data).join()}|${this.sky.version}|${this.projectedKey}|${this.capacity}`;
+    this.frameKey = `${new Uint32Array(params.data).join()}|${this.sky.version}|${this.projectedKey}|${this.capacity}|${this.listVersion}`;
     const { keys, vals } = this.sorter.keyInput(this.capacity);
     this.device.queue.writeBuffer(
       this.sorter.drawArgs,
@@ -889,7 +993,7 @@ export class CompactRelitPath {
         label: "compact.cull",
         timestampWrites: profiler?.timestampWrites("compact.cull"),
       });
-      const n = cloud.layout.count;
+      const n = this.listed;
       const row = K.kCompactDispatchRow;
       this.registry.get(compactModule, "atheneaCompactCull").dispatch(pass, {
         grid: [Math.min(n, row), Math.ceil(n / row)],

@@ -7,6 +7,7 @@
 // AttribPool.from() makes a pool of either on this side.
 
 import type { AttribValues } from "../../defines";
+import type { JointCpcaResident } from "../athenea/cpcaJoint";
 import type { CpcaTable } from "../athenea/cpcaResident";
 import { coreAttrib } from "../generated/constants";
 
@@ -311,6 +312,11 @@ export class AttribPool {
    * clustered PCA on the GPU: src/webgpu/athenea/cpcaResident.ts).
    */
   cpca?: CpcaTable;
+  /**
+   * athenea's joint CPCA basis of a `transferQ8` attribute (one cluster and
+   * 24 int8 weights a splat: src/webgpu/athenea/cpcaJoint.ts).
+   */
+  cpcaJoint?: JointCpcaResident;
 
   constructor(public count: number) {}
 

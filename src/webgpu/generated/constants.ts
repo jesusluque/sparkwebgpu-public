@@ -8,6 +8,16 @@ export const atheneaAdapterCpca = {
   kCpcaDispatchRow: 16776960,
 } as const;
 
+/** slang/athenea_adapter/cpca_joint.slang */
+export const atheneaAdapterCpcaJoint = {
+  kJointClusterFloats: 1008,
+  kJointRecordWords: 7,
+  kJointDispatchRow: 16776960,
+  kJointProjWords: 144,
+  kJointEyeSlotWords: 28,
+  kJointEyeLead: 32,
+} as const;
+
 /** slang/athenea_adapter/env.slang */
 export const atheneaAdapterEnv = {
   kAtheneaEnvGroup: 64,
@@ -60,6 +70,7 @@ export const atheneaAdapterRelight = {
   kRelightCullBacks: 4096,
   kRelightFootprintPixel: 8192,
   kRelightCpca: 16384,
+  kRelightJoint: 32768,
   kRelightGroup: 256,
   kRelightStride: 5,
   kRelightPixel: 2,

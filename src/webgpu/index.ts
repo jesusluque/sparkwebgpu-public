@@ -104,6 +104,18 @@ export {
   atheneaRelightPlugin,
 } from "./athenea/relightPlugin";
 export {
+  type JointCpcaBasis,
+  type JointCpcaResident,
+  Q8_RECORD_WORDS,
+  TRANSFER_Q8,
+  attachJointCpca,
+  encodeJointCpca,
+  packJointBasis,
+  parseJointCpca,
+  syntheticJointBasis,
+  syntheticJointRecords,
+} from "./athenea/cpcaJoint";
+export {
   ATHENEA_SKIN_ID,
   type AtheneaSkinOptions,
   type AtheneaSkinPlugin,

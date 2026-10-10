@@ -383,6 +383,21 @@ export class AtheneaSky {
     this.version += 1;
   }
 
+  /**
+   * Frees the dome's source image and its residual (rgba32f, with mips:
+   * ~11 MiB for a 1k HDRI) once prepare() has been encoded: what the relight
+   * reads (envSh, envSun, envTexels) stays. A later prepare uploads the image
+   * again. (The compact path, thread CB: the iPhone budget.)
+   */
+  releaseSources() {
+    this.source?.destroy();
+    this.source = null;
+    this.sourceImage = null;
+    this.sourceMips = false;
+    this.residual?.destroy();
+    this.residual = null;
+  }
+
   /** Prepares now, on a submit of its own. */
   prepareNow() {
     const encoder = this.device.createCommandEncoder({ label: "athenea sky" });

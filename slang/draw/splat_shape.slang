@@ -66,6 +66,25 @@ static const uint DRAW_SURFEL_MASS = 2048u;
 static const uint DRAW_AA_BOX = 4096u;
 static const float BOX_GAUSS_SIGMA = 2.0;
 
+// The accumulator's marks in a.w's high half (generate.slang's
+// GEN_MARK_*): additive, and a THIN SHEET of glass (athenea's relight).
+static const uint MARK_ADDITIVE = 0x3C00u;
+static const uint MARK_SHEET = 0x4000u;
+// athenea's kSheetAlpha (splat_project): a thin sheet's gaussians are drawn
+// at this alpha at least, their colour scaled down by as much, which keeps
+// alpha x colour (the reflection) and covers a tenth of what is behind each.
+// athenea floors AFTER its anti-alias compensation, max(paid x own, 0.1);
+// the relight has floored the splat's own alpha already, so the draw floors
+// again after its own (paid x stored, the colour scaled by paid x stored /
+// alpha): a grazing sheet, which the compensation takes far under 0.1,
+// still covers a tenth (it let 0.27 of what is behind through where athenea
+// lets 0.18 on the Corvette's headlight cover, 1.63x as bright).
+static const float SHEET_ALPHA = 0.1;
+// A sheet's alpha in the draw's varyings and tile records (markedRgba):
+// SHEET_VARYING + its alpha before the floor (in [0, 1]), from which the
+// fragment takes both its alpha and its colour's scale (sheetUnmark).
+static const float SHEET_VARYING = 8.0;
+
 // erf(x), Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
 float erfApprox(float x) {
     const float t = 1.0 / (1.0 + 0.3275911 * abs(x));
@@ -422,6 +441,10 @@ struct SplatShape {
     // Adds its light and covers nothing (generate's GEN_ADDITIVE: an ext,
     // non-covariance splat whose alpha word has a non-zero high half).
     bool additive;
+    // A thin sheet (MARK_SHEET): its alpha before SHEET_ALPHA's floor, after
+    // the anti-alias compensation (rgba.a holds the floored one); -1 when
+    // the splat is not one.
+    float sheet;
     // DRAW_AA_BOX (not surfels): the sigmas of the unfiltered Gaussian along
     // axis1 and axis2 (scaled pixels); the quad's axes then reach
     // adjustedStdDev sigmas plus the box's square (boxFrame).
@@ -429,9 +452,44 @@ struct SplatShape {
 };
 
 // rgba with the additive mark as alpha's sign, for the draw's varyings and
-// the tile rasterizer's records (alpha is never 0 past projectSplat).
+// the tile rasterizer's records (alpha is never 0 past projectSplat); a
+// sheet's alpha SHEET_VARYING + its alpha before the floor.
 float4 markedRgba(SplatShape s) {
+    if (s.sheet >= 0.0) {
+        return float4(s.rgba.rgb, SHEET_VARYING + s.sheet);
+    }
     return s.additive ? float4(s.rgba.rgb, -s.rgba.a) : s.rgba;
+}
+
+// A marked alpha (markedRgba's, not additive) back to the alpha drawn and
+// the scale of the colour, in linear light: a sheet's max(own, SHEET_ALPHA)
+// and own / that; anything else its own and 1. The scale goes on the
+// colour after the blend terms (athenea scales the colour and its per-pixel
+// records alike).
+float sheetUnmark(float marked, out float scale) {
+    scale = 1.0;
+    if (marked < SHEET_VARYING - 0.5) {
+        return marked;
+    }
+    const float own = marked - SHEET_VARYING;
+    const float alpha = max(own, SHEET_ALPHA);
+    scale = own / alpha;
+    return alpha;
+}
+
+// The alpha a splat's footprint ends at (the falloff's cut): minAlpha; a
+// sheet's athenea's 1/255 (splat_project's cutoffPower, min(2 ln(255
+// alpha), 9): 2.54 sigma at SHEET_ALPHA where minAlpha's is 2.80; a dozen
+// sheets deep that is 3.5% of what the headlight cover lets through).
+float cutAlpha(bool sheet) {
+    return sheet ? max(params.minAlpha, 1.0 / 255.0) : params.minAlpha;
+}
+
+// A sheet's floor on the alpha the anti-alias compensation left (`paid`
+// alpha): the alpha drawn, and its alpha before the floor in s.sheet.
+float sheetFloor(inout SplatShape s, float paid) {
+    s.sheet = paid;
+    return max(paid, SHEET_ALPHA);
 }
 
 // projectSplat's surfel: the record and the cuts, with s's centre and
@@ -515,12 +573,14 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     s.rows.y = float3(0.0);
     s.rows.w = float3(0.0);
     s.additive = false;
+    s.sheet = -1.0;
     s.box = float2(0.0);
 
     float3 center, scales, xxyyzz, xyxzyz;
     float4 quaternion, rgba;
     bool3 zeroScales = bool3(false);
     bool cov = hasFlag(DRAW_COV);
+    bool sheet = false;
 
     if (hasFlag(DRAW_EXT)) {
         uint4 a = splats[2u * splatIndex];
@@ -531,7 +591,9 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
         uint4 b = splats[2u * splatIndex + 1u];
         if (!cov) {
             unpackSplatExt(a, b, center, scales, quaternion, rgba);
-            s.additive = (a.w >> 16u) != 0u;
+            const uint mark = a.w >> 16u;
+            s.additive = mark == MARK_ADDITIVE;
+            sheet = mark == MARK_SHEET && alpha <= 1.0;
             zeroScales = scales == float3(0.0);
             if (all(zeroScales)) {
                 return false;
@@ -641,7 +703,7 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     }
 
     if (hasFlag(DRAW_AA_BOX)) {
-        return projectBoxed(s, splatIndex, a, b, d, fullBlurAmount - params.blurAmount, adjustedStdDev);
+        return projectBoxed(s, splatIndex, a, b, d, fullBlurAmount - params.blurAmount, adjustedStdDev, sheet);
     }
 
     // Convolve with a ~0.5-pixel Gaussian for anti-aliasing, keeping energy.
@@ -661,7 +723,11 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     // minAlpha of a Gaussian's mass (falloff 1). athc_measure faint: the
     // pawn's glass head at 192 px, relMSE 0.41 -> 0.009.
     const float faintTarget = FAINT_ALPHA * params.minAlpha;
-    if (hasFlag(DRAW_FAINT) && rgba.a <= 1.0 && params.falloff == 1.0 && detOrig > 0.0 && blurred < faintTarget) {
+    if (sheet) {
+        // A thin sheet: floored after the compensation (SHEET_ALPHA), never
+        // faint.
+        rgba.a = sheetFloor(s, blurred);
+    } else if (hasFlag(DRAW_FAINT) && rgba.a <= 1.0 && params.falloff == 1.0 && detOrig > 0.0 && blurred < faintTarget) {
         const float mass = rgba.a * sqrt(detOrig);
         const float tr = a0 + d0;
         const float want = sqr(mass / faintTarget);
@@ -703,8 +769,9 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     // which ties the quad's edge to adjustedStdDev.
     float f = params.falloff;
     float floorAlpha = (1.0 - f) * rgba.a;
-    if (rgba.a <= 1.0 && f > 0.0 && floorAlpha < params.minAlpha && adjustedStdDev * sqrt(eigen1) <= params.maxPixelRadius) {
-        float cut = sqrt(max(0.0, 2.0 * log(f * rgba.a / (params.minAlpha - floorAlpha))));
+    const float cutAt = cutAlpha(sheet);
+    if (rgba.a <= 1.0 && f > 0.0 && floorAlpha < cutAt && adjustedStdDev * sqrt(eigen1) <= params.maxPixelRadius) {
+        float cut = sqrt(max(0.0, 2.0 * log(f * rgba.a / (cutAt - floorAlpha))));
         if (cut < adjustedStdDev) {
             scale1 *= cut / adjustedStdDev;
             scale2 *= cut / adjustedStdDev;
@@ -723,7 +790,8 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
 // faint path as the Gaussian's (at its floor alpha with the probability
 // that keeps the mass; the box keeps its width), the quad's axes adjustedStdDev
 // sigmas plus half a pixel.
-bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d, float focus, float adjustedStdDev) {
+bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d, float focus, float adjustedStdDev,
+                  bool sheet) {
     const float detOrig = a * d - b * b;
     float share = 1.0;
     if (focus > 0.0) {
@@ -737,7 +805,9 @@ bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d
     const float peak = boxMass(sigma, boxFrame(e1, sigma, rot)) * share;
     float alpha = s.rgba.a * peak;
     const float faintTarget = FAINT_ALPHA * params.minAlpha;
-    if (hasFlag(DRAW_FAINT) && s.rgba.a <= 1.0 && params.falloff == 1.0 && alpha < faintTarget) {
+    if (sheet) {
+        alpha = sheetFloor(s, alpha);
+    } else if (hasFlag(DRAW_FAINT) && s.rgba.a <= 1.0 && params.falloff == 1.0 && alpha < faintTarget) {
         if (!(alpha > 0.0) || faintHash(splatIndex) >= alpha / faintTarget) {
             return false;
         }
@@ -751,8 +821,9 @@ bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d
     // under minAlpha (on the sigmas; the half pixel is added after).
     const float f = params.falloff;
     const float floorAlpha = (1.0 - f) * alpha;
-    if (alpha <= 1.0 && f > 0.0 && floorAlpha < params.minAlpha) {
-        adjustedStdDev = min(adjustedStdDev, sqrt(max(0.0, 2.0 * log(f * alpha / (params.minAlpha - floorAlpha)))));
+    const float cutAt = cutAlpha(sheet);
+    if (alpha <= 1.0 && f > 0.0 && floorAlpha < cutAt) {
+        adjustedStdDev = min(adjustedStdDev, sqrt(max(0.0, 2.0 * log(f * alpha / (cutAt - floorAlpha)))));
     }
     const float h = 0.5 * params.focalAdjustment;
     // The box's square, turned by rot, reaches h (|cos| + |sin|) on each axis.

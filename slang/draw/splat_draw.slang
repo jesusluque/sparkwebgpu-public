@@ -239,7 +239,9 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     // An additive splat (alpha's sign, markedRgba): its light is added,
     // premultiplied, and its alpha written 0 so nothing behind is covered.
     const bool additive = rgba.a < 0.0;
-    rgba.a = abs(rgba.a);
+    // A thin sheet (markedRgba): floored alpha, and its colour's scale.
+    float sheetScale;
+    rgba.a = sheetUnmark(abs(rgba.a), sheetScale);
     float2 uv = v.splatUv;
     const float stdDev = abs(v.adjustedStdDev);
     float fade = 0.0;
@@ -262,6 +264,10 @@ float4 computeSplatFragment<B : IBlendTerm>(SplatVertex v) {
     }
     BlendInput blendIn = { v.splatIndex, uv, v.position };
     rgba = applyBlendTerm<B>(rgba, blendIn);
+    if (sheetScale < 1.0) {
+        // In linear light: the colours are encoded with a power of 2.2.
+        rgba.rgb *= pow(sheetScale, 1.0 / 2.2);
+    }
     if (hasFlag(DRAW_ENCODE_LINEAR)) {
         rgba.rgb = srgbToLinear(rgba.rgb);
     }

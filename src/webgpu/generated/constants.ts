@@ -60,10 +60,12 @@ export const atheneaAdapterRelight = {
   kRelightCullBacks: 4096,
   kRelightFootprintPixel: 8192,
   kRelightCpca: 16384,
+  kRelightSheetDraw: 32768,
   kRelightGroup: 256,
   kRelightStride: 5,
   kRelightPixel: 2,
   kRelightKeepAll: -2,
+  kRelightSheet: 8,
   kCatcherDepth: 6.2831853,
   kRelightDispatchRow: 16776960,
 } as const;
@@ -154,6 +156,10 @@ export const drawSplatShape = {
   DRAW_SURFEL_MASS: 2048,
   DRAW_AA_BOX: 4096,
   BOX_GAUSS_SIGMA: 2,
+  MARK_ADDITIVE: 15360,
+  MARK_SHEET: 16384,
+  SHEET_ALPHA: 0.1,
+  SHEET_VARYING: 8,
   SURFEL_FILTER_INV_SQUARE: 2,
 } as const;
 
@@ -247,6 +253,8 @@ export const kernelsGenerate = {
   GEN_LOD_FADE: 65536,
   GEN_ADDITIVE: 131072,
   GEN_LOD_INDEX_MASK: 16777215,
+  GEN_MARK_ADDITIVE: 15360,
+  GEN_MARK_SHEET: 16384,
 } as const;
 
 /** slang/kernels/sort_radix.slang */

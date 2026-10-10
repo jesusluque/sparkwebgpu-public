@@ -7,7 +7,8 @@
 // light, athenea's relitSplat -- handed on encoded with Spark's transfer, as
 // the raster plugin does (raster.slang), so a draw into a linear target
 // blends exactly this light. The splat's own alpha is kept unless the pass
-// set one (a thin sheet held to its floor), and its whole rgba where the
+// set one (a thin sheet held to its floor, handed on as a negative alpha:
+// generate's sheet mark), and its whole rgba where the
 // pass kept it (its transfer page is not resident). It also copies the
 // splat's per-pixel record (relight.slang's kRelightPixel: athenea's
 // `slopes` and `sharpPolish` records, the centre in pixels) to its slot in
@@ -70,7 +71,10 @@ public struct AtheneaRelightColour : ISplatColour {
         if (keepAll) {
             return rgba;
         }
-        return float4(pow(max(c.rgb, float3(0.0)), float3(1.0 / 2.2)), c.a >= 0.0 ? c.a : rgba.a);
+        // A thin sheet (relight.slang's kRelightSheet + its alpha) goes on
+        // as a negative alpha: generate marks it for the draw's floor.
+        const float alpha = c.a >= 4.0 ? -(c.a - 8.0) : (c.a >= 0.0 ? c.a : rgba.a);
+        return float4(pow(max(c.rgb, float3(0.0)), float3(1.0 / 2.2)), alpha);
     }
 }
 

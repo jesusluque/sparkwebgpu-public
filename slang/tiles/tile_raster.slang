@@ -395,7 +395,9 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                 // Additive (a negative alpha, markedRgba): adds its light,
                 // leaves the transmittance.
                 const bool additive = g1.w < 0.0;
-                float alpha = splatAlpha(abs(g1.w), z2 + fade);
+                // A thin sheet (markedRgba): floored alpha, colour scale.
+                float sheetScale;
+                float alpha = splatAlpha(sheetUnmark(abs(g1.w), sheetScale), z2 + fade);
                 if (alpha < params.minAlpha) {
                     continue;
                 }
@@ -407,6 +409,10 @@ void tileBlend(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
                 BlendInput blendIn = { ordering[sortedVals[end - 1u - j]], uv, float4(p, c.w, 1.0) };
                 float4 blended = applyBlendTerm<SPLAT_BLEND>(float4(c.rgb, alpha), blendIn);
                 alpha = blended.a;
+                if (sheetScale < 1.0) {
+                    // Colours here are linear with DRAW_ENCODE_LINEAR.
+                    blended.rgb *= hasFlag(DRAW_ENCODE_LINEAR) ? sheetScale : pow(sheetScale, 1.0 / 2.2);
+                }
                 float3 rgb = blended.rgb * alpha;
                 if (clampColor) {
                     rgb = min(rgb, float3(1.0));

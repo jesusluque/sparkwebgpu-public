@@ -189,6 +189,19 @@ export interface AtheneaRelightOptions {
   cullBacks?: boolean;
   /** The facing (cosine to the eye) below which cullBacks drops a splat. */
   cullBacksFacing?: number;
+  /**
+   * Where a thin sheet of glass is held to athenea's kSheetAlpha (0.1, its
+   * colour scaled to keep alpha x colour). "relight" (default): in the
+   * relight pass, before the draw's anti-alias compensation, which then
+   * takes a sheet thin on screen (grazing, or far) under 0.1 and keeps its
+   * mass. "draw": after the compensation, as athenea's splat_project
+   * (max(paid x own, 0.1)): the sheet is marked and the draw floors it,
+   * and cuts it at athenea's 1/255. athenea's headlight cover pieces: 1.63x
+   * athenea's raster with "relight", 0.98x with "draw". It covers more of
+   * what is behind wherever sheets are thin on screen: the Corvette's
+   * glass seen from far away 0.56-0.62x as bright as with "relight".
+   */
+  sheetFloor?: "relight" | "draw";
   /** For investigations: the lighting's parts left out, or a debug view. */
   debug?: AtheneaRelightDebug;
   /**
@@ -424,6 +437,7 @@ export function atheneaRelightPlugin(
     footprintPixel: false,
     cullBacks: false,
     cullBacksFacing: CULL_BACKS_FACING,
+    sheetFloor: "relight",
     cpcaBatch: CPCA_BATCH,
     frame: null,
   };
@@ -770,6 +784,7 @@ export function atheneaRelightPlugin(
       (slopeOn ? C.kRelightSlope : 0) |
       (footprintPixelOn ? C.kRelightFootprintPixel : 0) |
       (options.cullBacks ? C.kRelightCullBacks : 0) |
+      (options.sheetFloor === "draw" ? C.kRelightSheetDraw : 0) |
       (options.debug?.noCells ? C.kRelightNoCells : 0) |
       (cpca && transferCount > 0 ? C.kRelightCpca : 0) |
       (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
@@ -1154,6 +1169,7 @@ export function atheneaRelightPlugin(
       if (o.cullBacks !== undefined) options.cullBacks = o.cullBacks;
       if (o.cullBacksFacing !== undefined)
         options.cullBacksFacing = o.cullBacksFacing;
+      if (o.sheetFloor !== undefined) options.sheetFloor = o.sheetFloor;
       if (o.debug !== undefined) options.debug = { ...o.debug };
       if (o.frame !== undefined) options.frame = o.frame;
       if (o.cpcaBatch !== undefined) options.cpcaBatch = o.cpcaBatch;

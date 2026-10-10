@@ -41,6 +41,13 @@ static const uint GEN_CULL = 2048u;      // drop splats the draw would skip
 static const uint GEN_LOD_FADE = 65536u; // lodIndices carry a fade in their top byte (LodFade)
 static const uint GEN_ADDITIVE = 131072u; // additive splats (ext, not cov): a.w's high half 1.0
 static const uint GEN_LOD_INDEX_MASK = 0x00FFFFFFu;
+// The accumulator's marks in a.w's high half (ext, not covariance; the
+// draw reads them in splat_shape.slang): additive (GEN_ADDITIVE), and a
+// thin sheet of glass, which a colour plugin hands on as a negative alpha
+// (athenea's relight): the draw floors its alpha at the sheet alpha after
+// its anti-alias compensation.
+static const uint GEN_MARK_ADDITIVE = 0x3C00u; // 1.0 as a half
+static const uint GEN_MARK_SHEET = 0x4000u;    // 2.0 as a half
 
 struct GenerateParams {
     uint numSplats;   // output splats for this mesh (the LOD count when LOD is on)
@@ -152,9 +159,15 @@ void generate(uint3 tid: SV_DispatchThreadID) {
     bool cov = hasFlag(GEN_OUT_COV);
     CovSplat c;
     c.flags = 0u;
+    bool sheet = false;
     if (isActive(s.flags)) {
         SplatColourInput colourIn = { s, index, shColor(index, s.center), params.viewObject.xyz, params.outBase + i };
         s.rgba = applySplatColour<SPLAT_COLOUR>(s.rgba, colourIn);
+        // A thin sheet (GEN_MARK_SHEET): its alpha came back negative.
+        if (s.rgba.a < 0.0) {
+            sheet = true;
+            s.rgba.a = -s.rgba.a;
+        }
         s = dynoObjectModifier(s);
 
         if (cov && hasFlag(GEN_COV_TRANSFORM)) {
@@ -198,10 +211,12 @@ void generate(uint3 tid: SV_DispatchThreadID) {
                 packSplatExtCov(a, b, center, c.rgba, c.xxyyzz, c.xyxzyz);
             } else {
                 packSplatExt(a, b, center, s.scales, s.quaternion, s.rgba);
-                // The draw reads a non-zero high half as additive
-                // (splat_shape.slang): light added, nothing covered.
+                // The draw reads the high half's marks (splat_shape.slang):
+                // additive, light added and nothing covered; or a sheet.
                 if (hasFlag(GEN_ADDITIVE)) {
-                    a.w |= 0x3C000000u;
+                    a.w |= GEN_MARK_ADDITIVE << 16u;
+                } else if (sheet) {
+                    a.w |= GEN_MARK_SHEET << 16u;
                 }
             }
         }

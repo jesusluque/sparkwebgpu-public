@@ -64,6 +64,7 @@ public static const uint kRelightDebugFootprint = 2048u; // debug view: the foot
 public static const uint kRelightCullBacks = 4096u;      // opaque splats whose stored face looks away are not drawn
 public static const uint kRelightFootprintPixel = 8192u; // the footprint prefilter knows the frame: its pixel term
 public static const uint kRelightCpca = 16384u;          // the transfer is rebuilt in envOfLight's scratch (cpca.slang)
+public static const uint kRelightSheetDraw = 32768u;     // thin sheets marked (kRelightSheet): the draw floors them after its AA
 public static const uint kRelightGroup = 256;
 /// Five uint4 a splat in `relit`: the colour (asuint float4: linear rgb,
 /// alpha, -1 to keep the splat's alpha, -2 to keep its whole rgba), the
@@ -74,6 +75,15 @@ public static const uint kRelightGroup = 256;
 public static const uint kRelightStride = 5;
 public static const uint kRelightPixel = 2;   // the first of the three
 public static const float kRelightKeepAll = -2.0;
+/// A thin sheet's colour word under kRelightSheetDraw: alpha kRelightSheet +
+/// its alpha (held to kSheetAlpha, the colour scaled to match). Without the
+/// flag the sheet's alpha alone, and the draw's compensation then takes it
+/// under kSheetAlpha (mass kept: a grazing or distant sheet lets more
+/// through than athenea's). The colour plugin hands it on
+/// as a negative alpha, generate marks the splat as a sheet in the
+/// accumulator, and the draw floors the alpha at kSheetAlpha again AFTER
+/// its anti-alias compensation (athenea's splat_project order).
+public static const float kRelightSheet = 8.0;
 
 public struct AtheneaRelightParams {
     public uint  count;            ///< source splats
@@ -595,6 +605,7 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
                                       hasFlag(kRelightIndirect), slope);
     }
     float alpha = -1.0;
+    bool sheet = false;
     const bool hasPbr = hasAttr(relightParams.pbr);
     const uint pbr = hasPbr ? poolWord(relightParams.pbr, i, 0u) : 0u;
     // splat_project's thin sheet, with Spark's alpha as the paid opacity.
@@ -605,6 +616,7 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
         const float alphaOwn = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
         alpha = max(alphaOwn, 0.1);
         sheetScale = alphaOwn / alpha;
+        sheet = true;
     } else if (hasPbr && !pbrThinWalled(pbr) && pbrTransmission(pbr) > 0.5 && relightParams.filter.w > 1.0) {
         // A solid glass covered whole (glassCover): what it lets through is
         // its lens, not the room straight behind it.
@@ -662,7 +674,7 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
         held *= sheetScale;
         pixel.centre = uint4(asuint(centre.x), asuint(centre.y), packHalves(held.x, held.y), packHalves(held.z, mark));
     }
-    return float4(light, alpha);
+    return float4(light, sheet && hasFlag(kRelightSheetDraw) ? kRelightSheet + alpha : alpha);
 }
 
 /// The splat thread t relights: the t-th of the list after the records

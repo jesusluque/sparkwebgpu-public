@@ -8,6 +8,13 @@ export const atheneaAdapterCpca = {
   kCpcaDispatchRow: 16776960,
 } as const;
 
+/** slang/athenea_adapter/cpca_joint.slang */
+export const atheneaAdapterCpcaJoint = {
+  kJointClusterFloats: 1008,
+  kJointRecordWords: 7,
+  kJointDispatchRow: 16776960,
+} as const;
+
 /** slang/athenea_adapter/env.slang */
 export const atheneaAdapterEnv = {
   kAtheneaEnvGroup: 64,

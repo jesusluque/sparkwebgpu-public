@@ -251,6 +251,10 @@ export interface RunOptions {
   timing?: boolean;
   image?: boolean;
   colours?: boolean;
+  /** Reference only: the draw's footprints (projectOnce's records) by splat. */
+  shapes?: boolean;
+  /** Reference only: more WgpuSplatRenderer options. */
+  renderer?: Record<string, unknown>;
 }
 
 function median(v: number[]) {
@@ -327,6 +331,8 @@ export async function referenceRun(
   const splats = new WgpuSplatRenderer(fakeRenderer as never, {
     depthTest: false,
     alwaysGenerate: true,
+    ...(o.shapes ? { projectOnce: true } : {}),
+    ...o.renderer,
   });
   const host = new PluginHost({ capabilities: splats.capabilities, tier: 2 });
   const relight = atheneaRelightPlugin({
@@ -353,7 +359,64 @@ export async function referenceRun(
     for (let i = 0; i < n; i++)
       for (let c = 0; c < 4; c++) colours[4 * i + c] = all[i * 20 + c];
   }
-  const image = o.image ? await readImage(d, color) : null;
+  let image: Float32Array | null = null;
+  if (o.image) {
+    // The renderer draws over what the target holds (three clears it): the
+    // warm-up frames stacked, so the target is cleared for one more frame.
+    const enc = d.createCommandEncoder();
+    enc
+      .beginRenderPass({
+        colorAttachments: [
+          {
+            view: color.createView(),
+            loadOp: "clear",
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            storeOp: "store",
+          },
+        ],
+      })
+      .end();
+    d.queue.submit([enc.finish()]);
+    splats.render(o.camera, tgt);
+    await d.queue.onSubmittedWorkDone();
+    image = await readImage(d, color);
+  }
+  let shapes: Float32Array | null = null;
+  let places: Float32Array | null = null;
+  if (o.shapes) {
+    const internals = splats as unknown as {
+      projected: GPUBuffer;
+      sorter: { drawArgs: GPUBuffer };
+    };
+    const p = internals.projected;
+    const staging = createReadback(d, p.size, "projected readback");
+    const args = createReadback(d, 16, "args readback");
+    const enc = d.createCommandEncoder();
+    enc.copyBufferToBuffer(p, 0, staging, 0, p.size);
+    enc.copyBufferToBuffer(internals.sorter.drawArgs, 0, args, 0, 16);
+    d.queue.submit([enc.finish()]);
+    const rec = await readAndDestroy(staging);
+    const f = new Float32Array(rec);
+    const u = new Uint32Array(rec);
+    const count = new Uint32Array(await readAndDestroy(args))[1];
+    shapes = new Float32Array(n * 4);
+    places = new Float32Array(n * 4);
+    for (let slot = 0; slot < count; slot++) {
+      const b = 16 * slot;
+      if (u[b + 12] === 0) continue;
+      const i = u[b + 13];
+      if (i >= n) continue;
+      shapes[4 * i] = Math.hypot(f[b + 8], f[b + 9]);
+      shapes[4 * i + 1] = Math.hypot(f[b + 10], f[b + 11]);
+      shapes[4 * i + 2] = f[b + 7];
+      shapes[4 * i + 3] = f[b + 12];
+      places[4 * i] = ((f[b] / f[b + 3] + 1) / 2) * o.W;
+      places[4 * i + 1] = ((1 - f[b + 1] / f[b + 3]) / 2) * o.H;
+      let angle = Math.atan2(-f[b + 9], f[b + 8]);
+      if (angle < 0) angle += Math.PI;
+      places[4 * i + 2] = angle;
+    }
+  }
   let timing: Record<string, Record<string, number>> | null = null;
   if (o.timing) {
     const frames = o.frames ?? 30;
@@ -385,7 +448,7 @@ export async function referenceRun(
   source.dispose?.();
   color.destroy();
   o.place(0);
-  return { colours, image, timing, memory };
+  return { colours, shapes, places, image, timing, memory };
 }
 
 /** The compact path on `cloud`. */
@@ -421,7 +484,10 @@ export async function compactRun(
     frame();
     await d.queue.onSubmittedWorkDone();
   }
-  const colours = o.colours ? await path.colours(o.camera, o.W, o.H) : null;
+  const both = o.colours ? await path.colours(o.camera, o.W, o.H) : null;
+  const colours = both?.colours ?? null;
+  const shapes = both?.shapes ?? null;
+  const places = both?.places ?? null;
   const image = o.image ? await readImage(d, color) : null;
   let timing: Record<string, Record<string, number>> | null = null;
   if (o.timing) {
@@ -446,5 +512,5 @@ export async function compactRun(
   path.dispose();
   color.destroy();
   o.place(0);
-  return { colours, image, timing, memory, drawn, capacity };
+  return { colours, shapes, places, image, timing, memory, drawn, capacity };
 }

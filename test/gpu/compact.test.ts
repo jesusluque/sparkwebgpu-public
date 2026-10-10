@@ -193,8 +193,16 @@ describe.skipIf(!wideDevice)("the compact relit path", () => {
     );
     const source = compactToSource(cloud, s.q8);
     const run = { W, H, sky: sky(), camera, place, colours: true, image: true };
-    const ref = await referenceRun(d, { ...source }, N, basis, run);
-    const got = await compactRun(d, cloud, run);
+    const noFaint = process.env.COMPACT_NO_FAINT === "1";
+    const ref = await referenceRun(d, { ...source }, N, basis, {
+      ...run,
+      shapes: true,
+      renderer: noFaint ? { faintSplats: "drop" } : {},
+    });
+    const got = await compactRun(d, cloud, {
+      ...run,
+      path: { faint: !noFaint },
+    });
     const colours = compare(
       got.colours as Float32Array,
       ref.colours as Float32Array,
@@ -210,6 +218,58 @@ describe.skipIf(!wideDevice)("the compact relit path", () => {
       );
     }
     const image = compare(got.image as Float32Array, ref.image as Float32Array);
+    {
+      // The footprints, splat by splat: the worst relative differences.
+      const a = got.shapes as Float32Array;
+      const b = ref.shapes as Float32Array;
+      const worst = [0, 0, 0, 0];
+      let onlyRef = 0;
+      let onlyGot = 0;
+      const examples: unknown[] = [];
+      for (let i = 0; i < N; i++) {
+        const gz = a[4 * i + 3] === 0;
+        const rz = b[4 * i + 3] === 0;
+        if (gz !== rz) {
+          if (gz) onlyRef++;
+          else onlyGot++;
+          continue;
+        }
+        if (gz) continue;
+        for (let k = 0; k < 4; k++) {
+          const e =
+            Math.abs(a[4 * i + k] - b[4 * i + k]) /
+            (Math.abs(b[4 * i + k]) + 1e-3);
+          if (e > worst[k]) worst[k] = e;
+          if (e > 0.05 && examples.length < 6)
+            examples.push({
+              i,
+              k,
+              got: [...a.subarray(4 * i, 4 * i + 4)],
+              ref: [...b.subarray(4 * i, 4 * i + 4)],
+            });
+        }
+      }
+      const pa = got.places as Float32Array;
+      const pb = ref.places as Float32Array;
+      let centre = 0;
+      let angle = 0;
+      for (let i = 0; i < N; i++) {
+        if (a[4 * i + 3] === 0 || b[4 * i + 3] === 0) continue;
+        centre = Math.max(
+          centre,
+          Math.hypot(pa[4 * i] - pb[4 * i], pa[4 * i + 1] - pb[4 * i + 1]),
+        );
+        // Only where the axes differ (a round footprint has no angle).
+        if (Math.abs(a[4 * i] - a[4 * i + 1]) > 0.1 * a[4 * i]) {
+          let da = Math.abs(pa[4 * i + 2] - pb[4 * i + 2]);
+          da = Math.min(da, Math.PI - da);
+          angle = Math.max(angle, da);
+        }
+      }
+      process.stderr.write(
+        `COMPACT_SHAPES ${JSON.stringify({ worst, onlyRef, onlyGot, centre, angle, examples })}\n`,
+      );
+    }
     if (process.env.COMPACT_DUMP) {
       const { writeFileSync } = await import("node:fs");
       writeFileSync(
@@ -233,6 +293,94 @@ describe.skipIf(!wideDevice)("the compact relit path", () => {
     );
     expect(colours.relMSE).toBeLessThan(1e-5);
     expect(alphaDiff).toBeLessThan(1e-3);
-    expect(image.relMSE).toBeLessThan(1e-2);
+    expect(image.relMSE).toBeLessThan(1e-3);
   }, 120_000);
+});
+
+describe.skipIf(!wideDevice || !process.env.COMPACT_SINGLE)("one splat", () => {
+  const d = wideDevice as GPUDevice;
+  it("draws as today's", async () => {
+    const n = 1;
+    const ext0 = new Uint32Array(4 * n);
+    const ext1 = new Uint32Array(4 * n);
+    const tilt = Number(process.env.COMPACT_SINGLE);
+    const q = new THREE.Quaternion().setFromUnitVectors(
+      new THREE.Vector3(0, 0, 1),
+      new THREE.Vector3(Math.cos(tilt), Math.sin(tilt), 0),
+    );
+    encodeExtSplat(
+      [ext0, ext1],
+      0,
+      0,
+      0,
+      0,
+      0.05,
+      0.03,
+      0.001,
+      q.x,
+      q.y,
+      q.z,
+      q.w,
+      0.9,
+      0.5,
+      0.5,
+      0.5,
+    );
+    const s: Streams = {
+      ext0,
+      ext1,
+      normalOct: new Uint32Array([
+        packNormal16([Math.cos(tilt), Math.sin(tilt), 0]),
+      ]),
+      pbr: new Uint32Array([128 << 8]),
+      lobes: new Uint32Array([0xffffffff, 0x3aa60000, 0]),
+      curvature: null,
+      shadowBits: new Uint32Array(8).fill(0xffffffff),
+      q8: syntheticJointRecords(1, 256),
+    };
+    const basis = syntheticJointBasis(256, 5);
+    const cloud = encodeCompact({
+      count: n,
+      ...s,
+      basis: packJointBasis(basis),
+      clusters: 256,
+    });
+    const W = 64;
+    const H = 64;
+    const { camera, place } = placeCamera(
+      W,
+      H,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0, -1, 0),
+      20,
+      1,
+    );
+    const run = { W, H, sky: sky(), camera, place, colours: true, image: true };
+    const ref = await referenceRun(d, compactToSource(cloud, s.q8), n, basis, {
+      ...run,
+      shapes: true,
+    });
+    const got = await compactRun(d, cloud, run);
+    const sum = (im: Float32Array) => {
+      let a = 0;
+      for (let k = 3; k < im.length; k += 4) a += im[k];
+      return a;
+    };
+    process.stderr.write(
+      `ONE ${JSON.stringify({ ref: sum(ref.image as Float32Array), got: sum(got.image as Float32Array), refShape: [...(ref.shapes as Float32Array)], gotShape: [...(got.shapes as Float32Array)], refPlace: [...(ref.places as Float32Array)], gotPlace: [...(got.places as Float32Array)] })}\n`,
+    );
+    const rows = (im: Float32Array) => {
+      const out: string[] = [];
+      for (let y = 26; y < 38; y++) {
+        let line = "";
+        for (let x = 20; x < 44; x++)
+          line += Math.round(im[(y * W + x) * 4 + 3] * 9);
+        out.push(line);
+      }
+      return out.join("\n");
+    };
+    process.stderr.write(
+      `REF\n${rows(ref.image as Float32Array)}\nGOT\n${rows(got.image as Float32Array)}\n`,
+    );
+  });
 });

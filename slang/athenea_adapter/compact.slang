@@ -14,7 +14,8 @@
 //                            LoD opacity) in 1/63 steps (192..255)
 //   scale              u8 x3 ln scale in its chunk's range (code 0: exactly 0)
 //   rotation           u32   ext's own quaternion word (oct xy 10/10, angle 12)
-//   normal             u16   octahedral 8 + 8 (athenea's packNormal, 8 bits)
+//   normal             u16..u32 octahedral, normalBits an axis (12: 3 bytes;
+//                            097's 8 + 8 shifts the coat's reflections)
 //   curvature          s8 x3 xx, xy, yy, a signed log in its chunk's range
 //   material           u16   into the material table (pbr, lobes: 4 words)
 //   cluster            u8    athenea's joint CPCA cluster (C = 256)
@@ -97,6 +98,7 @@ public struct CompactParams {
     public uint  tableBase;    ///< the projections in compactFrame, words
     public uint  envBaseSide;
     public uint  capacity;     ///< sort slots
+    public uint  normalBits;   ///< bits an axis of the octahedral normal (8, 12, 16)
     public float ior;
     public float footprint;
     public float footprintClamp;
@@ -213,10 +215,12 @@ public CompactSplat readCompact(uint i) {
     return g;
 }
 
-/// The stored normal (athenea's packNormal at 8 bits an axis).
+/// The stored normal (athenea's packNormal at normalBits an axis).
 float3 normalOf(uint i) {
-    const uint q = fieldAt(compactParams.normal, 2u, i);
-    const float2 f = float2(float(q & 0xFFu), float(q >> 8u)) / 255.0 * 2.0 - 1.0;
+    const uint bits = compactParams.normalBits;
+    const uint q = fieldAt(compactParams.normal, (2u * bits + 7u) / 8u, i);
+    const uint top = (1u << bits) - 1u;
+    const float2 f = float2(float(q & top), float((q >> bits) & top)) / float(top) * 2.0 - 1.0;
     float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
     const float t = saturate(-n.z);
     n.x += n.x >= 0.0 ? -t : t;
@@ -840,7 +844,28 @@ void atheneaCompactColours(uint3 tid: SV_DispatchThreadID) {
         return;
     }
     const CompactSplat g = readCompact(i);
-    debugOut[i] = shadeColour(i, g);
+    const float4 lit = shadeColour(i, g);
+    debugOut[3u * i] = lit;
+    // The footprint as the draw takes it: its two axes' lengths in pixels,
+    // the alpha, the adjusted deviations (0s: not drawn).
+    float alpha = lit.w >= 0.0 ? lit.w : g.rgba.a;
+    const float3 v = toView(g.center);
+    float2 centre, sigma;
+    float angle;
+    bool lod;
+    float4 shape = float4(0.0);
+    float4 place = float4(0.0);
+    if (inFrustum(v) && alpha > 0.0) {
+        float pre = alpha > 1.0 ? min(alpha * 4.0 - 3.0, 5.0) : alpha;
+        if (projectCompact(g, v, i, alpha, centre, sigma, angle, lod)) {
+            const float adjusted = adjustedStdDevOf(alpha, lod, sigma, pre);
+            shape = float4(min(compactParams.maxPixelRadius, adjusted * sigma.x),
+                           min(compactParams.maxPixelRadius, adjusted * sigma.y), alpha, adjusted);
+            place = float4(centre, angle, 0.0);
+        }
+    }
+    debugOut[3u * i + 1u] = shape;
+    debugOut[3u * i + 2u] = place;
 }
 
 // ------------------------------------------------------------- the draw

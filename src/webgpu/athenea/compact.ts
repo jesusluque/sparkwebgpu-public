@@ -64,6 +64,11 @@ export interface CompactInput {
   clusters: number;
   /** The stored colour is linear light (else sRGB). */
   linear?: boolean;
+  /**
+   * Bits an axis of the octahedral normal (8: 097's u16; 12 by default, 3
+   * bytes: the Corvette's coat reflects the normal's error, iphone-compact.md).
+   */
+  normalBits?: number;
 }
 
 /** Where each plane and table starts (words) and how wide (bytes a gaussian). */
@@ -76,6 +81,7 @@ export interface CompactLayout {
   clusters: number;
   linear: boolean;
   curvature: boolean;
+  normalBits: number;
   words: Record<string, number>;
   /** Bytes by category: per-gaussian planes and the tables. */
   bytes: Record<string, number>;
@@ -130,8 +136,15 @@ function octVector(fx: number, fy: number): [number, number, number] {
   return [x / l, y / l, z / l];
 }
 
-/** An 8 + 8 octahedral code of n, the best of the four around it. */
-export function encodeNormal8(n: [number, number, number]): number {
+/**
+ * An octahedral code of n at `bits` an axis (x | y << bits), the best of
+ * the four around it.
+ */
+export function encodeNormalBits(
+  n: [number, number, number],
+  bits: number,
+): number {
+  const top = 2 ** bits - 1;
   const l1 = Math.abs(n[0]) + Math.abs(n[1]) + Math.abs(n[2]) || 1;
   let px = n[0] / l1;
   let py = n[1] / l1;
@@ -141,27 +154,33 @@ export function encodeNormal8(n: [number, number, number]): number {
     px = ox;
     py = oy;
   }
-  const ux = (px * 0.5 + 0.5) * 255;
-  const uy = (py * 0.5 + 0.5) * 255;
+  const ux = (px * 0.5 + 0.5) * top;
+  const uy = (py * 0.5 + 0.5) * top;
   let best = 0;
   let bestDot = -2;
   for (const qx of [Math.floor(ux), Math.ceil(ux)]) {
     for (const qy of [Math.floor(uy), Math.ceil(uy)]) {
-      const cx = Math.min(Math.max(qx, 0), 255);
-      const cy = Math.min(Math.max(qy, 0), 255);
-      const v = decodeNormal8(cx | (cy << 8));
+      const cx = Math.min(Math.max(qx, 0), top);
+      const cy = Math.min(Math.max(qy, 0), top);
+      const v = decodeNormalBits(cx + cy * 2 ** bits, bits);
       const d = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
       if (d > bestDot) {
         bestDot = d;
-        best = cx | (cy << 8);
+        best = cx + cy * 2 ** bits;
       }
     }
   }
   return best;
 }
 
-export function decodeNormal8(q: number): [number, number, number] {
-  return octVector(((q & 0xff) / 255) * 2 - 1, ((q >> 8) / 255) * 2 - 1);
+export function decodeNormalBits(
+  q: number,
+  bits: number,
+): [number, number, number] {
+  const top = 2 ** bits - 1;
+  const x = q % 2 ** bits;
+  const y = Math.floor(q / 2 ** bits);
+  return octVector((x / top) * 2 - 1, (y / top) * 2 - 1);
 }
 
 /** athenea's packNormal (16 + 16). */
@@ -219,7 +238,9 @@ export function encodeCompact(input: CompactInput): CompactCloud {
   const opacity = new Uint8Array(n);
   const scale = new Uint8Array(3 * n);
   const rotation = new Uint32Array(n);
-  const normal = new Uint16Array(n);
+  const normalBits = input.normalBits ?? 12;
+  const normalBytes = Math.ceil((2 * normalBits) / 8);
+  const normal = new Uint8Array(normalBytes * n);
   const curvature = new Uint8Array(3 * n);
   const material = new Uint16Array(n);
   const cluster = new Uint8Array(n);
@@ -317,7 +338,11 @@ export function encodeCompact(input: CompactInput): CompactCloud {
                 : 0);
       }
       rotation[i] = b[4 * i + 3];
-      normal[i] = encodeNormal8(unpackNormal(input.normalOct[i]));
+      let code = encodeNormalBits(unpackNormal(input.normalOct[i]), normalBits);
+      for (let k = 0; k < normalBytes; k++) {
+        normal[normalBytes * i + k] = code % 256;
+        code = Math.floor(code / 256);
+      }
       if (hasCurvature && range > 0) {
         for (let k = 0; k < 3; k++) {
           const v = curv(i, k);
@@ -400,7 +425,7 @@ export function encodeCompact(input: CompactInput): CompactCloud {
     opacity: w.add(opacity),
     scale: w.add(scale),
     rotation: w.addWords(rotation),
-    normal: w.add(bytes(normal)),
+    normal: w.add(normal),
     curvature: w.add(curvature),
     material: w.add(bytes(material)),
     cluster: w.add(cluster),
@@ -433,6 +458,7 @@ export function encodeCompact(input: CompactInput): CompactCloud {
     clusters: input.clusters,
     linear: Boolean(input.linear),
     curvature: hasCurvature,
+    normalBits,
     words,
     bytes: {
       position: 6 * n,
@@ -440,7 +466,7 @@ export function encodeCompact(input: CompactInput): CompactCloud {
       opacity: n,
       scale: 3 * n,
       rotation: 4 * n,
-      normal: 2 * n,
+      normal: normalBytes * n,
       curvature: 3 * n,
       material: 2 * n,
       cluster: n,
@@ -485,7 +511,12 @@ export function decodeCompactSplat(cloud: CompactCloud, i: number) {
   const a = field(W.albedo, 3);
   const rgb = [a & 0xff, (a >> 8) & 0xff, (a >> 16) & 0xff].map((v) => v / 255);
   const opacity = decodeOpacity(field(W.opacity, 1));
-  const normal = decodeNormal8(field(W.normal, 2));
+  const nb = layout.normalBits;
+  const nw = Math.ceil((2 * nb) / 8);
+  let code = 0;
+  for (let k = nw - 1; k >= 0; k--)
+    code = code * 256 + bytes[W.normal * 4 + i * nw + k];
+  const normal = decodeNormalBits(code, nb);
   const cw = field(W.curvature, 3);
   const curvature = [0, 1, 2].map((k) => {
     const c = ((cw >> (8 * k)) << 24) >> 24;
@@ -689,6 +720,7 @@ export class CompactRelitPath {
       scale: W.scale,
       rotation: W.rotation,
       normal: W.normal,
+      normalBits: cloud.layout.normalBits,
       curvature: W.curvature,
       material: W.material,
       cluster: W.cluster,
@@ -937,11 +969,15 @@ export class CompactRelitPath {
     pass.end();
   }
 
-  /** Every gaussian's relit colour and alpha (float4), for checks. */
+  /**
+   * Every gaussian's relit colour and alpha (float4), then its footprint as
+   * drawn (axes in px, alpha, adjusted deviations), for checks: 8 floats a
+   * gaussian.
+   */
   async colours(camera: THREE.Camera, width: number, height: number) {
     const cloud = this.cloud as CompactCloud;
     const n = cloud.layout.count;
-    const out = createStorage(this.device, n * 16, "compact colours");
+    const out = createStorage(this.device, n * 48, "compact colours");
     const encoder = this.device.createCommandEncoder();
     const params = this.params(camera, width, height);
     this.prepareLight(encoder, params, null);
@@ -953,12 +989,20 @@ export class CompactRelitPath {
       uniforms: params.data,
     });
     pass.end();
-    const staging = createReadback(this.device, n * 16, "compact colours");
-    encoder.copyBufferToBuffer(out, 0, staging, 0, n * 16);
+    const staging = createReadback(this.device, n * 48, "compact colours");
+    encoder.copyBufferToBuffer(out, 0, staging, 0, n * 48);
     this.registry.submit(encoder.finish());
-    const f = new Float32Array(await readAndDestroy(staging));
+    const all = new Float32Array(await readAndDestroy(staging));
     out.destroy();
-    return f;
+    const colours = new Float32Array(n * 4);
+    const shapes = new Float32Array(n * 4);
+    const places = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      colours.set(all.subarray(12 * i, 12 * i + 4), 4 * i);
+      shapes.set(all.subarray(12 * i + 4, 12 * i + 8), 4 * i);
+      places.set(all.subarray(12 * i + 8, 12 * i + 12), 4 * i);
+    }
+    return { colours, shapes, places };
   }
 
   /** The splats drawn last frame (a readback of the sort's count). */

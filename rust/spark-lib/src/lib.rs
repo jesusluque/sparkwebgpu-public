@@ -31,6 +31,8 @@ pub mod athc_v3;
 #[cfg(feature = "athc")]
 pub mod athc_cpca;
 #[cfg(feature = "athc")]
+pub mod athc_shadow_vq;
+#[cfg(feature = "athc")]
 pub mod athc_merge;
 #[cfg(feature = "athc")]
 pub mod athc_lod_error;

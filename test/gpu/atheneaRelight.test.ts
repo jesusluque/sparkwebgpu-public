@@ -568,6 +568,20 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
         expect(alpha[i]).toBeCloseTo(Math.max(0.9 - 1 / 255, 0.1), 3);
       else expect(alpha[i]).toBe(-1);
     });
+    // sheetFloor "draw": the sheet is marked for the draw's floor after its
+    // compensation (kRelightSheet + its alpha); nothing else changes.
+    relight.set({ sheetFloor: "draw" });
+    splats.render(camera, target);
+    await d.queue.onSubmittedWorkDone();
+    const marked = new Float32Array(await read(relit));
+    MATERIALS.forEach((m, i) => {
+      for (let c = 0; c < 3; c++)
+        expect(marked[20 * i + c]).toBe(got[20 * i + c]);
+      expect(marked[20 * i + 3]).toBeCloseTo(
+        m.name === "thin sheet" ? 8 + alpha[i] : alpha[i],
+        5,
+      );
+    });
     host.detach();
     splats.dispose();
   }, 120_000);

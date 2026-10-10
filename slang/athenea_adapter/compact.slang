@@ -74,6 +74,7 @@ public static const uint kCompactCurvature = 4u;   // the cloud keeps its curvat
 public static const uint kCompactFaint = 8u;       // faint splats keep their mass (Spark's DRAW_FAINT)
 public static const uint kCompactPlain = 16u;      // debug: the albedo, no relight
 public static const uint kCompactCullBacks = 32u;  // opaque splats whose stored face looks away are not drawn
+public static const uint kCompactDrawList = 64u;   // the cull walks a list of gaussians (a LoD cut) in compactFrame
 
 public struct CompactParams {
     public uint  count;
@@ -117,7 +118,7 @@ public struct CompactParams {
     public float falloff;
     public float keyScale;     ///< (2^24 - 1) / the farthest distance sorted
     public float cullFacing;   ///< kCompactCullBacks: the cosine below which a back is culled
-    public float pad1;
+    public uint  drawList;     ///< kCompactDrawList: the list's start in compactFrame, words (count entries)
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
     public float4 row1;
     public float4 row2;
@@ -687,10 +688,13 @@ uint gaussianIndex(uint3 tid) { return tid.x + tid.y * kCompactDispatchRow; }
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
-    const uint i = gaussianIndex(tid);
-    if (i >= compactParams.count) {
+    const uint t = gaussianIndex(tid);
+    if (t >= compactParams.count) {
         return;
     }
+    // With a draw list (a LoD cut chosen on the host), thread t culls its
+    // t-th entry; else gaussian t.
+    const uint i = hasFlag(kCompactDrawList) ? compactFrame[compactParams.drawList + t] : t;
     if (fieldAt(compactParams.opacity, 1u, i) == 0u) {
         return;
     }

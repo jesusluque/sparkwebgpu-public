@@ -116,6 +116,17 @@ export {
   syntheticJointRecords,
 } from "./athenea/cpcaJoint";
 export {
+  COMPACT_CHUNK,
+  COMPACT_PIECE,
+  type CompactCloud,
+  type CompactInput,
+  type CompactLayout,
+  type CompactPathOptions,
+  CompactRelitPath,
+  WordDictionary,
+  encodeCompact,
+} from "./athenea/compact";
+export {
   ATHENEA_SKIN_ID,
   type AtheneaSkinOptions,
   type AtheneaSkinPlugin,

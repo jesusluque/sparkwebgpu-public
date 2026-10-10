@@ -46,7 +46,10 @@ import { ATTRIB_NONE, type AttribPool } from "../attributes/schema";
 import cpcaModule from "../generated/athenea_adapter/cpca";
 import jointModule from "../generated/athenea_adapter/cpca_joint";
 import relightModule from "../generated/athenea_adapter/relight";
-import { atheneaAdapterRelight } from "../generated/constants";
+import {
+  atheneaAdapterCpcaJoint as JOINT,
+  atheneaAdapterRelight,
+} from "../generated/constants";
 import { createStorage, upload } from "../gpuBuffers";
 import type { PluginFrame, SplatPlugin } from "../plugins/types";
 import { UniformWriter } from "../uniforms";
@@ -245,6 +248,12 @@ export interface AtheneaRelightDebug {
   alwaysBlend?: boolean;
   /** For A/B timings: rebuild a CPCA transfer a word a thread (else a splat a thread). */
   cpcaPerWord?: boolean;
+  /**
+   * For A/B checks: "cpca8" rebuilds the whole transfer a gaussian (else,
+   * under a dome alone, only the eye's blocks, the rest from the clusters'
+   * projections: kRelightJoint).
+   */
+  jointFull?: boolean;
 }
 
 const DEBUG_VIEWS: Record<string, number> = {
@@ -772,6 +781,21 @@ export function atheneaRelightPlugin(
       id("shadowBits") === ATTRIB_NONE ? 0 : (pool?.shadowWords ?? 0);
     const kTransfer =
       transferCount >= 9 && shadowWords >= 8 ? 2 : transferCount >= 9 ? 1 : 0;
+    // athenea's proposal 094 route for the joint CPCA: a TX transfer with its
+    // field under one dome and nothing else. The direct and indirect blocks
+    // are projected a cluster (cpca_joint.slang atheneaJointProject, into
+    // envOfLight before the scratch); a gaussian's eye pass rebuilds the
+    // openness and the reflected block only.
+    const projected =
+      Boolean(joint?.buffer) &&
+      !options.debug?.jointFull &&
+      kTransfer === 2 &&
+      transferCount === 112 &&
+      envLights === 1 &&
+      lightCount === 1 &&
+      !options.litBody;
+    const clusters = joint?.resident.basis.clusters ?? 0;
+    const tableWords = projected ? clusters * JOINT.kJointProjWords : 0;
     const storedLinear = lookupLinear(mesh);
     // The frame's projection, for SplatSlope (splat_project's tx3, ty3):
     // the cloud's space to the eye's with depth ahead, and the focal and
@@ -822,6 +846,7 @@ export function atheneaRelightPlugin(
       (options.cullBacks ? C.kRelightCullBacks : 0) |
       (options.debug?.noCells ? C.kRelightNoCells : 0) |
       (rebuilt ? C.kRelightCpca : 0) |
+      (projected ? C.kRelightJoint : 0) |
       (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
     const e = world.elements;
     const row = (k: number) => [e[k], e[k + 4], e[k + 8], e[k + 12]];
@@ -845,7 +870,7 @@ export function atheneaRelightPlugin(
       curvature: id("curvature"),
       footprint: options.footprint,
       listBase: source.count * C.kRelightStride,
-      cpcaWords: rebuiltWords,
+      cpcaWords: projected ? JOINT.kJointEyeSlotWords : rebuiltWords,
       encoding: source.encoding,
       row0: row(0),
       row1: row(1),
@@ -862,7 +887,18 @@ export function atheneaRelightPlugin(
     });
     emptyPool ??= upload(device, new Uint32Array([0, 0, 4, 0]), "relight pool");
     const batch = Math.max(256, Math.ceil(options.cpcaBatch / 256) * 256);
-    if (rebuilt) {
+    // The projections, a 32-word lead, then the eye's slots (the direct
+    // block's first word sits 32 words before a slot's reflected block).
+    const jointTable = scratchBase();
+    const eyeScratch = jointTable + tableWords + JOINT.kJointEyeLead;
+    if (projected) {
+      ensureScratch(
+        device,
+        tableWords + JOINT.kJointEyeLead + batch * JOINT.kJointEyeSlotWords,
+      );
+      params.set("jointTable", jointTable);
+      params.set("cpcaScratch", eyeScratch - JOINT.kJointEyeLead);
+    } else if (rebuilt) {
       ensureScratch(device, batch * rebuiltWords);
       params.set("cpcaScratch", scratchBase());
     }
@@ -907,6 +943,65 @@ export function atheneaRelightPlugin(
     // An entry over `threads` threads (a list's or the cloud's): at once,
     // or with the transfer rebuilt from its clusters a batch at a time.
     const run = (entry: string, threads: number, listCount: number) => {
+      if (projected && joint?.buffer) {
+        const decode = UniformWriter.for(jointModule, "jointParams").setAll({
+          count: clusters,
+          dome: 0,
+          tableBase: jointTable,
+          listCount,
+          listBase: source.count * C.kRelightStride,
+          attribute: transferId,
+          scratchBase: eyeScratch,
+          scratchWords: JOINT.kJointEyeSlotWords,
+          blocks: 3,
+          mode: 1,
+        });
+        const decodeBuffers = {
+          jointPool: buffers.relightPool,
+          jointBasis: joint.buffer,
+          jointList: state.relit,
+          jointOut: envOfLight as GPUBuffer,
+          envSh: buffers.envSh,
+          envSun: buffers.envSun,
+        };
+        // The clusters' projections on this frame's light (256 threads).
+        r.registry.get(jointModule, "atheneaJointProject").dispatch(pass, {
+          grid: [clusters],
+          buffers: decodeBuffers,
+          uniforms: decode.data,
+        });
+        decode.set("count", source.count);
+        if (entry === "atheneaRelightViewless") {
+          // The kept terms: no transfer rebuilt.
+          r.registry
+            .get(relightModule, "atheneaRelightViewlessJoint")
+            .dispatch(pass, {
+              grid: relightGrid(threads),
+              buffers,
+              uniforms: params.data,
+            });
+          return;
+        }
+        for (let first = 0; first < threads; first += batch) {
+          const n = Math.min(batch, threads - first);
+          decode.set("threadFirst", first);
+          decode.set("batch", n);
+          r.registry.get(jointModule, "atheneaJointDecode").dispatch(pass, {
+            grid: relightGrid(n),
+            buffers: decodeBuffers,
+            uniforms: decode.data,
+          });
+          params.set("threadFirst", first);
+          r.registry.get(relightModule, "atheneaRelightJoint").dispatch(pass, {
+            grid: relightGrid(n),
+            buffers,
+            uniforms: params.data,
+          });
+          stats.cpca += 1;
+        }
+        params.set("threadFirst", 0);
+        return;
+      }
       if (joint?.buffer && rebuilt) {
         const decode = UniformWriter.for(jointModule, "jointParams").setAll({
           count: source.count,

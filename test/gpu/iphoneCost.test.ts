@@ -300,6 +300,8 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           words112: [words112, "words"],
           cpca: [cpca, "cpca"],
           cpca8: [cpca8, "cpca8"],
+          // The whole transfer rebuilt a gaussian (no cluster projections).
+          cpca8full: [cpca8, "cpca8"],
         };
         const track = tracker(d);
         let wantColours = false;
@@ -315,7 +317,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
                 _memory: memory,
                 _colours: colours,
                 ...result
-              } = await run(pool, resident, W, H);
+              } = await run(pool, resident, W, H, mode === "cpca8full");
               const out = {
                 file: file.split("/").slice(-1)[0],
                 gaussians: leaves,
@@ -371,6 +373,28 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
                 ratio: +(gotSum / refSum).toFixed(4),
               };
             }
+            // The projected route against the whole rebuild (same records).
+            const full = colourOf.cpca8full;
+            const proj = colourOf.cpca8;
+            if (full && proj) {
+              let e = 0;
+              let r = 0;
+              let worst = 0;
+              for (let k = 0; k < full.length; k++) {
+                if (!Number.isFinite(full[k]) || !Number.isFinite(proj[k]))
+                  continue;
+                e += (proj[k] - full[k]) ** 2;
+                r += full[k] ** 2;
+                worst = Math.max(
+                  worst,
+                  Math.abs(proj[k] - full[k]) / (Math.abs(full[k]) + 0.01),
+                );
+              }
+              vs.cpca8VsCpca8full = {
+                relMSE: +(e / r).toExponential(3),
+                worstRel: +worst.toExponential(3),
+              };
+            }
             process.stderr.write(
               `IPHONE_RELIT ${JSON.stringify({ file: file.split("/").slice(-1)[0], gaussians: leaves, vsWords112: vs })}\n`,
             );
@@ -384,6 +408,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           resident: TransferResident,
           W: number,
           H: number,
+          jointFull = false,
         ) {
           const color = d.createTexture({
             size: [W, H],
@@ -421,6 +446,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
             hdri: sky,
             transferResident: resident,
             cpcaBatch: BATCH,
+            debug: { jointFull },
           });
           host.register(relight).attach(splats);
           const mesh = splats.add(source);
@@ -442,10 +468,14 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
             camera.updateProjectionMatrix();
             camera.updateMatrixWorld();
           };
-          const frames = async (moving: boolean) => {
+          // lights: the lights change every frame too (relight.set: the kept
+          // terms, and the joint CPCA's projections, computed again).
+          let lightTick = 0;
+          const frames = async (moving: boolean, lights = false) => {
             const ms: number[] = [];
             for (let k = 0; k < FRAMES; k++) {
               if (moving) place(0.2 * (k + 1));
+              if (lights) relight.set({ emission: 1 + 1e-6 * ++lightTick });
               const s = performance.now();
               splats.render(camera, target);
               await d.queue.onSubmittedWorkDone();
@@ -490,10 +520,10 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
               } | null;
             }
           ).profiler;
-          const timed = async (moving: boolean) => {
+          const timed = async (moving: boolean, lights = false) => {
             const got: Record<string, number>[] = [];
             if (profiler) profiler.onFrame = (f) => got.push({ ...f });
-            await frames(moving);
+            await frames(moving, lights);
             // The last readbacks land after their frames.
             for (let k = 0; k < 4; k++) {
               await d.queue.onSubmittedWorkDone();
@@ -511,16 +541,22 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           };
           const gpuMoving = await timed(true);
           const gpuStill = await timed(false);
+          const gpuLights = await timed(true, true);
+          const lightsWall = await frames(true, true);
           splats.options.profile = false;
           const round = (o: Record<string, number>) =>
             Object.fromEntries(
               Object.entries(o).map(([k, v]) => [k, +v.toFixed(3)]),
             );
           const result = {
-            wallMs: { relighting: moving, still },
+            wallMs: { relighting: moving, still, lightsChanging: lightsWall },
             relitFrames: { relighting: relitFrames, still: stillRelit },
             cpcaBatches: relight.stats.cpca,
-            gpuMs: { relighting: round(gpuMoving), still: round(gpuStill) },
+            gpuMs: {
+              relighting: round(gpuMoving),
+              still: round(gpuStill),
+              lightsChanging: round(gpuLights),
+            },
           };
           const snapshot = track.snapshot();
           host.detach();

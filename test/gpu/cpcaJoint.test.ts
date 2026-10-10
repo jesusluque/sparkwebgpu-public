@@ -23,6 +23,7 @@ import {
   packJointBasis,
   parseJointCpca,
   q8Column,
+  syntheticJointBasis,
 } from "../../src/webgpu/athenea/cpcaJoint";
 import { AttribPool } from "../../src/webgpu/attributes/schema";
 import jointModule from "../../src/webgpu/generated/athenea_adapter/cpca_joint";
@@ -164,6 +165,105 @@ describe.skipIf(!device)("joint CPCA (int8) rebuilt on the GPU", () => {
     const c = compareHalves(table, records, gpu, n);
     expect(c.worse).toBe(0);
     expect(c.exact / (n * 112)).toBeGreaterThan(0.99);
+  });
+
+  it("projects each cluster on the light as the CPU does", async () => {
+    const basis = syntheticJointBasis(256, 5);
+    // Directions large enough to matter.
+    for (const d of basis.dir) for (let k = 0; k < d.length; k++) d[k] *= 50;
+    const table = packJointBasis(basis);
+    const envShValues = new Float32Array(16 * 4).map((_, k) =>
+      Math.sin(k * 0.7),
+    );
+    const sun = [0.3, 0.8, 0.5];
+    const n = Math.hypot(...sun);
+    const envSunValues = new Float32Array([
+      sun[0] / n,
+      sun[1] / n,
+      sun[2] / n,
+      0.01,
+      2,
+      2,
+      2,
+      0,
+    ]);
+    const words = (f: Float32Array) =>
+      new Uint32Array(f.buffer, f.byteOffset, f.length);
+    const tableBase = 64;
+    const out = createStorage(
+      d,
+      (tableBase + 256 * 144) * 4,
+      "cpca8 projections",
+    );
+    const empty = createStorage(d, 16, "empty");
+    registry.get(jointModule, "atheneaJointProject").run({
+      grid: [256],
+      buffers: {
+        jointPool: empty,
+        jointBasis: upload(d, words(table), "cpca8 basis"),
+        jointList: empty,
+        jointOut: out,
+        envSh: upload(d, words(envShValues), "env sh"),
+        envSun: upload(d, words(envSunValues), "env sun"),
+      },
+      uniforms: UniformWriter.for(jointModule, "jointParams").setAll({
+        count: 256,
+        dome: 0,
+        tableBase,
+      }).data,
+    });
+    const staging = createReadback(d, out.size, "projections readback");
+    const enc = d.createCommandEncoder();
+    enc.copyBufferToBuffer(out, 0, staging, 0, out.size);
+    d.queue.submit([enc.finish()]);
+    const got = new Float32Array(await readAndDestroy(staging));
+    // The CPU: the same sums over the packed table.
+    const Y = (k: number, x: number, y: number, z: number) =>
+      [
+        0.28209479177387814,
+        -0.4886025119029199 * y,
+        0.4886025119029199 * z,
+        -0.4886025119029199 * x,
+        1.0925484305920792 * x * y,
+        -1.0925484305920792 * y * z,
+        0.31539156525252005 * (2 * z * z - x * x - y * y),
+        -1.0925484305920792 * x * z,
+        0.5462742152960396 * (x * x - y * y),
+        -0.5900435899266435 * y * (3 * x * x - y * y),
+        2.890611442640554 * x * y * z,
+        -0.4570457994644658 * y * (4 * z * z - x * x - y * y),
+        0.3731763325901154 * z * (2 * z * z - 3 * x * x - 3 * y * y),
+        -0.4570457994644658 * x * (4 * z * z - x * x - y * y),
+        1.445305721320277 * z * (x * x - y * y),
+        -0.5900435899266435 * x * (x * x - 3 * y * y),
+      ][k];
+    let worst = 0;
+    for (let c = 0; c < 256; c++) {
+      const at = c * 1008;
+      for (let j = 0; j < 9; j++) {
+        for (let ch = 0; ch < 3; ch++) {
+          let body = 0;
+          for (let k = 0; k < 16; k++)
+            body += envShValues[4 * k + ch] * table[at + j * 16 + k];
+          let gathered = 0;
+          let along = 0;
+          for (let k = 0; k < 16; k++) {
+            const v = table[at + 144 + j * 48 + 3 * k + ch];
+            gathered += envShValues[4 * k + ch] * v;
+            along +=
+              Y(k, envSunValues[0], envSunValues[1], envSunValues[2]) * v;
+          }
+          const white = table[at + 144 + j * 48 + ch];
+          const w = tableBase + c * 144 + j * 4 + ch;
+          for (const [term, want] of [body, gathered, along, white].entries()) {
+            const e =
+              Math.abs(got[w + 36 * term] - want) / (Math.abs(want) + 1e-3);
+            worst = Math.max(worst, e);
+          }
+        }
+      }
+    }
+    expect(worst).toBeLessThan(1e-4);
   });
 
   it("encodes and decodes on the CPU within the quantization step", () => {

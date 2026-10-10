@@ -293,3 +293,82 @@ export function halfToFloat(h: number) {
   if (e === 31) return m ? Number.NaN : s * Number.POSITIVE_INFINITY;
   return s * (1 + m / 1024) * 2 ** (e - 15);
 }
+
+/**
+ * A basis of athenea's shape (C clusters, K 8) with SYNTHETIC values, for a
+ * cloud that carries no 112-value transfer to encode (the published sets'
+ * t16): the costs of the real path, not its image. Each cluster's direct
+ * mean is an open sky's constant term (an ambient body), every other mean
+ * zero, its directions small.
+ */
+export function syntheticJointBasis(C = 256, seed = 1): JointCpcaBasis {
+  let s = seed >>> 0;
+  const rand = () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 2 ** 32 - 0.5;
+  };
+  const mean = JOINT_BLOCKS.map((D) => new Float32Array(C * D));
+  for (let c = 0; c < C; c++) mean[0][c * 16] = 0.28209479177387814;
+  return {
+    clusters: C,
+    k: JOINT_K,
+    centroids: new Float32Array(C * 112),
+    energyNorm: Float32Array.from([1, 1, 1]),
+    mean,
+    dir: JOINT_BLOCKS.map((D) =>
+      Float32Array.from({ length: C * D * JOINT_K }, () => rand() * 0.02),
+    ),
+    scale: JOINT_BLOCKS.map(() => new Float32Array(C * JOINT_K).fill(1)),
+  };
+}
+
+/**
+ * SYNTHETIC records for `n` gaussians: clusters by runs of 512 (as a cloud's
+ * neighbours share a material), weights pseudo-random in [-32, 32].
+ */
+export function syntheticJointRecords(
+  n: number,
+  clusters = 256,
+  seed = 7,
+): Uint32Array {
+  const records = new Uint32Array(n * Q8_RECORD_WORDS);
+  let s = seed >>> 0;
+  for (let i = 0; i < n; i++) {
+    const r = i * Q8_RECORD_WORDS;
+    for (let w = 0; w < 6; w++) {
+      let word = 0;
+      for (let b = 0; b < 4; b++) {
+        s = (Math.imul(s, 1103515245) + 12345) >>> 0;
+        word |= ((((s >>> 16) % 65) - 32) & 0xff) << (8 * b);
+      }
+      records[r + w] = word >>> 0;
+    }
+    records[r + 6] = (Math.imul((i >>> 9) + 1, 2654435761) >>> 0) % clusters;
+  }
+  return records;
+}
+
+/**
+ * Puts athenea's joint CPCA on `pool` in place of its `transfer`: the
+ * records (`transferQ8`) and the basis the relight rebuilds them with
+ * (atheneaRelightPlugin({ transferResident: "cpca8" })).
+ */
+export function attachJointCpca(
+  pool: {
+    count: number;
+    removeAttribute(name: string): void;
+    setColumn(col: AttributeColumn): void;
+    cpcaJoint?: JointCpcaResident;
+  },
+  resident: JointCpcaResident,
+  records: Uint32Array,
+) {
+  if (records.length !== pool.count * Q8_RECORD_WORDS) {
+    throw new Error(
+      `cpca8: ${records.length / Q8_RECORD_WORDS} records for ${pool.count} splats`,
+    );
+  }
+  pool.removeAttribute("transfer");
+  pool.setColumn(q8Column(records));
+  pool.cpcaJoint = resident;
+}

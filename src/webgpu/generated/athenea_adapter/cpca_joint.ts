@@ -2,7 +2,7 @@
 // slang/athenea_adapter/cpca_joint.slang — do not edit.
 import type { KernelModule } from "../../KernelModule";
 
-export const wgsl = "struct AtheneaJointParams_std140_0\n{\n    @align(16) count_0 : u32,\n    @align(4) listCount_0 : u32,\n    @align(8) listBase_0 : u32,\n    @align(4) threadFirst_0 : u32,\n    @align(16) batch_0 : u32,\n    @align(4) attribute_0 : u32,\n    @align(8) scratchBase_0 : u32,\n    @align(4) scratchWords_0 : u32,\n    @align(16) blocks_0 : u32,\n    @align(4) pad0_0 : u32,\n    @align(8) pad1_0 : u32,\n    @align(4) pad2_0 : u32,\n};\n\n@binding(4) @group(0) var<uniform> jointParams_0 : AtheneaJointParams_std140_0;\n@binding(2) @group(0) var<storage, read> jointList_0 : array<vec4<u32>>;\n\n@binding(0) @group(0) var<storage, read> jointPool_0 : array<u32>;\n\n@binding(1) @group(0) var<storage, read> jointBasis_0 : array<vec4<f32>>;\n\n@binding(3) @group(0) var<storage, read_write> jointOut_0 : array<u32>;\n\nstruct AttribDesc_0\n{\n     offsetWords_0 : u32,\n     format_0 : u32,\n     components_0 : u32,\n     flags_0 : u32,\n};\n\nfn AttribDesc_x24init_0( offsetWords_1 : u32,  format_1 : u32,  components_1 : u32,  flags_1 : u32) -> AttribDesc_0\n{\n    var _S1 : AttribDesc_0;\n    _S1.offsetWords_0 = offsetWords_1;\n    _S1.format_0 = format_1;\n    _S1.components_0 = components_1;\n    _S1.flags_0 = flags_1;\n    return _S1;\n}\n\nfn attribFormatBytes_0( format_2 : u32) -> u32\n{\n    switch(format_2)\n    {\n    case u32(0), u32(6):\n        {\n            return u32(4);\n        }\n    case u32(1), u32(5):\n        {\n            return u32(2);\n        }\n    default :\n        {\n            return u32(1);\n        }\n    }\n}\n\nfn attribWords_0( d_0 : AttribDesc_0) -> u32\n{\n    return (d_0.components_0 * attribFormatBytes_0(d_0.format_0) + u32(3)) / u32(4);\n}\n\nfn weightOf_0( w_0 : u32,  k_0 : u32) -> f32\n{\n    return f32((i32((w_0 << ((u32(24) - u32(8) * k_0)))) >> (u32(24))));\n}\n\nfn decodeBlock_0( at4_0 : u32,  d4_0 : u32,  w0_0 : u32,  w1_0 : u32,  out_0 : u32)\n{\n    var q_0 : array<f32, i32(8)>;\n    var k_1 : u32 = u32(0);\n    for(;;)\n    {\n        if(k_1 < u32(4))\n        {\n        }\n        else\n        {\n            break;\n        }\n        q_0[k_1] = weightOf_0(w0_0, k_1);\n        q_0[u32(4) + k_1] = weightOf_0(w1_0, k_1);\n        k_1 = k_1 + u32(1);\n    }\n    var v_0 : u32 = u32(0);\n    for(;;)\n    {\n        if(v_0 < d4_0)\n        {\n        }\n        else\n        {\n            break;\n        }\n        var acc_0 : vec4<f32> = jointBasis_0[at4_0 + v_0];\n        k_1 = u32(0);\n        for(;;)\n        {\n            if(k_1 < u32(8))\n            {\n            }\n            else\n            {\n                break;\n            }\n            var _S2 : vec4<f32> = acc_0 + vec4<f32>(q_0[k_1]) * jointBasis_0[at4_0 + (u32(1) + k_1) * d4_0 + v_0];\n            var k_2 : u32 = k_1 + u32(1);\n            acc_0 = _S2;\n            k_1 = k_2;\n        }\n        var _S3 : u32 = out_0 + u32(2) * v_0;\n        jointOut_0[_S3] = ((pack2x16float(vec2f((acc_0.x),0.0))) | ((((pack2x16float(vec2f((acc_0.y),0.0))) << (u32(16))))));\n        jointOut_0[_S3 + u32(1)] = ((pack2x16float(vec2f((acc_0.z),0.0))) | ((((pack2x16float(vec2f((acc_0.w),0.0))) << (u32(16))))));\n        v_0 = v_0 + u32(1);\n    }\n    return;\n}\n\nfn attribDesc_0( _S4 : u32) -> AttribDesc_0\n{\n    var b_0 : u32 = u32(4) + u32(4) * _S4;\n    return AttribDesc_x24init_0(jointPool_0[b_0], jointPool_0[b_0 + u32(1)], jointPool_0[b_0 + u32(2)], jointPool_0[b_0 + u32(3)]);\n}\n\nfn attribBase_0( _S5 : AttribDesc_0,  _S6 : u32) -> u32\n{\n    if((((_S5.flags_0) & (u32(2)))) == u32(0))\n    {\n        return jointPool_0[i32(2)] + _S6 * jointPool_0[i32(0)] + _S5.offsetWords_0;\n    }\n    var pages_0 : u32 = ((jointPool_0[i32(3)] + u32(65536) - u32(1)) >> (u32(16)));\n    var page_0 : u32 = (_S6 >> (u32(16)));\n    var slot_0 : u32;\n    if(page_0 < pages_0)\n    {\n        slot_0 = jointPool_0[_S5.offsetWords_0 + page_0];\n    }\n    else\n    {\n        slot_0 = u32(4294967295);\n    }\n    if(slot_0 == u32(4294967295))\n    {\n        return u32(4294967295);\n    }\n    return _S5.offsetWords_0 + pages_0 + (((slot_0 << (u32(16)))) + ((_S6 & (u32(65535))))) * attribWords_0(_S5);\n}\n\n@compute\n@workgroup_size(256, 1, 1)\nfn atheneaJointDecode(@builtin(global_invocation_id) tid_0 : vec3<u32>)\n{\n    var slot_1 : u32 = tid_0.x + tid_0.y * u32(16776960);\n    if(slot_1 >= (jointParams_0.batch_0))\n    {\n        return;\n    }\n    var t_0 : u32 = jointParams_0.threadFirst_0 + slot_1;\n    var i_0 : u32;\n    if((jointParams_0.listCount_0) != u32(0))\n    {\n        if(t_0 >= (jointParams_0.listCount_0))\n        {\n            return;\n        }\n        i_0 = jointList_0[jointParams_0.listBase_0 + t_0 / u32(4)][t_0 % u32(4)];\n    }\n    else\n    {\n        i_0 = t_0;\n    }\n    if(i_0 >= (jointParams_0.count_0))\n    {\n        return;\n    }\n    var _S7 : u32 = attribBase_0(attribDesc_0(jointParams_0.attribute_0), i_0);\n    if(_S7 == u32(4294967295))\n    {\n        return;\n    }\n    var out_1 : u32 = jointParams_0.scratchBase_0 + slot_1 * jointParams_0.scratchWords_0;\n    var cluster4_0 : u32 = jointPool_0[_S7 + u32(6)] * u32(252);\n    decodeBlock_0(cluster4_0, u32(4), jointPool_0[_S7], jointPool_0[_S7 + u32(1)], out_1);\n    if((jointParams_0.blocks_0) > u32(1))\n    {\n        decodeBlock_0(cluster4_0 + u32(36), u32(12), jointPool_0[_S7 + u32(2)], jointPool_0[_S7 + u32(3)], out_1 + u32(8));\n    }\n    if((jointParams_0.blocks_0) > u32(2))\n    {\n        decodeBlock_0(cluster4_0 + u32(144), u32(12), jointPool_0[_S7 + u32(4)], jointPool_0[_S7 + u32(5)], out_1 + u32(32));\n    }\n    return;\n}\n\n";
+export const wgsl = "struct AtheneaJointParams_std140_0\n{\n    @align(16) count_0 : u32,\n    @align(4) listCount_0 : u32,\n    @align(8) listBase_0 : u32,\n    @align(4) threadFirst_0 : u32,\n    @align(16) batch_0 : u32,\n    @align(4) attribute_0 : u32,\n    @align(8) scratchBase_0 : u32,\n    @align(4) scratchWords_0 : u32,\n    @align(16) blocks_0 : u32,\n    @align(4) mode_0 : u32,\n    @align(8) dome_0 : u32,\n    @align(4) tableBase_0 : u32,\n};\n\n@binding(6) @group(0) var<uniform> jointParams_0 : AtheneaJointParams_std140_0;\n@binding(4) @group(0) var<storage, read> jointList_0 : array<vec4<u32>>;\n\n@binding(0) @group(0) var<storage, read> jointPool_0 : array<u32>;\n\n@binding(3) @group(0) var<storage, read> jointBasis_0 : array<vec4<f32>>;\n\n@binding(5) @group(0) var<storage, read_write> jointOut_0 : array<u32>;\n\n@binding(2) @group(0) var<storage, read> envSun_0 : array<vec4<f32>>;\n\n@binding(1) @group(0) var<storage, read> envSh_0 : array<vec4<f32>>;\n\nstruct AttribDesc_0\n{\n     offsetWords_0 : u32,\n     format_0 : u32,\n     components_0 : u32,\n     flags_0 : u32,\n};\n\nfn AttribDesc_x24init_0( offsetWords_1 : u32,  format_1 : u32,  components_1 : u32,  flags_1 : u32) -> AttribDesc_0\n{\n    var _S1 : AttribDesc_0;\n    _S1.offsetWords_0 = offsetWords_1;\n    _S1.format_0 = format_1;\n    _S1.components_0 = components_1;\n    _S1.flags_0 = flags_1;\n    return _S1;\n}\n\nfn attribFormatBytes_0( format_2 : u32) -> u32\n{\n    switch(format_2)\n    {\n    case u32(0), u32(6):\n        {\n            return u32(4);\n        }\n    case u32(1), u32(5):\n        {\n            return u32(2);\n        }\n    default :\n        {\n            return u32(1);\n        }\n    }\n}\n\nfn attribWords_0( d_0 : AttribDesc_0) -> u32\n{\n    return (d_0.components_0 * attribFormatBytes_0(d_0.format_0) + u32(3)) / u32(4);\n}\n\nfn weightOf_0( w_0 : u32,  k_0 : u32) -> f32\n{\n    return f32((i32((w_0 << ((u32(24) - u32(8) * k_0)))) >> (u32(24))));\n}\n\nfn decodeBlock_0( at4_0 : u32,  d4_0 : u32,  w0_0 : u32,  w1_0 : u32,  out_0 : u32)\n{\n    var q_0 : array<f32, i32(8)>;\n    var k_1 : u32 = u32(0);\n    for(;;)\n    {\n        if(k_1 < u32(4))\n        {\n        }\n        else\n        {\n            break;\n        }\n        q_0[k_1] = weightOf_0(w0_0, k_1);\n        q_0[u32(4) + k_1] = weightOf_0(w1_0, k_1);\n        k_1 = k_1 + u32(1);\n    }\n    var v_0 : u32 = u32(0);\n    for(;;)\n    {\n        if(v_0 < d4_0)\n        {\n        }\n        else\n        {\n            break;\n        }\n        var acc_0 : vec4<f32> = jointBasis_0[at4_0 + v_0];\n        k_1 = u32(0);\n        for(;;)\n        {\n            if(k_1 < u32(8))\n            {\n            }\n            else\n            {\n                break;\n            }\n            var _S2 : vec4<f32> = acc_0 + vec4<f32>(q_0[k_1]) * jointBasis_0[at4_0 + (u32(1) + k_1) * d4_0 + v_0];\n            var k_2 : u32 = k_1 + u32(1);\n            acc_0 = _S2;\n            k_1 = k_2;\n        }\n        var _S3 : u32 = out_0 + u32(2) * v_0;\n        jointOut_0[_S3] = ((pack2x16float(vec2f((acc_0.x),0.0))) | ((((pack2x16float(vec2f((acc_0.y),0.0))) << (u32(16))))));\n        jointOut_0[_S3 + u32(1)] = ((pack2x16float(vec2f((acc_0.z),0.0))) | ((((pack2x16float(vec2f((acc_0.w),0.0))) << (u32(16))))));\n        v_0 = v_0 + u32(1);\n    }\n    return;\n}\n\nfn attribDesc_0( _S4 : u32) -> AttribDesc_0\n{\n    var b_0 : u32 = u32(4) + u32(4) * _S4;\n    return AttribDesc_x24init_0(jointPool_0[b_0], jointPool_0[b_0 + u32(1)], jointPool_0[b_0 + u32(2)], jointPool_0[b_0 + u32(3)]);\n}\n\nfn attribBase_0( _S5 : AttribDesc_0,  _S6 : u32) -> u32\n{\n    if((((_S5.flags_0) & (u32(2)))) == u32(0))\n    {\n        return jointPool_0[i32(2)] + _S6 * jointPool_0[i32(0)] + _S5.offsetWords_0;\n    }\n    var pages_0 : u32 = ((jointPool_0[i32(3)] + u32(65536) - u32(1)) >> (u32(16)));\n    var page_0 : u32 = (_S6 >> (u32(16)));\n    var slot_0 : u32;\n    if(page_0 < pages_0)\n    {\n        slot_0 = jointPool_0[_S5.offsetWords_0 + page_0];\n    }\n    else\n    {\n        slot_0 = u32(4294967295);\n    }\n    if(slot_0 == u32(4294967295))\n    {\n        return u32(4294967295);\n    }\n    return _S5.offsetWords_0 + pages_0 + (((slot_0 << (u32(16)))) + ((_S6 & (u32(65535))))) * attribWords_0(_S5);\n}\n\n@compute\n@workgroup_size(256, 1, 1)\nfn atheneaJointDecode(@builtin(global_invocation_id) tid_0 : vec3<u32>)\n{\n    var slot_1 : u32 = tid_0.x + tid_0.y * u32(16776960);\n    if(slot_1 >= (jointParams_0.batch_0))\n    {\n        return;\n    }\n    var t_0 : u32 = jointParams_0.threadFirst_0 + slot_1;\n    var i_0 : u32;\n    if((jointParams_0.listCount_0) != u32(0))\n    {\n        if(t_0 >= (jointParams_0.listCount_0))\n        {\n            return;\n        }\n        i_0 = jointList_0[jointParams_0.listBase_0 + t_0 / u32(4)][t_0 % u32(4)];\n    }\n    else\n    {\n        i_0 = t_0;\n    }\n    if(i_0 >= (jointParams_0.count_0))\n    {\n        return;\n    }\n    var _S7 : u32 = attribBase_0(attribDesc_0(jointParams_0.attribute_0), i_0);\n    if(_S7 == u32(4294967295))\n    {\n        return;\n    }\n    var out_1 : u32 = jointParams_0.scratchBase_0 + slot_1 * jointParams_0.scratchWords_0;\n    var cluster4_0 : u32 = jointPool_0[_S7 + u32(6)] * u32(252);\n    if((jointParams_0.mode_0) == u32(1))\n    {\n        var _S8 : u32 = jointPool_0[_S7];\n        var _S9 : u32 = jointPool_0[_S7 + u32(1)];\n        var acc_1 : vec2<f32> = jointBasis_0[cluster4_0].xy;\n        var k_3 : u32 = u32(0);\n        for(;;)\n        {\n            if(k_3 < u32(4))\n            {\n            }\n            else\n            {\n                break;\n            }\n            var _S10 : vec2<f32> = acc_1 + vec2<f32>(weightOf_0(_S8, k_3)) * jointBasis_0[cluster4_0 + (u32(1) + k_3) * u32(4)].xy + vec2<f32>(weightOf_0(_S9, k_3)) * jointBasis_0[cluster4_0 + (u32(5) + k_3) * u32(4)].xy;\n            var k_4 : u32 = k_3 + u32(1);\n            acc_1 = _S10;\n            k_3 = k_4;\n        }\n        jointOut_0[out_1 - u32(32)] = ((pack2x16float(vec2f((acc_1.x),0.0))) | ((((pack2x16float(vec2f((acc_1.y),0.0))) << (u32(16))))));\n        decodeBlock_0(cluster4_0 + u32(144), u32(12), jointPool_0[_S7 + u32(4)], jointPool_0[_S7 + u32(5)], out_1);\n        return;\n    }\n    decodeBlock_0(cluster4_0, u32(4), jointPool_0[_S7], jointPool_0[_S7 + u32(1)], out_1);\n    if((jointParams_0.blocks_0) > u32(1))\n    {\n        decodeBlock_0(cluster4_0 + u32(36), u32(12), jointPool_0[_S7 + u32(2)], jointPool_0[_S7 + u32(3)], out_1 + u32(8));\n    }\n    if((jointParams_0.blocks_0) > u32(2))\n    {\n        decodeBlock_0(cluster4_0 + u32(144), u32(12), jointPool_0[_S7 + u32(4)], jointPool_0[_S7 + u32(5)], out_1 + u32(32));\n    }\n    return;\n}\n\nfn envBasisValue_0( k_5 : u32,  d_1 : vec3<f32>) -> f32\n{\n    var x_0 : f32 = d_1.x;\n    var y_0 : f32 = d_1.y;\n    var z_0 : f32 = d_1.z;\n    switch(k_5)\n    {\n    case u32(0):\n        {\n            return 0.282094806432724f;\n        }\n    case u32(1):\n        {\n            return -0.48860251903533936f * y_0;\n        }\n    case u32(2):\n        {\n            return 0.48860251903533936f * z_0;\n        }\n    case u32(3):\n        {\n            return -0.48860251903533936f * x_0;\n        }\n    case u32(4):\n        {\n            return 1.09254848957061768f * x_0 * y_0;\n        }\n    case u32(5):\n        {\n            return -1.09254848957061768f * y_0 * z_0;\n        }\n    case u32(6):\n        {\n            return 0.31539157032966614f * (2.0f * z_0 * z_0 - x_0 * x_0 - y_0 * y_0);\n        }\n    case u32(7):\n        {\n            return -1.09254848957061768f * x_0 * z_0;\n        }\n    case u32(8):\n        {\n            return 0.54627424478530884f * (x_0 * x_0 - y_0 * y_0);\n        }\n    case u32(9):\n        {\n            return -0.59004360437393188f * y_0 * (3.0f * x_0 * x_0 - y_0 * y_0);\n        }\n    case u32(10):\n        {\n            return 2.89061141014099121f * x_0 * y_0 * z_0;\n        }\n    case u32(11):\n        {\n            return -0.4570457935333252f * y_0 * (4.0f * z_0 * z_0 - x_0 * x_0 - y_0 * y_0);\n        }\n    case u32(12):\n        {\n            return 0.37317633628845215f * z_0 * (2.0f * z_0 * z_0 - 3.0f * x_0 * x_0 - 3.0f * y_0 * y_0);\n        }\n    case u32(13):\n        {\n            return -0.4570457935333252f * x_0 * (4.0f * z_0 * z_0 - x_0 * x_0 - y_0 * y_0);\n        }\n    case u32(14):\n        {\n            return 1.44530570507049561f * z_0 * (x_0 * x_0 - y_0 * y_0);\n        }\n    case u32(15):\n        {\n            return -0.59004360437393188f * x_0 * (x_0 * x_0 - 3.0f * y_0 * y_0);\n        }\n    default :\n        {\n            return 0.0f;\n        }\n    }\n}\n\n@compute\n@workgroup_size(64, 1, 1)\nfn atheneaJointProject(@builtin(global_invocation_id) tid_1 : vec3<u32>)\n{\n    var c_0 : u32 = tid_1.x;\n    if(c_0 >= (jointParams_0.count_0))\n    {\n        return;\n    }\n    var _S11 : u32 = jointParams_0.dome_0 * u32(16);\n    var disc_0 : vec4<f32> = envSun_0[jointParams_0.dome_0 * u32(2)];\n    var _S12 : vec3<f32>;\n    if((disc_0.w) > 0.0f)\n    {\n        _S12 = disc_0.xyz;\n    }\n    else\n    {\n        _S12 = vec3<f32>(0.0f, 0.0f, 1.0f);\n    }\n    var _S13 : u32 = c_0 * u32(252);\n    var _S14 : u32 = jointParams_0.tableBase_0 + c_0 * u32(144);\n    var j_0 : u32 = u32(0);\n    for(;;)\n    {\n        if(j_0 < u32(9))\n        {\n        }\n        else\n        {\n            break;\n        }\n        var _S15 : vec3<f32> = vec3<f32>(0.0f);\n        var v_1 : u32 = u32(0);\n        var body_0 : vec3<f32> = _S15;\n        for(;;)\n        {\n            if(v_1 < u32(4))\n            {\n            }\n            else\n            {\n                break;\n            }\n            var d_2 : vec4<f32> = jointBasis_0[_S13 + j_0 * u32(4) + v_1];\n            var _S16 : u32 = _S11 + u32(4) * v_1;\n            var body_1 : vec3<f32> = body_0 + (envSh_0[_S16].xyz * vec3<f32>(d_2.x) + envSh_0[_S16 + u32(1)].xyz * vec3<f32>(d_2.y) + envSh_0[_S16 + u32(2)].xyz * vec3<f32>(d_2.z) + envSh_0[_S16 + u32(3)].xyz * vec3<f32>(d_2.w));\n            v_1 = v_1 + u32(1);\n            body_0 = body_1;\n        }\n        var _S17 : u32 = _S13 + u32(36) + j_0 * u32(12);\n        var white_0 : vec3<f32> = _S15;\n        var k_6 : u32 = u32(0);\n        var gathered_0 : vec3<f32> = _S15;\n        var along_0 : vec3<f32> = _S15;\n        for(;;)\n        {\n            if(k_6 < u32(16))\n            {\n            }\n            else\n            {\n                break;\n            }\n            var _S18 : u32 = u32(3) * k_6;\n            var rgb_0 : vec3<f32>;\n            var ch_0 : u32 = u32(0);\n            for(;;)\n            {\n                if(ch_0 < u32(3))\n                {\n                }\n                else\n                {\n                    break;\n                }\n                var _S19 : u32 = _S18 + ch_0;\n                var q_1 : vec4<f32> = jointBasis_0[_S17 + _S19 / u32(4)];\n                var lane_0 : u32 = _S19 % u32(4);\n                var _S20 : f32;\n                if(lane_0 == u32(0))\n                {\n                    _S20 = q_1.x;\n                }\n                else\n                {\n                    if(lane_0 == u32(1))\n                    {\n                        _S20 = q_1.y;\n                    }\n                    else\n                    {\n                        if(lane_0 == u32(2))\n                        {\n                            _S20 = q_1.z;\n                        }\n                        else\n                        {\n                            _S20 = q_1.w;\n                        }\n                    }\n                }\n                rgb_0[ch_0] = _S20;\n                ch_0 = ch_0 + u32(1);\n            }\n            var gathered_1 : vec3<f32> = gathered_0 + envSh_0[_S11 + k_6].xyz * rgb_0;\n            var along_1 : vec3<f32> = along_0 + vec3<f32>(envBasisValue_0(k_6, _S12)) * rgb_0;\n            if(k_6 == u32(0))\n            {\n                white_0 = rgb_0;\n            }\n            k_6 = k_6 + u32(1);\n            gathered_0 = gathered_1;\n            along_0 = along_1;\n        }\n        var w_1 : u32 = _S14 + j_0 * u32(4);\n        jointOut_0[w_1] = (bitcast<u32>((body_0.x)));\n        jointOut_0[w_1 + u32(1)] = (bitcast<u32>((body_0.y)));\n        jointOut_0[w_1 + u32(2)] = (bitcast<u32>((body_0.z)));\n        jointOut_0[w_1 + u32(36)] = (bitcast<u32>((gathered_0.x)));\n        jointOut_0[w_1 + u32(37)] = (bitcast<u32>((gathered_0.y)));\n        jointOut_0[w_1 + u32(38)] = (bitcast<u32>((gathered_0.z)));\n        jointOut_0[w_1 + u32(72)] = (bitcast<u32>((along_0.x)));\n        jointOut_0[w_1 + u32(73)] = (bitcast<u32>((along_0.y)));\n        jointOut_0[w_1 + u32(74)] = (bitcast<u32>((along_0.z)));\n        jointOut_0[w_1 + u32(108)] = (bitcast<u32>((white_0.x)));\n        jointOut_0[w_1 + u32(109)] = (bitcast<u32>((white_0.y)));\n        jointOut_0[w_1 + u32(110)] = (bitcast<u32>((white_0.z)));\n        j_0 = j_0 + u32(1);\n    }\n    return;\n}\n\n";
 
 export const reflection = {
   "entries": [
@@ -22,6 +22,23 @@ export const reflection = {
         "jointParams"
       ],
       "workgroupStorageBytes": 0
+    },
+    {
+      "name": "atheneaJointProject",
+      "stage": "compute",
+      "workgroupSize": [
+        64,
+        1,
+        1
+      ],
+      "uses": [
+        "envSh",
+        "envSun",
+        "jointBasis",
+        "jointOut",
+        "jointParams"
+      ],
+      "workgroupStorageBytes": 0
     }
   ],
   "bindings": [
@@ -33,30 +50,44 @@ export const reflection = {
       "elementBytes": 4
     },
     {
-      "name": "jointBasis",
+      "name": "envSh",
       "group": 0,
       "binding": 1,
       "kind": "read-only-storage",
       "elementBytes": 16
     },
     {
-      "name": "jointList",
+      "name": "envSun",
       "group": 0,
       "binding": 2,
       "kind": "read-only-storage",
       "elementBytes": 16
     },
     {
-      "name": "jointOut",
+      "name": "jointBasis",
       "group": 0,
       "binding": 3,
+      "kind": "read-only-storage",
+      "elementBytes": 16
+    },
+    {
+      "name": "jointList",
+      "group": 0,
+      "binding": 4,
+      "kind": "read-only-storage",
+      "elementBytes": 16
+    },
+    {
+      "name": "jointOut",
+      "group": 0,
+      "binding": 5,
       "kind": "storage",
       "elementBytes": 4
     },
     {
       "name": "jointParams",
       "group": 0,
-      "binding": 4,
+      "binding": 6,
       "kind": "uniform",
       "bytes": 48,
       "fields": [
@@ -124,21 +155,21 @@ export const reflection = {
           "components": 1
         },
         {
-          "name": "pad0",
+          "name": "mode",
           "offset": 36,
           "size": 4,
           "scalar": "uint32",
           "components": 1
         },
         {
-          "name": "pad1",
+          "name": "dome",
           "offset": 40,
           "size": 4,
           "scalar": "uint32",
           "components": 1
         },
         {
-          "name": "pad2",
+          "name": "tableBase",
           "offset": 44,
           "size": 4,
           "scalar": "uint32",

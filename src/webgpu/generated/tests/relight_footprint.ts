@@ -254,7 +254,7 @@ export const reflection = {
           "components": 1
         },
         {
-          "name": "pad1",
+          "name": "jointTable",
           "offset": 88,
           "size": 4,
           "scalar": "uint32",

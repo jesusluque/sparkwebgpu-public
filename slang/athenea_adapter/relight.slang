@@ -48,6 +48,7 @@ import athenea.splat.splat_relight;
 import athenea.common.packing;
 import athenea.common.color;
 import athenea.common.octahedral;
+import athenea.common.transfer_layout;
 import athenea.scene.splat_encoding;
 
 public static const uint kRelightExt = 1u;         // src is ext (else packed)
@@ -64,6 +65,11 @@ public static const uint kRelightDebugFootprint = 2048u; // debug view: the foot
 public static const uint kRelightCullBacks = 4096u;      // opaque splats whose stored face looks away are not drawn
 public static const uint kRelightFootprintPixel = 8192u; // the footprint prefilter knows the frame: its pixel term
 public static const uint kRelightCpca = 16384u;          // the transfer is rebuilt in envOfLight's scratch (cpca.slang)
+// athenea's joint CPCA under a dome alone (proposal 094, cpca_joint.slang):
+// the kept terms from the clusters' projections (jointTable) and the
+// gaussian's int8 weights, no transfer rebuilt; the eye pass reads only the
+// openness and the reflected block, which cpca_joint.slang rebuilt.
+public static const uint kRelightJoint = 32768u;
 public static const uint kRelightGroup = 256;
 /// Five uint4 a splat in `relit`: the colour (asuint float4: linear rgb,
 /// alpha, -1 to keep the splat's alpha, -2 to keep its whole rgba), the
@@ -98,7 +104,7 @@ public struct AtheneaRelightParams {
     public uint  threadFirst;      ///< the dispatch's first thread (a batch of the list or of the cloud)
     public uint  cpcaScratch;      ///< kRelightCpca: where the batch's transfer starts in envOfLight, words
     public uint  cpcaWords;        ///< kRelightCpca: words a slot of it
-    public uint  pad1;
+    public uint  jointTable;       ///< kRelightJoint: where the clusters' projections start in envOfLight, words
     public uint  pad2;
     public float4 encoding;        ///< packed src: rgbMin, rgbMax, lnScaleMin, lnScaleMax
     public float4 row0;            ///< object to world, rows of a 3x4
@@ -277,7 +283,9 @@ uint4 viewless<let kCpca : int>(uint i, Gsplat g) {
     float3 front;
     float3 coupling;
     float  sunShare;
-    if (kCpca != 0) {
+    if (kCpca == 2) {
+        jointViewless(s, i, dome, hasFlag(kRelightIndirect), front, coupling, sunShare);
+    } else if (kCpca != 0) {
         transferViewless<2>(s, envOfLight, relightPool, envSh, envSun, dome, hasFlag(kRelightIndirect), front,
                             coupling, sunShare);
     } else {
@@ -286,6 +294,59 @@ uint4 viewless<let kCpca : int>(uint i, Gsplat g) {
     }
     return uint4(packHalves(front.x, front.y), packHalves(front.z, coupling.x),
                  packHalves(coupling.y, coupling.z), packHalves(sunShare, float(dome + 1u)));
+}
+
+/// Term `term` of a cluster's projections (cpca_joint.slang
+/// atheneaJointProject) for a block's 8 int8 weights (words w0, w1).
+float3 jointTerm(uint cluster, uint term, uint w0, uint w1) {
+    const uint at = relightParams.jointTable + cluster * 144u + term * 36u;
+    float3 v = float3(asfloat(envOfLight[at]), asfloat(envOfLight[at + 1u]), asfloat(envOfLight[at + 2u]));
+    [unroll] for (uint k = 0; k < 8u; ++k) {
+        const uint w = k < 4u ? w0 : w1;
+        const float q = float(int(w << (24u - 8u * (k & 3u))) >> 24);
+        const uint d = at + 4u * (1u + k);
+        v += q * float3(asfloat(envOfLight[d]), asfloat(envOfLight[d + 1u]), asfloat(envOfLight[d + 2u]));
+    }
+    return v;
+}
+
+/// transferViewless (a TX transfer with cells) from the joint CPCA: the
+/// body's two halves, the sun's bounce and the white sky's gathering out of
+/// the cluster's projections, the rest as athenea writes it.
+void jointViewless(SplatSurface s, uint i, uint dome, bool withIndirect, out float3 front, out float3 coupling,
+                   out float sunShare) {
+    const uint base = attribBase(relightPool, attribDesc(relightPool, relightParams.transfer), i);
+    const uint c = relightPool[base + 6u];
+    const uint i0 = relightPool[base + 2u];
+    const uint i1 = relightPool[base + 3u];
+    front = jointTerm(c, 0u, relightPool[base], relightPool[base + 1u]);
+    const float3 gathered = jointTerm(c, 1u, i0, i1);
+    if (withIndirect) {
+        front += gathered;
+    }
+    const float4 disc = envSun[dome * 2];
+    const float3 irradiance = disc.w > 0.0 ? envSun[dome * 2 + 1].rgb : float3(0.0);
+    const float cosine = max(dot(s.normal, disc.xyz), 0.0);
+    sunShare = disc.w > 0.0 ? splatOpenToward(s, relightPool, relightPool, disc.xyz) : 1.0;
+    front += irradiance * (cosine * sunShare * kOverPiSun);
+    float3 along = float3(0.0);
+    if (withIndirect && disc.w > 0.0) {
+        along = max(jointTerm(c, 2u, i0, i1), float3(0.0));
+        front += irradiance * along;
+    }
+    coupling = float3(0.0);
+    if (withIndirect && transferHasField(s.transferCount)) {
+        float3 all = gathered;
+        float3 mean = envSh[dome * kEnvCoefficients].rgb * 0.28209479177387814;
+        if (disc.w > 0.0) {
+            all += irradiance * along;
+            mean += irradiance * (1.0 / (4.0 * 3.14159265358979));
+        }
+        const float3 white = jointTerm(c, 3u, i0, i1) * 3.5449077018110318;
+        coupling = float3(white.x > 1.0e-4 ? max(all.x / white.x, 0.0) : mean.x,
+                          white.y > 1.0e-4 ? max(all.y / white.y, 0.0) : mean.y,
+                          white.z > 1.0e-4 ? max(all.z / white.z, 0.0) : mean.z);
+    }
 }
 
 /// What the draw reads of a splat per pixel (kRelightPixel's three uint4).
@@ -525,6 +586,23 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
             slope.cachedFront = float3(lowHalf(kept.x), highHalf(kept.x), lowHalf(kept.y));
             slope.cachedCoupling = float3(highHalf(kept.y), lowHalf(kept.z), highHalf(kept.z));
             slope.cachedSunShare = lowHalf(kept.w);
+        }
+    }
+    // The joint CPCA keeps no direct or indirect block for this pass: what
+    // relitSplat would compute from them (transferViewless, for a splat the
+    // kept terms do not cover) comes from the clusters' projections.
+    if (kCpca == 2 && kTransfer >= 2 && !slope.cached) {
+        const uint dome = firstDome();
+        if (dome != kEnvNone && !surface.lit) {
+            float3 front;
+            float3 coupling;
+            float sunShare;
+            jointViewless(surface, i, dome, hasFlag(kRelightIndirect), front, coupling, sunShare);
+            slope.cached = true;
+            slope.cachedDome = dome;
+            slope.cachedFront = front;
+            slope.cachedCoupling = coupling;
+            slope.cachedSunShare = sunShare;
         }
     }
     // splat_project: WHICH WAY THE SURFACE FACES A PIXEL AWAY, from the
@@ -813,6 +891,21 @@ void atheneaRelightViewless(uint3 tid: SV_DispatchThreadID) {
 [numthreads(256, 1, 1)]
 void atheneaRelightViewlessCpca(uint3 tid: SV_DispatchThreadID) {
     viewlessAt<1>(relightIndex(tid));
+}
+
+/// The kept terms from the joint CPCA's projections (kRelightJoint).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaRelightViewlessJoint(uint3 tid: SV_DispatchThreadID) {
+    viewlessAt<2>(relightIndex(tid));
+}
+
+/// A TX cloud under a dome with the joint CPCA (kRelightJoint): the eye's
+/// blocks rebuilt by cpca_joint.slang (mode 1), the rest projected.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaRelightJoint(uint3 tid: SV_DispatchThreadID) {
+    relightAt<2, 2>(relightIndex(tid));
 }
 
 /// A cloud with a TX transfer (cells): everything.

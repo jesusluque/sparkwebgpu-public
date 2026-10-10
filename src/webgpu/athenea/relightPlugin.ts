@@ -1089,6 +1089,16 @@ export function atheneaRelightPlugin(
       dirty = true;
     },
     detach() {
+      // The meshes' relit records and uploaded streams (else left to the
+      // garbage collector, which a phone may not run before it runs out).
+      for (const m of renderer?.meshes ?? []) {
+        const s = states.get(m);
+        if (!s) continue;
+        s.relit.destroy();
+        if (s.pool?.owned) s.pool.buffer.destroy();
+        s.pool?.cpca?.buffer?.destroy();
+        states.delete(m);
+      }
       sky?.destroy();
       sky = null;
       lightsBuffer?.destroy();

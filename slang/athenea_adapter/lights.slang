@@ -316,9 +316,13 @@ public struct AtheneaLightsColour : ISplatColour {
         // (kSheetAlpha 0.1, its colour scaled by alphaOwn / 0.1 to keep
         // alpha x colour): athenea adds the lamps before that scale
         // (splat_project: colour += lampLight, then colour *= alphaOwn /
-        // alpha), so the sheet's own lamp light is scaled the same way.
+        // alpha), so the sheet's own lamp light is scaled the same way. With
+        // sheetFloor "draw" the relight hands a sheet on with its alpha
+        // negative (generate's sheet mark).
         const float own = max(min(i.splat.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
-        const float sheetScale = (rgba.a == 0.1 && i.splat.rgba.a != rgba.a && own < 0.1) ? own / 0.1 : 1.0;
+        const float sheetScale = rgba.a < 0.0 ? min(own / -rgba.a, 1.0)
+                                 : (rgba.a == 0.1 && i.splat.rgba.a != rgba.a && own < 0.1) ? own / 0.1
+                                                                                             : 1.0;
         for (uint g = 0; g < groups; ++g) {
             const float3 w = atheneaLights.weights[g].rgb;
             if (all(w == float3(0.0))) {

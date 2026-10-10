@@ -19,7 +19,8 @@
 //   curvature          s8 x3 xx, xy, yy, a signed log in its chunk's range
 //   material           u16   into the material table (pbr, lobes: 4 words)
 //   cluster            u8    athenea's joint CPCA cluster (C = 256)
-//   weights            3 planes of 8 int8 (direct, indirect, reflected)
+//   weights            3 planes of 8 int8 (direct, indirect, reflected), or of
+//                            8 int4 (weightBits 4, 097's mode 1)
 //   shadow             u16   into its piece's codebook (the open-direction
 //                            cells, 8 words; a piece is 16384 gaussians)
 // and tables: the chunks' ranges (12 words a chunk), the pieces' codebook
@@ -72,6 +73,7 @@ public static const uint kCompactIndirect = 2u;    // the transfer's indirect ha
 public static const uint kCompactCurvature = 4u;   // the cloud keeps its curvature
 public static const uint kCompactFaint = 8u;       // faint splats keep their mass (Spark's DRAW_FAINT)
 public static const uint kCompactPlain = 16u;      // debug: the albedo, no relight
+public static const uint kCompactCullBacks = 32u;  // opaque splats whose stored face looks away are not drawn
 
 public struct CompactParams {
     public uint  count;
@@ -99,6 +101,7 @@ public struct CompactParams {
     public uint  envBaseSide;
     public uint  capacity;     ///< sort slots
     public uint  normalBits;   ///< bits an axis of the octahedral normal (8, 12, 16)
+    public uint  weightBits;   ///< bits a CPCA weight: 8, or 4 (a word a block: q8 = round(q4 x 127 / 7))
     public float ior;
     public float footprint;
     public float footprintClamp;
@@ -113,7 +116,7 @@ public struct CompactParams {
     public float far;
     public float falloff;
     public float keyScale;     ///< (2^24 - 1) / the farthest distance sorted
-    public float pad0;
+    public float cullFacing;   ///< kCompactCullBacks: the cosine below which a back is culled
     public float pad1;
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
     public float4 row1;
@@ -266,6 +269,22 @@ float weightOf(uint w, uint k) {
 /// Block b's 8 int8 weights of splat i (two words).
 uint2 weightsOf(uint i, uint b) {
     const uint plane = compactParams.weights + b * compactParams.weightsStride;
+    if (compactParams.weightBits == 4u) {
+        // Back on the int8 grid the records were measured on.
+        const uint w = compactData[plane + i];
+        uint2 out = uint2(0u);
+        [unroll] for (uint k = 0; k < 8u; ++k) {
+            const int q4 = int(((w >> (4u * k)) & 0xFu) << 28u) >> 28;
+            const int q8 = int(round(float(q4) * (127.0 / 7.0)));
+            const uint byte = uint(q8) & 0xFFu;
+            if (k < 4u) {
+                out.x |= byte << (8u * k);
+            } else {
+                out.y |= byte << (8u * (k - 4u));
+            }
+        }
+        return out;
+    }
     return uint2(compactData[plane + 2u * i], compactData[plane + 2u * i + 1u]);
 }
 
@@ -675,9 +694,23 @@ void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
     if (fieldAt(compactParams.opacity, 1u, i) == 0u) {
         return;
     }
-    const float3 v = toView(positionOf(i));
+    const float3 p = positionOf(i);
+    const float3 v = toView(p);
     if (!inFrustum(v)) {
         return;
+    }
+    // relight.slang's culledBack: an opaque splat (no transmission, not a
+    // thin sheet) whose stored face looks away from the eye is a closed
+    // surface's back, hidden by its front.
+    if (hasFlag(kCompactCullBacks)) {
+        const uint pbr = materialOf(i).x;
+        if (!(pbrTransmission(pbr) > 0.0) && !pbrThinWalled(pbr)) {
+            const float3 toEye = compactParams.eyeObject.xyz - p;
+            const float far = length(toEye);
+            if (far > 0.0 && dot(normalOf(i), toEye / far) < compactParams.cullFacing) {
+                return;
+            }
+        }
     }
     const float key = (1u << kCompactKeyBits) - 1u - min(length(v) * compactParams.keyScale, 16777215.0);
     const uint slot = sortArgs[1].add(1u);

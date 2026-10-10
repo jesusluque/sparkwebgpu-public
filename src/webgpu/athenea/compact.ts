@@ -69,6 +69,12 @@ export interface CompactInput {
    * bytes: the Corvette's coat reflects the normal's error, iphone-compact.md).
    */
   normalBits?: number;
+  /**
+   * Bits a CPCA weight: 8 (the records as they are, 24 B) or 4 (097's mode
+   * 1, 12 B: records encoded with encodeJointCpca(..., levels 7), each
+   * weight q8 = round(q4 x 127 / 7) and stored as q4).
+   */
+  weightBits?: 8 | 4;
 }
 
 /** Where each plane and table starts (words) and how wide (bytes a gaussian). */
@@ -82,6 +88,7 @@ export interface CompactLayout {
   linear: boolean;
   curvature: boolean;
   normalBits: number;
+  weightBits: number;
   words: Record<string, number>;
   /** Bytes by category: per-gaussian planes and the tables. */
   bytes: Record<string, number>;
@@ -244,7 +251,9 @@ export function encodeCompact(input: CompactInput): CompactCloud {
   const curvature = new Uint8Array(3 * n);
   const material = new Uint16Array(n);
   const cluster = new Uint8Array(n);
-  const weights = [0, 1, 2].map(() => new Uint32Array(2 * n));
+  const weightBits = input.weightBits ?? 8;
+  const weightWords = weightBits === 4 ? 1 : 2;
+  const weights = [0, 1, 2].map(() => new Uint32Array(weightWords * n));
   const shadow = new Uint16Array(n);
   const chunkTable = new Float32Array(chunks * CHUNK_WORDS);
   const f32 = new Float32Array(
@@ -401,8 +410,25 @@ export function encodeCompact(input: CompactInput): CompactCloud {
   }
   for (let i = 0; i < n; i++) {
     for (let b = 0; b < 3; b++) {
-      weights[b][2 * i] = input.q8[7 * i + 2 * b];
-      weights[b][2 * i + 1] = input.q8[7 * i + 2 * b + 1];
+      const w0 = input.q8[7 * i + 2 * b];
+      const w1 = input.q8[7 * i + 2 * b + 1];
+      if (weightBits === 8) {
+        weights[b][2 * i] = w0;
+        weights[b][2 * i + 1] = w1;
+        continue;
+      }
+      let packed = 0;
+      for (let k = 0; k < 8; k++) {
+        const q8 = ((k < 4 ? w0 : w1) << (24 - 8 * (k & 3))) >> 24;
+        const q4 = Math.round((q8 * 7) / 127);
+        if (Math.round((q4 * 127) / 7) !== q8) {
+          throw new Error(
+            "compact: 4-bit weights need records encoded at 7 levels",
+          );
+        }
+        packed |= (q4 & 0xf) << (4 * k);
+      }
+      weights[b][i] = packed >>> 0;
     }
     cluster[i] = input.q8[7 * i + 6];
     if (input.q8[7 * i + 6] > 255)
@@ -459,6 +485,7 @@ export function encodeCompact(input: CompactInput): CompactCloud {
     linear: Boolean(input.linear),
     curvature: hasCurvature,
     normalBits,
+    weightBits,
     words,
     bytes: {
       position: 6 * n,
@@ -470,7 +497,7 @@ export function encodeCompact(input: CompactInput): CompactCloud {
       curvature: 3 * n,
       material: 2 * n,
       cluster: n,
-      weights: 24 * n,
+      weights: 3 * 4 * weightWords * n,
       shadowIndex: 2 * n,
       planesPadded: perGaussianWords * 4,
       chunkTable: chunkTable.byteLength,
@@ -567,6 +594,13 @@ export interface CompactPathOptions {
   releaseSky?: boolean;
   /** Debug: the albedo, no relight. */
   plain?: boolean;
+  /**
+   * Opaque splats whose stored face looks away (cosine under
+   * `cullBacksFacing`, -0.2) are not sorted, shaded or drawn: the relight
+   * plugin's cullBacks, here before the sort (half a closed car).
+   */
+  cullBacks?: boolean;
+  cullBacksFacing?: number;
 }
 
 /**
@@ -617,6 +651,8 @@ export class CompactRelitPath {
       faint: true,
       releaseSky: true,
       plain: false,
+      cullBacks: false,
+      cullBacksFacing: -0.2,
       ...options,
       frame: options.frame ?? null,
     };
@@ -673,7 +709,8 @@ export class CompactRelitPath {
       (o.indirect ? K.kCompactIndirect : 0) |
       (l?.curvature ? K.kCompactCurvature : 0) |
       (o.faint ? K.kCompactFaint : 0) |
-      (o.plain ? K.kCompactPlain : 0)
+      (o.plain ? K.kCompactPlain : 0) |
+      (o.cullBacks ? K.kCompactCullBacks : 0)
     );
   }
 
@@ -726,6 +763,7 @@ export class CompactRelitPath {
       cluster: W.cluster,
       weights: W.weights,
       weightsStride: W.weightsStride,
+      weightBits: cloud.layout.weightBits,
       shadow: W.shadow,
       materials: W.materials,
       basis: W.basis,
@@ -747,6 +785,7 @@ export class CompactRelitPath {
       far,
       falloff: 1,
       keyScale: ((1 << K.kCompactKeyBits) - 1) / (far * 1.8),
+      cullFacing: o.cullBacksFacing,
       row0: row(0),
       row1: row(1),
       row2: row(2),

@@ -21,6 +21,7 @@ export const atheneaAdapterCompact = {
   kCompactCurvature: 4,
   kCompactFaint: 8,
   kCompactPlain: 16,
+  kCompactCullBacks: 32,
 } as const;
 
 /** slang/athenea_adapter/cpca.slang */

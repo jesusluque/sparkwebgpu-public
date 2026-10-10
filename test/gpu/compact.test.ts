@@ -150,152 +150,184 @@ function sky() {
   return { width: W, height: H, data };
 }
 
-describe.skipIf(!wideDevice)("the compact relit path", () => {
-  const d = wideDevice as GPUDevice;
-  const s = syntheticCloud();
-  const basis = syntheticJointBasis(256, 5);
-  const cloud = encodeCompact({
-    count: N,
-    ...s,
-    basis: packJointBasis(basis),
-    clusters: 256,
-  });
-
-  it("decodes what it encoded", () => {
-    const f = new Float32Array(s.ext0.buffer);
-    let worstPos = 0;
-    for (let i = 0; i < N; i += 37) {
-      const g = decodeCompactSplat(cloud, i);
-      for (let k = 0; k < 3; k++)
-        worstPos = Math.max(worstPos, Math.abs(g.center[k] - f[4 * i + k]));
-      expect(g.rotation).toBe(s.ext1[4 * i + 3]);
-      expect(g.pbr).toBe(s.pbr[i]);
-      expect([...g.cells]).toEqual([
-        ...s.shadowBits.subarray(8 * i, 8 * i + 8),
-      ]);
-    }
-    // A unit sphere's chunk box over 65535 steps.
-    expect(worstPos).toBeLessThan(2e-5);
-    expect(cloud.layout.pieces).toBe(2);
-    expect(cloud.layout.materials).toBe(4);
-  });
-
-  it("relights as today's path does on the same values", async () => {
-    const W = 320;
-    const H = 240;
-    const { camera, place } = placeCamera(
-      W,
-      H,
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(1.2, -1.0, 0.6),
-      50,
-      1,
-    );
-    const source = compactToSource(cloud, s.q8);
-    const run = { W, H, sky: sky(), camera, place, colours: true, image: true };
-    const noFaint = process.env.COMPACT_NO_FAINT === "1";
-    const ref = await referenceRun(d, { ...source }, N, basis, {
-      ...run,
-      shapes: true,
-      renderer: noFaint ? { faintSplats: "drop" } : {},
-    });
-    const got = await compactRun(d, cloud, {
-      ...run,
-      path: { faint: !noFaint },
-    });
-    const colours = compare(
-      got.colours as Float32Array,
-      ref.colours as Float32Array,
-    );
-    let alphaDiff = 0;
-    for (let i = 0; i < N; i++) {
-      alphaDiff = Math.max(
-        alphaDiff,
-        Math.abs(
-          (got.colours as Float32Array)[4 * i + 3] -
-            (ref.colours as Float32Array)[4 * i + 3],
-        ),
-      );
-    }
-    const image = compare(got.image as Float32Array, ref.image as Float32Array);
-    {
-      // The footprints, splat by splat: the worst relative differences.
-      const a = got.shapes as Float32Array;
-      const b = ref.shapes as Float32Array;
-      const worst = [0, 0, 0, 0];
-      let onlyRef = 0;
-      let onlyGot = 0;
-      const examples: unknown[] = [];
-      for (let i = 0; i < N; i++) {
-        const gz = a[4 * i + 3] === 0;
-        const rz = b[4 * i + 3] === 0;
-        if (gz !== rz) {
-          if (gz) onlyRef++;
-          else onlyGot++;
-          continue;
-        }
-        if (gz) continue;
-        for (let k = 0; k < 4; k++) {
-          const e =
-            Math.abs(a[4 * i + k] - b[4 * i + k]) /
-            (Math.abs(b[4 * i + k]) + 1e-3);
-          if (e > worst[k]) worst[k] = e;
-          if (e > 0.05 && examples.length < 6)
-            examples.push({
-              i,
-              k,
-              got: [...a.subarray(4 * i, 4 * i + 4)],
-              ref: [...b.subarray(4 * i, 4 * i + 4)],
-            });
+describe.skipIf(!wideDevice).each([8, 4])(
+  "the compact relit path, weights on %i bits",
+  (bits) => {
+    const d = wideDevice as GPUDevice;
+    const s = syntheticCloud();
+    const basis = syntheticJointBasis(256, 5);
+    // 4 bits: the records put on the 7-level grid first, as
+    // encodeJointCpca(..., 7) writes them.
+    const weightBits = bits as 8 | 4;
+    if (weightBits === 4) {
+      for (let r = 0; r < N; r++) {
+        for (let w = 0; w < 6; w++) {
+          const at = 7 * r + w;
+          let word = 0;
+          for (let k = 0; k < 4; k++) {
+            const q8 = ((s.q8[at] << (24 - 8 * k)) >> 24) as number;
+            const q = Math.round((Math.round((q8 * 7) / 127) * 127) / 7);
+            word |= (q & 0xff) << (8 * k);
+          }
+          s.q8[at] = word >>> 0;
         }
       }
-      const pa = got.places as Float32Array;
-      const pb = ref.places as Float32Array;
-      let centre = 0;
-      let angle = 0;
+    }
+    const cloud = encodeCompact({
+      count: N,
+      ...s,
+      basis: packJointBasis(basis),
+      clusters: 256,
+      weightBits,
+    });
+
+    it("decodes what it encoded", () => {
+      const f = new Float32Array(s.ext0.buffer);
+      let worstPos = 0;
+      for (let i = 0; i < N; i += 37) {
+        const g = decodeCompactSplat(cloud, i);
+        for (let k = 0; k < 3; k++)
+          worstPos = Math.max(worstPos, Math.abs(g.center[k] - f[4 * i + k]));
+        expect(g.rotation).toBe(s.ext1[4 * i + 3]);
+        expect(g.pbr).toBe(s.pbr[i]);
+        expect([...g.cells]).toEqual([
+          ...s.shadowBits.subarray(8 * i, 8 * i + 8),
+        ]);
+      }
+      // A unit sphere's chunk box over 65535 steps.
+      expect(worstPos).toBeLessThan(2e-5);
+      expect(cloud.layout.pieces).toBe(2);
+      expect(cloud.layout.materials).toBe(4);
+    });
+
+    it("relights as today's path does on the same values", async () => {
+      const W = 320;
+      const H = 240;
+      const { camera, place } = placeCamera(
+        W,
+        H,
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(1.2, -1.0, 0.6),
+        50,
+        1,
+      );
+      const source = compactToSource(cloud, s.q8);
+      const run = {
+        W,
+        H,
+        sky: sky(),
+        camera,
+        place,
+        colours: true,
+        image: true,
+      };
+      const noFaint = process.env.COMPACT_NO_FAINT === "1";
+      const ref = await referenceRun(d, { ...source }, N, basis, {
+        ...run,
+        shapes: true,
+        renderer: noFaint ? { faintSplats: "drop" } : {},
+      });
+      const got = await compactRun(d, cloud, {
+        ...run,
+        path: { faint: !noFaint },
+      });
+      const colours = compare(
+        got.colours as Float32Array,
+        ref.colours as Float32Array,
+      );
+      let alphaDiff = 0;
       for (let i = 0; i < N; i++) {
-        if (a[4 * i + 3] === 0 || b[4 * i + 3] === 0) continue;
-        centre = Math.max(
-          centre,
-          Math.hypot(pa[4 * i] - pb[4 * i], pa[4 * i + 1] - pb[4 * i + 1]),
+        alphaDiff = Math.max(
+          alphaDiff,
+          Math.abs(
+            (got.colours as Float32Array)[4 * i + 3] -
+              (ref.colours as Float32Array)[4 * i + 3],
+          ),
         );
-        // Only where the axes differ (a round footprint has no angle).
-        if (Math.abs(a[4 * i] - a[4 * i + 1]) > 0.1 * a[4 * i]) {
-          let da = Math.abs(pa[4 * i + 2] - pb[4 * i + 2]);
-          da = Math.min(da, Math.PI - da);
-          angle = Math.max(angle, da);
-        }
       }
-      process.stderr.write(
-        `COMPACT_SHAPES ${JSON.stringify({ worst, onlyRef, onlyGot, centre, angle, examples })}\n`,
-      );
-    }
-    if (process.env.COMPACT_DUMP) {
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(
-        `${process.env.COMPACT_DUMP}/ref.f32`,
+      const image = compare(
+        got.image as Float32Array,
         ref.image as Float32Array,
       );
-      writeFileSync(
-        `${process.env.COMPACT_DUMP}/got.f32`,
+      {
+        // The footprints, splat by splat: the worst relative differences.
+        const a = got.shapes as Float32Array;
+        const b = ref.shapes as Float32Array;
+        const worst = [0, 0, 0, 0];
+        let onlyRef = 0;
+        let onlyGot = 0;
+        const examples: unknown[] = [];
+        for (let i = 0; i < N; i++) {
+          const gz = a[4 * i + 3] === 0;
+          const rz = b[4 * i + 3] === 0;
+          if (gz !== rz) {
+            if (gz) onlyRef++;
+            else onlyGot++;
+            continue;
+          }
+          if (gz) continue;
+          for (let k = 0; k < 4; k++) {
+            const e =
+              Math.abs(a[4 * i + k] - b[4 * i + k]) /
+              (Math.abs(b[4 * i + k]) + 1e-3);
+            if (e > worst[k]) worst[k] = e;
+            if (e > 0.05 && examples.length < 6)
+              examples.push({
+                i,
+                k,
+                got: [...a.subarray(4 * i, 4 * i + 4)],
+                ref: [...b.subarray(4 * i, 4 * i + 4)],
+              });
+          }
+        }
+        const pa = got.places as Float32Array;
+        const pb = ref.places as Float32Array;
+        let centre = 0;
+        let angle = 0;
+        for (let i = 0; i < N; i++) {
+          if (a[4 * i + 3] === 0 || b[4 * i + 3] === 0) continue;
+          centre = Math.max(
+            centre,
+            Math.hypot(pa[4 * i] - pb[4 * i], pa[4 * i + 1] - pb[4 * i + 1]),
+          );
+          // Only where the axes differ (a round footprint has no angle).
+          if (Math.abs(a[4 * i] - a[4 * i + 1]) > 0.1 * a[4 * i]) {
+            let da = Math.abs(pa[4 * i + 2] - pb[4 * i + 2]);
+            da = Math.min(da, Math.PI - da);
+            angle = Math.max(angle, da);
+          }
+        }
+        process.stderr.write(
+          `COMPACT_SHAPES ${JSON.stringify({ worst, onlyRef, onlyGot, centre, angle, examples })}\n`,
+        );
+      }
+      if (process.env.COMPACT_DUMP) {
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(
+          `${process.env.COMPACT_DUMP}/ref.f32`,
+          ref.image as Float32Array,
+        );
+        writeFileSync(
+          `${process.env.COMPACT_DUMP}/got.f32`,
+          got.image as Float32Array,
+        );
+      }
+      const alphaImage = compare(
         got.image as Float32Array,
+        ref.image as Float32Array,
+        4,
+        4,
       );
-    }
-    const alphaImage = compare(
-      got.image as Float32Array,
-      ref.image as Float32Array,
-      4,
-      4,
-    );
-    process.stderr.write(`COMPACT_ALPHA ${JSON.stringify(alphaImage)}\n`);
-    process.stderr.write(
-      `COMPACT_SYNTHETIC ${JSON.stringify({ colours, alphaDiff, image, drawn: got.drawn })}\n`,
-    );
-    expect(colours.relMSE).toBeLessThan(1e-5);
-    expect(alphaDiff).toBeLessThan(1e-3);
-    expect(image.relMSE).toBeLessThan(1e-3);
-  }, 120_000);
-});
+      process.stderr.write(`COMPACT_ALPHA ${JSON.stringify(alphaImage)}\n`);
+      process.stderr.write(
+        `COMPACT_SYNTHETIC ${JSON.stringify({ colours, alphaDiff, image, drawn: got.drawn })}\n`,
+      );
+      expect(colours.relMSE).toBeLessThan(1e-5);
+      expect(alphaDiff).toBeLessThan(1e-3);
+      expect(image.relMSE).toBeLessThan(1e-3);
+    }, 120_000);
+  },
+);
 
 describe.skipIf(!wideDevice || !process.env.COMPACT_SINGLE)("one splat", () => {
   const d = wideDevice as GPUDevice;

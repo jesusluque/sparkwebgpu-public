@@ -123,14 +123,17 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           json,
           new Uint8Array(readFileSync(`${DIR}/cpca_joint_C256_K8.bin`)),
         );
-        const cache = `${file}.q8`;
-        let q8: Uint32Array;
-        if (existsSync(cache)) {
-          const b = readFileSync(cache);
-          q8 = new Uint32Array(
-            b.buffer.slice(b.byteOffset, b.byteOffset + b.length),
-          );
-        } else {
+        const levels = Number(process.env.IPHONE_WEIGHT_LEVELS ?? 127);
+        // The int8 records (today's cpca8), and the compact path's at
+        // `levels` (127 the same; 7: 4-bit weights on the int8 grid).
+        const records = (l: number) => {
+          const cache = `${file}.q8${l === 127 ? "" : `-${l}`}`;
+          if (existsSync(cache)) {
+            const b = readFileSync(cache);
+            return new Uint32Array(
+              b.buffer.slice(b.byteOffset, b.byteOffset + b.length),
+            );
+          }
           const t16 = new Uint16Array(
             raw.transfer.buffer,
             raw.transfer.byteOffset,
@@ -138,11 +141,19 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           );
           const lut = new Float32Array(65536);
           for (let h = 0; h < 65536; h++) lut[h] = halfToFloat(h);
-          q8 = encodeJointCpca(basis, n, (i, out) => {
-            for (let v = 0; v < 112; v++) out[v] = lut[t16[i * 112 + v]];
-          }).records;
-          writeFileSync(cache, new Uint8Array(q8.buffer));
-        }
+          const r = encodeJointCpca(
+            basis,
+            n,
+            (i, out) => {
+              for (let v = 0; v < 112; v++) out[v] = lut[t16[i * 112 + v]];
+            },
+            l,
+          ).records;
+          writeFileSync(cache, new Uint8Array(r.buffer));
+          return r;
+        };
+        const q8 = records(127);
+        const q8w = levels === 127 ? q8 : records(levels);
         expect(q8.length).toBe(n * Q8_RECORD_WORDS);
         const rawStreams: Streams = { ...raw, q8 };
         let vqStreams: Streams = rawStreams;
@@ -156,6 +167,8 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
         const cloud = encodeCompact({
           count: n,
           ...vqStreams,
+          q8: q8w,
+          weightBits: levels === 7 ? 4 : 8,
           basis: table,
           clusters: basis.clusters,
           normalBits: Number(process.env.IPHONE_NORMAL_BITS ?? 12),
@@ -207,7 +220,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           const refVq = vqFile
             ? await referenceRun(d, vqStreams, n, basis, run)
             : refRaw;
-          const deq = compactToSource(cloud, q8);
+          const deq = compactToSource(cloud, q8w);
           const refDeq = await referenceRun(
             d,
             { ...deq, curvature: rawStreams.curvature ? deq.curvature : null },
@@ -252,7 +265,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
             };
             const ablation: Record<string, unknown> = {};
             for (const [field, put] of Object.entries(fields)) {
-              const s0 = compactToSource(cloud, q8);
+              const s0 = compactToSource(cloud, q8w);
               const s: Streams = { ...s0, curvature: s0.curvature };
               put(s);
               const r = await referenceRun(d, s, n, basis, run);
@@ -271,7 +284,11 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
               `IPHONE_COMPACT_ABLATE ${JSON.stringify({ file: name, ablation })}\n`,
             );
           }
-          const got = await compactRun(d, cloud, run);
+          const cullBacks = process.env.IPHONE_CULL_BACKS === "1";
+          const got = await compactRun(d, cloud, {
+            ...run,
+            path: { cullBacks },
+          });
           const c = (
             a: { colours: Float32Array | null },
             b: { colours: Float32Array | null },
@@ -287,6 +304,30 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
                 v.image as Float32Array,
               );
           }
+          // The draw's record keeps the colour as RGB9E5: its rounding alone.
+          const rgb9e5 = (c: Float32Array) => {
+            const out = new Float32Array(c.length);
+            for (let k = 0; k < c.length; k += 4) {
+              const v = [0, 1, 2].map((j) =>
+                Math.min(Math.max(c[k + j], 0), 65408),
+              );
+              const largest = Math.max(...v);
+              if (!(largest >= 5.9604645e-8)) continue;
+              let e = Math.max(-16, Math.floor(Math.log2(largest))) + 16;
+              let step = 2 ** (e - 24);
+              if (Math.floor(largest / step + 0.5) >= 512) {
+                e += 1;
+                step *= 2;
+              }
+              for (let j = 0; j < 3; j++)
+                out[k + j] =
+                  Math.min(Math.floor(v[j] / step + 0.5), 511) * step;
+            }
+            return out;
+          };
+          process.stderr.write(
+            `IPHONE_COMPACT_RGB9E5 ${JSON.stringify(compare(rgb9e5(got.colours as Float32Array), got.colours as Float32Array))}\n`,
+          );
           process.stderr.write(
             `IPHONE_COMPACT_ACCURACY ${JSON.stringify({
               file: name,
@@ -329,14 +370,10 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
             };
             const track = tracker(d);
             try {
-              const today = await referenceRun(
-                d,
-                vqStreams,
-                n,
-                basis,
-                run,
-                track,
-              );
+              const today =
+                process.env.IPHONE_TODAY_TIMING === "0"
+                  ? { timing: null, memory: null }
+                  : await referenceRun(d, vqStreams, n, basis, run, track);
               const compact = await compactRun(
                 d,
                 cloud,

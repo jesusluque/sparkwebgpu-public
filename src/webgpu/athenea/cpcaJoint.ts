@@ -135,6 +135,13 @@ export function encodeJointCpca(
   basis: JointCpcaBasis,
   n: number,
   row: (i: number, out: Float32Array) => void,
+  /**
+   * Levels each side of zero a weight keeps (127: int8). Fewer (7: a 4-bit
+   * weight, proposal 097's mode 1) round to that grid and are stored back on
+   * the int8 one (round(q x 127 / levels)), for measuring what fewer bits
+   * cost with the same decode.
+   */
+  levels = 127,
 ): { records: Uint32Array; clusters: Uint32Array } {
   const C = basis.clusters;
   const K = basis.k;
@@ -181,8 +188,11 @@ export function encodeJointCpca(
             dir[(best * D + d) * K + k] * (x[first + d] - mean[best * D + d]);
         }
         const s = basis.scale[b][best * K + k];
-        const q =
-          s > 0 ? Math.max(-127, Math.min(127, Math.round((w / s) * 127))) : 0;
+        const ql =
+          s > 0
+            ? Math.max(-levels, Math.min(levels, Math.round((w / s) * levels)))
+            : 0;
+        const q = levels === 127 ? ql : Math.round((ql * 127) / levels);
         records[r + 2 * b + (k >> 2)] |= (q & 0xff) << (8 * (k & 3));
       }
       first += D;

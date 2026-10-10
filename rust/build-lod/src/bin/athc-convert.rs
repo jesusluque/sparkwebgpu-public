@@ -48,6 +48,13 @@
 //!                         --no-lod-sizes; --lod-size-opts k=v,... (lambda, material, normal,
 //!                         thick, shape, v0, gamma, hi) over LodSizeOptions::default()
 //!
+//!   --shadow-vq C[,R[,P]] the open-direction bits (shadowBits, 8 words) as a dictionary: per
+//!                         piece (P splats in cloud order, 16384; 0: a material, pbr + lobes)
+//!                         k-means in Hamming space, C centroids (1024), R rounds (12),
+//!                         majority centroids, seeds by cloud order; the splats only
+//!                         (athc_shadow_vq); each row's bits become its centroid's. Prints the
+//!                         Hamming distances (p50/p90/p99 of 256) and the codebook entries
+//!
 //! Pruning and decimating (thread BB, `spark_lib::athc_prune`), every section
 //! following the kept splats (transfer, curvature, lobes, skin, attributes)
 //! and the levels built again over them:
@@ -110,7 +117,7 @@ fn main() -> Result<()> {
         .iter()
         .enumerate()
         .filter(|&(i, a)| {
-            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--cpca" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || args[i - 1] == "--lod-size-opts" || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
+            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--cpca" || args[i - 1] == "--shadow-vq" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || args[i - 1] == "--lod-size-opts" || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
         })
         .map(|(_, a)| a)
         .collect();
@@ -250,6 +257,27 @@ fn main() -> Result<()> {
     }
     for c in file.chunks.iter_mut() {
         c.lod_size.clear();
+    }
+    if let Some(spec) = text("--shadow-vq") {
+        let mut o = spark_lib::athc_shadow_vq::ShadowVqOptions::default();
+        let parts: Vec<&str> = spec.split(',').collect();
+        o.centroids = parts[0].parse().context("--shadow-vq C")?;
+        if let Some(r) = parts.get(1) {
+            o.rounds = r.parse().context("--shadow-vq C,R")?;
+        }
+        if let Some(p) = parts.get(2) {
+            o.piece_splats = p.parse().context("--shadow-vq C,R,P")?;
+        }
+        let t = std::time::Instant::now();
+        let st = spark_lib::athc_shadow_vq::shadow_vq(&mut file, &o)?;
+        use spark_lib::athc_shadow_vq::ShadowVqStats as S;
+        println!(
+            "shadow-vq {} x {} rounds: {} pieces ({} exact), {} rows, {} codebook entries ({:.1} KB); splats Hamming mean {:.2} p50 {} p90 {} p99 {} max {}; all rows p99 {}; {:.1}s",
+            o.centroids, o.rounds, st.pieces, st.exact_pieces, st.rows, st.codebook_entries, st.codebook_entries as f64 * 32.0 / 1e3,
+            S::mean(&st.splat_hist), S::percentile(&st.splat_hist, 0.5), S::percentile(&st.splat_hist, 0.9),
+            S::percentile(&st.splat_hist, 0.99), S::percentile(&st.splat_hist, 1.0), S::percentile(&st.all_hist, 0.99),
+            t.elapsed().as_secs_f32()
+        );
     }
     let all = value("--encoding").transpose()?.map(|e| e as u32);
     let encoding = move |_: SectionId| all.unwrap_or(0);

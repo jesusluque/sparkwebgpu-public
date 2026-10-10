@@ -48,6 +48,15 @@
 //!                         --no-lod-sizes; --lod-size-opts k=v,... (lambda, material, normal,
 //!                         thick, shape, v0, gamma, hi) over LodSizeOptions::default()
 //!
+//!   --lod-errors          write each merged node's error cut bounds (athc_lod_cut, the v3 section
+//!                         LODE): eps = max(r x cost, children's), r = sqrt(tr Sigma) and cost
+//!                         athc_merge::group_cost of its children (BC's merge cost without the
+//!                         on-screen weight, any number of children); rho the sphere round its
+//!                         leaves; theta the back-face cone of its leaves' normals (none for glass,
+//!                         thin walls, no normals, --double-sided). A file that has them keeps them
+//!                         (athenea's, from usd-athc --tree) unless the tree changes (then ours);
+//!                         --no-lod-errors drops them; --lod-error-weights colour=,normal=,guard=,floor=
+//!
 //!   --shadow-vq C[,R[,P]] the open-direction bits (shadowBits, 8 words) as a dictionary: per
 //!                         piece (P splats in cloud order, 16384; 0: a material, pbr + lobes)
 //!                         k-means in Hamming space, C centroids (1024), R rounds (12),
@@ -117,7 +126,7 @@ fn main() -> Result<()> {
         .iter()
         .enumerate()
         .filter(|&(i, a)| {
-            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--cpca" || args[i - 1] == "--shadow-vq" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || args[i - 1] == "--lod-size-opts" || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
+            !a.starts_with("--") && !(i > 0 && (args[i - 1].starts_with("--keep-") || args[i - 1] == "--encoding" || args[i - 1] == "--lod-error-weights" || args[i - 1] == "--cpca" || args[i - 1] == "--shadow-vq" || args[i - 1] == "--creases" || args[i - 1] == "--crease-depth" || args[i - 1] == "--rebuild-frame" || args[i - 1].starts_with("--athl") || args[i - 1] == "--lod-size-opts" || (args[i - 1].starts_with("--error-") && args[i - 1] != "--error-levels")))
         })
         .map(|(_, a)| a)
         .collect();
@@ -127,6 +136,7 @@ fn main() -> Result<()> {
     let bytes = std::fs::read(input)?;
     let mut file = read_any(&bytes)?;
     let had_lod_sizes = file.levels.iter().any(|(_, b)| !b.lod_size.is_empty());
+    let had_lod_errors = file.levels.iter().any(|(_, b)| !b.lod_error.is_empty());
     let text = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let athl_io = match (text("--athl"), text("--athl-out")) {
         (Some(i), Some(o)) => Some((i, o)),
@@ -257,6 +267,18 @@ fn main() -> Result<()> {
     }
     for c in file.chunks.iter_mut() {
         c.lod_size.clear();
+    }
+    // The error cut's bounds (athc_lod_cut): kept as stored (athenea's, from
+    // usd-athc --tree) unless the tree changed, then ours (group_cost).
+    let tree_changed = keep.is_some() || lists.is_some() || flag("--rebuild-frame") || flag("--error") || flag("--error-levels");
+    if flag("--no-lod-errors") {
+        for (_, b) in file.levels.iter_mut() {
+            b.lod_error.clear();
+        }
+    } else if flag("--lod-errors") || had_lod_errors && tree_changed {
+        let w = spark_lib::athc_lod_cut::ErrorWeights::parse(&text("--lod-error-weights").unwrap_or_default())?;
+        file = spark_lib::athc_lod_cut::with_lod_errors(&file, None, &w, flag("--double-sided"))?;
+        println!("LoD errors (ours) for {} merged nodes", file.levels.iter().map(|(_, b)| b.n).sum::<usize>());
     }
     if let Some(spec) = text("--shadow-vq") {
         let mut o = spark_lib::athc_shadow_vq::ShadowVqOptions::default();

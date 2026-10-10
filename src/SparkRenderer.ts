@@ -217,6 +217,17 @@ export interface SparkRendererOptions {
    */
   lodRenderScale?: number;
   /**
+   * The LoD error cut (rust spark-lib athc_lod_cut.rs): tau in pixels. Trees
+   * whose file carries the bounds (`.athc` section LODE) are cut by projected
+   * error, the others by size (lodRenderScale). 0: off. @default 0
+   */
+  lodErrorTau?: number;
+  /**
+   * Drop wholly back-facing merged nodes (with LODE's back-face cones) and
+   * their subtrees. @default false
+   */
+  lodBackCull?: boolean;
+  /**
    * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
    * @default false
    */
@@ -467,6 +478,8 @@ export class SparkRenderer extends THREE.Mesh {
   lodSplatCount?: number;
   lodSplatScale: number;
   lodRenderScale: number;
+  lodErrorTau: number;
+  lodBackCull: boolean;
   lodInflate: boolean;
   lodTraverseMode: "dynamic" | "standard";
   pagedExtSplats: boolean;
@@ -664,6 +677,8 @@ export class SparkRenderer extends THREE.Mesh {
     this.lodSplatCount = options.lodSplatCount;
     this.lodSplatScale = options.lodSplatScale ?? 1.0;
     this.lodRenderScale = options.lodRenderScale ?? 1.0;
+    this.lodErrorTau = options.lodErrorTau ?? 0;
+    this.lodBackCull = options.lodBackCull ?? false;
     this.lodInflate = options.lodInflate ?? false;
     this.lodTraverseMode = options.lodTraverseMode ?? "standard";
     this.pagedExtSplats = options.pagedExtSplats ?? false;

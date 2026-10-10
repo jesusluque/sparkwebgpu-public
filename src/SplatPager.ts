@@ -94,6 +94,8 @@ export class SplatPager {
     chunk: number;
     numSplats: number;
     lodTree?: Uint32Array;
+    /** The LoD error cut's bounds, two words a node (athc_lod_cut.rs). */
+    lodError?: Uint32Array;
   }[];
 
   private readonly fetchers: { splats: PagedSplats; chunk: number }[];
@@ -749,6 +751,7 @@ export class SplatPager {
         chunk,
         numSplats,
         lodTree: extra.lodTree as Uint32Array,
+        lodError: extra.lodError as Uint32Array | undefined,
       });
 
       if (isExtResult(data, this.extSplats)) {

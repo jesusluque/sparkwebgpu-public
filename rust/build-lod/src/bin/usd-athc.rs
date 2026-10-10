@@ -34,6 +34,14 @@
 //! own node, not merged again; only the levels above its roots are merged
 //! here. `--lod-sizes` (any conversion) writes the merged nodes' LoD sizes
 //! by error (`athc_lod_error`, the v3 section LODS).
+//! `--lod-errors` (any conversion) writes each merged node's LoD error, the
+//! radius of the sphere round its leaves and its back-face cone (the v3
+//! section LODE, `athc_lod_cut`, the run-time error cut): with `--tree`
+//! athenea's own, from her whole tree (`r |lodCost|`, raised up the tree, as
+//! lod_tree_cut.slang; `--lod-error-weights colour=,normal=,guard=,floor=`
+//! for her bounded form), otherwise ours (`athc_merge::group_cost`). The cone
+//! is left out (never culled) for glass, thin walls, a cloud without normals
+//! and with `--double-sided` (or a constant `athenea:splat:doubleSided`).
 //!
 //! For the web: `--add` appends more clouds of the same streams (one file for
 //! several of athenea's per-material clouds; `--add more.usdc::TEXT,TEXT`
@@ -127,6 +135,7 @@ use spark_lib::athc_build::{
 };
 use spark_lib::athc_lod_error::{with_lod_sizes, LodSizeOptions};
 use spark_lib::athc_merge::{levels_from_tree, ErrorOptions, ErrorView, MergeTree};
+use spark_lib::athc_lod_cut::{athenea_tree_errors, with_lod_errors, ErrorWeights, Known, NO_CONE};
 use spark_lib::athl::SplatSources;
 use spark_lib::athc_skin::{AthcSkeleton, SkinClip};
 use spark_lib::athc_v3::{gzip, parse_v3, write_v3_skinned, COMPRESSION_GZIP, COMPRESSION_NONE};
@@ -1194,6 +1203,21 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     if flag("--lod-sizes") {
         file = with_lod_sizes(&file, &LodSizeOptions::parse(arg(args, "--lod-size-opts").unwrap_or(""))?);
     }
+    if flag("--lod-errors") {
+        // athenea's own eps, rho and cone over her whole tree (lod_tree_cut.slang),
+        // for the level groups that are her nodes; the rest (above her roots) ours.
+        let weights = ErrorWeights::parse(arg(args, "--lod-error-weights").unwrap_or(""))?;
+        let double_sided = flag("--double-sided") || prim.bool("athenea:splat:doubleSided");
+        let bounds = athenea_tree_errors(&packed.block, &tree.parent, tree.leaves, &tree.cost, &weights, double_sided);
+        let known: Known = import
+            .level_nodes
+            .iter()
+            .map(|rows| rows.iter().map(|&r| (r != u32::MAX).then(|| bounds[r as usize])).collect())
+            .collect();
+        file = with_lod_errors(&file, Some(&known), &weights, double_sided)?;
+        let culled = file.levels.iter().map(|(_, b)| b.lod_error.iter().skip(1).step_by(2).filter(|&&w| w != NO_CONE as u32).count()).sum::<usize>();
+        eprintln!("LoD errors: athenea's for {} level groups, ours for {}; {} with a back-face cone", import.tree_nodes, import.made_here, culled);
+    }
     let build_s = t.elapsed().as_secs_f32();
     let compression = if flag("--gzip") { COMPRESSION_GZIP } else { COMPRESSION_NONE };
     let bytes = if flag("--v2") { file.write()? } else { write_v3_skinned(&file, compression, rig.as_ref())? };
@@ -1258,6 +1282,7 @@ fn main() -> Result<()> {
         "--tree",
         "--keep-splats",
         "--lod-size-opts",
+        "--lod-error-weights",
     ];
     let mut paths = Vec::new();
     let mut skip = false;
@@ -1573,6 +1598,11 @@ fn main() -> Result<()> {
     spark_lib::athc::uncap_levels(&mut file);
     if flag("--lod-sizes") {
         file = with_lod_sizes(&file, &LodSizeOptions::parse(arg(&args, "--lod-size-opts").unwrap_or(""))?);
+    }
+    if flag("--lod-errors") {
+        // Our own merge cost (athc_merge::group_cost) over the octree's groups.
+        let weights = ErrorWeights::parse(arg(&args, "--lod-error-weights").unwrap_or(""))?;
+        file = with_lod_errors(&file, None, &weights, flag("--double-sided"))?;
     }
     let build_s = t.elapsed().as_secs_f32() - read_s;
     let compression = if flag("--gzip") {

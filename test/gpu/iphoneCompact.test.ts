@@ -377,7 +377,11 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
               const compact = await compactRun(
                 d,
                 cloud,
-                { ...run, fit: true },
+                {
+                  ...run,
+                  fit: true,
+                  path: { cullBacks: process.env.IPHONE_CULL_BACKS === "1" },
+                },
                 track,
               );
               process.stderr.write(

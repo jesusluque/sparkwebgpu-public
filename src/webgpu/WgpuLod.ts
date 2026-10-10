@@ -57,6 +57,16 @@ export interface WgpuLodOptions {
    * @default false
    */
   lodBackCull?: boolean;
+  /**
+   * tau that breathes with a budget (thread CG, Nanite-style), with
+   * lodErrorTau > 0: a detail scale s in [min, 1] divides tau (the cut
+   * coarsens under pressure, never finer than lodErrorTau). Every
+   * intervalMs at most, s x 0.97 when the frame time (an EMA of update()'s
+   * interval) passes frameMs or the page pool is fuller than `high`, s x 1.01
+   * when the pool is under `low` and the frame time under 0.85 frameMs;
+   * between the two it holds (hysteresis). true: the defaults.
+   */
+  lodErrorTauAuto?: boolean | LodTauAutoOptions;
   /** @default 0.2 */
   behindFoveate?: number;
   /** @default 90 */
@@ -102,6 +112,51 @@ export interface WgpuLodOptions {
    * @default 0
    */
   lodFadeMs?: number;
+}
+
+export interface LodTauAutoOptions {
+  /** Frame budget, ms. @default 1000 / 50 */
+  frameMs?: number;
+  /** Pool fill (pages in use over the pool's) above which it coarsens. @default 0.85 */
+  high?: number;
+  /** ... and under which it may refine. @default 0.7 */
+  low?: number;
+  /** Least time between two steps, ms. @default 250 */
+  intervalMs?: number;
+  /** The coarsest detail scale. @default 0.3 */
+  min?: number;
+}
+
+/** The breathing tau's controller (lodErrorTauAuto), alone for tests. */
+export class LodTauController {
+  /** The detail scale: tau is divided by it. */
+  scale = 1;
+  frameEma = 0;
+  private lastFrame = 0;
+  private lastStep = Number.NEGATIVE_INFINITY;
+
+  /** A frame at `now` with the pool `fill` (0..1, or null without a pool). */
+  frame(now: number, fill: number | null, o: LodTauAutoOptions = {}): boolean {
+    const frameMs = o.frameMs ?? 1000 / 50;
+    if (this.lastFrame > 0) {
+      const dt = Math.min(now - this.lastFrame, 1000);
+      this.frameEma = this.frameEma > 0 ? 0.9 * this.frameEma + 0.1 * dt : dt;
+    }
+    this.lastFrame = now;
+    if (now - this.lastStep < (o.intervalMs ?? 250) || this.frameEma === 0) {
+      return false;
+    }
+    const f = fill ?? 0;
+    const over = f > (o.high ?? 0.85) || this.frameEma > frameMs;
+    const under = f < (o.low ?? 0.7) && this.frameEma < 0.85 * frameMs;
+    const before = this.scale;
+    if (over) this.scale *= 0.97;
+    else if (under) this.scale *= 1.01;
+    this.scale = Math.min(1, Math.max(o.min ?? 0.3, this.scale));
+    if (this.scale === before) return false;
+    this.lastStep = now;
+    return true;
+  }
 }
 
 export interface WgpuLodMeshOptions {
@@ -176,7 +231,16 @@ export class WgpuLod {
   readonly meshes: WgpuLodMesh[] = [];
   pager?: WgpuSplatPager;
   /** Time of the last traversal in ms, and the splats it selected. */
-  readonly stats = { traverseMs: 0, lodSplats: 0, traversals: 0, culled: 0 };
+  readonly stats = {
+    traverseMs: 0,
+    lodSplats: 0,
+    traversals: 0,
+    culled: 0,
+    /** The tau the last update used (lodErrorTau over the auto scale). */
+    tau: 0,
+  };
+  /** lodErrorTauAuto's controller. */
+  readonly tauController = new LodTauController();
 
   private worker: SplatWorker | null = null;
   private pagerId: number | undefined;
@@ -217,6 +281,7 @@ export class WgpuLod {
       lodTraverseMode: "standard",
       lodErrorTau: 0,
       lodBackCull: false,
+      lodErrorTauAuto: false,
       behindFoveate: 0.2,
       coneFov0: 90,
       coneFov: 120,
@@ -465,8 +530,21 @@ export class WgpuLod {
         viewHeight / Math.max(1, size.y),
       );
     }
-    // The error cut's tau in the same angular units (a pixel's size).
-    const errorLimit = o.lodErrorTau > 0 ? pixelScaleLimit * o.lodErrorTau : 0;
+    // The error cut's tau in the same angular units (a pixel's size),
+    // breathing with the budget when asked.
+    let tau = o.lodErrorTau;
+    if (tau > 0 && o.lodErrorTauAuto) {
+      const pager = this.pager;
+      const fill = pager ? pager.pagesInUse / pager.maxPages : null;
+      this.tauController.frame(
+        performance.now(),
+        fill,
+        o.lodErrorTauAuto === true ? {} : o.lodErrorTauAuto,
+      );
+      tau /= this.tauController.scale;
+    }
+    this.stats.tau = tau;
+    const errorLimit = tau > 0 ? pixelScaleLimit * tau : 0;
     pixelScaleLimit *= o.lodRenderScale;
 
     camera.updateMatrixWorld();

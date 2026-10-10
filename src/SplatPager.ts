@@ -702,6 +702,11 @@ export class SplatPager {
     this.freeablePages = Array.from(extraPages).map(({ page }) => page);
   }
 
+  /** Pages holding a chunk (the pool's fill: pagesInUse / maxPages). */
+  get pagesInUse(): number {
+    return this.maxPages - this.pageFreelist.length;
+  }
+
   private allocateFreeable(): number | undefined {
     const page = this.freeablePages.shift();
     if (page === undefined) {

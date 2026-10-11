@@ -141,6 +141,8 @@ use spark_lib::athc_build::{
 };
 use spark_lib::athc_lod_error::{with_lod_sizes, LodSizeOptions};
 use spark_lib::athc_merge::{levels_from_tree, ErrorOptions, ErrorView, MergeTree};
+use spark_lib::athc_pages::{check_paged, pack_pages, PageBox, PageInput};
+use spark_lib::athc_v3::write_v3_paged;
 use spark_lib::athc_lod_cut::{athenea_tree_errors, with_lod_errors, ErrorWeights, Known, NO_CONE};
 use spark_lib::athl::SplatSources;
 use spark_lib::athc_skin::{AthcSkeleton, SkinClip};
@@ -1499,6 +1501,125 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
         packed.block.lod_mass = old.iter().map(|&o| in_tree[o as usize].to_bits()).collect();
         eprintln!("second opacities (coverageMass held at 0.99): {} merges", in_tree.iter().filter(|&&v| v > 0.0).count());
     }
+    // `--pages`: her error-band pages (`decimate --tree-pages`), every node
+    // of the tree in the file page by page (athc_pages).
+    if flag("--pages") {
+        let to_tree = |v: Vec<u32>| -> Vec<u32> {
+            let v: Vec<u32> = match &perm {
+                Some(order) => order.iter().map(|&o| v[o as usize]).collect(),
+                None => v,
+            };
+            old.iter().map(|&o| v[o as usize]).collect()
+        };
+        let page = prim.ints("athenea:splat:lodPage")?;
+        if page.len() != total {
+            bail!("{tree_path}: --pages needs athenea:splat:lodPage (decimate --tree-pages), {} for {} gaussians", page.len(), total);
+        }
+        let first_leaf = to_tree(prim.ints("athenea:splat:lodStart")?);
+        let page = to_tree(page);
+        let ids = to_tree((0..total as u32).collect());
+        let weights = ErrorWeights::athenea().parse_over(arg(args, "--lod-error-weights").unwrap_or(""))?;
+        let marks = closed_marks.as_ref().map(|m| -> Vec<bool> {
+            let m: Vec<bool> = match &perm {
+                Some(order) => order.iter().map(|&o| m[o as usize]).collect(),
+                None => m.clone(),
+            };
+            old.iter().map(|&o| m[o as usize]).collect()
+        });
+        let double_sided = if marks.is_some() && !flag("--closed") { flag("--double-sided") } else { no_cone(args, prim.closed()) };
+        let marks = if flag("--closed") { None } else { marks };
+        let bounds = athenea_tree_errors(&packed.block, &tree.parent, tree.leaves, &tree.cost, &weights, double_sided, marks.as_deref());
+        let page_box = if flag("--page-box-own") { PageBox::Own } else { PageBox::Parents };
+        let input = PageInput {
+            block: &packed.block,
+            parent: &tree.parent,
+            page: &page,
+            bounds: &bounds,
+            ids: &ids,
+            first_leaf: &first_leaf,
+            sh_words: packed.sh_words as usize,
+            page_box,
+        };
+        let paged = pack_pages(&input)?;
+        check_paged(&paged.pages, &paged.rows)?;
+        // Her table beside ours: how far apart (bands, error ranges, boxes).
+        let her_info = prim.ints("athenea:splat:lodPageInfo")?;
+        let her_bounds = prim.floats(&["athenea:splat:lodPageBounds"])?;
+        let mut cmp = json!(null);
+        if her_info.len() == 3 * paged.rows.len() && her_bounds.len() == 8 * paged.rows.len() {
+            let (mut band_diff, mut eps_ratio_max, mut eps_ratio_min, mut box_grow) = (0usize, 0.0f32, f32::MAX, 0.0f32);
+            for (r, row) in paged.rows.iter().enumerate() {
+                band_diff += (her_info[3 * r] != row.band) as usize;
+                let hb = &her_bounds[8 * r..8 * r + 8];
+                if hb[6] < 1e30 && row.eps_max < 1e30 && hb[6] > 0.0 {
+                    eps_ratio_max = eps_ratio_max.max(row.eps_max / hb[6]);
+                    eps_ratio_min = eps_ratio_min.min(row.eps_max / hb[6]);
+                }
+                let her_d = (0..3).map(|k| hb[3 + k] - hb[k]).fold(0.0f32, f32::max);
+                let our_d = (0..3).map(|k| row.hi[k] - row.lo[k]).fold(0.0f32, f32::max);
+                if her_d > 0.0 {
+                    box_grow = box_grow.max(our_d / her_d);
+                }
+            }
+            cmp = json!({ "bandsDiffering": band_diff, "epsMaxRatio": [eps_ratio_min, eps_ratio_max], "largestBoxGrowth": box_grow });
+        }
+        let mut head = packed.block.slice(0, 0);
+        head.n = 0;
+        let h = spark_lib::athc::AthcHeader {
+            flags: spark_lib::athc::FLAG_PAGED
+                | if packed.linear { spark_lib::athc::FLAG_LINEAR } else { 0 }
+                | if node_coverage { spark_lib::athc::FLAG_NODE_COVERAGE } else { 0 },
+            rest_per_colour: packed.rest_per_colour,
+            bounds_min: packed.bounds_min,
+            bounds_max: packed.bounds_max,
+            bounds_lo: packed.bounds_min,
+            extent: (0..3).map(|k| packed.bounds_max[k] - packed.bounds_min[k]).fold(0.0f32, f32::max),
+            ..Default::default()
+        };
+        let mut pages_blocks = paged.pages;
+        if !packed.block.occlusion.is_empty() {
+            // Indices are in the blocks already (reorder keeps them).
+        } else {
+            for b in pages_blocks.iter_mut() {
+                b.occlusion.clear();
+            }
+        }
+        let file = spark_lib::athc::AthcFile {
+            header: h,
+            extra: spark_lib::athc::ExtraHeader { transfer_count: packed.transfer_count, ..Default::default() },
+            levels: Vec::new(),
+            starts: Vec::new(),
+            chunks: pages_blocks,
+            occlusion_codebook: if packed.block.occlusion.is_empty() { Vec::new() } else { occlusion_codebook.clone() },
+        };
+        let compression = if flag("--gzip") { COMPRESSION_GZIP } else { COMPRESSION_NONE };
+        let planes = flag("--planes");
+        let encoding = |id: spark_lib::athc_v3::SectionId| -> u32 {
+            use spark_lib::athc_v3::SectionId as S;
+            if !planes || matches!(id, S::Shadow) { 0 } else { spark_lib::athc_v3::ENCODING_BYTE_PLANES }
+        };
+        let cpca = arg(args, "--cpca").map(spark_lib::athc_cpca::CpcaOptions::parse).transpose()?;
+        let (bytes, _) = write_v3_paged(&file, &paged.rows, compression, &encoding, cpca.as_ref(), rig.as_ref())?;
+        std::fs::write(output, &bytes)?;
+        let layout = spark_lib::athc_v3::parse_v3(&bytes)?;
+        let tier: Vec<u64> = (0..3).map(|t| layout.pages.iter().map(|r| r.tier_bytes[t] as u64).sum()).collect();
+        let report = json!({
+            "tree": tree_path,
+            "output": output,
+            "bytes": bytes.len(),
+            "tablesBytes": spark_lib::athc_v3::tables_bytes(&bytes)?,
+            "pack": paged.report,
+            "tierBytes": tier,
+            "pageBox": format!("{:?}", page_box),
+            "herTable": cmp,
+            "seconds": t.elapsed().as_secs_f32(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if let Some(j) = arg(args, "--json") {
+            std::fs::write(j, serde_json::to_string_pretty(&report)?)?;
+        }
+        return Ok(());
+    }
     let keep: Option<usize> = arg(args, "--keep-splats").map(|v| v.parse()).transpose().context("--keep-splats")?;
     let mut o = ErrorOptions::new(ErrorView::around(packed.bounds_min, packed.bounds_max));
     o.node_coverage = node_coverage;
@@ -1602,6 +1723,7 @@ fn main() -> Result<()> {
         "--keep-splats",
         "--lod-size-opts",
         "--lod-error-weights",
+        "--cpca",
     ];
     let mut paths = Vec::new();
     let mut skip = false;

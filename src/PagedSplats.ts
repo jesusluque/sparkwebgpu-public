@@ -10,14 +10,17 @@ import {
   ATHC_PAGE_SPLATS,
   type AnyAthcLayout,
   type AthcPaging,
+  type AthcV3Layout,
   athcAttribSpecs,
   athcMergedCpca,
   athcPageCount,
   athcSplatBase,
   athcWantOf,
   fetchAthc3Page,
+  fetchAthcBandPages,
   fetchAthcPage,
   fetchAthcStreams,
+  isAthcPaged,
   isAthcV3,
   openAthc,
   readAthcLayout,
@@ -331,7 +334,40 @@ export class PagedSplats implements SplatSource {
       : null;
   }
 
+  /**
+   * Band pages `chunks` (consecutive) of a paged .athc tree (athenea's
+   * error-band pages, src/athc.ts fetchAthcBandPages): ONE Range request,
+   * each page decoded. `bytes`: what the request read.
+   */
+  async fetchDecodeBandPages(chunks: readonly number[]) {
+    const paging = await this.getAthc();
+    if (!isAthcPaged(paging.layout)) {
+      throw new Error("PagedSplats: not a paged .athc tree");
+    }
+    const kept = this.keptSpecs() ?? [];
+    const { bytes, ranges, pages } = await fetchAthcBandPages(
+      paging.layout as AthcV3Layout,
+      chunks,
+      this.fetchOptions(),
+      kept,
+      paging.keepLinear,
+    );
+    const decoded = await Promise.all(
+      pages.map(async (p) => ({
+        chunk: p.page,
+        data: await this.decodePage(p.bytes, p.streams, p.page, null),
+      })),
+    );
+    return { bytes, ranges, pages: decoded };
+  }
+
   async fetchDecodeChunk(chunk: number) {
+    if (this.fileType === SplatFileType.ATHC) {
+      const paging = await this.getAthc();
+      if (isAthcPaged(paging.layout)) {
+        return (await this.fetchDecodeBandPages([chunk])).pages[0].data;
+      }
+    }
     let decodeBytes = undefined;
     let streams: AttribPool | null = null;
     // A merged .athc page whose transfer is kept as clusters (cpcaMerged).
@@ -432,6 +468,21 @@ export class PagedSplats implements SplatSource {
       throw new Error("No url or fileBytes provided");
     }
 
+    return this.decodePage(
+      decodeBytes as Uint8Array,
+      streams,
+      chunk,
+      mergedCpca,
+    );
+  }
+
+  /** A fetched page decoded by a loader worker, its streams set beside. */
+  private async decodePage(
+    decodeBytes: Uint8Array,
+    streams: AttribPool | null,
+    chunk: number,
+    mergedCpca: AthcPaging | null,
+  ) {
     return await workerPool.withWorker(async (worker) => {
       if (!this.pager) {
         throw new Error("PagedSplats.pager not set");

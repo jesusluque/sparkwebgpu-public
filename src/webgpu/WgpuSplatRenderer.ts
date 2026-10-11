@@ -282,10 +282,17 @@ export interface WgpuSplatRendererOptions {
   /**
    * A merged LoD node that carries a second opacity (.athc `LODM`: athenea's
    * mass ratio W / A held at 0.99, beside the stored composited coverage;
-   * ext sources only, in a.w's high half) is drawn at it while its size on
-   * screen, 2 x its widest sigma, is at most this many pixels, and at the
-   * stored opacity above. Chosen per splat in generate, every frame. Leaves
-   * have one opacity. 0 (default): always the stored one.
+   * ext sources only, in a.w's high half): "mass" (default) draws every such
+   * node at its mass, which Spark's mass-keeping draw composites right
+   * (research/errcut.md round 4); "coverage" at the stored opacity. Leaves
+   * have one opacity; clouds without LODM are unchanged.
+   */
+  nodeOpacity?: "mass" | "coverage";
+  /**
+   * Opt-in switch by size (off by default): when > 0, a node with a second
+   * opacity is drawn at its mass while its size on screen, 2 x its widest
+   * sigma, is at most this many pixels, and at the stored coverage above,
+   * whatever nodeOpacity says. Chosen per splat in generate, every frame.
    */
   opacitySwitchPx?: number;
   /**
@@ -554,6 +561,7 @@ export class WgpuSplatRenderer {
       covSplats: false,
       surfels: "auto",
       faintSplats: "keep",
+      nodeOpacity: "mass",
       opacitySwitchPx: 0,
       sheetFade: 0,
       aaFilter: "gaussian",
@@ -1332,10 +1340,9 @@ export class WgpuSplatRenderer {
     if (out.lod && mesh.lodFaded) flags |= GEN_LOD_FADE;
     if (this.isAdditive(mesh) && !out.packed) flags |= GEN_ADDITIVE;
     if (source.lodOpacity) flags |= GEN_LOD_OPACITY;
-    const switchPx = this.options.opacitySwitchPx ?? 0;
     const focalPx = out.camera ? this.switchFocalPx(out.camera) : 0;
-    if (switchPx > 0 && source.format === "ext" && focalPx > 0)
-      flags |= GEN_OPACITY_SWITCH;
+    const switchPx = this.nodeSwitchPx(focalPx > 0);
+    if (switchPx > 0 && source.format === "ext") flags |= GEN_OPACITY_SWITCH;
     if (this.options.sortRadial) flags |= GEN_SORT_RADIAL;
     if (dyno && mesh.dyno?.generator) flags |= GEN_DYNO_SOURCE;
     if (this.options.covSplats && !out.noCov) {
@@ -1474,6 +1481,18 @@ export class WgpuSplatRenderer {
       range = { lo: near + 100, hi: far + 100 };
     }
     return (range.hi - range.lo) / 2 ** 24 <= 2.5e-4 ? range : null;
+  }
+
+  /**
+   * The size on screen up to which a node with a second opacity draws its
+   * mass (generate's GEN_OPACITY_SWITCH, the relight pass's): opacitySwitchPx
+   * when on (with a known focal length), every size for nodeOpacity "mass",
+   * 0 (never) for "coverage".
+   */
+  nodeSwitchPx(focalKnown: boolean): number {
+    const t = this.options.opacitySwitchPx ?? 0;
+    if (t > 0) return focalKnown ? t : 0;
+    return (this.options.nodeOpacity ?? "mass") === "mass" ? 3.0e38 : 0;
   }
 
   // The focal length in pixels of this frame's `camera` (opacitySwitchPx's

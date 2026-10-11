@@ -838,7 +838,7 @@ export function atheneaRelightPlugin(
     const h = size?.height ?? 1;
     // The renderer's opacitySwitchPx (generate's GEN_OPACITY_SWITCH): a
     // merged sheet's alpha is the one generate draws.
-    const switchPx = r.options.opacitySwitchPx ?? 0;
+    const switchPx = r.nodeSwitchPx(Boolean(size));
     const projection = {
       view0: eyeRow(0, 1),
       view1: eyeRow(1, 1),
@@ -865,9 +865,7 @@ export function atheneaRelightPlugin(
       (options.debug?.noCells ? C.kRelightNoCells : 0) |
       (rebuilt ? C.kRelightCpca : 0) |
       (projected ? C.kRelightJoint : 0) |
-      (switchPx > 0 && size && source.format === "ext"
-        ? C.kRelightOpacitySwitch
-        : 0) |
+      (switchPx > 0 && source.format === "ext" ? C.kRelightOpacitySwitch : 0) |
       (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
     const e = world.elements;
     const row = (k: number) => [e[k], e[k + 4], e[k + 8], e[k + 12]];

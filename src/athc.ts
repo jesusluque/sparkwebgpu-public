@@ -115,6 +115,7 @@ export type AthcSection = {
     | "LODE"
     | "OCCL"
     | "LODM"
+    | "TREE"
     | "SKIN"
     | "MATL"
     | "SHAD"
@@ -152,7 +153,155 @@ export type AthcV3Layout = {
   attribSpecs: AthcLayout["attribSpecs"];
   /** The transfer forms it can be kept as (athc_v3.rs transfer_forms). */
   transferForms: number[];
+  /** A paged tree's page table (FLAG_PAGED, athc_pages.rs PageRow). */
+  pages?: AthcPageRow[];
 };
+
+/** Header flag: the blocks are athenea's error-band pages (athc_pages.rs). */
+export const ATHC_FLAG_PAGED = 1024;
+
+/**
+ * A row of a paged tree's page table (athc_pages.rs PageRow): the band of
+ * its nodes' parent errors, its nodes and the first in page order, the box
+ * holding the spheres its need is tested on, the largest and smallest
+ * parent error (world units; a root's 3e38), its first byte and the bytes
+ * through each tier.
+ */
+export type AthcPageRow = {
+  band: number;
+  count: number;
+  first: number;
+  lo: number[];
+  hi: number[];
+  epsMax: number;
+  epsMin: number;
+  offset: number;
+  tierBytes: number[];
+};
+
+/** Whether a layout is a paged tree (its blocks athenea's band pages). */
+export function isAthcPaged(layout: AnyAthcLayout): boolean {
+  return (
+    isAthcV3(layout) &&
+    (layout.header.flags & ATHC_FLAG_PAGED) !== 0 &&
+    !!layout.pages?.length
+  );
+}
+
+/** Sections a band page hands the loader worker (the tree's own). */
+const TREE_SECTIONS = new Set([
+  "CORE",
+  "SHRS",
+  "LODS",
+  "LODE",
+  "OCCL",
+  "LODM",
+  "TREE",
+]);
+
+/**
+ * Bytes a band page fetch reads for `want`: from its first byte through the
+ * last section needed (as fetchAthcBandPages reads it).
+ */
+export function athcBandPageBytes(
+  layout: AthcV3Layout,
+  page: number,
+  want: AthcWant,
+): number {
+  const ids = sectionsFor(layout, want, true, true);
+  const block = layout.blocks[page];
+  return layout.sections.reduce(
+    (n, s, k) => n + (ids.includes(s.id) ? block.spans[k].stored : 0),
+    0,
+  );
+}
+
+/**
+ * Band pages `pages` (consecutive) of a paged tree with the streams `streams`
+ * (the pool's specs): one Range request a tier wanted, each from the first
+ * page's first section of the tier through the last page's last. Each page as a kind-2 ATHV
+ * page of its tree sections (CORE, SHRS, LODE, OCCL, LODM, TREE) for the loader
+ * worker, and its streams as attribute columns. `bytes`: what was read.
+ */
+export async function fetchAthcBandPages(
+  layout: AthcV3Layout,
+  pages: readonly number[],
+  options: FetchOptions,
+  streams: readonly AttributeSpec[],
+  keepLinear: boolean,
+): Promise<{
+  bytes: number;
+  /** Range requests made (one a tier wanted). */
+  ranges: number;
+  pages: { page: number; bytes: Uint8Array; streams: AttribPool | null }[];
+}> {
+  for (let k = 1; k < pages.length; k++) {
+    if (pages[k] !== pages[k - 1] + 1) {
+      throw new Error(".athc band pages: one Range takes consecutive pages");
+    }
+  }
+  const want = athcWantOf(layout, streams);
+  const ids = sectionsFor(layout, want, true, true);
+  const picks = layout.sections
+    .map((section, k) => ({ section, k }))
+    .filter(({ section }) => ids.includes(section.id));
+  // The file is laid out by tier (athc_pages.rs): a tier's sections of
+  // consecutive pages are one run, one Range request a tier wanted.
+  const tiers = [...new Set(picks.map(({ section }) => section.tier))];
+  const runs = await Promise.all(
+    tiers.map(async (tier) => {
+      const ks = picks.filter((p) => p.section.tier === tier).map((p) => p.k);
+      const first = layout.blocks[pages[0]].spans[ks[0]];
+      const last =
+        layout.blocks[pages[pages.length - 1]].spans[ks[ks.length - 1]];
+      const start = first.offset;
+      const { data } = await readRange(
+        options,
+        start,
+        last.offset + last.stored - start,
+      );
+      return { ks, start, data };
+    }),
+  );
+  const at = (k: number, span: { offset: number; stored: number }) => {
+    const run = runs.find((r) => r.ks.includes(k)) as (typeof runs)[number];
+    return run.data.subarray(
+      span.offset - run.start,
+      span.offset - run.start + span.stored,
+    );
+  };
+  const out = [];
+  for (const page of pages) {
+    const block = layout.blocks[page];
+    const parts = picks.map(({ section, k }) => ({
+      section,
+      stored: at(k, block.spans[k]),
+      raw: block.spans[k].raw,
+    }));
+    const tree = parts.filter((p) => TREE_SECTIONS.has(p.section.id));
+    const rest = parts.filter((p) => !TREE_SECTIONS.has(p.section.id));
+    const bytes = athvSectionsPage(
+      layout,
+      0,
+      block.n,
+      keepLinear ? ATHV_KEEP_LINEAR : 0,
+      0,
+      tree,
+    );
+    out.push({
+      page,
+      bytes,
+      streams: rest.length
+        ? await streamColumns(layout, block.n, rest, streams, `p${page}`)
+        : null,
+    });
+  }
+  return {
+    bytes: runs.reduce((n, r) => n + r.data.length, 0),
+    ranges: runs.length,
+    pages: out,
+  };
+}
 
 /**
  * The transfer words a splat in TXDI, and through TXIN, as the file's
@@ -277,6 +426,8 @@ export function athcNeeds(
     // The merged nodes' second opacities (generate's opacity switch). A
     // chunk's are 0: see sectionsFor.
     case "LODM":
+    // A paged tree's children (athc_pages.rs): the traversal's.
+    case "TREE":
       return true;
     // A skinned cloud's rig (athc_skin.rs): read whole-file only for now;
     // a paged skinned cloud is drawn in its bind pose.
@@ -689,6 +840,26 @@ async function openAthcV3(
     transferValues: layout.extra.transferCount,
   };
   const keepLinear = options.keepLinear ?? false;
+  if (isAthcPaged(layout)) {
+    // A paged tree: no levels; every page is fetched on its own
+    // (fetchAthcBandPages), page 0 holding the root.
+    return {
+      layout,
+      tree: {
+        synthRoot: false,
+        levelBase: [],
+        merged: 0,
+        splatBase: 0,
+        count: layout.header.count,
+        clippedGroups: 0,
+      },
+      headers: layout.headers,
+      mergedPages: [],
+      pageCount: layout.blocks.length,
+      keepLinear,
+      levelsWant,
+    };
+  }
   const flags = keepLinear ? ATHV_KEEP_LINEAR : 0;
   const ids = sectionsFor(layout, levelsWant, true, true);
   const levelBlocks = layout.blocks.filter((b) => b.kind === 0);

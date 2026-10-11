@@ -100,16 +100,17 @@ export class WgpuSplatPager extends SplatPager {
       device.limits.maxBufferSize,
     );
     const maxWords = Math.max(coreWords, shWords);
-    const fitPages = Math.floor(limit / (PAGE_SPLATS * maxWords * 4));
+    const pageSplats = options.pageSplats ?? PAGE_SPLATS;
+    const fitPages = Math.floor(limit / (pageSplats * maxWords * 4));
     const wanted = options.maxSplats ?? 256 * PAGE_SPLATS;
     super({
       ...options,
       renderer: unusedRenderer,
-      maxSplats: Math.min(wanted, fitPages * PAGE_SPLATS),
+      maxSplats: Math.min(wanted, fitPages * pageSplats),
     });
     if (this.maxSplats < wanted) {
       console.warn(
-        `WgpuSplatPager: ${this.maxPages} pages fit maxStorageBufferBindingSize (${limit}), not ${wanted / PAGE_SPLATS}`,
+        `WgpuSplatPager: ${this.maxPages} pages fit maxStorageBufferBindingSize (${limit}), not ${wanted / pageSplats}`,
       );
     }
     this.device = device;
@@ -190,6 +191,7 @@ export class WgpuSplatPager extends SplatPager {
       pages: o.pages,
       transferForm: o.transferForm,
       cloudPages: this.cloudPages,
+      pageSplats: this.pageSplats,
     };
     let plan = planAttribPaging(this.attribSchema, this.maxPages, options);
     if (plan.bytes > limit) {
@@ -266,7 +268,7 @@ export class WgpuSplatPager extends SplatPager {
       : null;
     const attribs = this.ensureAttribs(chunk);
     if (!attribs) return;
-    attribs.uploadPage(page * PAGE_SPLATS, count, chunk);
+    attribs.uploadPage(page * this.pageSplats, count, chunk);
     this.residency?.onPageUpload(page, count, chunk);
   }
 
@@ -336,26 +338,30 @@ export class WgpuSplatPager extends SplatPager {
     extArray?: Uint32Array,
     attribs?: unknown,
   ) {
-    const base = page * PAGE_SPLATS;
+    const base = page * this.pageSplats;
     const core = this.pools.core;
-    const count = packedArray.length / 4;
+    // A decoded page's arrays may be padded past its splats (texture rows):
+    // a slot smaller than 65 536 (WgpuBandPager) takes no more than it holds.
+    const count = Math.min(packedArray.length / 4, this.pageSplats);
+    const packed = packedArray.subarray(0, count * 4);
+    const ext = extArray?.subarray(0, count * 4);
     this.pageCounts[page] = count;
     this.uploaded[page] = this.pageToSplatsChunk[page];
     for (const source of this.sources) source.version += 1;
-    this.mirror(this.packedTexture, base, packedArray);
-    if (extArray) this.mirror(this.extTexture, base, extArray);
+    this.mirror(this.packedTexture, base, packed);
+    if (ext) this.mirror(this.extTexture, base, ext);
     // Every page, so one without attributes clears the previous tenant's.
     this.uploadAttribs(page, count, attribs);
-    if (extArray) {
+    if (ext) {
       // Ext pages arrive as two arrays; the pool interleaves a and b.
       const words = new Uint32Array(count * 8);
       for (let i = 0; i < count; i++) {
-        words.set(packedArray.subarray(4 * i, 4 * i + 4), 8 * i);
-        words.set(extArray.subarray(4 * i, 4 * i + 4), 8 * i + 4);
+        words.set(packed.subarray(4 * i, 4 * i + 4), 8 * i);
+        words.set(ext.subarray(4 * i, 4 * i + 4), 8 * i + 4);
       }
       this.write(core, base, words);
     } else {
-      this.write(core, base, packedArray);
+      this.write(core, base, packed);
     }
 
     const numSh = Math.min(shArrays.length, 3);

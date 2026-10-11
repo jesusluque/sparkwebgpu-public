@@ -152,7 +152,8 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 | S0l | `LODS` | 1 | 4 | a merged node's LoD size by error, f32 (0 in a chunk: geometric); flag bit 6 (sparkwebGPU's, below) |
 | S0e | `LODE` | 1 | 8 | a merged node's LoD error cut bounds: f16 eps, f16 rho; f16 theta, 8+8-bit cone axis (0 in a chunk); flag bit 7 (sparkwebGPU's, below) |
 | S0o | `OCCL` | 1 | 4 | athenea's occlusion mask: the element's codebook entry + 1 (0: none), in a word; flag bit 9 (below) |
-| S0m | `LODM` | 1 | 4 | a merged node's second opacity, f32 (its mass ratio held at 0.99; 0 in a chunk and for none); flag bit 10 (below) |
+| S0m | `LODM` | 1 | 4 | a merged node's second opacity, f32 (its mass ratio held at 0.99; 0 for a leaf and for none); flag bit 11 (below) |
+| S0t | `TREE` | 1 | 8 | a paged tree's children: their page, the first one's place and their count; flag bit 10 (below) |
 | S0s | `SKIN` | 1 | 4 · (influences + gradientWords) | a skinned cloud's rig (sparkwebGPU's, below) |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
 | S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
@@ -433,7 +434,7 @@ ratio has moved to `coverageMass` (pieces/t21) -- or with `--node-coverage`
 (then the opacities are read as they are), and reads `coverage` as the
 merges' opacity.
 
-### Two opacities a merged node (`LODM`, flag bit 10)
+### Two opacities a merged node (`LODM`, flag bit 11)
 
 athenea's coverage trees (pieces/t47) carry both opacities of each merge:
 `opacity` is the composited coverage of its leaves fitted over its core,
@@ -442,7 +443,7 @@ ranks the coverage first near and the mass far; the switch below lets a
 player pick by size on screen. In Spark's mass-keeping draw the mass ratio
 held at 0.99 was as good or better nearly everywhere, and the switch gained
 at most 0.06 dB (research/errcut.md, round 4), so it is off by default. With
-header flag bit 10 (`FLAG_LOD_MASS`) a file keeps both: the stored opacity
+header flag bit 11 (`FLAG_LOD_MASS`) a file keeps both: the stored opacity
 (the coverage, with `FLAG_NODE_COVERAGE`) and, in a tier-1 section after
 `OCCL`, one f32 an element: a level group's mass ratio clamped to
 [1.01/255, 0.99], 0 for a group without one; a chunk's (a leaf, one
@@ -453,16 +454,22 @@ after the occlusion indices, f32 each, with decode flag bit 4
 (`ATHV_LOD_MASS`); the browser fetches `LODM` with the levels and never with
 a chunk; the decoder's synthetic root has none.
 
+In a paged file (flag bit 10, error-band pages) `LODM` is one more tier-1
+section of every page, beside `TREE`: each page carries its own nodes'
+values (0 for its leaves and for the synthetic root), fetched with the
+page's tree sections.
+
 The decoder hands it to the receiver (`set_lod_mass`). ExtSplats keep it in
 the high half of word a.w, as f16 (the low half is the opacity; a source
 splat's high half is otherwise 0); PackedSplats have no room and drop it.
-The player chooses per splat, every frame, in generate (and in the relight
-pass, so a merged glass sheet's alpha is the one drawn): with the renderer's
-`opacitySwitchPx` T > 0, a node with a second opacity whose size on screen,
-2 x its widest sigma x focal / distance (object space, as the LoD
-traversal's size / distance), is at most T pixels is drawn at the second
-opacity, a larger one at the stored coverage. Leaves keep their own.
-A v2 file never holds it, and a reader before it refuses the flag.
+The player draws a node that has one at its **mass by default**
+(`WgpuSplatRenderer` `nodeOpacity: "mass"`; `"coverage"` draws the stored
+opacity), in generate and in the relight pass, so a merged glass sheet's
+alpha is the one drawn. The opt-in switch `opacitySwitchPx` T > 0 (off by
+default) instead draws the mass while the node's size on screen, 2 x its
+widest sigma x focal / distance (object space, as the LoD traversal's size
+/ distance), is at most T pixels, and the coverage above. Leaves keep their
+own. A v2 file never holds it, and a reader before it refuses the flag.
 
 ### Occlusion masks (`OCCL` and the codebook, flag bit 9)
 
@@ -496,6 +503,100 @@ masks. Merged ATHV pages carry the indices after the errors (decode flag
 bit 3, `ATHV_OCCLUSION`); decoded splats as `extra.lodOcclusion`, a whole
 file's codebook and box as `extra.lodOcclusionCodebook` /
 `lodOcclusionBounds`.
+
+### Error-band pages (`TREE`, `PAGE`, flag bit 10)
+
+athenea's `decimate --tree-pages P` pages her whole merge tree (leaves and
+merges) by ERROR BANDS, as Nanite does: a node is needed exactly when its
+parent's projected error passes tau, so each node goes to the band (an
+octave) of its PARENT's error, the bands coarsest first, each band's nodes in
+leaf order, the whole order cut into pages of P nodes
+(`primvars:athenea:splat:lodPage`), with a table a player tests a page by
+without reading its nodes (`lodPageInfo`: band, nodes, first;
+`lodPageBounds`: a box, the largest and smallest parent error). `usd-athc
+--tree tree.usdc out.athc --pages [--gzip --planes --cpca K,M]` (thread CK,
+`athc_pages.rs`) writes that tree page by page; `FLAG_PAGED` (1024) says so:
+
+- every block is a page (block kind 2, `first` its first node in page
+  order); no levels, no starts, `chunks` the pages, `chunkSplats` the
+  largest page;
+- every node, leaves and merges, with all its sections (tier 1 is `CORE`,
+  `SHRS`, `LODE`, `OCCL`, `TREE`); the merges' `LODE` are athenea's bounded errors over her whole
+  tree (as `--lod-errors`), a leaf's 0; the merges turned so their third
+  axis is the normal (`orient_merged`, what the decoder does to a
+  producer's coverage), stored as the decoder will read them;
+- **`TREE`**, tier 1, two words a node: the page its children are in, then
+  the first one's place in it (low 16 bits) and their count (high 16; 0 a
+  leaf). Spark's tree names children as one run, so the packer keeps every
+  node's children in ONE page, next to one another: a page boundary that
+  splits siblings moves the later ones into the earliest one's page (their
+  parent is in it or before it, their children after it); a parent her
+  order put after one of its children (it happens where the two share a
+  band and a first leaf and the boundary falls between them: 92 of the
+  hood's 648k nodes) is brought forward to the child's page; within a page,
+  the root and the runs whose parent is in an earlier page first (merges
+  before leaves, by first leaf), then breadth first. A forest (her trees
+  have 14 to 251 roots) gets a root merged over its roots (`merge_root`) at
+  the head of page 0;
+- **`PAGE`**, the page table, among the tables (a pager reads it with the
+  header): its offset (u64), rows and words a row at header byte 176 (the
+  header is 192 bytes; the codebook's 16 bytes at 160, 0 without one), a
+  row of 16 words a page:
+
+```text
+0  band (athenea's bandOf of the largest parent error)   1 nodes   2 first node
+3  box lo xyz   6 box hi xyz (f32)
+9  largest parent error   10 smallest (f32; a root's 3e38)
+11 the page's first byte (u64)   13 the bytes of its tier 1, tier 2, tier 3
+```
+
+The data is laid out BY TIER, not page by page: every page's tier-1
+sections, page after page, then every page's tier 2, then tier 3 (no page
+alignment in between). A page's sections of one tier are contiguous, so a
+run of consecutive pages is one Range request a tier, and a reader of tier
+1 alone never reads a byte of the material or the transfer. (Page by page,
+a Range over pages p..q read q-p pages' transfers in between: on the six
+t42 pieces a tier-1 reader fetched 74 MB for the near view instead of 12.)
+
+The table is recomputed from the nodes as the traversal reads them (the
+LODE words, f16 rounded up: within 0.3 % of athenea's but where the packer
+moved nodes), and its box holds the PARENTS' spheres (each widened by the
+f16 a centre is in the traversal), not the nodes' own: a node is refined by
+its parent's projected error from the parent's sphere, so this box makes the
+page test conservative against the traversal -- every node the cut can reach
+is in a needed page. It is up to 1.07-1.23x wider than athenea's
+(`usd-athc --page-box-own`: hers). A page is needed when
+
+```text
+epsMax · ppu / max(dist(eye, box), near) > tau        (page 0 always)
+```
+
+Decoded whole (`new SplatMesh({ url })`), the nodes are in page order and a
+node's children are named by their place in the file: the reference, every
+node resident. Paged (`PagedSplats`), page p is Spark chunk p of a sparse
+virtual space (child `p << 16 | place`), held in a pool slot of
+`WgpuLodOptions.bandPageSplats` (3072) splats: `WgpuBandPager` (below).
+
+#### Streaming them (`WgpuBandPager`)
+
+`WgpuLod` gives a paged tree a pool of small slots (`bandPageSplats`,
+`maxPagedSplats` the residency budget in nodes) and its own pager
+(`src/webgpu/WgpuBandPager.ts`). After each traversal:
+
+- the needed set from each tree's table alone (the eye in its object
+  space, tau as the error cut's `lodErrorTau`, over the mesh's lodScale);
+- the missing needed pages asked for by priority, the error a page removes
+  per byte it costs (`epsMin` from its box over the bytes its fetch reads),
+  nearer first on ties, consecutive pages of a tree merged into one Range
+  request (at most 8 MiB), within the pool's free capacity;
+- the pool evicts pages not needed from the highest index down (the finest
+  bands first), never page 0, never one a resident page depends on (whose
+  nodes' children are in it);
+- `neededFill` (the needed set over the pool) drives tau's breathing
+  (`lodErrorTauAuto`) when the needed set does not fit.
+
+The traversal cuts within the resident pages: a node whose children's page
+is absent is drawn as a leaf (spark-rs `lod_tree.rs`, the tree's `slot`).
 
 ### The curvature (`CURV`)
 

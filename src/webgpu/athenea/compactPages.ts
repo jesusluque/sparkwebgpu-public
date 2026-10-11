@@ -601,6 +601,8 @@ export interface CompactBandOptions {
     protect?: "neighbours" | "none";
     /** New records a update at most (the rest drawn as parent or children meanwhile). */
     uploadsPerUpdate?: number;
+    /** Range requests for dropped runs in flight at most; default 8. */
+    runFetchers?: number;
     /** Runs inflated an update at most (the frame's decode budget); default 256. */
     inflatesPerUpdate?: number;
   };
@@ -1403,11 +1405,15 @@ export class CompactBandStreamer {
     this.wantedRuns.set(page, set);
   }
 
-  /** The dropped runs the cut asked for, by Range (adjacent runs of a page in one). */
+  /**
+   * The dropped runs the cut asked for, by Range: a page's wanted runs in
+   * one request (the runs between them read too while that at most doubles
+   * the bytes), `runFetchers` (8) requests in flight.
+   */
   private fetchRuns() {
     const runs = this.runs;
     if (!runs) return;
-    const max = this.options.fetchers ?? 4;
+    const max = this.options.nodePool?.runFetchers ?? 8;
     for (const [g, set] of this.wantedRuns) {
       if (this.runFetches >= max) break;
       this.wantedRuns.delete(g);
@@ -1416,13 +1422,29 @@ export class CompactBandStreamer {
       const list = [...set]
         .filter((r) => runs.missing(g, r))
         .sort((a, b) => a - b);
-      let k = 0;
-      while (k < list.length) {
-        let e = k + 1;
-        while (e < list.length && list[e] === list[e - 1] + 1) e++;
-        const first = runs.fileSpan(g, list[k]) as [number, number];
-        const last = runs.fileSpan(g, list[e - 1]) as [number, number];
-        const rs = list.slice(k, e);
+      // Groups: a run joins the group before it unless the gap would more
+      // than double the group's bytes.
+      const groups: number[][] = [];
+      for (const r of list) {
+        const last = groups[groups.length - 1];
+        if (last) {
+          const a = runs.fileSpan(g, last[0]) as [number, number];
+          const b = runs.fileSpan(g, last[last.length - 1]) as [number, number];
+          const c = runs.fileSpan(g, r) as [number, number];
+          const need = last.reduce(
+            (n, q) => n + (runs.fileSpan(g, q) as [number, number])[1],
+            c[1],
+          );
+          if (c[0] + c[1] - a[0] <= 2 * need || c[0] === b[0] + b[1]) {
+            last.push(r);
+            continue;
+          }
+        }
+        groups.push([r]);
+      }
+      for (const rs of groups) {
+        const first = runs.fileSpan(g, rs[0]) as [number, number];
+        const last = runs.fileSpan(g, rs[rs.length - 1]) as [number, number];
         this.runFetches += 1;
         this.stats.runRanges += 1;
         this.stats.runBytes += last[0] + last[1] - first[0];
@@ -1443,7 +1465,6 @@ export class CompactBandStreamer {
           .finally(() => {
             this.runFetches -= 1;
           });
-        k = e;
       }
     }
   }

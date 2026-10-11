@@ -366,6 +366,19 @@ fn main() -> Result<()> {
         }).collect();
         let marked = words.iter().filter(|&&w| (w >> 26) & 1 != 0).count();
         println!("  material roughness marked on {marked} of {} pbr words", words.len());
+        if marked > 0 {
+            let mut steps = [0usize; 32];
+            for w in words.iter().filter(|&&w| (w >> 26) & 1 != 0) {
+                steps[(w >> 27) as usize] += 1;
+            }
+            let hist: Vec<String> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(k, c)| format!("{:.2}: {c}", k as f32 / 31.0))
+                .collect();
+            println!("  material roughness by value: {}", hist.join(", "));
+        }
         return Ok(());
     }
     let Some(output) = paths.get(1) else { bail!("no output path") };

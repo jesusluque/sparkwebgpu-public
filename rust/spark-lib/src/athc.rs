@@ -95,8 +95,20 @@ pub const FLAG_LOD_SIZE: u32 = 64;
 /// (each merged node's monotone error and bounding radius, two f16), or a
 /// merged ATHV page's. Never in a v2 file.
 pub const FLAG_LOD_ERROR: u32 = 128;
-pub const KNOWN_FLAGS: u32 =
-    FLAG_NORMALS | FLAG_LINEAR | FLAG_EMISSION | FLAG_MATERIAL | FLAG_TRANSFER | FLAG_LOD_SIZE | FLAG_LOD_ERROR;
+/// The merged levels' opacities are their producer's own coverage (athenea's
+/// `decimate --tree-coverage`: each merge's leaves composited on its plane,
+/// 1 - prod(1 - alpha G) over an 8 x 8 grid, as its opacity): kept as stored,
+/// never replaced by the mass ratio (`uncap_levels`) nor divided by the area
+/// the decoder's widening adds (`widen_merged` only orients them). v3 only.
+pub const FLAG_NODE_COVERAGE: u32 = 256;
+pub const KNOWN_FLAGS: u32 = FLAG_NORMALS
+    | FLAG_LINEAR
+    | FLAG_EMISSION
+    | FLAG_MATERIAL
+    | FLAG_TRANSFER
+    | FLAG_LOD_SIZE
+    | FLAG_LOD_ERROR
+    | FLAG_NODE_COVERAGE;
 
 /// Spark's LoD pages (and athenea's default chunk): 65 536 splats.
 pub const PAGE_SPLATS: u32 = 65536;
@@ -1138,14 +1150,14 @@ pub fn merged_block(file: &AthcFile, tree: &VirtualTree) -> AthcBlock {
     let extent = file.header.extent;
     let mut all = if tree.synth_root {
         let mut root = merge_root(&file.levels[0].1, file.header.sh_words as usize);
-        widen_merged(&mut root, extent);
+        widen_levels(file, &mut root, extent);
         root
     } else {
         AthcBlock::default()
     };
     for (level, block) in &file.levels {
         let mut block = block.clone();
-        widen_merged(&mut block, extent / (1u64 << *level) as f32);
+        widen_levels(file, &mut block, extent / (1u64 << *level) as f32);
         all.append(&block);
     }
     all
@@ -1268,6 +1280,10 @@ pub fn coverage_ratios(file: &AthcFile) -> Vec<Vec<f32>> {
 /// Every level's opacities replaced by their uncapped ratio, and every
 /// merged glass spread to its splats' area (`spread_translucent`).
 pub fn uncap_levels(file: &mut AthcFile) {
+    // A producer's own coverage stays as it is (FLAG_NODE_COVERAGE).
+    if file.header.has(FLAG_NODE_COVERAGE) {
+        return;
+    }
     let ratios = coverage_ratios(file);
     let areas = translucent_areas(file);
     for (((_, block), r), a) in file.levels.iter_mut().zip(ratios).zip(areas) {
@@ -1414,6 +1430,16 @@ pub const MERGED_FILL: f32 = 0.35;
 /// file whose coverage is not known) stays at least 0.99. Measured on the
 /// Corvette (paint and body, CPU raster of Spark's draw): the light let
 /// through at 58 m goes from 5.2% to 0.6%.
+/// `widen_merged` for a file's merged nodes, or only `orient_merged` when
+/// their opacities are their producer's coverage (FLAG_NODE_COVERAGE).
+pub fn widen_levels(file: &AthcFile, block: &mut AthcBlock, edge: f32) {
+    if file.header.has(FLAG_NODE_COVERAGE) {
+        orient_merged(block);
+    } else {
+        widen_merged(block, edge);
+    }
+}
+
 pub fn widen_merged(block: &mut AthcBlock, edge: f32) {
     orient_merged(block);
     let grow = (MERGED_FILL * edge).powi(2);
@@ -1519,7 +1545,7 @@ pub fn truncate_levels(file: &AthcFile, keep: usize) -> Result<AthcFile> {
     let mut splats = full.levels[keep].1.clone();
     // The kept groups are drawn as splats, never through `merged_block`:
     // widened here, once.
-    widen_merged(&mut splats, full.header.extent / (1u64 << full.levels[keep].0) as f32);
+    widen_levels(&full, &mut splats, full.header.extent / (1u64 << full.levels[keep].0) as f32);
     let parents = &full.levels[keep - 1].1.tail;
     let mut starts = Vec::with_capacity(parents.len());
     let mut j = 0;
@@ -1720,7 +1746,7 @@ pub fn truncate_creases(file: &AthcFile, keep: usize, max_spread: f32, max_depth
     let widened: Vec<AthcBlock> = (keep..levels)
         .map(|l| {
             let mut b = full.levels[l].1.clone();
-            widen_merged(&mut b, full.header.extent / (1u64 << full.levels[l].0) as f32);
+            widen_levels(&full, &mut b, full.header.extent / (1u64 << full.levels[l].0) as f32);
             b
         })
         .collect();

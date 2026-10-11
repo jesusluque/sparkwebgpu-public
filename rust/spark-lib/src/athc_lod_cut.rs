@@ -160,11 +160,13 @@ pub fn one_sided(b: &AthcBlock, i: usize) -> bool {
     (w >> 24) & 1 == 0 && ((w >> 16) & 255) <= 127
 }
 
-/// Element i's base colour (as stored) and roughness (pbr byte 1; 1 without).
+/// Element i's base colour as stored, at least 0 (lod_blob's `blobOf`:
+/// 0.5 + SH0 dc), and roughness (pbr byte 1; 0.5 without, as athenea's
+/// Decimate.cpp fills `roughness` when the cloud has none).
 pub fn look_of(b: &AthcBlock, i: usize) -> ([f32; 3], f32) {
     let w = &b.shape[i * 4..i * 4 + 4];
-    let rough = if b.pbr.is_empty() { 1.0 } else { ((b.pbr[i * (b.pbr.len() / b.n)] >> 8) & 255) as f32 / 255.0 };
-    ([high_half(w[2]), low_half(w[3]), high_half(w[3])], rough)
+    let rough = if b.pbr.is_empty() { 0.5 } else { ((b.pbr[i * (b.pbr.len() / b.n)] >> 8) & 255) as f32 / 255.0 };
+    ([high_half(w[2]).max(0.0), low_half(w[3]).max(0.0), high_half(w[3]).max(0.0)], rough)
 }
 
 /// athenea's node size `r`: `sqrt(dot(scale, scale))`, `sqrt(tr Sigma)`.
@@ -199,6 +201,34 @@ impl Default for ErrorWeights {
 }
 
 impl ErrorWeights {
+    /// athenea's research prototype on the GPU (Decimate.cpp, the cut by
+    /// error with `--cut-bounds`): colour 10, normal 1, guard 4, floor 2.
+    /// The default for her trees (`usd-athc --tree --lod-errors`).
+    pub fn athenea() -> Self {
+        Self { colour: 10.0, normal: 1.0, guard: 4.0, floor_size: 2.0 }
+    }
+
+    /// `k=v,...` over `self` ("own": treeErrorOwn's weights, 0 0 1 0).
+    pub fn parse_over(self, spec: &str) -> anyhow::Result<Self> {
+        let mut w = self;
+        for kv in spec.split(',').filter(|s| !s.is_empty()) {
+            if kv == "own" {
+                w = Self::default();
+                continue;
+            }
+            let (k, v) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("--lod-error-weights k=v,..."))?;
+            let v: f32 = v.parse()?;
+            match k {
+                "colour" | "color" => w.colour = v,
+                "normal" => w.normal = v,
+                "guard" => w.guard = v,
+                "floor" => w.floor_size = v,
+                _ => anyhow::bail!("--lod-error-weights: unknown {k}"),
+            }
+        }
+        Ok(w)
+    }
+
     pub fn parse(spec: &str) -> anyhow::Result<Self> {
         let mut w = Self::default();
         for kv in spec.split(',').filter(|s| !s.is_empty()) {
@@ -677,6 +707,64 @@ mod tests {
             let got: Vec<u32> = pages.iter().flat_map(|p| decode(p).errors.into_iter().flat_map(|e| e.1)).collect();
             assert_eq!(got, expect, "{name}");
         }
+    }
+
+    /// athenea's bounded error (Decimate.cpp's weights): r (|cost| + 10 s_c
+    /// + theta^2 / alpha), a guarded merge (cost < 0) x 4, at least 2 r.
+    #[test]
+    fn athenea_bounded_weights() {
+        let f = fixture("hood_t16.athc");
+        let b = &f.chunks[0];
+        // A small chain over the first splats: 0 1 -> 4, 2 3 -> 5, 4 5 -> 6.
+        let mut block = AthcBlock::default();
+        for k in [0, 700, 1400, 2100, 300, 1000, 1700] {
+            block.append(&b.slice(k, 1));
+        }
+        let parent = [4, 4, 5, 5, 6, 6, 6];
+        let cost = [0.0, 0.0, 0.0, 0.0, 0.2, -0.3, 0.05];
+        let w = ErrorWeights::athenea();
+        let nb = athenea_tree_errors(&block, &parent, 4, &cost, &w, false);
+        let own = |k: usize| {
+            let r = size_of(scales_of(&block, k));
+            let alpha = look_of(&block, k).1.max(0.02).powi(2);
+            r * (cost[k].abs() + 10.0 * nb[k].spread + nb[k].theta * nb[k].theta / alpha)
+        };
+        assert!(nb[6].theta > 0.0);
+        assert!((nb[4].eps - own(4)).abs() <= 1e-6 * own(4).max(1e-6));
+        let r5 = size_of(scales_of(&block, 5));
+        assert!((nb[5].eps - (4.0 * own(5)).max(2.0 * r5)).abs() <= 1e-6 * nb[5].eps);
+        assert_eq!(nb[6].eps, own(6).max(nb[4].eps).max(nb[5].eps));
+        assert_eq!(ErrorWeights::athenea().parse_over("own").unwrap().colour, 0.0);
+        assert_eq!(ErrorWeights::athenea().parse_over("colour=3").unwrap().guard, 4.0);
+    }
+
+    /// A producer's own coverage (FLAG_NODE_COVERAGE) is kept: not uncapped,
+    /// not divided by the widening's area, through v3.
+    #[test]
+    fn node_coverage_is_kept_as_stored() {
+        use crate::athc::{merged_block, uncap_levels, VirtualTree, FLAG_NODE_COVERAGE};
+        let mut f = fixture("two_cards.athc");
+        f.header.flags |= FLAG_NODE_COVERAGE;
+        for (_, b) in f.levels.iter_mut() {
+            for i in 0..b.n {
+                b.positions[i * 4 + 3] = 0.37;
+            }
+        }
+        let mut g = f.clone();
+        uncap_levels(&mut g);
+        assert!(g.levels.iter().all(|(_, b)| (0..b.n).all(|i| b.positions[i * 4 + 3] == 0.37)));
+        let back = crate::athc_v3::read_v3(&crate::athc_v3::write_v3(&g, crate::athc_v3::COMPRESSION_GZIP).unwrap()).unwrap();
+        assert!(back.header.has(FLAG_NODE_COVERAGE));
+        assert!(back.levels.iter().all(|(_, b)| (0..b.n).all(|i| b.positions[i * 4 + 3] == 0.37)));
+        let tree = VirtualTree::of_file(&back, false).unwrap();
+        let m = merged_block(&back, &tree);
+        let first = if tree.synth_root { 1 } else { 0 };
+        assert!((first..m.n).all(|i| m.positions[i * 4 + 3] == 0.37));
+        // Without the flag the decoder widens (and uncaps) them.
+        let mut plain = back.clone();
+        plain.header.flags &= !FLAG_NODE_COVERAGE;
+        let m = merged_block(&plain, &tree);
+        assert!((first..m.n).any(|i| m.positions[i * 4 + 3] != 0.37));
     }
 
     /// athenea's definitions on a hand tree: leaves 0, a merge r |cost|

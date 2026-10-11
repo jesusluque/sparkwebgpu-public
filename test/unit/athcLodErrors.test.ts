@@ -51,7 +51,7 @@ const { fetchAthcPage, openAthc } = await import("../../src/athc");
 const wasm = (await import("spark-rs")) as unknown as Record<string, any>;
 
 // hood_t16.athc with its levels' coverage and error bounds:
-// athc-convert hood_t16.athc hood_t16.lode.athc --coverage --lod-errors --gzip
+// athc-convert hood_t16.athc hood_t16.lode.athc --coverage --lod-errors --closed --gzip
 const BYTES = new Uint8Array(
   readFileSync(new URL("../fixtures/athc/hood_t16.lode.athc", import.meta.url)),
 );
@@ -109,7 +109,7 @@ function traverse(
   lodId: number,
   eye: number[],
   tau: number | undefined,
-  backCull: boolean,
+  backCullMinPx?: number,
 ) {
   const m = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, eye[0], eye[1], eye[2], 1];
   const r = wasm.traverse_lod_trees(
@@ -125,7 +125,7 @@ function traverse(
     new Float32Array([0]),
     new Float32Array([0]),
     tau === undefined ? undefined : PX * tau,
-    backCull,
+    backCullMinPx === undefined ? undefined : PX * backCullMinPx,
   ) as {
     culledCount: number;
     instanceIndices: { numSplats: number; indices: Uint32Array }[];
@@ -182,8 +182,8 @@ describe(".athc LoD error cut (LODE)", () => {
       [3, 2],
     ]) {
       const eye = [root[0], root[1] + dist * 0.3, root[2] + dist];
-      const { cut } = traverse(lodId, eye, tau, false);
-      const size = traverse(lodId, eye, undefined, false).cut;
+      const { cut } = traverse(lodId, eye, tau);
+      const size = traverse(lodId, eye, undefined).cut;
       expect(cut.length).toBeGreaterThan(0);
       const leafOwners = new Map<number, number>();
       for (const k of cut) {
@@ -206,7 +206,7 @@ describe(".athc LoD error cut (LODE)", () => {
     wasm.dispose_lod_tree(lodId);
   });
 
-  it("drops wholly back-facing nodes with their subtrees", () => {
+  it("leaves out the cut's coarse back-facing nodes", () => {
     const { lodId } = wasm.init_lod_tree(n, whole.lodTree, whole.lodError);
     const err = whole.lodError as Uint32Array;
     // The hood's mean facing, from its nodes' cone axes.
@@ -224,12 +224,18 @@ describe(".athc LoD error cut (LODE)", () => {
     const l = Math.hypot(...mean);
     const root = nodes(whole.lodTree, err, 1)[0].c;
     const eyeAt = (s: number) => root.map((v, i) => v + (s * 2 * mean[i]) / l);
-    const front = traverse(lodId, eyeAt(1), 1, true);
-    const back = traverse(lodId, eyeAt(-1), 1, true);
-    const backPlain = traverse(lodId, eyeAt(-1), 1, false);
+    const front = traverse(lodId, eyeAt(1), 1, 0);
+    const back = traverse(lodId, eyeAt(-1), 1, 0);
+    const backPlain = traverse(lodId, eyeAt(-1), 1);
     expect(front.culled).toBe(0);
     expect(back.culled).toBeGreaterThan(0);
-    expect(back.cut.length).toBeLessThan(backPlain.cut.length);
+    // Only nodes the cut draws: the same cut less the culled ones.
+    expect(back.cut.length + back.culled).toBe(backPlain.cut.length);
+    const kept = new Set(backPlain.cut);
+    for (const k of back.cut) expect(kept.has(k)).toBe(true);
+    // Coarse only: nothing as narrow as the cut's nodes is culled past a
+    // minimum wider than the whole hood.
+    expect(traverse(lodId, eyeAt(-1), 1, 1e6).culled).toBe(0);
     wasm.dispose_lod_tree(lodId);
   });
 });

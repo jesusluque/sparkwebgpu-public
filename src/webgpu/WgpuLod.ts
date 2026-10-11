@@ -51,12 +51,15 @@ export interface WgpuLodOptions {
    */
   lodErrorTau?: number;
   /**
-   * With the bounds' back-face cones (LODE): a merged node whose leaves all
-   * face away from the eye is dropped with its subtree. Glass, thin walls,
-   * double-sided pieces and clouds without normals carry no cone.
-   * @default false
+   * With the bounds' back-face cones (LODE): a node the cut draws whose
+   * leaves all face away from the eye is left out, when it is coarse
+   * (wider than lodBackCullMinPx on screen; a node the cut refines is never
+   * culled, so full detail never is). Only closed, non-glass pieces carry a
+   * cone (usd-athc: `athenea:splat:closed`). @default false
    */
   lodBackCull?: boolean;
+  /** The narrowest node lodBackCull culls, in pixels. @default 1 */
+  lodBackCullMinPx?: number;
   /**
    * tau that breathes with a budget (thread CG, Nanite-style), with
    * lodErrorTau > 0: a detail scale s in [min, 1] divides tau (the cut
@@ -264,11 +267,13 @@ export class WgpuLod {
     quat: THREE.Quaternion;
     pixelScaleLimit: number;
     errorLimit: number;
-    backCull: boolean;
+    backCull: number;
     maxSplats: number;
   };
   private lastPixelLimit?: number;
   private lastRaycastTime = Number.NEGATIVE_INFINITY;
+  /** lodBackCull's narrowest node, in the limit's angle units (-1: off). */
+  private backCullMin = -1;
 
   constructor(
     readonly renderer: WgpuSplatRenderer,
@@ -281,6 +286,7 @@ export class WgpuLod {
       lodTraverseMode: "standard",
       lodErrorTau: 0,
       lodBackCull: false,
+      lodBackCullMinPx: 1,
       lodErrorTauAuto: false,
       behindFoveate: 0.2,
       coneFov0: 90,
@@ -545,6 +551,10 @@ export class WgpuLod {
     }
     this.stats.tau = tau;
     const errorLimit = tau > 0 ? pixelScaleLimit * tau : 0;
+    // The narrowest node the back-face cull may drop (-1: off).
+    this.backCullMin = o.lodBackCull
+      ? pixelScaleLimit * Math.max(0, o.lodBackCullMinPx)
+      : -1;
     pixelScaleLimit *= o.lodRenderScale;
 
     camera.updateMatrixWorld();
@@ -556,7 +566,7 @@ export class WgpuLod {
       if (
         this.lastLod.pixelScaleLimit !== pixelScaleLimit ||
         this.lastLod.errorLimit !== errorLimit ||
-        this.lastLod.backCull !== o.lodBackCull ||
+        this.lastLod.backCull !== this.backCullMin ||
         this.lastLod.maxSplats !== maxSplats
       ) {
         this.dirty = true;
@@ -774,7 +784,7 @@ export class WgpuLod {
       quat: viewQuat,
       pixelScaleLimit,
       errorLimit,
-      backCull: this.options.lodBackCull,
+      backCull: this.backCullMin,
       maxSplats,
     };
     await this.traverse(
@@ -862,7 +872,7 @@ export class WgpuLod {
         instances,
         traverseMode: o.lodTraverseMode,
         errorLimit: errorLimit > 0 ? errorLimit : undefined,
-        backCull: o.lodBackCull,
+        backCullMin: this.backCullMin >= 0 ? this.backCullMin : undefined,
       },
     );
     this.stats.culled = culledCount ?? 0;
@@ -959,7 +969,7 @@ export class WgpuLod {
       instances,
       traverseMode: o.lodTraverseMode,
       errorLimit: errorLimit > 0 ? errorLimit : undefined,
-      backCull: o.lodBackCull,
+      backCullMin: this.backCullMin >= 0 ? this.backCullMin : undefined,
     });
     for (const [id, { numSplats, indices }] of Object.entries(keyIndices)) {
       const m = byId.get(id);

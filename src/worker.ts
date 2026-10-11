@@ -756,15 +756,18 @@ function traverseLodTrees({
   instances,
   traverseMode,
   errorLimit,
-  backCull,
+  backCullMin,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
   lastPixelLimit?: number;
   /** The error cut: tau x the size of a pixel (athc_lod_cut.rs). */
   errorLimit?: number;
-  /** Drop wholly back-facing nodes with their subtrees. */
-  backCull?: boolean;
+  /**
+   * Leave out the cut's back-facing nodes wider than this (a pixel's angle
+   * x lodBackCullMinPx); undefined: no culling.
+   */
+  backCullMin?: number;
   instances: Record<
     string,
     {
@@ -829,7 +832,7 @@ function traverseLodTrees({
     coneFov0s,
     coneFovs,
     errorLimit,
-    backCull,
+    backCullMin,
   ) as {
     culledCount?: number;
     instanceIndices: {

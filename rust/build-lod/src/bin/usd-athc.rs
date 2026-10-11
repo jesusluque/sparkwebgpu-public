@@ -40,8 +40,13 @@
 //! athenea's own, from her whole tree (`r |lodCost|`, raised up the tree, as
 //! lod_tree_cut.slang; `--lod-error-weights colour=,normal=,guard=,floor=`
 //! for her bounded form), otherwise ours (`athc_merge::group_cost`). The cone
-//! is left out (never culled) for glass, thin walls, a cloud without normals
-//! and with `--double-sided` (or a constant `athenea:splat:doubleSided`).
+//! is given only to a closed piece (a constant `athenea:splat:closed` 1, or
+//! `--closed`), never with `--double-sided`, and never to glass, thin walls
+//! or a cloud without normals. With `--tree` the error defaults to her
+//! bounded form (colour 10, normal 1, guard 4, floor 2; `own` for r|cost|).
+//! `--node-coverage` (or a constant `athenea:splat:treeCoverage` true): her
+//! merges' opacity is their composited coverage, kept as it is (the file is
+//! flagged FLAG_NODE_COVERAGE).
 //!
 //! For the web: `--add` appends more clouds of the same streams (one file for
 //! several of athenea's per-material clouds; `--add more.usdc::TEXT,TEXT`
@@ -317,6 +322,19 @@ impl Prim {
             }
         }
         Ok(Vec::new())
+    }
+
+    /// athenea's `primvars:athenea:splat:closed` (a constant, 1 a closed piece:
+    /// mesh2splat found no open edge), as a bool, int or float; None without.
+    fn closed(&self) -> Option<bool> {
+        match self.get("athenea:splat:closed")? {
+            Value::Bool(b) => Some(*b),
+            Value::Int(i) => Some(*i != 0),
+            Value::Float(f) => Some(*f != 0.0),
+            Value::Double(f) => Some(*f != 0.0),
+            Value::IntVec(v) if !v.is_empty() => Some(v.iter().all(|&i| i != 0)),
+            _ => None,
+        }
     }
 
     fn ints(&self, name: &str) -> Result<Vec<u32>> {
@@ -1108,6 +1126,15 @@ fn write_athl(
     }))
 }
 
+/// Whether a cloud's merged nodes get no back-face cone: only a closed piece
+/// (`athenea:splat:closed` 1, or `--closed`) gets one; `--double-sided`
+/// takes it away whatever the primvar says.
+fn no_cone(args: &[String], closed: Option<bool>) -> bool {
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let closed = flag("--closed") || closed == Some(true);
+    flag("--double-sided") || !closed
+}
+
 /// `--tree`: athenea's merge tree to a `.athc` (see the module).
 fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     let flag = |f: &str| args.iter().any(|a| a == f);
@@ -1154,7 +1181,16 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     };
     let constants = prim.constants();
     let up = up_axis(data.as_ref());
-    let streams = prim.streams()?;
+    let mut streams = prim.streams()?;
+    // athenea's `decimate --tree-coverage`: each merge's opacity is what its
+    // leaves cover composited on its plane. Kept as the opacity, as it is
+    // (the mass-ratio `coverage` primvar is not read over it, the file is
+    // flagged FLAG_NODE_COVERAGE so no reader recomputes or widens it).
+    // `--node-coverage`, or a constant `athenea:splat:treeCoverage` true.
+    let node_coverage = flag("--node-coverage") || prim.bool("athenea:splat:treeCoverage");
+    if node_coverage {
+        streams.coverage.clear();
+    }
     if streams.count != total {
         bail!("{tree_path}: {} gaussians, {} lodParent", streams.count, total);
     }
@@ -1198,7 +1234,8 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
         packed.block = spark_lib::athc_build::reorder(&packed.block, &rows);
     }
     let keep: Option<usize> = arg(args, "--keep-splats").map(|v| v.parse()).transpose().context("--keep-splats")?;
-    let o = ErrorOptions::new(ErrorView::around(packed.bounds_min, packed.bounds_max));
+    let mut o = ErrorOptions::new(ErrorView::around(packed.bounds_min, packed.bounds_max));
+    o.node_coverage = node_coverage;
     let (mut file, import) = levels_from_tree(&packed, &tree, keep, &o, options.chunk_splats)?;
     if flag("--lod-sizes") {
         file = with_lod_sizes(&file, &LodSizeOptions::parse(arg(args, "--lod-size-opts").unwrap_or(""))?);
@@ -1206,8 +1243,9 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     if flag("--lod-errors") {
         // athenea's own eps, rho and cone over her whole tree (lod_tree_cut.slang),
         // for the level groups that are her nodes; the rest (above her roots) ours.
-        let weights = ErrorWeights::parse(arg(args, "--lod-error-weights").unwrap_or(""))?;
-        let double_sided = flag("--double-sided") || prim.bool("athenea:splat:doubleSided");
+        // athenea's bounded error (her research prototype's weights) unless told.
+        let weights = ErrorWeights::athenea().parse_over(arg(args, "--lod-error-weights").unwrap_or(""))?;
+        let double_sided = no_cone(args, prim.closed());
         let bounds = athenea_tree_errors(&packed.block, &tree.parent, tree.leaves, &tree.cost, &weights, double_sided);
         let known: Known = import
             .level_nodes
@@ -1305,6 +1343,7 @@ fn main() -> Result<()> {
     let t = std::time::Instant::now();
     let data = read_layer(input)?;
     let prim = Prim::read(data.as_ref(), prim_path)?;
+    let closed = prim.closed();
     let up_axis = up_axis(data.as_ref());
     if flag("--list") {
         if let Some(up) = &up_axis {
@@ -1602,7 +1641,7 @@ fn main() -> Result<()> {
     if flag("--lod-errors") {
         // Our own merge cost (athc_merge::group_cost) over the octree's groups.
         let weights = ErrorWeights::parse(arg(&args, "--lod-error-weights").unwrap_or(""))?;
-        file = with_lod_errors(&file, None, &weights, flag("--double-sided"))?;
+        file = with_lod_errors(&file, None, &weights, no_cone(&args, closed))?;
     }
     let build_s = t.elapsed().as_secs_f32() - read_s;
     let compression = if flag("--gzip") {

@@ -474,13 +474,17 @@ pub fn traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
-    error_limit: Option<f32>, back_cull: Option<bool>,
+    error_limit: Option<f32>, back_cull_min: Option<f32>,
 ) -> anyhow::Result<Object, JsValue> {
     // The error cut (spark-lib athc_lod_cut): a node with bounds is measured
     // by its projected error, P = eps / max(d - rho, near), scaled so that
     // P <= error_limit compares as the size cut's pixel_scale_limit.
     let err_ratio = error_limit.filter(|&e| e > 0.0).map_or(0.0, |e| pixel_scale_limit / e);
-    let back_cull = back_cull.unwrap_or(false);
+    // Back-face culling of the cut's coarse nodes: a node the cut draws (not
+    // one it refines) whose whole normal cone faces away, when it is wider
+    // than `back_cull_min` on screen (the same angle units as the limit: a
+    // node at full detail is never culled). None: off.
+    let back_cull_min = back_cull_min.filter(|m| m.is_finite() && *m >= 0.0);
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
     if view_to_objects.len() != num_instances * 16 {
@@ -532,10 +536,6 @@ pub fn traverse_lod_trees(
             let root_page = root_pages[inst_index];
             let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
             let root_index = root_page << 16;
-            if back_cull && splats[root_index as usize].back_facing(instance.4) {
-                culled_count += 1;
-                continue;
-            }
             let pixel_scale = compute_pixel_scale(&splats[root_index as usize], instance);
             frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
             num_splats += 1;
@@ -547,6 +547,13 @@ pub fn traverse_lod_trees(
         
         let mut min_pixel_scale = f32::INFINITY;
         let mut leaf_count = 0;
+        let culled = |inst: u32, index: u32| -> bool {
+            back_cull_min.is_some_and(|min| {
+                let i = &instances[inst as usize];
+                let s = &i.1[index as usize];
+                s.size() / (s.center() - i.4).length().max(1.0e-6) > min && s.back_facing(i.4)
+            })
+        };
 
         while let Some(&(OrderedFloat(pixel_scale), inst_index, paged_index)) = frontier.peek() {
             min_pixel_scale = min_pixel_scale.min(pixel_scale);
@@ -583,44 +590,54 @@ pub fn traverse_lod_trees(
             }
 
             if last_chunk as usize >= chunk_to_page.len() {
-                output.push((inst_index, paged_index));
+                if culled(inst_index, paged_index) {
+                    culled_count += 1;
+                } else {
+                    output.push((inst_index, paged_index));
+                }
                 continue;
             }
             let first_page = chunk_to_page[first_chunk as usize];
             let last_page = chunk_to_page[last_chunk as usize];
 
             if first_page == 0xFFFFFFFF || last_page == 0xFFFFFFFF {
-                output.push((inst_index, paged_index));
+                if culled(inst_index, paged_index) {
+                    culled_count += 1;
+                } else {
+                    output.push((inst_index, paged_index));
+                }
                 continue;
             }
 
-            let mut culled_here = 0;
             for child in child_start..child_start + child_count as u32 {
                 let child_chunk = (child >> 16) as usize;
                 let child_page = chunk_to_page[child_chunk];
                 let paged_index = (child_page << 16) | (child & 0xffff);
-                // A wholly back-facing node goes with its subtree.
-                if back_cull && splats[paged_index as usize].back_facing(instance.4) {
-                    culled_here += 1;
-                    continue;
-                }
                 let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
                 if pixel_scale <= pixel_scale_limit {
-                    output.push((inst_index, paged_index));
+                    // In the cut: drawn, unless a coarse node facing away.
+                    if culled(inst_index, paged_index) {
+                        culled_count += 1;
+                    } else {
+                        output.push((inst_index, paged_index));
+                    }
                 } else {
                     frontier.push((OrderedFloat(pixel_scale), inst_index, paged_index));
                 }
             }
-            culled_count += culled_here;
 
-            num_splats = new_num_splats - culled_here as usize;
+            num_splats = new_num_splats;
         }
 
         let output_size = output.len();
         let frontier_size = frontier.len();
 
         for (_, inst_index, paged_index) in frontier.drain() {
-            output.push((inst_index, paged_index));
+            if culled(inst_index, paged_index) {
+                culled_count += 1;
+            } else {
+                output.push((inst_index, paged_index));
+            }
         }
 
         let mut instance_counts = vec![0; num_instances];
@@ -719,10 +736,10 @@ pub fn dynamic_traverse_lod_trees(
     cone_fov0s: &[f32], cone_fovs: &[f32],
     // readback: Uint32Array,
     // flag: bool,
-    error_limit: Option<f32>, back_cull: Option<bool>,
+    error_limit: Option<f32>, _back_cull_min: Option<f32>,
 ) -> anyhow::Result<Object, JsValue> {
+    // (The dynamic traversal does not cull.)
     let err_ratio = error_limit.filter(|&e| e > 0.0).map_or(0.0, |e| pixel_scale_limit / e);
-    let back_cull = back_cull.unwrap_or(false);
 
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
@@ -840,9 +857,6 @@ pub fn dynamic_traverse_lod_trees(
                         let child_chunk = (child >> 16) as usize;
                         let child_page = chunk_to_page[child_chunk];
                         let paged_index = (child_page << 16) | (child & 0xffff);
-                        if back_cull && splats[paged_index as usize].back_facing(instance.4) {
-                            continue;
-                        }
                         let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
                         if pixel_scale <= current_scale {
                             if pixel_scale <= pixel_scale_limit {

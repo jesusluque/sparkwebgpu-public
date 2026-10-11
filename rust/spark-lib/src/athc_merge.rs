@@ -142,6 +142,10 @@ pub struct ErrorOptions {
     /// Each pass merges a greedy matching of every cluster's cheapest
     /// candidates instead of the pairs that chose each other (`greedy_to`).
     pub matching: bool,
+    /// `levels_from_tree`: the tree's merges carry their own coverage as
+    /// their opacity (athenea's `--tree-coverage`): the file is flagged
+    /// `FLAG_NODE_COVERAGE` and nothing recomputes it.
+    pub node_coverage: bool,
     /// With `matching`, a pass merges at most this fraction of the clusters
     /// (a matching offers about twice the pairs mutual choice does, and
     /// half of them a pass is a coarser cheapest-first).
@@ -187,6 +191,7 @@ impl ErrorOptions {
             surfel_min: 4,
             matching: true,
             pass_fraction: 0.125,
+            node_coverage: false,
         }
     }
 }
@@ -1706,7 +1711,11 @@ pub fn levels_from_tree(
         *block = merged;
     }
     // The groups' whole coverage over the splats (athenea's own W / A when
-    // the splats are its leaves or its nodes).
+    // the splats are its leaves or its nodes) -- or, when her merges carry
+    // their composited coverage, theirs as it is.
+    if o.node_coverage {
+        out.header.flags |= crate::athc::FLAG_NODE_COVERAGE;
+    }
     crate::athc::uncap_levels(&mut out);
     import.groups = out.levels.iter().map(|(_, b)| b.n).collect();
     Ok((out, import))

@@ -366,7 +366,8 @@ rho(n)   = max(2 max sigma(n), max over children |mu(n) - mu(c)| + rho(c))
 theta(n) = max over children theta(c) + angle(n_c, n_n)      (leaf: 0)
 P(n)     = eps(n) ppu / max(d(n) - rho(n), 1e-3)             (pixels)
 drawn    : P(n) <= tau < P(parent)
-culled   : n . v < -sin(theta + asin(rho / d))               (with its subtree)
+culled   : a node the cut draws, wider than lodBackCullMinPx (1) on screen,
+           with n . v < -sin(theta + asin(rho / d))
 ```
 
 `eps` grows up the tree and each sphere holds its children's, so `P` is
@@ -379,21 +380,30 @@ bound per unit mass with the covariances floored at 1% of the merged mean
 variance, plus 128 x the mass-weighted variance of the linear base colour
 and of the key mix, plus 32 x that of metallic, sqrt roughness and
 transmission). The two costs are on different scales: a tau for one is not
-a tau for the other. `--lod-error-weights colour=,normal=,guard=,floor=`
-gives athenea's bounded form (treeErrorBounded: `r (|cost| + w_c s_c +
-w_n theta^2 / alpha)`, a merge past the guards `max(guard e, floor r)`);
-the default is her treeErrorOwn. The cone axis is the node's normal (the
+a tau for the other. Her trees default to her bounded form (treeErrorBounded
+with Decimate.cpp's weights: `r (|cost| + 10 s_c + theta^2 / alpha)`, a
+merge past the guards (cost < 0) `max(4 e, 2 r)`; s_c the spread of the
+stored base colour, clamped at 0, climbed as the cone is; alpha
+`max(roughness, 0.02)^2`, roughness 0.5 without a material); ours to
+`r |cost|`. `--lod-error-weights colour=,normal=,guard=,floor=` (or `own`
+for treeErrorOwn) changes either. The cone axis is the node's normal (the
 normals stream), rounded to 8 bits a component with theta widened by the
-rounding; glass, thin walls, clouds without normals and `--double-sided`
-(or a constant `athenea:splat:doubleSided`) carry none. The decoder's
+rounding. Only a closed piece carries one: athenea's constant
+`primvars:athenea:splat:closed` 1 (mesh2splat found no open edge; the
+USD's doubleSided is set on too many meshes to tell), or `--closed`;
+`--double-sided` takes it away whatever the primvar says. Glass, thin
+walls and clouds without normals never carry one. The decoder's
 synthetic root takes level 1's largest eps, its sphere round theirs, no
 cone.
 
 Spark's traversal (spark-rs `lod_tree.rs`) takes them as an opt-in mode:
 `WgpuLod`'s `lodErrorTau` (SparkRenderer's, tau in pixels, 0 off) refines
 a node with bounds while `P > tau` (a node without them, a tree without
-them, by the size cut), and `lodBackCull` drops wholly back-facing nodes
-with their subtrees. A merged ATHV page carries them after its sizes (or
+them, by the size cut), and `lodBackCull` leaves out the nodes the cut
+draws whose whole cone faces away, when they are wider than
+`lodBackCullMinPx` (1) on screen: a node the cut refines is never culled,
+so full detail never is (culling it brightened the grille past its leaves:
+their back faces show through the semi-transparent fronts). A merged ATHV page carries them after its sizes (or
 its group ranges), two words a node, with bit 2 of its decode flags
 (`ATHV_LOD_ERRORS`); the decoded splats carry them as `extra.lodError`; the
 browser fetches `LODE` with the levels and never with a chunk. A v2 file
@@ -402,6 +412,18 @@ never holds them, and a reader before them refuses the flag.
 `usd-athc --lod-errors` (any conversion) and `athc-convert --lod-errors`
 write them; a file that has them keeps them unless its tree changes (a cut,
 `--error`, `--rebuild-frame`: then ours), `--no-lod-errors` drops them.
+
+### A producer's own coverage (flag bit 8)
+
+athenea's `decimate --tree-coverage` gives each merge of her tree, as its
+opacity, what its leaves cover composited on its plane (an 8 x 8 grid over
+its +-2 sigma, `1 - prod(1 - alpha G)`). Header flag bit 8
+(`FLAG_NODE_COVERAGE`) says the levels' opacities are such a coverage:
+kept as stored -- never replaced by the mass ratio (`uncap_levels`), and
+the decoder's widening only orients those nodes (`widen_levels`), it does
+not divide them by an area it adds. `usd-athc --tree` sets it with
+`--node-coverage` or a constant `athenea:splat:treeCoverage` true, and
+then reads the merges' opacity, not the mass-ratio `coverage` primvar.
 
 ### The curvature (`CURV`)
 

@@ -812,6 +812,14 @@ fn write_v3_impl(
             to.lod_error = if from.lod_error.is_empty() { vec![0; from.n * w] } else { from.lod_error.clone() };
         }
     }
+    // So does a producer's own coverage (FLAG_NODE_COVERAGE): the levels'
+    // opacities as they are, never capped.
+    if file.header.has(crate::athc::FLAG_NODE_COVERAGE) {
+        v2.header.flags |= crate::athc::FLAG_NODE_COVERAGE;
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.positions = from.positions.clone();
+        }
+    }
     // So do merged opacities past 0.99 (athc::coverage_ratios), which the
     // v2 writer caps as athenea's files hold them.
     if file.over_capped() {

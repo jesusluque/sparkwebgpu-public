@@ -80,54 +80,70 @@ function planeOffsets(n: number) {
  * last node goes. About 16 KB a page, where a Map takes ~40 bytes a node.
  */
 export class NodeIndex {
-  private pages = new Map<number, { slots: Int32Array; count: number }>();
+  /** A page's places (by page number: an array index, not a Map lookup). */
+  private pages: (Int32Array | undefined)[] = [];
+  private counts: number[] = [];
+  private held = 0;
   size = 0;
 
   /** Places a page holds at most (a pool slot's nodes). */
   constructor(readonly places = PAGE_PLACES) {}
 
   get(key: number): number | undefined {
-    const p = this.pages.get(Math.floor(key / PAGE_PLACES));
-    if (!p) return undefined;
-    const s = p.slots[key % PAGE_PLACES];
+    const p = this.pages[key >>> 12];
+    if (p === undefined) return undefined;
+    const s = p[key & 4095];
     return s < 0 ? undefined : s;
   }
 
+  /** The slot of `key`, or -1 (get without the undefined). */
+  slot(key: number): number {
+    const p = this.pages[key >>> 12];
+    return p === undefined ? -1 : p[key & 4095];
+  }
+
   set(key: number, slot: number) {
-    const g = Math.floor(key / PAGE_PLACES);
-    let p = this.pages.get(g);
-    if (!p) {
-      p = { slots: new Int32Array(this.places).fill(-1), count: 0 };
-      this.pages.set(g, p);
+    const g = key >>> 12;
+    let p = this.pages[g];
+    if (p === undefined) {
+      p = new Int32Array(this.places).fill(-1);
+      this.pages[g] = p;
+      this.counts[g] = 0;
+      this.held += 1;
     }
-    const k = key % PAGE_PLACES;
-    if (p.slots[k] < 0) {
-      p.count += 1;
+    const k = key & 4095;
+    if (p[k] < 0) {
+      this.counts[g] += 1;
       this.size += 1;
     }
-    p.slots[k] = slot;
+    p[k] = slot;
   }
 
   delete(key: number) {
-    const g = Math.floor(key / PAGE_PLACES);
-    const p = this.pages.get(g);
-    if (!p) return;
-    const k = key % PAGE_PLACES;
-    if (p.slots[k] < 0) return;
-    p.slots[k] = -1;
-    p.count -= 1;
+    const g = key >>> 12;
+    const p = this.pages[g];
+    if (p === undefined) return;
+    const k = key & 4095;
+    if (p[k] < 0) return;
+    p[k] = -1;
+    this.counts[g] -= 1;
     this.size -= 1;
-    if (p.count === 0) this.pages.delete(g);
+    if (this.counts[g] === 0) {
+      this.pages[g] = undefined;
+      this.held -= 1;
+    }
   }
 
   clear() {
-    this.pages.clear();
+    this.pages = [];
+    this.counts = [];
+    this.held = 0;
     this.size = 0;
   }
 
   /** Bytes held by the index. */
   get bytes() {
-    return this.pages.size * this.places * 4;
+    return this.held * this.places * 4;
   }
 }
 
@@ -190,8 +206,8 @@ export class NodeSlotAllocator {
 
   /** The slot of `key` if it is held (and in this frame's cut from now), else -1. */
   use(key: number) {
-    const s = this.slotOf.get(key);
-    if (s === undefined) return -1;
+    const s = this.slotOf.slot(key);
+    if (s < 0) return -1;
     this.stamp[s] = this.frame;
     this.stats.reused += 1;
     return s;
@@ -246,8 +262,13 @@ export class NodeSlotAllocator {
    * not in it go idle, oldest first to be taken.
    */
   commit(cut: Uint32Array) {
-    for (const s of this.lastCut) {
-      if (this.stamp[s] !== this.frame && this.keyOf[s] >= 0) this.idle.push(s);
+    const last = this.lastCut;
+    const stamp = this.stamp;
+    const keyOf = this.keyOf;
+    const frame = this.frame;
+    for (let k = 0; k < last.length; k++) {
+      const s = last[k];
+      if (stamp[s] !== frame && keyOf[s] >= 0) this.idle.push(s);
     }
     this.lastCut = cut;
     this.lastCutStamp = this.frame;
@@ -718,17 +739,38 @@ export function packRunRecords(
   page: number,
   base: number,
   out: Uint8Array,
-  first: number,
+  first: number | ArrayLike<number>,
 ) {
   const offs = runPlaneOffsets(m);
   const R = NODE_RECORD_WORDS * 4;
+  const F = RECORD_FIELDS.length;
+  // Each field's source plane start, width, and offset in the record.
+  const src = new Int32Array(F);
+  const wid = new Int32Array(F);
+  const dst = new Int32Array(F);
+  for (let f = 0; f < F; f++) {
+    const [, plane, off] = RECORD_FIELDS[f];
+    src[f] = offs[plane];
+    wid[f] = COMPACT_PLANE_WIDTHS[plane];
+    dst[f] = off;
+  }
+  const at0 = typeof first === "number" ? first : -1;
+  const pos = typeof first === "number" ? null : first;
   for (let k = 0; k < locals.length; k++) {
     const j = locals[k];
-    const at = (first + k) * R;
-    for (const [, plane, off] of RECORD_FIELDS) {
-      const w = COMPACT_PLANE_WIDTHS[plane];
-      const from = offs[plane] + j * w;
-      for (let b = 0; b < w; b++) out[at + off + b] = planes[from + b];
+    const at = (pos ? pos[k] : at0 + k) * R;
+    for (let f = 0; f < F; f++) {
+      const w = wid[f];
+      const from = src[f] + j * w;
+      const to = at + dst[f];
+      out[to] = planes[from];
+      if (w > 1) {
+        out[to + 1] = planes[from + 1];
+        if (w > 2) {
+          out[to + 2] = planes[from + 2];
+          if (w > 3) out[to + 3] = planes[from + 3];
+        }
+      }
     }
     const origin = (page + (base + j) * 65536) >>> 0;
     out[at + 40] = origin & 0xff;
@@ -845,26 +887,40 @@ export class RunPayloadStore {
    */
   trim() {
     if (this.bytes <= this.budget) return 0;
-    const cands: [number, number, number, number][] = [];
+    // Candidates as sort keys (one typed sort, no tuples): class other
+    // first, then culled, the longest unmarked first; the low 26 bits a
+    // candidate's index into `who`.
+    let count = 0;
+    for (const p of this.pages.values()) count += p.bytes.length;
+    const keys = new Float64Array(count);
+    const who: [number, RunPage, number][] = [];
+    let k = 0;
     for (const [page, p] of this.pages) {
       for (let r = 0; r < p.bytes.length; r++) {
         if (!p.bytes[r]) continue;
         const cls = p.stamp[r] === this.frame ? p.cls[r] : RUN_OTHER;
         if (cls === RUN_CUT) continue;
-        cands.push([cls, p.stamp[r], page, r]);
+        const age = Math.min(p.stamp[r], 0xffffff);
+        keys[k] = ((2 - cls) * 0x1000000 + age) * 0x4000000 + who.length;
+        who.push([page, p, r]);
+        k += 1;
       }
     }
-    cands.sort((a, b) => b[0] - a[0] || a[1] - b[1]);
+    const order = keys.subarray(0, k).sort();
     let dropped = 0;
-    for (const [, , page, r] of cands) {
-      if (this.bytes <= this.budget) break;
-      const p = this.pages.get(page) as RunPage;
+    for (let q = 0; q < k && this.bytes > this.budget; q++) {
+      const [, p, r] = who[order[q] % 0x4000000];
       this.bytes -= (p.bytes[r] as Uint8Array).byteLength;
       p.bytes[r] = null;
       dropped += 1;
     }
     this.stats.dropped += dropped;
     return dropped;
+  }
+
+  /** A page's runs: its nodes and nodes a run (undefined: not held). */
+  runInfo(page: number): { n: number; run: number } | undefined {
+    return this.pages.get(page);
   }
 
   /** Whether run r is inflated already (no inflate to pack it). */

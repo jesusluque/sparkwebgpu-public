@@ -690,6 +690,8 @@ export class CompactBandStreamer {
     occluded: 0,
     tau: 0,
     traverseMs: 0,
+    /** The WASM traversal alone (the rest: the worker's round trip). */
+    traverseWasmMs: 0,
     starved: 0,
     /** Node pool: nodes uploaded, their writes, gunzips and their ms, at the last update. */
     uploaded: 0,
@@ -699,6 +701,9 @@ export class CompactBandStreamer {
     packMs: 0,
     /** Node pool: cut nodes with no payload at hand, at the last update. */
     missing: 0,
+    /** Node pool: of those, whose run was dropped (fetched again), and left by the decode budget. */
+    missDropped: 0,
+    missDeferred: 0,
     /** Node pool: of those, drawn as their parent or children. */
     substituted: 0,
     /** Node pool: cut nodes with no slot (past maxCapacity). */
@@ -970,9 +975,8 @@ export class CompactBandStreamer {
       | undefined;
     if (Object.keys(instances).length) {
       const t0 = performance.now();
-      const { keyIndices, culledCount, occludedCount, chunks } = (await lod(
-        "traverseLodTrees",
-        {
+      const { keyIndices, culledCount, occludedCount, chunks, wasmMs } =
+        (await lod("traverseLodTrees", {
           maxSplats:
             this.pool instanceof CompactNodePool
               ? this.pool.maxCapacity
@@ -985,24 +989,27 @@ export class CompactBandStreamer {
           backCullMin: this.options.backCull === false ? undefined : -1,
           occlusionCull: this.options.occlusion === true,
           neighbours: !!this.runs,
-        },
-      )) as {
-        keyIndices: Record<
-          string,
-          {
-            numSplats: number;
-            indices: Uint32Array;
-            parents?: Uint32Array;
-            firstKids?: Uint32Array;
-            kidCounts?: Uint32Array;
-            culled?: Uint32Array;
-          }
-        >;
-        culledCount?: number;
-        occludedCount?: number;
-        chunks?: [number, number][];
-      };
+          // The budget never binds the cut (it fits the pool): any order.
+          unordered: true,
+        })) as {
+          keyIndices: Record<
+            string,
+            {
+              numSplats: number;
+              indices: Uint32Array;
+              parents?: Uint32Array;
+              firstKids?: Uint32Array;
+              kidCounts?: Uint32Array;
+              culled?: Uint32Array;
+            }
+          >;
+          culledCount?: number;
+          occludedCount?: number;
+          chunks?: [number, number][];
+          wasmMs?: number;
+        };
       this.stats.traverseMs = performance.now() - t0;
+      this.stats.traverseWasmMs = wasmMs ?? 0;
       // The pages the traversal asked for, by tree (spark-rs touched).
       if (this.pruning() && chunks) {
         const wanted = new Map<number, Set<number>>();
@@ -1198,6 +1205,8 @@ export class CompactBandStreamer {
       kidCounts: Uint32Array;
     },
   ) {
+    // Typed arrays throughout (thread CU): no per-node objects, Sets or
+    // comparator sorts; the misses are sorted as packed float keys.
     const alloc = this.nodes as NodeSlotAllocator;
     const pool = this.pool as CompactNodePool;
     const runs = this.runs;
@@ -1210,186 +1219,284 @@ export class CompactBandStreamer {
       path?.setPagedCloud(pool);
     }
     alloc.begin();
-    const keys = new Float64Array(list.length);
-    const out = new Int32Array(list.length);
-    const miss: number[] = [];
-    for (let k = 0; k < list.length; k++) {
-      const key = this.keyOfIndex(list[k]);
+    const n = list.length;
+    const N = this.slotNodes;
+    // Pool index -> node key: i + kb[slot] (the slot's page's first key less its first index).
+    const kb = this.slotKeyBases();
+    const keys = new Int32Array(n);
+    const out = new Int32Array(n);
+    // Misses as key * 2^23 + k (exact in a double; a cut under 2^23).
+    const SH = 8388608;
+    const missKeys = new Float64Array(n);
+    let missN = 0;
+    for (let k = 0; k < n; k++) {
+      const i = list[k];
+      const key = i + kb[(i / N) | 0];
       keys[k] = key;
       const s = alloc.use(key);
-      if (s < 0) miss.push(k);
+      if (s < 0) missKeys[missN++] = key * SH + k;
       else out[k] = s;
     }
-    // The misses with their payload at hand (runs: not dropped).
-    const groupOf = (key: number) => {
-      const g = Math.floor(key / PAGE_PLACES);
-      if (!runs) return g * 64;
-      const r = runs.runOf(g, key - g * PAGE_PLACES);
-      return g * 64 + (r ? r.r : 0);
-    };
-    miss.sort((a, b) => keys[a] - keys[b]);
-    const ready: number[] = [];
-    const absent: number[] = [];
+    const miss = missKeys.subarray(0, missN).sort();
+    // Each miss: ready (payload at hand, under the budgets) or absent.
+    // CMPC v4: one decision a run (the misses of a run are consecutive).
+    const ready = new Int32Array(missN);
+    let readyN = 0;
+    const failed = new Uint8Array(n);
+    let failedN = 0;
     this.deferred = false;
     const cap =
       this.options.nodePool?.uploadsPerUpdate ?? Number.POSITIVE_INFINITY;
     const inflateCap = this.options.nodePool?.inflatesPerUpdate ?? 256;
-    const inflating = new Set<number>();
-    for (const k of miss) {
-      // A run with a cut node still to upload stays (any protection mode).
-      if (runs) {
-        const gm = Math.floor(keys[k] / PAGE_PLACES);
-        runs.mark(gm, keys[k] - gm * PAGE_PLACES, RUN_CUT);
+    let inflating = 0;
+    let missDropped = 0;
+    let missDeferred = 0;
+    let q = 0;
+    while (q < missN) {
+      const k0 = miss[q] % SH;
+      const key0 = keys[k0];
+      const g = key0 >>> 12;
+      const info = runs?.runInfo(g);
+      // The group: a run's misses (v4), or a page's (a section).
+      const r = info ? ((key0 & 4095) / info.run) | 0 : -1;
+      let e = q + 1;
+      while (e < missN) {
+        const key = keys[miss[e] % SH];
+        if (key >>> 12 !== g) break;
+        if (info && (((key & 4095) / info.run) | 0) !== r) break;
+        e++;
       }
-      if (ready.length >= cap) {
-        absent.push(k);
-        continue;
-      }
+      let ok = true;
       if (runs) {
-        // The decode budget: runs not inflated yet, at most inflateCap.
-        const g0 = Math.floor(keys[k] / PAGE_PLACES);
-        const r0 = runs.runOf(g0, keys[k] - g0 * PAGE_PLACES);
-        if (r0 && !runs.isInflated(g0, r0.r) && !runs.missing(g0, r0.r)) {
-          const rk = g0 * 64 + r0.r;
-          if (!inflating.has(rk)) {
-            if (inflating.size >= inflateCap) {
-              absent.push(k);
+        if (!info) ok = false;
+        else {
+          // A run with a cut node still to upload stays (any protection mode).
+          runs.mark(g, key0 & 4095, RUN_CUT);
+          if (runs.missing(g, r)) {
+            this.wantRun(g, r);
+            ok = false;
+            missDropped += e - q;
+          } else if (!runs.isInflated(g, r)) {
+            // The decode budget: runs not inflated yet, at most inflateCap.
+            if (inflating >= inflateCap) {
               this.deferred = true;
-              continue;
-            }
-            inflating.add(rk);
+              ok = false;
+              missDeferred += e - q;
+            } else inflating += 1;
           }
         }
       }
-      const g = Math.floor(keys[k] / PAGE_PLACES);
-      const place = keys[k] - g * PAGE_PLACES;
-      const r = runs?.runOf(g, place);
-      if (runs && (!r || runs.missing(g, r.r))) {
-        if (r) this.wantRun(g, r.r);
-        absent.push(k);
-      } else {
-        ready.push(k);
+      for (let x = q; x < e; x++) {
+        const k = miss[x] % SH;
+        if (ok && readyN < cap) ready[readyN++] = k;
+        else {
+          failed[k] = 1;
+          failedN += 1;
+        }
       }
+      q = e;
     }
-    const got: number[] = [];
-    const gotSlot: number[] = [];
+    // Slots for the ready (in key order: a run's nodes together).
+    const got = new Int32Array(readyN);
+    const gotSlot = new Float64Array(readyN);
+    let gotN = 0;
     let noSlot = 0;
-    for (const k of ready) {
+    for (let x = 0; x < readyN; x++) {
+      const k = ready[x];
       const s = alloc.allocate(keys[k]);
       if (s < 0) {
         noSlot += 1;
+        failed[k] = 1;
+        failedN += 1;
         continue;
       }
       out[k] = s;
-      got.push(k);
-      gotSlot.push(s);
+      gotSlot[gotN] = s * SH + gotN;
+      got[gotN++] = k;
+    }
+    // Each record's place in slot order (one write a run of slots).
+    const bySlot = gotSlot.subarray(0, gotN).sort();
+    const pos = new Int32Array(gotN);
+    const slots = new Uint32Array(gotN);
+    for (let x = 0; x < gotN; x++) {
+      const v = bySlot[x];
+      const w = v % SH;
+      pos[w] = x;
+      slots[x] = (v - w) / SH;
     }
     // Packed group by group (a page, or a page's run: one inflate each),
-    // then written in slot order (runs of slots, one write each).
+    // straight into slot order.
     const R = NODE_RECORD_WORDS * 4;
-    const packed = new Uint8Array(got.length * R);
-    const dropped = new Set<number>();
+    const records = new Uint8Array(gotN * R);
+    const dropped: number[] = [];
     let j = 0;
-    while (j < got.length) {
-      const grp = groupOf(keys[got[j]]);
+    while (j < gotN) {
+      const key0 = keys[got[j]];
+      const g = key0 >>> 12;
+      const info = runs?.runInfo(g);
+      const r = info ? ((key0 & 4095) / info.run) | 0 : -1;
       let e = j + 1;
-      while (e < got.length && groupOf(keys[got[e]]) === grp) e++;
-      const g = Math.floor(keys[got[j]] / PAGE_PLACES);
-      if (runs) {
-        const r = grp - g * 64;
-        const info = runs.runOf(g, r * 64) as { base: number; m: number };
+      while (e < gotN) {
+        const key = keys[got[e]];
+        if (key >>> 12 !== g) break;
+        if (info && (((key & 4095) / info.run) | 0) !== r) break;
+        e++;
+      }
+      const at = pos.subarray(j, e);
+      if (runs && info) {
+        const base = r * info.run;
+        const m = Math.min(info.run, info.n - base);
         const planes = runs.planes(g, r);
         const locals = new Uint32Array(e - j);
-        for (let q = j; q < e; q++) {
-          locals[q - j] = keys[got[q]] - g * PAGE_PLACES - info.base;
-        }
-        if (planes)
-          packRunRecords(planes, info.m, locals, g, info.base, packed, j);
-        else for (let q = j; q < e; q++) dropped.add(got[q]);
+        for (let x = j; x < e; x++)
+          locals[x - j] = (keys[got[x]] & 4095) - base;
+        if (planes) packRunRecords(planes, m, locals, g, base, records, at);
+        else for (let x = j; x < e; x++) dropped.push(x);
       } else {
         const owner = this.pageOwner[g];
-        const n = this.pieces[owner.piece].rows[owner.page].count;
+        const pn = this.pieces[owner.piece].rows[owner.page].count;
         const raw = store?.sectionOf(g) ?? null;
         const places = new Uint32Array(e - j);
-        for (let q = j; q < e; q++)
-          places[q - j] = keys[got[q]] - g * PAGE_PLACES;
-        if (raw) packPageRecords(raw, n, places, g, packed, j);
-        else for (let q = j; q < e; q++) dropped.add(got[q]);
+        for (let x = j; x < e; x++) places[x - j] = keys[got[x]] & 4095;
+        if (raw) {
+          const tmp = new Uint8Array(places.length * R);
+          packPageRecords(raw, pn, places, g, tmp, 0);
+          for (let x = 0; x < places.length; x++) {
+            records.set(tmp.subarray(x * R, x * R + R), at[x] * R);
+          }
+        } else for (let x = j; x < e; x++) dropped.push(x);
       }
       j = e;
     }
-    const order = got.map((_, q) => q).sort((a, b) => gotSlot[a] - gotSlot[b]);
-    const records = new Uint8Array(order.length * R);
-    const slots = new Uint32Array(order.length);
-    order.forEach((q, k) => {
-      records.set(packed.subarray(q * R, q * R + R), k * R);
-      slots[k] = gotSlot[q];
-    });
-    this.stats.writes = order.length ? pool.writeRecords(slots, records) : 0;
-    this.stats.uploaded = order.length;
+    // A dropped record's slot is written with nothing: left out of the writes.
+    let wSlots = slots;
+    let wRecords = records;
+    if (dropped.length) {
+      const bad = new Uint8Array(gotN);
+      for (const x of dropped) {
+        const k = got[x];
+        bad[pos[x]] = 1;
+        alloc.release(out[k]);
+        failed[k] = 1;
+        failedN += 1;
+      }
+      const keepN = gotN - dropped.length;
+      wSlots = new Uint32Array(keepN);
+      wRecords = new Uint8Array(keepN * R);
+      let y = 0;
+      for (let x = 0; x < gotN; x++) {
+        if (bad[x]) continue;
+        wSlots[y] = slots[x];
+        wRecords.set(records.subarray(x * R, x * R + R), y * R);
+        y++;
+      }
+    }
+    this.stats.writes = wSlots.length ? pool.writeRecords(wSlots, wRecords) : 0;
+    this.stats.uploaded = wSlots.length;
     this.stats.decodes =
       (runs ? runs.stats.inflates : (store?.stats.decodes ?? 0)) - d0;
     this.stats.decodeMs =
       (runs ? runs.stats.inflateMs : (store?.stats.decodeMs ?? 0)) - ms0;
-    for (const k of dropped) alloc.release(out[k]);
     // The rest: drawn as their parent or children when held, else not yet.
-    const failed = new Set<number>(dropped);
-    const placed = new Set(got);
-    for (const k of ready) if (!placed.has(k)) failed.add(k);
-    for (const k of absent) failed.add(k);
     let result: Uint32Array;
     let substituted = 0;
-    if (failed.size) {
-      const subs = new Set<number>();
-      const keep: number[] = [];
-      for (let k = 0; k < list.length; k++) {
-        if (!failed.has(k)) {
-          keep.push(out[k]);
+    if (failedN) {
+      // Each slot drawn once: the cut's own slots marked first, then a
+      // substitute only if not marked (an epoch stamp a slot).
+      const seen = this.seenStamps(alloc.capacity);
+      const epoch = ++this.seenEpoch;
+      for (let k = 0; k < n; k++) if (!failed[k]) seen[out[k]] = epoch;
+      let res = new Uint32Array(n + 64);
+      let rn = 0;
+      const push = (s: number) => {
+        if (rn === res.length) {
+          const g2 = new Uint32Array(res.length * 2);
+          g2.set(res);
+          res = g2;
+        }
+        res[rn++] = s;
+      };
+      for (let k = 0; k < n; k++) {
+        if (!failed[k]) {
+          push(out[k]);
           continue;
         }
         if (!near) continue;
         const parent = near.parents[k];
         const ps =
-          parent !== 0xffffffff ? alloc.use(this.keyOfIndex(parent)) : -1;
+          parent !== 0xffffffff ? alloc.use(parent + kb[(parent / N) | 0]) : -1;
         if (ps >= 0) {
-          if (!subs.has(ps)) keep.push(ps);
-          subs.add(ps);
+          if (seen[ps] !== epoch) {
+            seen[ps] = epoch;
+            push(ps);
+          }
           substituted += 1;
           continue;
         }
         const first = near.firstKids[k];
         const count = near.kidCounts[k];
         if (first === 0xffffffff || !count) continue;
-        const kids: number[] = [];
-        for (let c = 0; c < count; c++) {
-          const s = alloc.use(this.keyOfIndex(first + c));
+        if (this.kidScratch.length < count)
+          this.kidScratch = new Int32Array(count * 2);
+        const ks = this.kidScratch;
+        let c = 0;
+        for (; c < count; c++) {
+          const i = first + c;
+          const s = alloc.use(i + kb[(i / N) | 0]);
           if (s < 0) break;
-          kids.push(s);
+          ks[c] = s;
         }
-        if (kids.length === count) {
-          for (const s of kids) if (!subs.has(s)) keep.push(s);
-          for (const s of kids) subs.add(s);
+        if (c === count) {
+          for (let x = 0; x < count; x++) {
+            const s = ks[x];
+            if (seen[s] !== epoch) {
+              seen[s] = epoch;
+              push(s);
+            }
+          }
           substituted += 1;
         }
       }
-      // A substitute also in the cut itself is drawn once.
-      const seen = new Set<number>();
-      result = Uint32Array.from(
-        keep.filter((s) => {
-          if (seen.has(s)) return false;
-          seen.add(s);
-          return true;
-        }),
-      );
+      result = res.slice(0, rn);
     } else {
       result = Uint32Array.from(out);
     }
-    this.stats.missing = failed.size;
+    this.stats.missing = failedN;
+    this.stats.missDropped = missDropped;
+    this.stats.missDeferred = missDeferred;
     this.stats.substituted = substituted;
     this.stats.noSlot = noSlot;
     alloc.commit(result);
     this.stats.packMs = performance.now() - t0 - this.stats.decodeMs;
     return result;
+  }
+
+  private seenEpoch = 0;
+  private seen = new Uint32Array(0);
+  private kidScratch = new Int32Array(64);
+
+  /** An epoch stamp a node slot (grown with the pool). */
+  private seenStamps(capacity: number) {
+    if (this.seen.length < capacity) {
+      const s = new Uint32Array(capacity);
+      s.set(this.seen);
+      this.seen = s;
+    }
+    return this.seen;
+  }
+
+  /** Each pool slot's key base: a node key is its pool index plus it. */
+  private slotKeyBases() {
+    const N = this.slotNodes;
+    const kb = new Int32Array(this.slotOwner.length);
+    for (let s = 0; s < kb.length; s++) {
+      const o = this.slotOwner[s];
+      // A slot with no page: keys below 0 (never held).
+      kb[s] = o
+        ? (this.pageBase[o.piece] + o.page) * PAGE_PLACES - s * N
+        : -(1 << 30);
+    }
+    return kb;
   }
 
   /** Nodes left for the next update by the decode budget. */

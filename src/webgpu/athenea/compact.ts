@@ -96,7 +96,18 @@ export interface CompactLayout {
    * Band pages in pool slots (compactPages.ts CompactPagePool): `words`
    * are then offsets within a slot, the gaussians slotNodes a slot.
    */
-  paged?: { slotNodes: number; slotWords: number; slotsBase: number };
+  paged?: {
+    slotNodes: number;
+    slotWords: number;
+    slotsBase: number;
+    /**
+     * A node pool (compactPages.ts CompactNodePool, thread CT): words a
+     * node record (slotNodes 0, `words` bytes in the record), and the
+     * pages' head table (words).
+     */
+    nodeWords?: number;
+    headTable?: number;
+  };
 }
 
 export interface CompactCloud {
@@ -931,6 +942,8 @@ export class CompactRelitPath {
       slotNodes: paged?.slotNodes ?? 0,
       slotWords: paged?.slotWords ?? 0,
       slotsBase: paged?.slotsBase ?? 0,
+      nodeWords: paged?.nodeWords ?? 0,
+      headTable: paged?.headTable ?? 0,
       drawList: this.projWords,
       chunkTable: W.chunkTable,
       pieceTable: W.pieceTable,

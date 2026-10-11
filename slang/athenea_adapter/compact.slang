@@ -36,6 +36,13 @@
 // element i % slotNodes; the codebooks, materials and the basis are global
 // to a piece (the pool's tables, always resident).
 //
+// NODE POOL (nodeWords > 0; thread CT, compactPages.ts CompactNodePool): only
+// the drawn cut is on the GPU, a record of nodeWords words a node at
+// slotsBase + i x nodeWords (the GPU's 40 bytes, the plane uniforms their
+// byte offsets in it, then the origin word: the node's page in the head
+// table, bits 0-15, its place in the page, 16-31). Every page's head is in
+// the head table (kCompactHeadWords a page, the slot head's words).
+//
 // Passes a frame:
 //   atheneaCompactProject  a thread a cluster: the dome's projections (as
 //                          cpca_joint.slang's atheneaJointProject), when the
@@ -65,6 +72,7 @@ import athenea.scene.splat_encoding;
 
 public static const uint kCompactChunk = 8192;
 public static const uint kCompactChunkWords = 12;
+public static const uint kCompactHeadWords = 16;      // a page's head in the node pool's head table
 public static const uint kCompactPiece = 16384;
 public static const uint kCompactMaterialWords = 4;
 public static const uint kCompactClusterWords = 504;   // 1008 halves
@@ -137,6 +145,8 @@ public struct CompactParams {
     public float cullFacing;   ///< kCompactCullBacks: the cosine below which a back is culled
     public float sheetFade;    ///< a thin sheet's floor after the AA blur, faded under A0 px^2 (0: unfaded); < 0: floored before the blur (CN's)
     public uint  drawList;     ///< kCompactDrawList: the list's start in compactFrame, words (count entries)
+    public uint  nodeWords;    ///< node pool (thread CT): words a node record (0: planes); the plane uniforms are then bytes in the record
+    public uint  headTable;    ///< node pool: the pages' heads, words (kCompactHeadWords a page)
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
     public float4 row1;
     public float4 row2;
@@ -199,11 +209,30 @@ uint planeOf(uint plane, uint i, out uint element) {
     return compactParams.slotsBase + slot * compactParams.slotWords + plane;
 }
 
-/// `width` bytes (1..4) of element i of the plane at word `plane`.
+/// Node pool (nodeWords > 0): node i's record, words.
+uint recordOf(uint i) {
+    return compactParams.slotsBase + i * compactParams.nodeWords;
+}
+
+/// Node pool: node i's origin (its page in the head table, bits 0-15; its
+/// place in the page, 16-31), the record's last word.
+uint originOf(uint i) {
+    return compactData[recordOf(i) + compactParams.nodeWords - 1u];
+}
+
+/// `width` bytes (1..4) of element i of the plane at word `plane` (node
+/// pool: at byte `plane` of node i's record).
 uint fieldAt(uint plane, uint width, uint i) {
-    uint e;
-    const uint base = planeOf(plane, i, e);
-    const uint at = e * width;
+    uint base;
+    uint at;
+    if (compactParams.nodeWords != 0u) {
+        base = recordOf(i);
+        at = plane;
+    } else {
+        uint e;
+        base = planeOf(plane, i, e);
+        at = e * width;
+    }
     const uint w = base + (at >> 2u);
     const uint shift = (at & 3u) * 8u;
     uint v = compactData[w] >> shift;
@@ -215,6 +244,9 @@ uint fieldAt(uint plane, uint width, uint i) {
 
 /// Word k of gaussian i's chunk (resident) or slot head (paged).
 uint chunkWord(uint i, uint k) {
+    if (compactParams.nodeWords != 0u) {
+        return compactData[compactParams.headTable + (originOf(i) & 0xFFFFu) * kCompactHeadWords + k];
+    }
     const uint nodes = compactParams.slotNodes;
     if (nodes == 0u) {
         return compactData[compactParams.chunkTable + (i / kCompactChunk) * kCompactChunkWords + k];
@@ -226,6 +258,9 @@ uint chunkWord(uint i, uint k) {
 /// node's place in its piece (slot head word 11, the page's base) -- the
 /// same whatever slot the page is in.
 uint stableIndexOf(uint i) {
+    if (compactParams.nodeWords != 0u) {
+        return chunkWord(i, 11u) + (originOf(i) >> 16u);
+    }
     const uint nodes = compactParams.slotNodes;
     return nodes == 0u ? i : chunkWord(i, 11u) + (i % nodes);
 }
@@ -309,15 +344,17 @@ float3 curvatureOf(uint i) {
 }
 
 uint4 materialOf(uint i) {
-    const uint table = compactParams.slotNodes == 0u ? compactParams.materials : chunkWord(i, 10u);
+    const uint table = compactParams.slotNodes == 0u && compactParams.nodeWords == 0u ? compactParams.materials
+                                                                                      : chunkWord(i, 10u);
     const uint at = table + fieldAt(compactParams.material, 2u, i) * kCompactMaterialWords;
     return uint4(compactData[at], compactData[at + 1u], compactData[at + 2u], compactData[at + 3u]);
 }
 
 /// Where splat i's open-direction cells are in `compact` (words).
 uint cellBaseOf(uint i) {
-    const uint book = compactParams.slotNodes == 0u ? compactData[compactParams.pieceTable + i / kCompactPiece]
-                                                    : chunkWord(i, 9u);
+    const uint book = compactParams.slotNodes == 0u && compactParams.nodeWords == 0u
+                          ? compactData[compactParams.pieceTable + i / kCompactPiece]
+                          : chunkWord(i, 9u);
     return book + fieldAt(compactParams.shadow, 2u, i) * 8u;
 }
 
@@ -335,7 +372,14 @@ float weightOf(uint w, uint k) {
 /// Block b's 8 int8 weights of splat i (two words).
 uint2 weightsOf(uint i, uint b) {
     uint e;
-    const uint plane = planeOf(compactParams.weights + b * compactParams.weightsStride, i, e);
+    uint plane;
+    if (compactParams.nodeWords != 0u) {
+        // Node pool: the block's word(s) at byte weights + b x weightsStride.
+        plane = recordOf(i) + (compactParams.weights + b * compactParams.weightsStride) / 4u;
+        e = 0u;
+    } else {
+        plane = planeOf(compactParams.weights + b * compactParams.weightsStride, i, e);
+    }
     if (compactParams.weightBits == 4u) {
         // Back on the int8 grid the records were measured on.
         const uint w = compactData[plane + e];

@@ -51,8 +51,15 @@ const rpcHandlers = {
   traverseLodTrees,
   getLodTreeLevel,
   nextChunk,
+  wasmMemory,
 };
 export type rpcHandlers = typeof rpcHandlers;
+
+let wasmExports: { memory: WebAssembly.Memory } | null = null;
+/** The worker's WASM heap, bytes (it never shrinks). */
+function wasmMemory() {
+  return { bytes: wasmExports?.memory.buffer.byteLength ?? 0 };
+}
 
 async function onMessage(event: MessageEvent) {
   const {
@@ -1046,7 +1053,7 @@ async function initialize() {
   };
   self.addEventListener("message", bufferMessage);
 
-  await init_wasm({ module_or_path: await waitForModule });
+  wasmExports = await init_wasm({ module_or_path: await waitForModule });
 
   self.removeEventListener("message", bufferMessage);
   self.addEventListener("message", onMessage);

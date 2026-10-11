@@ -1049,35 +1049,35 @@ export class CompactBandStreamer {
       got.push(k);
       gotSlot.push(s);
     }
-    // Packed in slot order (runs of slots, one write each).
-    const order = got.map((_, j) => j).sort((a, b) => gotSlot[a] - gotSlot[b]);
+    // Packed page by page (one section each, in key order), then written
+    // in slot order (runs of slots, one write each).
     const R = NODE_RECORD_WORDS * 4;
-    const records = new Uint8Array(order.length * R);
-    const slots = new Uint32Array(order.length);
+    const packed = new Uint8Array(got.length * R);
     const dropped = new Set<number>();
     let j = 0;
-    while (j < order.length) {
-      // Consecutive entries of one page share its section.
-      const g = Math.floor(keys[got[order[j]]] / PAGE_PLACES);
+    while (j < got.length) {
+      const g = Math.floor(keys[got[j]] / PAGE_PLACES);
       let e = j + 1;
-      while (
-        e < order.length &&
-        Math.floor(keys[got[order[e]]] / PAGE_PLACES) === g
-      ) {
+      while (e < got.length && Math.floor(keys[got[e]] / PAGE_PLACES) === g) {
         e++;
       }
       const owner = this.pageOwner[g];
       const n = this.pieces[owner.piece].rows[owner.page].count;
       const raw = store.sectionOf(g);
       const places = new Uint32Array(e - j);
-      for (let q = j; q < e; q++) {
-        places[q - j] = keys[got[order[q]]] - g * PAGE_PLACES;
-        slots[q] = gotSlot[order[q]];
-      }
-      if (raw) packPageRecords(raw, n, places, g, records, j);
-      else for (let q = j; q < e; q++) dropped.add(got[order[q]]);
+      for (let q = j; q < e; q++)
+        places[q - j] = keys[got[q]] - g * PAGE_PLACES;
+      if (raw) packPageRecords(raw, n, places, g, packed, j);
+      else for (let q = j; q < e; q++) dropped.add(got[q]);
       j = e;
     }
+    const order = got.map((_, q) => q).sort((a, b) => gotSlot[a] - gotSlot[b]);
+    const records = new Uint8Array(order.length * R);
+    const slots = new Uint32Array(order.length);
+    order.forEach((q, k) => {
+      records.set(packed.subarray(q * R, q * R + R), k * R);
+      slots[k] = gotSlot[q];
+    });
     this.stats.writes = order.length ? pool.writeRecords(slots, records) : 0;
     this.stats.uploaded = order.length;
     this.stats.decodes = store.stats.decodes - d0;

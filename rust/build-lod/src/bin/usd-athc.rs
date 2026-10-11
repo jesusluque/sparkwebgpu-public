@@ -1575,10 +1575,39 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
             if !planes || matches!(id, S::Shadow) { 0 } else { spark_lib::athc_v3::ENCODING_BYTE_PLANES }
         };
         let cpca = arg(args, "--cpca").map(spark_lib::athc_cpca::CpcaOptions::parse).transpose()?;
-        let (bytes, _) = write_v3_paged(&file, &paged.rows, compression, &encoding, cpca.as_ref(), rig.as_ref())?;
+        // `--compact-basis basis.json` (its .bin beside it): the compact
+        // relit path's planes as a fourth tier (athc_compact, thread CN),
+        // the transfer through that joint CPCA basis (athenea's q97 basis
+        // is local only: never publish a file made with it).
+        let compact = match arg(args, "--compact-basis") {
+            Some(json_path) => {
+                let bin_path = json_path.strip_suffix(".json").map(|p| format!("{p}.bin")).unwrap_or_else(|| format!("{json_path}.bin"));
+                let basis = spark_lib::athc_compact::JointBasis::parse(&std::fs::read_to_string(json_path)?, &std::fs::read(&bin_path)?)?;
+                let mut co = spark_lib::athc_compact::CompactOptions::default();
+                if let Some(c) = arg(args, "--compact-centroids") {
+                    co.centroids = c.parse().context("--compact-centroids")?;
+                }
+                // Only to measure: the weights' levels a side (7, int4, is
+                // what the GPU reads; others write the same 4-bit planes
+                // wrongly and are for the transfer error alone).
+                if let Some(l) = arg(args, "--compact-levels") {
+                    co.levels = l.parse().context("--compact-levels")?;
+                }
+                let c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
+                eprintln!("compact tier: {}", serde_json::to_string(&c.stats)?);
+                Some(c)
+            }
+            None => None,
+        };
+        let (bytes, _) = match &compact {
+            Some(c) => spark_lib::athc_v3::write_v3_paged_compact(&file, &paged.rows, compression, &encoding, cpca.as_ref(), rig.as_ref(), c)?,
+            None => write_v3_paged(&file, &paged.rows, compression, &encoding, cpca.as_ref(), rig.as_ref())?,
+        };
         std::fs::write(output, &bytes)?;
         let layout = spark_lib::athc_v3::parse_v3(&bytes)?;
-        let tier: Vec<u64> = (0..3).map(|t| layout.pages.iter().map(|r| r.tier_bytes[t] as u64).sum()).collect();
+        let tier: Vec<u64> = (0..4)
+            .map(|t| layout.pages.iter().map(|r| if t < 3 { r.tier_bytes[t] } else { r.tier4_bytes } as u64).sum())
+            .collect();
         let report = json!({
             "tree": tree_path,
             "output": output,
@@ -1588,6 +1617,7 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
             "tierBytes": tier,
             "pageBox": format!("{:?}", page_box),
             "herTable": cmp,
+            "compact": compact.as_ref().map(|c| &c.stats),
             "seconds": t.elapsed().as_secs_f32(),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1700,6 +1730,9 @@ fn main() -> Result<()> {
         "--lod-size-opts",
         "--lod-error-weights",
         "--cpca",
+        "--compact-basis",
+        "--compact-centroids",
+        "--compact-levels",
     ];
     let mut paths = Vec::new();
     let mut skip = false;

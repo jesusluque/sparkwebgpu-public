@@ -98,6 +98,10 @@ pub enum SectionId {
     TransferIndirect,
     /// The rest: the reflected field.
     TransferField,
+    /// The compact relit path's planes of a paged tree's page
+    /// (`athc_compact`, thread CN): tier 4, `NODE_BYTES` a node, read on
+    /// its own by a reader that draws only the compact path.
+    Compact,
 }
 
 impl SectionId {
@@ -116,10 +120,11 @@ impl SectionId {
             Self::Shadow => b"SHAD",
             Self::Curvature => b"CURV",
             Self::Material => b"MATL",
+            Self::Compact => b"CMPC",
         })
     }
 
-    pub const ALL: [SectionId; 13] = [
+    pub const ALL: [SectionId; 14] = [
         Self::Core,
         Self::Sh,
         Self::LodSize,
@@ -133,6 +138,7 @@ impl SectionId {
         Self::TransferDirect,
         Self::TransferIndirect,
         Self::TransferField,
+        Self::Compact,
     ];
 
     pub fn from_code(code: u32) -> Option<Self> {
@@ -154,6 +160,7 @@ impl SectionId {
             Self::TransferDirect => "TXDI",
             Self::TransferIndirect => "TXIN",
             Self::TransferField => "TXFD",
+            Self::Compact => "CMPC",
         }
     }
 
@@ -163,6 +170,7 @@ impl SectionId {
         match self {
             Self::Core | Self::Sh | Self::LodSize | Self::LodError | Self::Occlusion | Self::Tree | Self::Skin => 1,
             Self::Material => 2,
+            Self::Compact => 4,
             _ => 3,
         }
     }
@@ -248,6 +256,8 @@ impl Want {
             SectionId::TransferDirect => words > 0,
             SectionId::TransferIndirect => words > direct,
             SectionId::TransferField => words > indirect,
+            // The compact tier is read on its own (athc_compact).
+            SectionId::Compact => false,
         }
     }
 
@@ -426,6 +436,8 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
                 put_words(&mut out, v);
             }
         }
+        // Built per page by athc_compact, handed to the writer as bytes.
+        SectionId::Compact => out.resize(block.n * s.words as usize * 4, 0),
     }
     out
 }
@@ -682,6 +694,9 @@ pub struct V3Layout {
     /// A paged tree's page table (FLAG_PAGED, `athc_pages`), one row a page
     /// (block), read from the tables; empty otherwise.
     pub pages: Vec<crate::athc_pages::PageRow>,
+    /// The compact tier's tables (`athc_compact::CompactTables`): offset and
+    /// bytes, among the tables; [0, 0] without.
+    pub compact_table: [u64; 2],
 }
 
 /// v2 (in memory) to v3 bytes.
@@ -757,7 +772,7 @@ pub fn write_v3_full(
     encoding: &dyn Fn(SectionId) -> u32,
     skeleton: Option<&crate::athc_skin::AthcSkeleton>,
 ) -> Result<Vec<u8>> {
-    write_v3_impl(file, compression, legacy, encoding, skeleton, None, None).map(|(out, _)| out)
+    write_v3_impl(file, compression, legacy, encoding, skeleton, None, None, None).map(|(out, _)| out)
 }
 
 /// A paged tree (`athc_pages`: FLAG_PAGED, its pages as `file.chunks`, each
@@ -774,7 +789,25 @@ pub fn write_v3_paged(
 ) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
     let pick = |id: SectionId| if cpca.is_some() && id.is_transfer() { ENCODING_CPCA } else { encoding(id) };
     let o = cpca.map(|c| crate::athc_cpca::CpcaOptions { gzip: compression == COMPRESSION_GZIP, ..*c });
-    write_v3_impl(file, compression, false, &pick, skeleton, o.as_ref(), Some(pages))
+    write_v3_impl(file, compression, false, &pick, skeleton, o.as_ref(), Some(pages), None)
+}
+
+/// `write_v3_paged` with the compact tier (`athc_compact`, thread CN): each
+/// page's `CMPC` section (tier 4, laid out after tier 3), its head in the
+/// page table's rows (`PAGE_ROW_WORDS_COMPACT`), the piece's tables after
+/// the page table (their offset and bytes at header byte 192).
+pub fn write_v3_paged_compact(
+    file: &AthcFile,
+    pages: &[crate::athc_pages::PageRow],
+    compression: u32,
+    encoding: &dyn Fn(SectionId) -> u32,
+    cpca: Option<&crate::athc_cpca::CpcaOptions>,
+    skeleton: Option<&crate::athc_skin::AthcSkeleton>,
+    compact: &crate::athc_compact::CompactPages,
+) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
+    let pick = |id: SectionId| if cpca.is_some() && id.is_transfer() { ENCODING_CPCA } else { encoding(id) };
+    let o = cpca.map(|c| crate::athc_cpca::CpcaOptions { gzip: compression == COMPRESSION_GZIP, ..*c });
+    write_v3_impl(file, compression, false, &pick, skeleton, o.as_ref(), Some(pages), Some(compact))
 }
 
 /// A paged tree's headers settled from its blocks, as `AthcFile::write`
@@ -871,7 +904,7 @@ pub fn write_v3_cpca(
 ) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
     let pick = |id: SectionId| if id.is_transfer() { ENCODING_CPCA } else { encoding(id) };
     let o = crate::athc_cpca::CpcaOptions { gzip: compression == COMPRESSION_GZIP, ..*cpca };
-    write_v3_impl(file, compression, false, &pick, skeleton, Some(&o), None)
+    write_v3_impl(file, compression, false, &pick, skeleton, Some(&o), None, None)
 }
 
 fn write_v3_impl(
@@ -882,8 +915,17 @@ fn write_v3_impl(
     skeleton: Option<&crate::athc_skin::AthcSkeleton>,
     cpca: Option<&crate::athc_cpca::CpcaOptions>,
     pages: Option<&[crate::athc_pages::PageRow]>,
+    compact: Option<&crate::athc_compact::CompactPages>,
 ) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
     let mut cpca_stats: Vec<CpcaSectionStats> = Vec::new();
+    if let Some(c) = compact {
+        if pages.is_none() {
+            bail!(".athc v3: the compact tier is a paged tree's");
+        }
+        if c.pages.len() != file.chunks.len() || c.pages.iter().zip(&file.chunks).any(|(p, b)| p.len() != b.n * crate::athc_compact::NODE_BYTES) {
+            bail!(".athc v3: the compact tier's pages do not match the tree's");
+        }
+    }
     if pages.is_some() != file.header.has(crate::athc::FLAG_PAGED) {
         bail!(".athc v3: a paged tree is written with its page table (write_v3_paged), and only it");
     }
@@ -989,6 +1031,16 @@ fn write_v3_impl(
             bail!(".athc v3: CPCA is for the transfer's sections, not {}", s.id.name());
         }
     }
+    // The compact tier: its own byte planes already, stored as they are.
+    if compact.is_some() {
+        sections.push(Section {
+            id: SectionId::Compact,
+            tier: 4,
+            encoding: ENCODING_V2_WORDS,
+            compression,
+            words: (crate::athc_compact::NODE_BYTES / 4) as u32,
+        });
+    }
     let blocks: Vec<(u32, u32, u32, &AthcBlock)> = v2
         .levels
         .iter()
@@ -1016,7 +1068,9 @@ fn write_v3_impl(
     let codebook = &file.occlusion_codebook;
     // A paged tree's page table widens it by 16 more: its offset, pages and
     // words a row at 176 (the codebook's 16 bytes then present, 0 without).
-    let header_bytes = if paged {
+    let header_bytes = if compact.is_some() {
+        V3_HEADER_BYTES + 48
+    } else if paged {
         V3_HEADER_BYTES + 32
     } else if codebook.is_empty() {
         V3_HEADER_BYTES
@@ -1033,20 +1087,30 @@ fn write_v3_impl(
     let codebook_offset = if codebook.is_empty() { 0 } else { after_skeleton.div_ceil(16) * 16 };
     let after_codebook = if codebook.is_empty() { after_skeleton } else { codebook_offset + 4 * codebook.len() as u64 };
     let page_table = if paged { after_codebook.div_ceil(16) * 16 } else { 0 };
-    let row_words = crate::athc_pages::PAGE_ROW_WORDS as u64;
-    let data_start = aligned(if paged { page_table + 4 * row_words * blocks.len() as u64 } else { after_codebook });
+    let row_words = if compact.is_some() {
+        crate::athc_pages::PAGE_ROW_WORDS_COMPACT as u64
+    } else {
+        crate::athc_pages::PAGE_ROW_WORDS as u64
+    };
+    let after_pages = if paged { page_table + 4 * row_words * blocks.len() as u64 } else { after_codebook };
+    let compact_blob = compact.map(|c| c.tables.to_bytes()).unwrap_or_default();
+    let compact_table = if compact_blob.is_empty() { 0 } else { after_pages.div_ceil(16) * 16 };
+    let data_start = aligned(if compact_blob.is_empty() { after_pages } else { compact_table + compact_blob.len() as u64 });
 
     let mut data = Vec::new();
     let mut entries = Vec::new();
     let mut at = data_start;
     // A paged tree's sections, held back to be laid out by tier (below).
     let mut held: Vec<Vec<Vec<u8>>> = Vec::new();
-    for &(kind, level, first, block) in &blocks {
+    for (b_at, &(kind, level, first, block)) in blocks.iter().enumerate() {
         let mut spans = Vec::new();
         let begin = data.len();
         let mut tx_from = 0;
         for s in &sections {
-            let raw = section_bytes(block, s, &x, tx_from);
+            let raw = match (s.id, compact) {
+                (SectionId::Compact, Some(c)) => c.pages[b_at].clone(),
+                _ => section_bytes(block, s, &x, tx_from),
+            };
             if s.id.is_transfer() {
                 tx_from += s.words;
             }
@@ -1103,10 +1167,10 @@ fn write_v3_impl(
     // pages is then one Range request a tier (a page's own sections of a
     // tier stay contiguous), and a reader of tier 1 never reads the rest.
     if paged {
-        for tier in 1..=3 {
+        for tier in 1..=4 {
             for (b, e) in entries.iter_mut().enumerate() {
                 for (k, s) in sections.iter().enumerate() {
-                    if s.tier.clamp(1, 3) != tier {
+                    if s.tier.clamp(1, 4) != tier {
                         continue;
                     }
                     let stored = std::mem::take(&mut held[b][k]);
@@ -1156,6 +1220,10 @@ fn write_v3_impl(
         out.extend_from_slice(&page_table.to_le_bytes());
         put_words(&mut out, &[blocks.len() as u32, row_words as u32]);
     }
+    if !compact_blob.is_empty() {
+        out.extend_from_slice(&compact_table.to_le_bytes());
+        put_words(&mut out, &[compact_blob.len() as u32, crate::athc_compact::TABLE_VERSION]);
+    }
     out.resize(header_bytes, 0);
     for s in &sections {
         // OCCL: the bytes an index needs (entry + 1, 0 none: two with 256
@@ -1190,11 +1258,21 @@ fn write_v3_impl(
     }
     if let Some(pages) = pages {
         out.resize(page_table as usize, 0);
-        for (row, e) in pages.iter().zip(&entries) {
+        for (r, (row, e)) in pages.iter().zip(&entries).enumerate() {
             let mut row = *row;
             row.fill_ranges(e, &sections);
-            put_words(&mut out, &row.to_words());
+            match compact {
+                Some(c) => {
+                    row.compact = c.heads[r];
+                    put_words(&mut out, &row.to_words_compact());
+                }
+                None => put_words(&mut out, &row.to_words()),
+            }
         }
+    }
+    if !compact_blob.is_empty() {
+        out.resize(compact_table as usize, 0);
+        out.extend_from_slice(&compact_blob);
     }
     out.resize(data_start as usize, 0);
     out.extend_from_slice(&data);
@@ -1282,9 +1360,19 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
             words: u32_at(bytes, at + 16)?,
         });
     }
+    // The compact tier (athc_compact) is not implied by the header: it is
+    // checked on its own, after the rest.
+    let compact_section = sections.iter().position(|s| s.id == SectionId::Compact);
+    if let Some(k) = compact_section {
+        let s = &sections[k];
+        if k + 1 != sections.len() || s.tier != 4 || s.words as usize * 4 != crate::athc_compact::NODE_BYTES || s.encoding != 0 {
+            bail!(".athc v3: a compact section of {} words, tier {}, encoding {}, not last", s.words, s.tier, s.encoding);
+        }
+    }
+    let implied = &sections[..compact_section.unwrap_or(sections.len())];
     let same = |expected: Vec<Section>| {
-        expected.len() == sections.len()
-            && expected.iter().zip(&sections).all(|(e, s)| e.id == s.id && e.words == s.words && e.tier == s.tier)
+        expected.len() == implied.len()
+            && expected.iter().zip(implied).all(|(e, s)| e.id == s.id && e.words == s.words && e.tier == s.tier)
     };
     if !same(sections_of(&header, &extra, COMPRESSION_NONE))
         && !same(legacy_sections_of(&header, &extra, COMPRESSION_NONE))
@@ -1333,15 +1421,27 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
         if rows != block_count || words < crate::athc_pages::PAGE_ROW_WORDS || header.levels != 0 {
             bail!(".athc v3: a page table of {rows} rows of {words} words for {block_count} blocks");
         }
+        let read = words.min(crate::athc_pages::PAGE_ROW_WORDS_COMPACT);
         for r in 0..rows {
-            let row: Vec<u32> = (0..crate::athc_pages::PAGE_ROW_WORDS).map(|k| u32_at(bytes, at + 4 * (r * words + k))).collect::<Result<_>>()?;
+            let row: Vec<u32> = (0..read).map(|k| u32_at(bytes, at + 4 * (r * words + k))).collect::<Result<_>>()?;
             pages.push(crate::athc_pages::PageRow::from_words(&row));
+        }
+        if compact_section.is_some() && words < crate::athc_pages::PAGE_ROW_WORDS_COMPACT {
+            bail!(".athc v3: a compact tier with page rows of {words} words");
         }
         if blocks.iter().any(|b| b.kind != BLOCK_PAGE) {
             bail!(".athc v3: a paged tree's blocks are all pages");
         }
     }
-    Ok(V3Layout { header, extra, sections, blocks, starts_offset, skeleton_offset, occlusion_codebook, pages })
+    // The compact tier's tables: offset and bytes at 192.
+    let mut compact_table = [0u64; 2];
+    if compact_section.is_some() {
+        if section_table < V3_HEADER_BYTES + 48 {
+            bail!(".athc v3: a compact tier without its tables");
+        }
+        compact_table = [u64_at(bytes, 192)?, u32_at(bytes, 200)? as u64];
+    }
+    Ok(V3Layout { header, extra, sections, blocks, starts_offset, skeleton_offset, occlusion_codebook, pages, compact_table })
 }
 
 /// One block's elements from its sections' bytes (`raw[k]`: section k,
@@ -1389,6 +1489,8 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
             SectionId::Shadow => block.shadow_bits = v,
             SectionId::Curvature => block.curvature = v,
             SectionId::Skin => block.skin = v,
+            // The compact tier is not a stream of the cloud.
+            SectionId::Compact => {}
             SectionId::Material => {
                 let mut at = 0;
                 let mut take = |on: bool, per: u32| -> Vec<u32> {
@@ -1665,6 +1767,10 @@ pub fn read_v3(bytes: &[u8]) -> Result<AthcFile> {
             .iter()
             .zip(&b.spans)
             .map(|(s, span)| {
+                // The compact tier is no stream of the cloud (athc_compact).
+                if s.id == SectionId::Compact {
+                    return Ok(None);
+                }
                 let stored = bytes
                     .get(span.offset as usize..span.offset as usize + span.stored as usize)
                     .ok_or_else(|| anyhow!(".athc v3: a section past the end"))?;

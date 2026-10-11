@@ -853,6 +853,7 @@ function traverseLodTrees({
   occlusionCull,
   errorSizeK,
   neighbours,
+  unordered,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -873,6 +874,11 @@ function traverseLodTrees({
    * culled nodes, per instance (the node pool, thread CT).
    */
   neighbours?: boolean;
+  /**
+   * A stack, not the heap (thread CU): the same cut while maxSplats does
+   * not bind (else the traversal runs again in order), about 2.4x faster.
+   */
+  unordered?: boolean;
   instances: Record<
     string,
     {
@@ -924,6 +930,7 @@ function traverseLodTrees({
     traverseMode === "dynamic"
       ? dynamic_traverse_lod_trees
       : traverse_lod_trees;
+  const wasm0 = performance.now();
   const result = lodFunction(
     maxSplats,
     pixelScaleLimit,
@@ -941,6 +948,7 @@ function traverseLodTrees({
     occlusionCull,
     errorSizeK,
     neighbours,
+    unordered,
   ) as {
     culledCount?: number;
     occludedCount?: number;
@@ -954,6 +962,7 @@ function traverseLodTrees({
   };
   const { instanceIndices, chunks, pixelLimit, culledCount, occludedCount } =
     result;
+  const wasmMs = performance.now() - wasm0;
 
   const indices = keyInstances.reduce(
     (indices, [key, _instance], index) => {
@@ -973,6 +982,7 @@ function traverseLodTrees({
     pixelLimit,
     culledCount,
     occludedCount,
+    wasmMs,
   };
 }
 

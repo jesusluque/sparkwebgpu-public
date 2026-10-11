@@ -17,41 +17,21 @@
 
 import { gunzipSync, inflateSync } from "fflate";
 import type { CompactCloud, CompactLayout } from "./compact";
+import { type CompactPieceTables, compactPlaneOffset } from "./compactPages";
 import {
   COMPACT_PLANE_WIDTHS,
-  type CompactPieceTables,
-  compactPlaneOffset,
-} from "./compactPages";
+  NODE_RECORD_WORDS,
+  RECORD_FIELDS,
+  packRunRecords,
+  runPlaneOffsets,
+} from "./compactRecords";
 
-/** Words a node record: the GPU's 40 bytes, then its origin word. */
-export const NODE_RECORD_WORDS = 11;
+export { NODE_RECORD_WORDS, packRunRecords };
+
 /** Words a page's head in the head table (compact.slang kCompactHeadWords). */
 export const NODE_HEAD_WORDS = 16;
 /** Places a page in a node key (CMPC's place: 12 bits). */
 export const PAGE_PLACES = 4096;
-
-/**
- * The GPU planes (compactPages GPU_PLANES' order, plane k of a CMPC section)
- * and their byte offset in a record: the 4-byte fields first, every 2-byte
- * field at an even byte, so no read crosses more than one word boundary.
- */
-const RECORD_FIELDS: [name: string, plane: number, at: number][] = [
-  ["rotation", 6, 0],
-  ["weights", 11, 4],
-  ["weights1", 12, 8],
-  ["weights2", 13, 12],
-  ["posX", 0, 16],
-  ["posY", 1, 18],
-  ["posZ", 2, 20],
-  ["material", 9, 22],
-  ["shadow", 14, 24],
-  ["albedo", 3, 26],
-  ["scale", 5, 29],
-  ["normal", 7, 32],
-  ["curvature", 8, 35],
-  ["opacity", 4, 38],
-  ["cluster", 10, 39],
-];
 
 /** Each field's byte offset in a record, by plane name. */
 export function nodeRecordLayout(): Record<string, number> {
@@ -80,54 +60,70 @@ function planeOffsets(n: number) {
  * last node goes. About 16 KB a page, where a Map takes ~40 bytes a node.
  */
 export class NodeIndex {
-  private pages = new Map<number, { slots: Int32Array; count: number }>();
+  /** A page's places (by page number: an array index, not a Map lookup). */
+  private pages: (Int32Array | undefined)[] = [];
+  private counts: number[] = [];
+  private held = 0;
   size = 0;
 
   /** Places a page holds at most (a pool slot's nodes). */
   constructor(readonly places = PAGE_PLACES) {}
 
   get(key: number): number | undefined {
-    const p = this.pages.get(Math.floor(key / PAGE_PLACES));
-    if (!p) return undefined;
-    const s = p.slots[key % PAGE_PLACES];
+    const p = this.pages[key >>> 12];
+    if (p === undefined) return undefined;
+    const s = p[key & 4095];
     return s < 0 ? undefined : s;
   }
 
+  /** The slot of `key`, or -1 (get without the undefined). */
+  slot(key: number): number {
+    const p = this.pages[key >>> 12];
+    return p === undefined ? -1 : p[key & 4095];
+  }
+
   set(key: number, slot: number) {
-    const g = Math.floor(key / PAGE_PLACES);
-    let p = this.pages.get(g);
-    if (!p) {
-      p = { slots: new Int32Array(this.places).fill(-1), count: 0 };
-      this.pages.set(g, p);
+    const g = key >>> 12;
+    let p = this.pages[g];
+    if (p === undefined) {
+      p = new Int32Array(this.places).fill(-1);
+      this.pages[g] = p;
+      this.counts[g] = 0;
+      this.held += 1;
     }
-    const k = key % PAGE_PLACES;
-    if (p.slots[k] < 0) {
-      p.count += 1;
+    const k = key & 4095;
+    if (p[k] < 0) {
+      this.counts[g] += 1;
       this.size += 1;
     }
-    p.slots[k] = slot;
+    p[k] = slot;
   }
 
   delete(key: number) {
-    const g = Math.floor(key / PAGE_PLACES);
-    const p = this.pages.get(g);
-    if (!p) return;
-    const k = key % PAGE_PLACES;
-    if (p.slots[k] < 0) return;
-    p.slots[k] = -1;
-    p.count -= 1;
+    const g = key >>> 12;
+    const p = this.pages[g];
+    if (p === undefined) return;
+    const k = key & 4095;
+    if (p[k] < 0) return;
+    p[k] = -1;
+    this.counts[g] -= 1;
     this.size -= 1;
-    if (p.count === 0) this.pages.delete(g);
+    if (this.counts[g] === 0) {
+      this.pages[g] = undefined;
+      this.held -= 1;
+    }
   }
 
   clear() {
-    this.pages.clear();
+    this.pages = [];
+    this.counts = [];
+    this.held = 0;
     this.size = 0;
   }
 
   /** Bytes held by the index. */
   get bytes() {
-    return this.pages.size * this.places * 4;
+    return this.held * this.places * 4;
   }
 }
 
@@ -190,11 +186,31 @@ export class NodeSlotAllocator {
 
   /** The slot of `key` if it is held (and in this frame's cut from now), else -1. */
   use(key: number) {
-    const s = this.slotOf.get(key);
-    if (s === undefined) return -1;
-    this.stamp[s] = this.frame;
+    const s = this.slotOf.slot(key);
+    if (s < 0) return -1;
+    if (this.stamp[s] !== this.frame) {
+      this.stamp[s] = this.frame;
+      this.touch(s);
+    }
     this.stats.reused += 1;
     return s;
+  }
+
+  /**
+   * The slots this frame stamped (its cut, the substitutes, the records on
+   * their way: whatever it used, thread CU), each once: at the next commit
+   * those the next frame does not use go idle.
+   */
+  private cur = new Uint32Array(1024);
+  private curN = 0;
+
+  private touch(s: number) {
+    if (this.curN === this.cur.length) {
+      const c = new Uint32Array(this.cur.length * 2);
+      c.set(this.cur);
+      this.cur = c;
+    }
+    this.cur[this.curN++] = s;
   }
 
   /** A slot for `key` (not held), in this frame's cut; -1: none left. */
@@ -228,7 +244,10 @@ export class NodeSlotAllocator {
       return -1;
     }
     this.keyOf[s] = key;
-    this.stamp[s] = this.frame;
+    if (this.stamp[s] !== this.frame) {
+      this.stamp[s] = this.frame;
+      this.touch(s);
+    }
     this.slotOf.set(key, s);
     this.stats.allocated += 1;
     return s;
@@ -242,14 +261,22 @@ export class NodeSlotAllocator {
   }
 
   /**
-   * This frame's cut is complete (`cut` its slots): the last cut's slots
-   * not in it go idle, oldest first to be taken.
+   * This frame's cut is complete: the last frame's slots not used in this
+   * one go idle, oldest first to be taken. (Every slot a frame stamps
+   * counts, not only `cut`: a substitute or a record on its way that a
+   * later draw list leaves out still goes idle, thread CU.)
    */
-  commit(cut: Uint32Array) {
-    for (const s of this.lastCut) {
-      if (this.stamp[s] !== this.frame && this.keyOf[s] >= 0) this.idle.push(s);
+  commit(_cut?: Uint32Array) {
+    const last = this.lastCut;
+    const stamp = this.stamp;
+    const keyOf = this.keyOf;
+    const frame = this.frame;
+    for (let k = 0; k < last.length; k++) {
+      const s = last[k];
+      if (stamp[s] !== frame && keyOf[s] >= 0) this.idle.push(s);
     }
-    this.lastCut = cut;
+    this.lastCut = this.cur.slice(0, this.curN);
+    this.curN = 0;
     this.lastCutStamp = this.frame;
   }
 
@@ -281,6 +308,7 @@ export class NodeSlotAllocator {
     this.idleHead = 0;
     this.lastCut = new Uint32Array(0);
     this.lastCutAt = 0;
+    this.curN = 0;
     this.free = [];
     for (let s = this.capacity - 1; s >= 0; s--) this.free.push(s);
   }
@@ -654,17 +682,6 @@ function runCount(n: number, run: number, r: number) {
   return Math.min(run, n - r * run);
 }
 
-/** A run's planes (inflated): plane k of a run of m nodes at prefix(k) x m. */
-function runPlaneOffsets(m: number) {
-  const offs: number[] = [];
-  let at = 0;
-  for (let k = 0; k < 15; k++) {
-    offs.push(at);
-    at += COMPACT_PLANE_WIDTHS[k] * m;
-  }
-  return offs;
-}
-
 /**
  * A container (as fetched) to the page's planes: the traversal's input
  * (positions then the traversal's planes, 30 bytes a node) and, with
@@ -704,38 +721,6 @@ export function unpackRunsContainer(
     }
   }
   return { input, raw, planes };
-}
-
-/**
- * Records of nodes `locals` (places within run r's nodes) from the run's
- * inflated planes (m nodes), packed in order into `out` from record
- * `first`; `page` their head-table page, `base` the run's first place.
- */
-export function packRunRecords(
-  planes: Uint8Array,
-  m: number,
-  locals: ArrayLike<number>,
-  page: number,
-  base: number,
-  out: Uint8Array,
-  first: number,
-) {
-  const offs = runPlaneOffsets(m);
-  const R = NODE_RECORD_WORDS * 4;
-  for (let k = 0; k < locals.length; k++) {
-    const j = locals[k];
-    const at = (first + k) * R;
-    for (const [, plane, off] of RECORD_FIELDS) {
-      const w = COMPACT_PLANE_WIDTHS[plane];
-      const from = offs[plane] + j * w;
-      for (let b = 0; b < w; b++) out[at + off + b] = planes[from + b];
-    }
-    const origin = (page + (base + j) * 65536) >>> 0;
-    out[at + 40] = origin & 0xff;
-    out[at + 41] = (origin >>> 8) & 0xff;
-    out[at + 42] = (origin >>> 16) & 0xff;
-    out[at + 43] = (origin >>> 24) & 0xff;
-  }
 }
 
 /** A run's priority: kept for the cut (its nodes, parents, children), culled, other. */
@@ -845,26 +830,40 @@ export class RunPayloadStore {
    */
   trim() {
     if (this.bytes <= this.budget) return 0;
-    const cands: [number, number, number, number][] = [];
+    // Candidates as sort keys (one typed sort, no tuples): class other
+    // first, then culled, the longest unmarked first; the low 26 bits a
+    // candidate's index into `who`.
+    let count = 0;
+    for (const p of this.pages.values()) count += p.bytes.length;
+    const keys = new Float64Array(count);
+    const who: [number, RunPage, number][] = [];
+    let k = 0;
     for (const [page, p] of this.pages) {
       for (let r = 0; r < p.bytes.length; r++) {
         if (!p.bytes[r]) continue;
         const cls = p.stamp[r] === this.frame ? p.cls[r] : RUN_OTHER;
         if (cls === RUN_CUT) continue;
-        cands.push([cls, p.stamp[r], page, r]);
+        const age = Math.min(p.stamp[r], 0xffffff);
+        keys[k] = ((2 - cls) * 0x1000000 + age) * 0x4000000 + who.length;
+        who.push([page, p, r]);
+        k += 1;
       }
     }
-    cands.sort((a, b) => b[0] - a[0] || a[1] - b[1]);
+    const order = keys.subarray(0, k).sort();
     let dropped = 0;
-    for (const [, , page, r] of cands) {
-      if (this.bytes <= this.budget) break;
-      const p = this.pages.get(page) as RunPage;
+    for (let q = 0; q < k && this.bytes > this.budget; q++) {
+      const [, p, r] = who[order[q] % 0x4000000];
       this.bytes -= (p.bytes[r] as Uint8Array).byteLength;
       p.bytes[r] = null;
       dropped += 1;
     }
     this.stats.dropped += dropped;
     return dropped;
+  }
+
+  /** A page's runs: its nodes and nodes a run (undefined: not held). */
+  runInfo(page: number): { n: number; run: number } | undefined {
+    return this.pages.get(page);
   }
 
   /** Whether run r is inflated already (no inflate to pack it). */
@@ -898,6 +897,23 @@ export class RunPayloadStore {
     return p;
   }
 
+  /** Run r's deflate bytes (null: dropped), used now (the last to go). */
+  runBytes(page: number, r: number): Uint8Array | null {
+    const p = this.pages.get(page);
+    const b = p?.bytes[r];
+    if (!p || !b) return null;
+    if (p.stamp[r] !== this.frame) {
+      p.stamp[r] = this.frame;
+      p.cls[r] = RUN_OTHER;
+    }
+    return b;
+  }
+
+  /** Run r's inflated planes if in the LRU (no inflate, no recency change). */
+  inflatedPlanes(page: number, r: number): Uint8Array | null {
+    return this.inflated.get(this.key(page, r)) ?? null;
+  }
+
   /** Where run r is in the file, to fetch it again: [offset, bytes]. */
   fileSpan(page: number, r: number): [number, number] | null {
     const p = this.pages.get(page);
@@ -913,6 +929,8 @@ export class RunPayloadStore {
     p.bytes[r] = bytes;
     this.bytes += bytes.byteLength;
     this.stats.fetched += 1;
+    // Fetched for a use: the most recent (the last to go over budget).
+    p.stamp[r] = this.frame;
   }
 
   missing(page: number, r: number) {

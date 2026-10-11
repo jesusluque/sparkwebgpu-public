@@ -275,7 +275,9 @@ enum LodNodes {
     /// quantization, and the nodes that do not fit kept whole.
     /// A pool page's records in a block of its own (a page's landing never
     /// moves the others: no copy of the whole tree, no doubled peak).
-    Quant { nodes: Vec<Box<[QuantNode]>>, pages: Vec<PageQuant>, full: AHashMap<u32, CompactLodNode>, wide: AHashMap<u32, u16>, slot: u32 },
+    /// thread CU round 3: a page's records by class, ~8 bytes a node (5, 7,
+    /// 9 or 11 with 9-bit centres; `PackedPage`).
+    Quant { nodes: Vec<PackedPage>, pages: Vec<PageQuant>, full: AHashMap<u32, CompactLodNode>, wide: AHashMap<u32, u16>, slot: u32, centre_bits: u32 },
 }
 
 /// A compact node's LodSplat from its 10 words (and its wide count).
@@ -313,19 +315,19 @@ impl LodNodes {
                 s.margin = margins.get(i / *slot as usize).copied().unwrap_or(0.0);
                 s
             }
-            LodNodes::Quant { nodes, pages, full, wide, slot } => {
+            LodNodes::Quant { nodes, pages, full, wide, slot, centre_bits } => {
                 let (g, k) = (i / *slot as usize, i % *slot as usize);
                 let p = &pages[g];
-                let q = &nodes[g][k];
-                // The map only for a node kept whole (bit 95).
-                if q.0[2] >> 31 != 0 {
+                let (class, bits) = nodes[g].read(k, *centre_bits);
+                // The map only for a node kept whole (class 0, palette index OCCL_FULL).
+                if class == 0 && ((bits >> (3 * *centre_bits)) as u32 & OCCL_MASK) == OCCL_FULL {
                     if let Some(n) = full.get(&(i as u32)) {
                         let mut s = compact_splat(n.0, wide, i);
                         s.margin = p.margin;
                         return s;
                     }
                 }
-                unpack_quant(q, p, &QUANT_RECORD_BITS)
+                unpack_node(class, bits, p, *centre_bits)
             }
         }
     }
@@ -614,8 +616,8 @@ pub fn new_lod_tree(capacity: u32, slot: Option<u32>, compact: Option<bool>) -> 
         let splats = if compact.unwrap_or(false) {
             // Grown with the pages that land (not reserved by the budget).
             let _ = capacity;
-            if QUANT.with_borrow(|q| *q == QUANT_RECORD_BITS) {
-                LodNodes::Quant { nodes: Vec::new(), pages: Vec::new(), full: AHashMap::new(), wide: AHashMap::new(), slot }
+            if let Some(centre_bits) = QUANT.with_borrow(|q| q.packed()) {
+                LodNodes::Quant { nodes: Vec::new(), pages: Vec::new(), full: AHashMap::new(), wide: AHashMap::new(), slot, centre_bits }
             } else {
                 LodNodes::Compact { nodes: Vec::new(), wide: AHashMap::new(), margins: Vec::new(), slot }
             }
@@ -770,7 +772,7 @@ fn put_compact_page(state: &mut LodState, lod_id: u32, page_base: u32, chunk_bas
         // A quantized tree frees the page's block.
         if let LodNodes::Quant { nodes, .. } = &mut *lod_tree.splats.borrow_mut() {
             if let Some(b) = nodes.get_mut(pool_page) {
-                *b = Box::new([]);
+                *b = PackedPage::default();
             }
         }
         return Ok(());
@@ -829,28 +831,26 @@ fn put_compact_page(state: &mut LodState, lod_id: u32, page_base: u32, chunk_bas
                 nodes[base + i] = compact_node(t);
             }
         }
-        LodNodes::Quant { nodes, pages, full, wide, .. } => {
+        LodNodes::Quant { nodes, pages, full, wide, centre_bits, .. } => {
             if pool_page >= nodes.len() {
-                nodes.resize_with(pool_page + 1, || Box::new([]));
+                nodes.resize_with(pool_page + 1, PackedPage::default);
             }
-            // The page's own block, its nodes' size.
-            let mut block = vec![QuantNode::default(); n].into_boxed_slice();
             if pool_page >= pages.len() {
                 pages.resize(pool_page + 1, PageQuant::default());
             }
-            pages[pool_page] = pq;
+            let mut w = PackedWriter::new(n, *centre_bits);
             for (i, (t, c)) in page.iter().zip(&codes).enumerate() {
                 let key = (base + i) as u32;
-                let packed = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_quant(t, c, chunk as u32) };
+                let packed = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_node(t, c, chunk as u32, *centre_bits) };
                 match packed {
-                    Some(q) => {
-                        block[i] = q;
+                    Some((class, bits)) => {
+                        w.push(i, class, bits);
                         full.remove(&key);
                         wide.remove(&key);
                     }
                     None => {
-                        // Bit 95 (free in both layouts): kept whole, in `full`.
-                        block[i].put(95, 1, 1);
+                        // Class 0 with the palette's last index: kept whole, in `full`.
+                        w.push(i, 0, (OCCL_FULL as u128) << (3 * *centre_bits));
                         full.insert(key, compact_node(t));
                         if t.count >= COMPACT_WIDE as u32 {
                             wide.insert(key, t.count as u16);
@@ -860,7 +860,8 @@ fn put_compact_page(state: &mut LodState, lod_id: u32, page_base: u32, chunk_bas
                     }
                 }
             }
-            nodes[pool_page] = block;
+            nodes[pool_page] = w.finish();
+            pages[pool_page] = pq;
         }
         LodNodes::Full(_) => return Err("update_compact_lod_trees: not a compact tree".to_string()),
     }
@@ -1898,6 +1899,8 @@ impl LogRange {
 #[derive(Clone, Debug, Default)]
 struct PageQuant {
     dec: Vec<u16>,
+    /// The page's distinct occlusion indices (a node keeps its place, 9 bits).
+    palette: Vec<u16>,
     lo: [f32; 3],
     span: [f32; 3],
     ctop: f32,
@@ -1948,8 +1951,10 @@ struct NodeCodes {
     /// Merges: 0 no cone, else the code; leaves: theta's class (0 none, 1 +0, 2 -0, 3 coded) and code.
     theta: u32,
     theta_class: u32,
-    /// Merges: the axis at axis_bits a component; leaves: the 16-bit word.
+    /// The axis at axis_bits a component (merges and leaves with a cone).
     axis: u32,
+    /// The occlusion index's place in the page's palette (OCCL_FULL: none fits).
+    occl: u32,
 }
 
 fn oct_axis(bits: u16) -> Vec3A {
@@ -2028,7 +2033,9 @@ impl CompactQuant {
         }
         // A merge's axis requantized, its error added to its theta.
         if self.axis_bits > 0 && self.axis_bits < 8 {
-            for (t, code) in page.iter_mut().zip(codes.iter_mut()).filter(|(t, _)| t.count > 0 && cone_present(t.cone)) {
+            // Leaves too (thread CU round 3: their axis in 5 + 5 bits as a
+            // merge's), a leaf's -0 (a cone of no width) widened the same way.
+            for (t, code) in page.iter_mut().zip(codes.iter_mut()).filter(|(t, _)| cone_present(t.cone) || (t.count == 0 && (t.cone & 0xffff) == 0x8000)) {
                 let axis = (t.cone >> 16) as u16;
                 let (qx, ax) = self.requant_axis(axis & 255);
                 let (qy, ay) = self.requant_axis(axis >> 8);
@@ -2058,110 +2065,214 @@ impl CompactQuant {
                 }
             }
         }
+        // The page's occlusion indices as a palette (9 bits a node).
+        let mut at: AHashMap<u16, u32> = AHashMap::new();
+        for (t, code) in page.iter().zip(codes.iter_mut()) {
+            let n = at.len() as u32;
+            let k = *at.entry(t.occlusion).or_insert(n);
+            code.occl = if k < OCCL_FULL { k } else { OCCL_FULL };
+        }
+        pq.palette = vec![0u16; at.len().min(OCCL_FULL as usize)];
+        for (&v, &k) in &at {
+            if k < OCCL_FULL {
+                pq.palette[k as usize] = v;
+            }
+        }
         pq.fill_tables();
         (pq, codes)
     }
+
+    /// The packed records' centre bits, when the other widths are the
+    /// records' (QUANT_RECORD_BITS but the centre, 8 to 10 bits).
+    fn packed(&self) -> Option<u32> {
+        let r = QUANT_RECORD_BITS;
+        (self.eps_bits == r.eps_bits && self.rho_bits == r.rho_bits && self.theta_bits == r.theta_bits && self.axis_bits == r.axis_bits && (8..=10).contains(&self.centre_bits)).then_some(self.centre_bits)
+    }
 }
 
-/// A 12-byte node (QUANT_RECORD_BITS), bit 0 the leaf flag:
-/// both: centre 3 x 10 (bits 1..31), occlusion 13 (31..44);
-/// a merge: eps 8 (44), rho 7 (52), place 12 (59), the children's page less
-/// its own 8 (71), theta 6 (79: 0 no cone), axis 5 + 5 (85);
-/// a leaf: theta's class 2 (44), theta 6 (46), axis 16 (52).
-/// What does not fit (another child count than 2, a page 255 or more ahead,
-/// a size-mode merge, an occlusion index past 13 bits, a code past its top)
-/// is kept whole in the tree's `full` map.
-#[derive(Clone, Copy, Debug, Default)]
-struct QuantNode([u32; 3]);
+/// Occlusion palette bits a node, and the index that says "kept whole".
+const OCCL_BITS: u32 = 9;
+const OCCL_MASK: u32 = (1 << OCCL_BITS) - 1;
+const OCCL_FULL: u32 = OCCL_MASK;
 
-impl QuantNode {
-    fn put(&mut self, at: u32, bits: u32, v: u32) {
-        debug_assert!(bits == 32 || v < 1 << bits);
-        for b in 0..bits {
-            let (w, k) = (((at + b) / 32) as usize, (at + b) % 32);
-            if (v >> b) & 1 != 0 {
-                self.0[w] |= 1 << k;
-            }
+/// The bits of each class's record (thread CU round 3), after the centre
+/// (3 x cb) and the occlusion palette index (9):
+/// 0 a leaf without a cone: theta's class (0 none, 1 +0), 1 bit;
+/// 1 a leaf with a cone: theta 6, axis 5 + 5;
+/// 2 a merge without a cone: eps 8, rho 7, place 12, page delta 9;
+/// 3 a merge with a cone: class 2's, theta 6, axis 5 + 5.
+fn class_bytes(cb: u32) -> [u32; 4] {
+    let base = 3 * cb + OCCL_BITS;
+    [base + 1, base + 16, base + 36, base + 52].map(|b| b.div_ceil(8))
+}
+
+/// A pool page's records in node order, a class a node (2 bits in `lo`
+/// and `hi`), each word of 32 nodes' first byte in `pre`.
+#[derive(Clone, Debug, Default)]
+struct PackedPage {
+    bytes: Box<[u8]>,
+    lo: Box<[u32]>,
+    hi: Box<[u32]>,
+    pre: Box<[u32]>,
+}
+
+impl PackedPage {
+    /// Node k's class and record bits.
+    fn read(&self, k: usize, cb: u32) -> (u32, u128) {
+        let sz = class_bytes(cb);
+        let w = k >> 5;
+        let bit = (k & 31) as u32;
+        let (lo, hi) = (self.lo[w], self.hi[w]);
+        let class = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+        let below = if bit == 0 { 0 } else { u32::MAX >> (32 - bit) };
+        let (l, h) = (lo & below, hi & below);
+        let n3 = (l & h).count_ones();
+        let n2 = (!l & h).count_ones();
+        let n1 = (l & !h).count_ones();
+        let n0 = bit - n1 - n2 - n3;
+        let at = (self.pre[w] + n0 * sz[0] + n1 * sz[1] + n2 * sz[2] + n3 * sz[3]) as usize;
+        let len = sz[class as usize] as usize;
+        // 16 bytes read at once (the page's bytes end with 16 of padding).
+        let v = u128::from_le_bytes(self.bytes[at..at + 16].try_into().unwrap());
+        (class, v & (u128::MAX >> (128 - 8 * len)))
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.bytes.len() + 4 * (self.lo.len() + self.hi.len() + self.pre.len())
+    }
+}
+
+/// A page's records written in node order.
+struct PackedWriter {
+    bytes: Vec<u8>,
+    lo: Vec<u32>,
+    hi: Vec<u32>,
+    pre: Vec<u32>,
+    sz: [u32; 4],
+}
+
+impl PackedWriter {
+    fn new(n: usize, cb: u32) -> Self {
+        let words = n.div_ceil(32);
+        Self { bytes: Vec::with_capacity(n * 8), lo: vec![0; words], hi: vec![0; words], pre: vec![0; words], sz: class_bytes(cb) }
+    }
+
+    /// Node k (in order) of `class`, its bits.
+    fn push(&mut self, k: usize, class: u32, bits: u128) {
+        let w = k >> 5;
+        if k & 31 == 0 {
+            self.pre[w] = self.bytes.len() as u32;
+        }
+        self.lo[w] |= (class & 1) << (k & 31);
+        self.hi[w] |= (class >> 1) << (k & 31);
+        for j in 0..self.sz[class as usize] {
+            self.bytes.push((bits >> (8 * j)) as u8);
         }
     }
 
-    fn get(&self, at: u32, bits: u32) -> u32 {
-        let (w, k) = ((at / 32) as usize, at % 32);
-        let lo = (self.0[w] as u64) | (self.0.get(w + 1).copied().unwrap_or(0) as u64) << 32;
-        ((lo >> k) & ((1u64 << bits) - 1)) as u32
+    fn finish(mut self) -> PackedPage {
+        self.bytes.extend_from_slice(&[0; 16]);
+        PackedPage { bytes: self.bytes.into_boxed_slice(), lo: self.lo.into_boxed_slice(), hi: self.hi.into_boxed_slice(), pre: self.pre.into_boxed_slice() }
     }
 }
 
-/// The record of node `t` (already quantized by `apply`) with its codes, or
-/// None when it does not fit.
-fn pack_quant(t: &spark_lib::athc_compact::TraversalNode, c: &NodeCodes, chunk: u32) -> Option<QuantNode> {
-    let mut q = QuantNode::default();
-    if t.occlusion as u32 >= 1 << 13 || t.size_mode {
+/// Bits `v` (width `n`) at `at` of a record.
+fn put(r: &mut u128, at: &mut u32, n: u32, v: u32) {
+    debug_assert!(n == 32 || v < 1 << n);
+    *r |= (v as u128) << *at;
+    *at += n;
+}
+
+fn take(r: u128, at: &mut u32, n: u32) -> u32 {
+    let v = ((r >> *at) & ((1u128 << n) - 1)) as u32;
+    *at += n;
+    v
+}
+
+/// Node `t`'s class and record (already quantized by `apply`, its codes
+/// `c`), or None: kept whole.
+fn pack_node(t: &spark_lib::athc_compact::TraversalNode, c: &NodeCodes, chunk: u32, cb: u32) -> Option<(u32, u128)> {
+    if t.size_mode || c.occl >= OCCL_FULL {
         return None;
     }
-    let leaf = t.count == 0;
-    q.put(0, 1, leaf as u32);
+    let mut r = 0u128;
+    let mut at = 0u32;
     for k in 0..3 {
-        q.put(1 + 10 * k as u32, 10, c.centre[k]);
+        put(&mut r, &mut at, cb, c.centre[k]);
     }
-    q.put(31, 13, t.occlusion as u32);
-    if leaf {
-        if c.theta_class == 3 && c.theta == 0 {
-            return None;
-        }
-        q.put(44, 2, c.theta_class);
-        q.put(46, 6, c.theta);
-        q.put(52, 16, t.cone >> 16);
-    } else {
-        let delta = t.child_page.wrapping_sub(chunk) & 0xffff;
-        if t.count != 2 || delta >= 255 || c.eps == 0 || c.rho == 0 && t.rho != 0 {
-            return None;
-        }
-        let th = (t.cone & 0xffff) as u16;
-        let theta = if th == NO_THETA { 0 } else if cone_present(t.cone) && c.theta > 0 { c.theta } else { return None };
-        q.put(44, 8, c.eps);
-        q.put(52, 7, c.rho);
-        q.put(59, 12, t.place);
-        q.put(71, 8, delta);
-        q.put(79, 6, theta);
-        q.put(85, 10, if theta == 0 { 0 } else { c.axis });
+    put(&mut r, &mut at, OCCL_BITS, c.occl);
+    if t.count == 0 {
+        return match c.theta_class {
+            0 | 1 => {
+                put(&mut r, &mut at, 1, c.theta_class);
+                Some((0, r))
+            }
+            3 if c.theta > 0 => {
+                put(&mut r, &mut at, 6, c.theta);
+                put(&mut r, &mut at, 10, c.axis);
+                Some((1, r))
+            }
+            _ => None,
+        };
     }
-    Some(q)
+    let delta = t.child_page.wrapping_sub(chunk) & 0xffff;
+    if t.count != 2 || delta >= 511 || c.eps == 0 || c.rho == 0 && t.rho != 0 {
+        return None;
+    }
+    put(&mut r, &mut at, 8, c.eps);
+    put(&mut r, &mut at, 7, c.rho);
+    put(&mut r, &mut at, 12, t.place);
+    put(&mut r, &mut at, 9, delta);
+    let th = (t.cone & 0xffff) as u16;
+    if th == NO_THETA {
+        return Some((2, r));
+    }
+    if !cone_present(t.cone) || c.theta == 0 {
+        return None;
+    }
+    put(&mut r, &mut at, 6, c.theta);
+    put(&mut r, &mut at, 10, c.axis);
+    Some((3, r))
 }
 
-/// A record back to the node's LodSplat (what `apply` wrote back, bit for bit).
-fn unpack_quant(q: &QuantNode, p: &PageQuant, bits: &CompactQuant) -> LodSplat {
-    let centre = p.centre([q.get(1, 10), q.get(11, 10), q.get(21, 10)]);
-    let leaf = q.get(0, 1) != 0;
+/// A record back to its node's LodSplat (what `apply` wrote back, bit for bit).
+fn unpack_node(class: u32, r: u128, p: &PageQuant, cb: u32) -> LodSplat {
+    let mut at = 0u32;
+    let q = [take(r, &mut at, cb), take(r, &mut at, cb), take(r, &mut at, cb)];
+    let centre = p.centre(q);
+    let occl = take(r, &mut at, OCCL_BITS);
+    let axis_of = |a: u32| {
+        let ax = ((a & 31) as f32 * 255.0 / 31.0).round() as u16;
+        let ay = ((a >> 5) as f32 * 255.0 / 31.0).round() as u16;
+        ax | ay << 8
+    };
     let mut s;
-    if leaf {
+    if class < 2 {
         s = LodSplat::new_f16(centre.map(f16::from_bits), f16::ZERO, 0, 0);
-        s.theta = f16::from_bits(match q.get(44, 2) {
-            0 => NO_THETA,
-            1 => 0,
-            2 => 0x8000,
-            _ => p.theta(q.get(46, 6)),
-        });
-        s.cone_axis = q.get(52, 16) as u16;
+        if class == 0 {
+            s.theta = f16::from_bits(if take(r, &mut at, 1) == 0 { NO_THETA } else { 0 });
+        } else {
+            s.theta = f16::from_bits(p.theta(take(r, &mut at, 6)));
+            s.cone_axis = axis_of(take(r, &mut at, 10));
+        }
     } else {
-        let child_page = (p.chunk + q.get(71, 8)) & 0xffff;
-        s = LodSplat::new_f16(centre.map(f16::from_bits), f16::ZERO, child_page << 16 | q.get(59, 12), 2);
-        s.eps = f16::from_bits(p.eps(q.get(44, 8)));
-        let rho = q.get(52, 7);
+        let eps = take(r, &mut at, 8);
+        let rho = take(r, &mut at, 7);
+        let place = take(r, &mut at, 12);
+        let delta = take(r, &mut at, 9);
+        let child_page = (p.chunk + delta) & 0xffff;
+        s = LodSplat::new_f16(centre.map(f16::from_bits), f16::ZERO, child_page << 16 | place, 2);
+        s.eps = f16::from_bits(p.eps(eps));
         s.rho = f16::from_bits(if rho == 0 { 0 } else { p.rho(rho) });
-        let theta = q.get(79, 6);
-        if theta == 0 {
+        if class == 2 {
             s.theta = f16::from_bits(NO_THETA);
         } else {
-            s.theta = f16::from_bits(p.theta(theta));
-            let top = ((1u32 << bits.axis_bits) - 1) as f32;
-            let a = q.get(85, 10);
-            let ax = ((a & 31) as f32 * 255.0 / top).round() as u16;
-            let ay = ((a >> 5) as f32 * 255.0 / top).round() as u16;
-            s.cone_axis = ax | ay << 8;
+            s.theta = f16::from_bits(p.theta(take(r, &mut at, 6)));
+            s.cone_axis = axis_of(take(r, &mut at, 10));
         }
     }
-    s.occlusion = q.get(31, 13) as u16;
+    s.occlusion = p.palette.get(occl as usize).copied().unwrap_or(0);
     s.margin = p.margin;
     s
 }
@@ -2223,45 +2334,72 @@ mod quant_tests {
             .collect()
     }
 
-    /// The 12-byte records decode to what `apply` wrote back, and the codes
-    /// only round up: eps, rho, theta not below the exact values, the centres
+    /// The packed records (9- and 10-bit centres) decode to what `apply`
+    /// wrote back, through a page written and read back, and the codes only
+    /// round up: eps, rho, theta not below the exact values, the centres
     /// within the margin.
     #[test]
     fn records_decode_to_the_quantized_nodes_and_round_up() {
-        let mut packed = 0;
-        let mut total = 0;
-        for (chunk, exact) in pages() {
-            let mut page = exact.clone();
-            let (mut pq, codes) = QUANT_RECORD_BITS.apply(&mut page);
-            pq.chunk = chunk;
-            for ((t, e), c) in page.iter().zip(&exact).zip(&codes) {
-                total += 1;
-                let up = |q: u16, x: u16| f16::from_bits(q).to_f32() >= f16::from_bits(x).to_f32();
-                assert!(up(t.eps, e.eps) && up(t.rho, e.rho));
-                if cone_present(e.cone) {
-                    assert!(up(t.cone as u16, e.cone as u16));
+        for cb in [9u32, 10] {
+            let bits = CompactQuant { centre_bits: cb, ..QUANT_RECORD_BITS };
+            let mut packed = 0;
+            let mut total = 0;
+            let mut bytes = 0;
+            for (chunk, exact) in pages() {
+                let mut page = exact.clone();
+                let (mut pq, codes) = bits.apply(&mut page);
+                pq.chunk = chunk;
+                let mut w = PackedWriter::new(page.len(), cb);
+                let mut want = vec![];
+                for (i, ((t, e), c)) in page.iter().zip(&exact).zip(&codes).enumerate() {
+                    total += 1;
+                    let up = |q: u16, x: u16| f16::from_bits(q).to_f32() >= f16::from_bits(x).to_f32();
+                    assert!(up(t.eps, e.eps) && up(t.rho, e.rho));
+                    if cone_present(e.cone) {
+                        assert!(up(t.cone as u16, e.cone as u16));
+                    }
+                    let d = Vec3A::from_array(t.centre.map(|v| f16::from_bits(v).to_f32())) - Vec3A::from_array(e.centre.map(|v| f16::from_bits(v).to_f32()));
+                    assert!(d.length() <= pq.margin);
+                    let p = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_node(t, c, chunk, cb) };
+                    match p {
+                        Some((class, r)) => {
+                            w.push(i, class, r);
+                            want.push(Some(i));
+                            packed += 1;
+                        }
+                        None => {
+                            w.push(i, 0, (OCCL_FULL as u128) << (3 * cb));
+                            want.push(None);
+                        }
+                    }
                 }
-                let d = Vec3A::from_array(t.centre.map(|v| f16::from_bits(v).to_f32())) - Vec3A::from_array(e.centre.map(|v| f16::from_bits(v).to_f32()));
-                assert!(d.length() <= pq.margin);
-                let Some(q) = pack_quant(t, c, chunk) else { continue };
-                packed += 1;
-                let s = unpack_quant(&q, &pq, &QUANT_RECORD_BITS);
-                let w = AHashMap::new();
-                let code = t.count as u16;
-                let r = compact_splat(
-                    [t.centre[0], t.centre[1], t.centre[2], t.eps, t.rho, t.child_page as u16, (t.place as u16 & 0xfff) | code << 12, t.cone as u16, (t.cone >> 16) as u16, t.occlusion],
-                    &w,
-                    0,
-                );
-                assert_eq!((s.center, s.child_start, s.child_count, s.occlusion), (r.center, r.child_start, r.child_count, r.occlusion));
-                assert_eq!((s.eps.to_bits(), s.rho.to_bits(), s.theta.to_bits()), (r.eps.to_bits(), r.rho.to_bits(), r.theta.to_bits()), "node {t:?}");
-                if cone_present(t.cone) {
-                    assert_eq!(s.cone_axis, r.cone_axis);
+                let page_out = w.finish();
+                bytes += page_out.bytes();
+                for (i, t) in page.iter().enumerate() {
+                    let (class, r) = page_out.read(i, cb);
+                    if want[i].is_none() {
+                        assert_eq!((class, (r >> (3 * cb)) as u32 & OCCL_MASK), (0, OCCL_FULL));
+                        continue;
+                    }
+                    let s = unpack_node(class, r, &pq, cb);
+                    let wide = AHashMap::new();
+                    let code = t.count as u16;
+                    let e = compact_splat(
+                        [t.centre[0], t.centre[1], t.centre[2], t.eps, t.rho, t.child_page as u16, (t.place as u16 & 0xfff) | code << 12, t.cone as u16, (t.cone >> 16) as u16, t.occlusion],
+                        &wide,
+                        0,
+                    );
+                    assert_eq!((s.center, s.child_start, s.child_count, s.occlusion), (e.center, e.child_start, e.child_count, e.occlusion));
+                    assert_eq!((s.eps.to_bits(), s.rho.to_bits(), s.theta.to_bits()), (e.eps.to_bits(), e.rho.to_bits(), e.theta.to_bits()), "node {t:?}");
+                    if cone_present(t.cone) {
+                        assert_eq!(s.cone_axis, e.cone_axis);
+                    }
+                    assert_eq!(s.margin, pq.margin);
                 }
-                assert_eq!(s.margin, pq.margin);
             }
+            assert!(packed * 10 >= total * 9, "{packed} of {total} in records");
+            eprintln!("centre {cb} bits: {:.2} bytes a node", bytes as f64 / total as f64);
         }
-        assert!(packed * 10 >= total * 9, "{packed} of {total} in records");
     }
 
     /// The conservative occlusion against the exact rule on random nodes,
@@ -2342,7 +2480,7 @@ mod quant_tests {
                 let head = layout.pages[p].compact;
                 let exact: Vec<TraversalNode> = (0..n).map(|i| spark_lib::athc_compact::traversal_node_input(&input, n, &head, p as u32, i)).collect();
                 let mut page = exact.clone();
-                let (pq, _) = QUANT_RECORD_BITS.apply(&mut page);
+                let (pq, _) = CompactQuant { centre_bits: 9, ..QUANT_RECORD_BITS }.apply(&mut page);
                 for (e, q) in exact.iter().zip(&page) {
                     nodes += 1;
                     if e.occlusion == 0 {
@@ -2386,14 +2524,15 @@ mod quant_tests {
         use spark_lib::athc_compact::{decode_runs, CompactAsset};
         let Ok(dir) = std::env::var("CU_CAR_DIR") else { return };
         let asset = CompactAsset::from_bytes(&std::fs::read(format!("{dir}/car.cmpa")).unwrap()).unwrap();
-        QUANT.with_borrow_mut(|q| *q = QUANT_RECORD_BITS);
+        let cb: u32 = std::env::var("CU_CB").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
+        QUANT.with_borrow_mut(|q| *q = CompactQuant { centre_bits: cb, ..QUANT_RECORD_BITS });
         let slot = 3072u32;
         let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "athc")).collect();
         files.sort();
         let (pool, pieces) = STATE.with_borrow_mut(|state| {
             let pool = state.next_id;
             state.next_id += 1;
-            let splats = Rc::new(RefCell::new(LodNodes::Quant { nodes: Vec::new(), pages: Vec::new(), full: AHashMap::new(), wide: AHashMap::new(), slot }));
+            let splats = Rc::new(RefCell::new(LodNodes::Quant { nodes: Vec::new(), pages: Vec::new(), full: AHashMap::new(), wide: AHashMap::new(), slot, centre_bits: QUANT.with_borrow(|q| q.packed()).unwrap() }));
             state.lod_trees.insert(pool, LodTree { splats: splats.clone(), page_to_chunk: vec![], chunk_to_page: vec![], occlusion: None, slot });
             let mut pieces = vec![];
             let mut next_slot = 0u32;
@@ -2428,10 +2567,13 @@ mod quant_tests {
         let mb = |b: usize| b as f64 / 1048576.0;
         let landed = super::counting::NOW.load(Relaxed);
         let nodes: usize = STATE.with_borrow(|state| match &*state.lod_trees.get(&pool).unwrap().splats.borrow() {
-            LodNodes::Quant { nodes, .. } => nodes.iter().map(|b| b.len()).sum::<usize>(),
+            LodNodes::Quant { nodes, full, wide, pages, .. } => {
+                eprintln!("full {} wide {} pages {} (cap {})", full.len(), wide.len(), pages.len(), full.capacity());
+                nodes.iter().map(|b| b.bytes()).sum::<usize>()
+            }
             _ => 0,
         });
-        eprintln!("landed: {:.1} MB now ({} nodes, {:.1} MB of 12-byte records), {:.1} MB peak", mb(landed), nodes, mb(nodes * 12), mb(super::counting::PEAK.load(Relaxed)));
+        eprintln!("landed: {:.1} MB now ({:.1} MB of packed records), {:.1} MB peak", mb(landed), mb(nodes), mb(super::counting::PEAK.load(Relaxed)));
         super::counting::PEAK.store(landed, Relaxed);
         let st = |p: [f32; 3]| Vec3A::new(p[0], -p[2], p[1]);
         let (cam, tgt, far) = ([4.378f32, 1.676, 5.854], [0.0f32, 0.553, 0.252], [13.4994f32, 4.0228, 17.5284]);
@@ -2535,22 +2677,63 @@ mod quant_tests {
                 let input = traversal_input(&raw, n);
                 let head = layout.pages[p].compact;
                 let mut page: Vec<TraversalNode> = (0..n).map(|i| spark_lib::athc_compact::traversal_node_input(&input, n, &head, p as u32, i)).collect();
-                let (_, codes) = QUANT_RECORD_BITS.apply(&mut page);
+                let (_, codes) = CompactQuant { centre_bits: 9, ..QUANT_RECORD_BITS }.apply(&mut page);
                 for (t, c) in page.iter().zip(&codes) {
                     total += 1;
                     let why = if t.count == 0 && (t.eps != 0 || t.rho != 0) { "leaf with error" }
-                    else if pack_quant(t, c, p as u32).is_some() { continue }
-                    else if t.occlusion as u32 >= 1 << 13 { "occlusion" }
+                    else if pack_node(t, c, p as u32, 9).is_some() { continue }
+                    else if c.occl >= OCCL_FULL { "occlusion palette" }
                     else if t.size_mode { "size mode" }
-                    else if t.count == 0 { "leaf theta" }
-                    else if t.count != 2 { if t.count == 1 { "1 child" } else if t.count <= 4 { "3-4 children" } else { "5+ children" } }
-                    else if t.child_page.wrapping_sub(p as u32) & 0xffff >= 255 { "page delta" }
+                    else if t.count == 0 { if c.theta_class == 2 { "leaf -0" } else { "leaf theta code" } }
+                    else if t.count != 2 { "children" }
+                    else if t.child_page.wrapping_sub(p as u32) & 0xffff >= 511 { "page delta" }
                     else if c.eps == 0 { "eps code" }
-                    else { "rho/theta code" };
+                    else if c.rho == 0 { "rho code" }
+                    else { "theta/cone" };
                     *r.entry(why).or_default() += 1;
                 }
             }
         }
         eprintln!("{total} nodes: {r:?}");
+    }
+
+    /// thread CU round 3: what an 8-byte record must hold, over the car.
+    #[test]
+    #[ignore]
+    fn car_record_stats() {
+        use spark_lib::athc_compact::decode_runs;
+        let Ok(dir) = std::env::var("CU_CAR_DIR") else { return };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "athc")).collect();
+        files.sort();
+        let (mut leaves, mut merges, mut same, mut d1, mut d16, mut wide, mut cone_m, mut cone_l, mut occl, mut pages) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut distinct_max = 0usize;
+        let mut distinct_hist = [0u64; 6];
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap();
+            let layout = parse_v3(&bytes).unwrap();
+            let k4 = layout.sections.iter().position(|s| s.id == SectionId::Compact).unwrap();
+            for (p, b) in layout.blocks.iter().enumerate() {
+                let span = b.spans[k4];
+                let (n, raw) = decode_runs(&bytes[span.offset as usize..][..span.stored as usize]).unwrap();
+                let input = traversal_input(&raw, n);
+                let head = layout.pages[p].compact;
+                let mut set = std::collections::HashSet::new();
+                pages += 1;
+                for i in 0..n {
+                    let t = spark_lib::athc_compact::traversal_node_input(&input, n, &head, p as u32, i);
+                    if t.occlusion != 0 { occl += 1; set.insert(t.occlusion); }
+                    if t.count == 0 { leaves += 1; if cone_present(t.cone) { cone_l += 1; } continue; }
+                    merges += 1;
+                    if cone_present(t.cone) { cone_m += 1; }
+                    if t.count != 2 { wide += 1; }
+                    let d = t.child_page.wrapping_sub(p as u32) & 0xffff;
+                    if d == 0 { same += 1 } else if d == 1 { d1 += 1 } else if d < 16 { d16 += 1 }
+                }
+                distinct_max = distinct_max.max(set.len());
+                let b = match set.len() { 0..=15 => 0, 16..=63 => 1, 64..=255 => 2, 256..=1023 => 3, 1024..=4095 => 4, _ => 5 };
+                distinct_hist[b] += 1;
+            }
+        }
+        eprintln!("pages {pages} leaves {leaves} merges {merges} (wide {wide}) children same page {same} next {d1} <16 {d16}; cones merges {cone_m} leaves {cone_l}; occluded {occl}; distinct occlusion a page max {distinct_max} hist(<16,<64,<256,<1k,<4k,more) {distinct_hist:?}");
     }
 }

@@ -120,6 +120,33 @@ describe("NodeSlotAllocator", () => {
     expect(a.use(1)).toBe(-1);
   });
 
+  it("shrinks: the drawn nodes past the new size move down, the idle go", () => {
+    const a = new NodeSlotAllocator(8);
+    frame(a, [1, 2, 3, 4, 5, 6, 7, 8]); // slots 0..7
+    frame(a, [2, 7, 8]); // 1, 3..6 idle; 2, 7, 8 drawn (slots 1, 6, 7)
+    const moves = a.shrink(4) as Uint32Array;
+    expect(moves).not.toBeNull();
+    expect(a.capacity).toBe(4);
+    // Every drawn node still held, below 4, the moves from where it was.
+    for (const k of [2, 7, 8]) {
+      a.begin();
+      const s = a.use(k);
+      expect(s).toBeGreaterThanOrEqual(0);
+      expect(s).toBeLessThan(4);
+    }
+    const from = new Set<number>();
+    for (let i = 0; i < moves.length; i += 2) {
+      from.add(moves[i]);
+      expect(moves[i + 1]).toBeLessThan(4);
+    }
+    expect([...from].sort()).toEqual([6, 7]);
+    // Too small for the drawn ones: refused.
+    const b = new NodeSlotAllocator(4);
+    frame(b, [1, 2, 3, 4]);
+    expect(b.shrink(2)).toBeNull();
+    expect(b.capacity).toBe(4);
+  });
+
   it("releases a slot", () => {
     const a = new NodeSlotAllocator(2);
     a.begin();

@@ -89,6 +89,8 @@
 //!   transmission (float[])                    pbr, flag bit 4
 //! primvars:athenea:splat:thinWalled,
 //!   schlickMetal (int[])                      pbr bits 24, 25
+//! primvars:athenea:splat:materialRoughness    pbr bits 26..31 (athenea's
+//!   (float[], -1: a part not named)           kMaterialRoughnessMark)
 //! primvars:athenea:splat:specularWeight, specularColor, specularIor,
 //!   coatWeight, coatRoughness, coatIor, sheenColor, sheenRoughness,
 //!   coatDarkening (float[], color3f[])        lobes (3 words, packing.slang
@@ -399,6 +401,7 @@ impl Prim {
             transmission: self.floats(&["athenea:splat:transmission"])?,
             thin_walled: self.ints("athenea:splat:thinWalled")?,
             schlick_metal: self.ints("athenea:splat:schlickMetal")?,
+            material_roughness: self.floats(&["athenea:splat:materialRoughness"])?,
             lobes: LobeStreams {
                 specular_weight: self.floats(&["athenea:splat:specularWeight"])?,
                 specular_colour: self.floats(&["athenea:splat:specularColor"])?,
@@ -635,6 +638,15 @@ fn append(a: &mut CloudStreams, b: CloudStreams) -> Result<()> {
             mine.resize(a.count + b.count, 0);
         } else {
             mine.extend_from_slice(&theirs[..b.count]);
+        }
+    }
+    // The material's own roughness: -1 (unknown) where a cloud has none.
+    if !a.material_roughness.is_empty() || !b.material_roughness.is_empty() {
+        a.material_roughness.resize(a.count, -1.0);
+        if b.material_roughness.is_empty() {
+            a.material_roughness.resize(a.count + b.count, -1.0);
+        } else {
+            a.material_roughness.extend_from_slice(&b.material_roughness[..b.count]);
         }
     }
     // athenea's coverage: where one cloud has none, its opacity is its own.
@@ -2103,7 +2115,8 @@ fn main() -> Result<()> {
                 at(&streams.roughness, 1.0),
                 at(&streams.transmission, 0.0)
                     + mark(&streams.thin_walled, 2.0)
-                    + mark(&streams.schlick_metal, 4.0),
+                    + mark(&streams.schlick_metal, 4.0)
+                    + spark_lib::athc_build::material_roughness_mark(at(&streams.material_roughness, -1.0)),
             );
             let l = streams.lobes.at(n, i);
             let w = spark_lib::athc_build::pack_lobes(&l);

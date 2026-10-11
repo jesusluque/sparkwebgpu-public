@@ -116,8 +116,10 @@ export interface CutterStats {
 export type FromCutter =
   | {
       t: "frame";
-      /** Grow the GPU pool to this many records first (0: no). */
+      /** Resize the GPU pool to exactly this many records first (0: no). */
       grow: number;
+      /** With a shrink: records to move (from, to slot pairs). */
+      moves?: Uint32Array | null;
       /** Records to write: slots ascending, records in the same order. */
       slots: Uint32Array;
       records: Uint8Array;
@@ -175,16 +177,29 @@ export class NodeCutter {
   private kb: Int32Array<ArrayBufferLike> = new Int32Array(0);
   private allArea = 0;
   /** Groups to pack, largest first: [start, end) in `miss`, run, page. */
-  private queue: { a: number; b: number; g: number; r: number; w: number }[] =
-    [];
+  /**
+   * The cut's groups as typed arrays (thread CU: no object a group): the
+   * misses [gA, gB) of `miss`, their page and run, their screen weight.
+   */
+  private gA = new Int32Array(0);
+  private gB = new Int32Array(0);
+  private gG = new Int32Array(0);
+  private gR = new Int32Array(0);
+  private gW = new Float64Array(0);
+  /** Groups to pack, by id, in order (appended to as runs come). */
+  private queue = new Int32Array(64);
+  private queueLen = 0;
   private queueAt = 0;
   /** Groups waiting for a dropped run: run key (page x 64 + r) -> groups. */
-  private waiting = new Map<
-    number,
-    { a: number; b: number; g: number; r: number; w: number }[]
-  >();
+  private waiting = new Map<number, number[]>();
   private miss = new Float64Array(0);
   private grow = 0;
+  /** Moves of a shrink, sent with the next frame's resize. */
+  private moves: Uint32Array | null = null;
+  /** The last cuts' sizes. */
+  private recent: number[] = [];
+  /** A view that stays: the pool down to its cut (thread CU). */
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private asked = new Set<number>();
   private fetches = 0;
   private stats: CutterStats = {
@@ -301,6 +316,26 @@ export class NodeCutter {
     const kb = m.kb;
     let n = 0;
     for (const p of m.parts) n += p.numSplats;
+    // The pool after a large cut (thread CU): its size the largest of the
+    // last cuts and 6 %, once that frees over a megabyte; the nodes in
+    // use past it move down (the GPU copies them with the resize).
+    this.recent.push(n);
+    if (this.recent.length > 8) this.recent.shift();
+    const most = Math.max(...this.recent);
+    const target = Math.max(1024, Math.ceil(most * 1.06));
+    if (
+      this.recent.length >= 4 &&
+      alloc.capacity > most * 1.15 &&
+      (alloc.capacity - target) * NODE_RECORD_WORDS * 4 > 1 << 20
+    ) {
+      const moves = alloc.shrink(target);
+      if (moves) {
+        this.grow = target;
+        this.moves = moves;
+      }
+    }
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => this.idleShrink(n), 1500);
     if (n > alloc.capacity && alloc.capacity < this.o.maxCapacity) {
       const next = Math.min(
         Math.ceil(Math.max(n * 1.06, alloc.capacity * 1.1)),
@@ -383,8 +418,12 @@ export class NodeCutter {
     const near = { parents, firstKids, kidCounts, screens };
     const miss = missKeys.subarray(0, missN).sort();
     // The groups (a run's misses), largest on screen first.
-    const groups: { a: number; b: number; g: number; r: number; w: number }[] =
-      [];
+    const gA = new Int32Array(missN);
+    const gB = new Int32Array(missN);
+    const gG = new Int32Array(missN);
+    const gR = new Int32Array(missN);
+    const gW = new Float64Array(missN);
+    let groups = 0;
     let q = 0;
     while (q < missN) {
       const key0 = keys[miss[q] % SH];
@@ -405,29 +444,41 @@ export class NodeCutter {
           w += sc * sc;
         }
       }
-      groups.push({ a: q, b: e, g, r, w });
+      gA[groups] = q;
+      gB[groups] = e;
+      gG[groups] = g;
+      gR[groups] = r;
+      gW[groups] = w;
+      groups += 1;
       q = e;
     }
-    if (screens && this.o.priority) groups.sort((x, y) => y.w - x.w);
-    this.queue = [];
+    const order = new Int32Array(groups);
+    for (let x = 0; x < groups; x++) order[x] = x;
+    if (screens && this.o.priority) order.sort((x, y) => gW[y] - gW[x]);
+    this.gA = gA;
+    this.gB = gB;
+    this.gG = gG;
+    this.gR = gR;
+    this.gW = gW;
+    this.queue = new Int32Array(Math.max(64, groups));
+    this.queueLen = 0;
     this.queueAt = 0;
     this.waiting = new Map();
     let dropped = 0;
-    for (const gr of groups) {
-      if (gr.r < 0) continue; // its page left: it comes back with it
-      runs.mark(
-        gr.g,
-        gr.r * (runs.runInfo(gr.g) as { run: number }).run,
-        RUN_CUT,
-      );
-      if (runs.missing(gr.g, gr.r)) {
-        const rk = gr.g * 64 + gr.r;
+    for (let o = 0; o < groups; o++) {
+      const x = order[o];
+      const g = gG[x];
+      const r = gR[x];
+      if (r < 0) continue; // its page left: it comes back with it
+      runs.mark(g, r * (runs.runInfo(g) as { run: number }).run, RUN_CUT);
+      if (runs.missing(g, r)) {
+        const rk = g * 64 + r;
         const list = this.waiting.get(rk) ?? [];
-        list.push(gr);
+        list.push(x);
         this.waiting.set(rk, list);
-        this.want(gr.g, gr.r, false, gr.w);
-        dropped += gr.b - gr.a;
-      } else this.queue.push(gr);
+        this.want(g, r, false, gW[x]);
+        dropped += gB[x] - gA[x];
+      } else this.enqueue(x);
     }
     this.keys = keys;
     this.out = out;
@@ -463,26 +514,28 @@ export class NodeCutter {
     const i0 = runs.stats.inflates;
     const ms0 = runs.stats.inflateMs;
     let noSlot = 0;
-    while (this.queueAt < this.queue.length) {
+    while (this.queueAt < this.queueLen) {
       if (performance.now() - t0 > ms && slots.length) break;
-      const gr = this.queue[this.queueAt++];
-      const info = runs.runInfo(gr.g);
+      const x0 = this.queue[this.queueAt++];
+      const grG = this.gG[x0];
+      const grR = this.gR[x0];
+      const info = runs.runInfo(grG);
       if (!info) continue;
-      const planes = runs.planes(gr.g, gr.r);
+      const planes = runs.planes(grG, grR);
       if (!planes) {
         // Dropped meanwhile: wait for it again.
-        const rk = gr.g * 64 + gr.r;
+        const rk = grG * 64 + grR;
         const list = this.waiting.get(rk) ?? [];
-        list.push(gr);
+        list.push(x0);
         this.waiting.set(rk, list);
-        this.want(gr.g, gr.r, false, gr.w);
+        this.want(grG, grR, false, this.gW[x0]);
         continue;
       }
-      const base = gr.r * info.run;
+      const base = grR * info.run;
       const m = Math.min(info.run, info.n - base);
       const locals: number[] = [];
       const gs: number[] = [];
-      for (let y = gr.a; y < gr.b; y++) {
+      for (let y = this.gA[x0]; y < this.gB[x0]; y++) {
         const k = this.miss[y] % SH;
         if (!this.failed[k]) continue;
         const key = this.keys[k];
@@ -499,7 +552,7 @@ export class NodeCutter {
       }
       if (!locals.length) continue;
       const rec = new Uint8Array(locals.length * R);
-      packRunRecords(planes, m, Uint32Array.from(locals), gr.g, base, rec, 0);
+      packRunRecords(planes, m, Uint32Array.from(locals), grG, base, rec, 0);
       chunks.push({ rec, slots: gs });
       for (const s of gs) slots.push(s);
     }
@@ -537,8 +590,8 @@ export class NodeCutter {
     s.decodes = runs.stats.inflates - i0;
     s.decodeMs = runs.stats.inflateMs - ms0;
     s.missDeferred = 0;
-    for (let y = this.queueAt; y < this.queue.length; y++) {
-      s.missDeferred += this.queue[y].b - this.queue[y].a;
+    for (let y = this.queueAt; y < this.queueLen; y++) {
+      s.missDeferred += this.gB[this.queue[y]] - this.gA[this.queue[y]];
     }
     if (first) runs.trim();
     this.fillStats();
@@ -548,11 +601,14 @@ export class NodeCutter {
     s.busyMs += s.sliceMs;
     const grow = this.grow;
     this.grow = 0;
+    const moves = this.moves;
+    this.moves = null;
     // Nothing to write nor show: no message (each is a task on the main thread).
     if (x || drawList || grow) {
       this.post({
         t: "frame",
         grow,
+        moves,
         slots: outSlots,
         records,
         drawList,
@@ -561,6 +617,64 @@ export class NodeCutter {
     }
     void gen;
     this.schedule();
+  }
+
+  /**
+   * No new cut for a while: the pool shrinks to this cut and 6 % (the
+   * largest of the last cuts held it up while the view moved).
+   */
+  private idleShrink(n: number) {
+    this.idleTimer = null;
+    const alloc = this.alloc;
+    const target = Math.max(1024, Math.ceil(n * 1.06));
+    if (this.queueAt < this.queueLen || this.scheduled) {
+      this.idleTimer = setTimeout(() => this.idleShrink(n), 500);
+      return;
+    }
+    if (
+      this.grow ||
+      this.moves ||
+      alloc.capacity <= n * 1.1 ||
+      (alloc.capacity - target) * NODE_RECORD_WORDS * 4 <= 1 << 20
+    )
+      return;
+    const moves = alloc.shrink(target);
+    if (!moves) return;
+    this.recent = [n];
+    // The held cut's slots follow their moves.
+    if (moves.length) {
+      const to = new Map<number, number>();
+      for (let k = 0; k < moves.length; k += 2) to.set(moves[k], moves[k + 1]);
+      for (const a of [this.base, this.out]) {
+        for (let i = 0; i < a.length; i++) {
+          const t = to.get(a[i]);
+          if (t !== undefined) a[i] = t;
+        }
+      }
+    }
+    // The list names the moved slots: a new one with the resize.
+    const drawList = this.buildDrawList();
+    this.lastListAt = performance.now();
+    this.fillStats();
+    this.post({
+      t: "frame",
+      grow: target,
+      moves,
+      slots: new Uint32Array(0),
+      records: new Uint8Array(0),
+      drawList,
+      stats: { ...this.stats },
+    });
+  }
+
+  /** Group x to pack (the queue grows as runs come). */
+  private enqueue(x: number) {
+    if (this.queueLen === this.queue.length) {
+      const q = new Int32Array(this.queue.length * 2);
+      q.set(this.queue);
+      this.queue = q;
+    }
+    this.queue[this.queueLen++] = x;
   }
 
   private scheduled = false;
@@ -581,6 +695,7 @@ export class NodeCutter {
         this.post({
           t: "frame",
           grow: 0,
+          moves: null,
           slots: new Uint32Array(0),
           records: new Uint8Array(0),
           drawList,
@@ -593,11 +708,11 @@ export class NodeCutter {
 
   /** One slice later (one at a time: fetches' replies get their turns). */
   private schedule() {
-    if (this.scheduled || this.queueAt >= this.queue.length) return;
+    if (this.scheduled || this.queueAt >= this.queueLen) return;
     this.scheduled = true;
     this.later(() => {
       this.scheduled = false;
-      if (this.queueAt < this.queue.length) this.slice(8);
+      if (this.queueAt < this.queueLen) this.slice(8);
     });
   }
 
@@ -611,7 +726,7 @@ export class NodeCutter {
     s.fetches = this.fetches;
     s.waitingRuns = this.waiting.size;
     s.busy =
-      this.queueAt < this.queue.length ||
+      this.queueAt < this.queueLen ||
       this.waiting.size > 0 ||
       this.fetches > 0 ||
       this.wantNow.size > 0 ||
@@ -816,7 +931,7 @@ export class NodeCutter {
     const list = this.waiting.get(rk);
     if (list) {
       this.waiting.delete(rk);
-      for (const gr of list) this.queue.push(gr);
+      for (const x of list) this.enqueue(x);
     }
   }
 
@@ -984,6 +1099,7 @@ if (typeof self !== "undefined" && typeof window === "undefined") {
     const t: Transferable[] = [];
     if (m.t === "frame") {
       t.push(m.slots.buffer, m.records.buffer);
+      if (m.moves) t.push(m.moves.buffer);
       if (m.drawList) t.push(m.drawList.buffer);
     } else if (m.t === "landed") t.push(m.input.buffer);
     else if (m.t === "keys") t.push(m.keys.buffer);

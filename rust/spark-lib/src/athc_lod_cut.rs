@@ -326,9 +326,18 @@ pub fn athenea_tree_errors(
     cost: &[f32],
     weights: &ErrorWeights,
     double_sided: bool,
+    closed: Option<&[bool]>,
 ) -> Vec<NodeBounds> {
     let n = parent.len();
-    let mut nb: Vec<NodeBounds> = (0..n).map(|k| NodeBounds::own(block, k, double_sided)).collect();
+    // `closed`: each node's own mark (athenea:splat:closed); a node is
+    // culled only when all its leaves are (the climb ANDs it).
+    let mut nb: Vec<NodeBounds> = (0..n)
+        .map(|k| {
+            let mut b = NodeBounds::own(block, k, double_sided);
+            b.cull &= closed.is_none_or(|c| c[k]);
+            b
+        })
+        .collect();
     // The spread, cone and sphere first (treeBoundsUp, with the sphere).
     for k in 0..n {
         let p = parent[k] as usize;
@@ -723,7 +732,7 @@ mod tests {
         let parent = [4, 4, 5, 5, 6, 6, 6];
         let cost = [0.0, 0.0, 0.0, 0.0, 0.2, -0.3, 0.05];
         let w = ErrorWeights::athenea();
-        let nb = athenea_tree_errors(&block, &parent, 4, &cost, &w, false);
+        let nb = athenea_tree_errors(&block, &parent, 4, &cost, &w, false, None);
         let own = |k: usize| {
             let r = size_of(scales_of(&block, k));
             let alpha = look_of(&block, k).1.max(0.02).powi(2);
@@ -782,7 +791,11 @@ mod tests {
         }
         let parent = [4, 4, 5, 5, 6, 6, 6];
         let cost = [0.0, 0.0, 0.0, 0.0, 0.5, -3.0, 0.1];
-        let nb = athenea_tree_errors(&b, &parent, 4, &cost, &ErrorWeights::default(), false);
+        let nb = athenea_tree_errors(&b, &parent, 4, &cost, &ErrorWeights::default(), false, None);
+        // A leaf left open takes the cone from every node over it.
+        let open = [true, false, true, true, true, true, true];
+        let nb2 = athenea_tree_errors(&b, &parent, 4, &cost, &ErrorWeights::default(), false, Some(&open));
+        assert!(!nb2[1].cull && !nb2[4].cull && !nb2[6].cull);
         let size = |k: usize| size_of(scales_of(&b, k));
         for k in 0..4 {
             assert_eq!(nb[k].eps, 0.0);

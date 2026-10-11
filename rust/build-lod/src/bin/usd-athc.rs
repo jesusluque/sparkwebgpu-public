@@ -44,9 +44,10 @@
 //! `--closed`), never with `--double-sided`, and never to glass, thin walls
 //! or a cloud without normals. With `--tree` the error defaults to her
 //! bounded form (colour 10, normal 1, guard 4, floor 2; `own` for r|cost|).
-//! `--node-coverage` (or a constant `athenea:splat:treeCoverage` true): her
-//! merges' opacity is their composited coverage, kept as it is (the file is
-//! flagged FLAG_NODE_COVERAGE).
+//! A tree whose merges carry their composited coverage (`decimate
+//! --tree-coverage`: `coverage` is it, the mass ratio moved to
+//! `coverageMass`; or `--node-coverage`): kept as the opacity, as it is (the
+//! file is flagged FLAG_NODE_COVERAGE).
 //!
 //! For the web: `--add` appends more clouds of the same streams (one file for
 //! several of athenea's per-material clouds; `--add more.usdc::TEXT,TEXT`
@@ -1157,20 +1158,63 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     if !prim.bool("athenea:splat:lodTree") {
         eprintln!("warning: {tree_path} does not say athenea:splat:lodTree = true");
     }
-    let parent: Vec<i32> = prim.ints("athenea:splat:lodParent")?.into_iter().map(|v| v as i32).collect();
-    let cost = prim.floats(&["athenea:splat:lodCost"])?;
-    let total = parent.len();
-    // The leaves: the nodes nothing merged into (all before the merges).
+    let file_parent: Vec<i32> = prim.ints("athenea:splat:lodParent")?.into_iter().map(|v| v as i32).collect();
+    let file_cost = prim.floats(&["athenea:splat:lodCost"])?;
+    let total = file_parent.len();
+    // The leaves: the nodes nothing merged into, before the merges. A tree
+    // written in another order (decimate --tree-coverage writes its store's,
+    // Morton order) is put in that order: its leaves as they come, then its
+    // merges by their height over the leaves (a child is lower than its
+    // parent), so children come before parents.
     let mut has_kids = vec![false; total];
-    for (k, &p) in parent.iter().enumerate() {
+    for (k, &p) in file_parent.iter().enumerate() {
         if p as usize != k && (p as usize) < total {
             has_kids[p as usize] = true;
         }
     }
-    let leaves = has_kids.iter().position(|&h| h).unwrap_or(total);
-    if has_kids[leaves..].iter().any(|&h| !h) {
-        bail!("{tree_path}: a leaf after the first merge (leaves first, then merges)");
-    }
+    let first_merge = has_kids.iter().position(|&h| h).unwrap_or(total);
+    let perm: Option<Vec<u32>> = if has_kids[first_merge..].iter().any(|&h| !h) {
+        // Each node's height over its leaves, raised until it holds.
+        let mut height = vec![0u32; total];
+        for round in 0.. {
+            let mut raised = false;
+            for (k, &p) in file_parent.iter().enumerate() {
+                let p = p as usize;
+                if p != k && p < total && height[p] < height[k] + 1 {
+                    height[p] = height[k] + 1;
+                    raised = true;
+                }
+            }
+            if !raised {
+                break;
+            }
+            if round > total {
+                bail!("{tree_path}: lodParent has a cycle");
+            }
+        }
+        let mut order: Vec<u32> = (0..total as u32).filter(|&k| !has_kids[k as usize]).collect();
+        let mut merges: Vec<u32> = (0..total as u32).filter(|&k| has_kids[k as usize]).collect();
+        merges.sort_by_key(|&k| (height[k as usize], k));
+        order.extend(merges);
+        eprintln!("{tree_path}: leaves and merges interleaved, put in order (leaves first, merges by height)");
+        Some(order)
+    } else {
+        None
+    };
+    let (parent, cost): (Vec<i32>, Vec<f32>) = match &perm {
+        Some(order) => {
+            let mut new_of = vec![0u32; total];
+            for (n, &o) in order.iter().enumerate() {
+                new_of[o as usize] = n as u32;
+            }
+            (
+                order.iter().map(|&o| new_of[file_parent[o as usize] as usize] as i32).collect(),
+                order.iter().map(|&o| file_cost[o as usize]).collect(),
+            )
+        }
+        None => (file_parent, file_cost),
+    };
+    let leaves = has_kids.iter().filter(|&&h| !h).count();
     let tree = MergeTree::from_parts(leaves, &parent, &cost)?;
     let fps = time_codes_per_second(data.as_ref());
     let rig = {
@@ -1182,14 +1226,27 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     let constants = prim.constants();
     let up = up_axis(data.as_ref());
     let mut streams = prim.streams()?;
+    // athenea:splat:closed as a per-gaussian int[] (the file's order).
+    let closed_marks: Option<Vec<bool>> = match prim.get("athenea:splat:closed") {
+        Some(Value::IntVec(v)) if v.len() == total => Some(v.iter().map(|&i| i != 0).collect()),
+        _ => None,
+    };
     // athenea's `decimate --tree-coverage`: each merge's opacity is what its
     // leaves cover composited on its plane. Kept as the opacity, as it is
     // (the mass-ratio `coverage` primvar is not read over it, the file is
     // flagged FLAG_NODE_COVERAGE so no reader recomputes or widens it).
     // `--node-coverage`, or a constant `athenea:splat:treeCoverage` true.
-    let node_coverage = flag("--node-coverage") || prim.bool("athenea:splat:treeCoverage");
-    if node_coverage {
+    // Her trees mark it by keeping the mass ratio apart (`coverageMass`):
+    // `coverage` is then the composited coverage, read as the opacity. With
+    // `--node-coverage` on a tree without it, the opacities are read as they
+    // are (the mass-ratio `coverage` left aside).
+    let marked = prim.get("athenea:splat:coverageMass").is_some();
+    let node_coverage = marked || flag("--node-coverage") || prim.bool("athenea:splat:treeCoverage");
+    if node_coverage && !marked {
         streams.coverage.clear();
+    }
+    if node_coverage {
+        eprintln!("node coverage: the merges' composited coverage kept as their opacity{}", if marked { " (coverage; coverageMass left aside)" } else { "" });
     }
     if streams.count != total {
         bail!("{tree_path}: {} gaussians, {} lodParent", streams.count, total);
@@ -1215,6 +1272,25 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     }
     let (mut packed, kept) = pack_streams_kept(&streams, &options)?;
     drop(streams);
+    // In the tree's order (above), when it was not the file's.
+    let kept = match &perm {
+        Some(order) => {
+            let mut row_of = vec![u32::MAX; total];
+            for (r, &k) in kept.iter().enumerate() {
+                row_of[k as usize] = r as u32;
+            }
+            let (mut rows, mut kept_new) = (Vec::new(), Vec::new());
+            for (n, &o) in order.iter().enumerate() {
+                if row_of[o as usize] != u32::MAX {
+                    rows.push(row_of[o as usize]);
+                    kept_new.push(n as u32);
+                }
+            }
+            packed.block = spark_lib::athc_build::reorder(&packed.block, &rows);
+            kept_new
+        }
+        None => kept,
+    };
     // Leaves validation dropped (opacity under 1/255) leave the tree; a merge
     // has to stay (its row stands for its leaves).
     let (tree, old) = if kept.len() < total {
@@ -1245,8 +1321,18 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
         // for the level groups that are her nodes; the rest (above her roots) ours.
         // athenea's bounded error (her research prototype's weights) unless told.
         let weights = ErrorWeights::athenea().parse_over(arg(args, "--lod-error-weights").unwrap_or(""))?;
-        let double_sided = no_cone(args, prim.closed());
-        let bounds = athenea_tree_errors(&packed.block, &tree.parent, tree.leaves, &tree.cost, &weights, double_sided);
+        // athenea:splat:closed per gaussian (int[], 1: its mesh has no open
+        // or non-manifold edge), in the tree's order; else the piece's flag.
+        let marks = closed_marks.as_ref().map(|m| -> Vec<bool> {
+            match &perm {
+                Some(order) => order.iter().map(|&o| m[o as usize]).collect(),
+                None => m.clone(),
+            }
+        });
+        let marks = marks.map(|m| -> Vec<bool> { old.iter().map(|&o| m[o as usize]).collect() });
+        let double_sided = if marks.is_some() && !flag("--closed") { flag("--double-sided") } else { no_cone(args, prim.closed()) };
+        let marks = if flag("--closed") { None } else { marks };
+        let bounds = athenea_tree_errors(&packed.block, &tree.parent, tree.leaves, &tree.cost, &weights, double_sided, marks.as_deref());
         let known: Known = import
             .level_nodes
             .iter()

@@ -421,9 +421,11 @@ its +-2 sigma, `1 - prod(1 - alpha G)`). Header flag bit 8
 (`FLAG_NODE_COVERAGE`) says the levels' opacities are such a coverage:
 kept as stored -- never replaced by the mass ratio (`uncap_levels`), and
 the decoder's widening only orients those nodes (`widen_levels`), it does
-not divide them by an area it adds. `usd-athc --tree` sets it with
-`--node-coverage` or a constant `athenea:splat:treeCoverage` true, and
-then reads the merges' opacity, not the mass-ratio `coverage` primvar.
+not divide them by an area it adds. `usd-athc --tree` sets it when her
+tree marks it -- `coverage` is then the composited coverage and the mass
+ratio has moved to `coverageMass` (pieces/t21) -- or with `--node-coverage`
+(then the opacities are read as they are), and reads `coverage` as the
+merges' opacity.
 
 ### The curvature (`CURV`)
 

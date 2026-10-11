@@ -92,6 +92,11 @@ export interface CompactLayout {
   words: Record<string, number>;
   /** Bytes by category: per-gaussian planes and the tables. */
   bytes: Record<string, number>;
+  /**
+   * Band pages in pool slots (compactPages.ts CompactPagePool): `words`
+   * are then offsets within a slot, the gaussians slotNodes a slot.
+   */
+  paged?: { slotNodes: number; slotWords: number; slotsBase: number };
 }
 
 export interface CompactCloud {
@@ -773,8 +778,9 @@ export class CompactRelitPath {
   }
 
   setCloud(cloud: CompactCloud) {
-    this.data?.destroy();
+    if (this.ownsData) this.data?.destroy();
     this.cloud = cloud;
+    this.ownsData = true;
     this.data = createStorage(
       this.device,
       cloud.data.byteLength,
@@ -787,6 +793,25 @@ export class CompactRelitPath {
       cloud.data.byteOffset,
       cloud.data.byteLength,
     );
+    this.afterCloud(cloud);
+  }
+
+  /**
+   * Band pages in a pool (compactPages.ts): the pool's buffer is read as it
+   * is (not owned), the gaussians its slot indices; the draw list
+   * (setDrawList, the traversal's cut) says which are drawn.
+   */
+  setPagedCloud(pool: { buffer: GPUBuffer; cloud: CompactCloud }) {
+    if (this.ownsData) this.data?.destroy();
+    this.cloud = pool.cloud;
+    this.data = pool.buffer;
+    this.ownsData = false;
+    this.afterCloud(pool.cloud);
+  }
+
+  private ownsData = false;
+
+  private afterCloud(cloud: CompactCloud) {
     const words =
       cloud.layout.clusters * K.kCompactProjWords + K.kCompactSunWords;
     this.projWords = words;
@@ -891,9 +916,13 @@ export class CompactRelitPath {
     const p = (camera as THREE.PerspectiveCamera).projectionMatrix.elements;
     const near = (camera as THREE.PerspectiveCamera).near ?? 0.01;
     const far = (camera as THREE.PerspectiveCamera).far ?? 1000;
+    const paged = cloud.layout.paged;
     return UniformWriter.for(compactModule, "compactParams").setAll({
       count: this.listed,
       flags: this.flags(),
+      slotNodes: paged?.slotNodes ?? 0,
+      slotWords: paged?.slotWords ?? 0,
+      slotsBase: paged?.slotsBase ?? 0,
       drawList: this.projWords,
       chunkTable: W.chunkTable,
       pieceTable: W.pieceTable,
@@ -1277,7 +1306,7 @@ export class CompactRelitPath {
   }
 
   dispose() {
-    this.data?.destroy();
+    if (this.ownsData) this.data?.destroy();
     this.bins?.destroy();
     this.frame.destroy();
     this.drawUniform.destroy();

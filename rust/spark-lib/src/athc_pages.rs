@@ -824,7 +824,26 @@ pub(crate) mod tests {
     /// every stream the compact tier reads (normals, pbr, lobes, curvature,
     /// shadow bits, a full transfer of 112), deterministic; and its file.
     pub(crate) fn sample_relit_paged(leaves: usize, per: usize) -> (PagedTree, AthcFile) {
+        sample_relit_paged_spread(leaves, per, 0.0)
+    }
+
+    /// `sample_relit_paged` with the row bent in 3D and stretched `spread`
+    /// times along x (0: as `tree` lays it).
+    pub(crate) fn sample_relit_paged_spread(leaves: usize, per: usize, spread: f32) -> (PagedTree, AthcFile) {
         let (mut b, parent, start, size) = tree(leaves);
+        if spread > 0.0 {
+            for i in 0..b.n {
+                let x = b.positions[4 * i];
+                b.positions[4 * i] = spread * x;
+                b.positions[4 * i + 1] = (x * 7.0).sin() * 0.2;
+                b.positions[4 * i + 2] = (x * 5.0).cos() * 0.1;
+                // Gaussians as much bigger: a few pixels from a few metres.
+                let sh = &mut b.shape[4 * i..4 * i + 4];
+                let g = (3.0 * spread).ln();
+                sh[1] = pack_halves(crate::athc::low_half(sh[1]) + g, crate::athc::high_half(sh[1]) + g);
+                sh[2] = pack_halves(crate::athc::low_half(sh[2]) + g, crate::athc::high_half(sh[2]));
+            }
+        }
         let nb = bounds(&b, &parent, &size);
         let page = her_pages(&parent, &nb, &start, per);
         let ids: Vec<u32> = (0..b.n as u32).collect();
@@ -843,7 +862,7 @@ pub(crate) mod tests {
             b.curvature.extend_from_slice(&[pack_halves(0.5 * t.sin(), -0.02), pack_halves(3.0 + t.cos(), 0.0)]);
             // A few dozen distinct masks, so the dictionary keeps them exactly.
             let m = rand() % 40;
-            b.shadow_bits.extend((0..8).map(|w| if w as u32 == m % 8 { 0xffff_0000 ^ m } else { m.wrapping_mul(2654435761) ^ w }));
+            b.shadow_bits.extend((0..8).map(|w| if w == m % 8 { 0xffff_0000 ^ m } else { m.wrapping_mul(2654435761) ^ w }));
             for v in 0..56 {
                 let x = 0.1 * ((k * 7 + v) as f32 * 0.13).sin();
                 b.transfer.push(pack_halves(x, 0.5 * x));

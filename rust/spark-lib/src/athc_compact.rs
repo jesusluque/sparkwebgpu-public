@@ -287,7 +287,7 @@ pub fn encode_normal_bits(n: [f32; 3], bits: u32) -> u32 {
 
 /// compact.ts encodeOpacity: sqrt up to 1, then 1..2 by 1/63.
 pub fn encode_opacity(a: f32) -> u8 {
-    if !(a > 0.0) {
+    if a.is_nan() || a <= 0.0 {
         return 0;
     }
     if a <= 1.0 {
@@ -585,7 +585,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
             lo = [0.0; 3];
             hi = [0.0; 3];
         }
-        if !(ln_lo <= ln_hi) {
+        if ln_lo.is_nan() || ln_hi.is_nan() || ln_lo > ln_hi {
             ln_lo = 0.0;
             ln_hi = 0.0;
         }
@@ -943,5 +943,27 @@ pub(crate) mod tests {
                 assert!((node.curvature[0] - k0).abs() <= 0.03 * k0.abs() + 0.01, "{} {}", node.curvature[0], k0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fixture {
+    /// test/fixtures/athc/compact_pages.athc: a small paged tree with its
+    /// compact tier (synthetic streams and basis), for the Dawn test of the
+    /// paged compact draw (test/gpu/compactPagesDraw.test.ts). Regenerate:
+    /// cargo test -p spark-lib --lib write_compact_fixture -- --ignored
+    #[test]
+    #[ignore]
+    fn write_compact_fixture() {
+        use super::*;
+        use crate::athc_v3::{write_v3_paged_compact, COMPRESSION_GZIP};
+        let (paged, file) = crate::athc_pages::tests::sample_relit_paged_spread(1200, 300, 3.0);
+        let rows = paged.rows.clone();
+        let basis = tests::sample_basis(8);
+        let c = build_compact(&file.chunks, false, &basis, &CompactOptions { threads: 2, ..Default::default() }).unwrap();
+        let (bytes, _) = write_v3_paged_compact(&file, &rows, COMPRESSION_GZIP, &|_| 0, None, None, &c).unwrap();
+        let out = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/compact_pages.athc");
+        std::fs::write(out, &bytes).unwrap();
+        eprintln!("{} bytes, {} pages, {} nodes", bytes.len(), rows.len(), c.stats.nodes);
     }
 }

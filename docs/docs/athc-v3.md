@@ -560,6 +560,53 @@ virtual space (child `p << 16 | place`), held in a pool slot of
 The traversal cuts within the resident pages: a node whose children's page
 is absent is drawn as a leaf (spark-rs `lod_tree.rs`, the tree's `slot`).
 
+#### The compact tier (`CMPC`, tier 4)
+
+`usd-athc --tree tree.usdc out.athc --pages --compact-basis basis.json`
+(thread CN, `athc_compact.rs`) adds a FOURTH tier for the compact relit path
+(`src/webgpu/athenea/compact.ts`, research/iphone-compact.md): what a phone
+draws of a relit page, without a byte of tiers 1 to 3.
+
+- **`CMPC`**, the last section, tier 4, laid out after tier 3 (a run of
+  consecutive pages is one Range), 64 bytes a node (16 words, encoding 0) as
+  byte planes, plane k at `n x (widths before k)`:
+
+```text
+posX posY posZ  u16 x3 in the page's box     albedo  u8 x3 sRGB
+opacity         u8 code (sqrt to 1, then LoD opacity 1..2 by 1/63)
+scale           u8 x3 ln in the page's range (0 = exactly 0)
+rotation        u32 the ext quaternion word  normal  3 bytes, octahedral 12+12
+curvature       s8 x3 signed log in the page's range
+material        u16 into the piece's table   cluster u8 (joint CPCA)
+weights         3 x u32: 8 int4 a block (direct, indirect, reflected)
+shadow          u16 into the piece's dictionary            -- the GPU's 40 bytes
+lodTree         4 words, as the decoder gives the node (children page << 16 | place)
+lodError        the 2 LODE words                            -- the traversal's 24
+```
+
+- **the page's head** in its page-table row: rows are 32 words, word 16 the
+  bytes of its `CMPC`, words 17-28 the head (box lo, hi; ln scale lo, hi;
+  the curvature's range; three words a reader fills: the slot's codebook
+  and materials offsets);
+- **the piece's tables**, global to its pages, after the page table (offset
+  u64 and bytes at header byte 192, the header 208 bytes): `CMPT` v1, the
+  shadow dictionary (k-means in Hamming space over every node, 1024 entries,
+  12 rounds; kept exactly when there are no more distinct masks), the
+  materials (every distinct pbr + lobes, 4 words each), the joint CPCA basis
+  in f16 (504 words a cluster). The basis is the one `--compact-basis`
+  names; athenea's q97 basis is local only, so a file made with it is never
+  published.
+
+A compact reader (`CompactBandStreamer`, `src/webgpu/athenea/compactPages.ts`)
+reads the tables with the page table, then only `CMPC` runs: each page goes
+into a pool slot of `slotNodes` (3072) nodes, its head then its planes, the
+GPU's 40 bytes a node; the LoD tree and LODE words go to the WASM traversal
+(one shared pool tree, a slot a page, as `WgpuBandPager`). The page plan,
+the eviction order and tau's fit are `WgpuBandPager`'s (`planBand`). The
+traversal's cut, slot indices, is the compact path's draw list
+(`CompactRelitPath.setPagedCloud` + `setDrawList`); compact.slang reads a
+slot's planes and head when `slotNodes` > 0.
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only

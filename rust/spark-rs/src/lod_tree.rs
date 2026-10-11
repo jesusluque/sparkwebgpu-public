@@ -560,11 +560,15 @@ pub fn traverse_lod_trees(
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
     error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
+    error_size_k: Option<f32>,
 ) -> anyhow::Result<Object, JsValue> {
     // The error cut (spark-lib athc_lod_cut): a node with bounds is measured
     // by its projected error, P = eps / max(d - rho, near), scaled so that
     // P <= error_limit compares as the size cut's pixel_scale_limit.
     let err_ratio = error_limit.filter(|&e| e > 0.0).map_or(0.0, |e| pixel_scale_limit / e);
+    // The combined cut (`error_size_k` k > 0): P = max(P_err, P_size / k), so
+    // the error cut never keeps a node more than k tau pixels wide.
+    let size_guard = error_size_k.filter(|&k| k > 0.0 && err_ratio > 0.0).map_or(0.0, |k| err_ratio / k);
     // Back-face culling of the cut's coarse nodes: a node the cut draws (not
     // one it refines) whose whole normal cone faces away, when it is wider
     // than `back_cull_min` on screen (the same angle units as the limit: a
@@ -606,7 +610,7 @@ pub fn traverse_lod_trees(
             let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
             let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
             let cone_dot = cone_dot.min(cone_dot0);
-            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio)
+            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard)
         }).collect();
         // Each instance's occlusion codebook, when culling by it.
         let occlusions: Vec<Option<&(Vec<u32>, [f32; 6])>> = lod_ids
@@ -799,17 +803,18 @@ pub fn traverse_lod_trees(
     })
 }
 
-type Inst<'a> = (u32, Ref<'a, Vec<LodSplat>>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32);
+type Inst<'a> = (u32, Ref<'a, Vec<LodSplat>>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32, f32);
 
 fn compute_pixel_scale<'a>(splat: &LodSplat, instance: &Inst<'a>) -> f32 {
-    let &(_, _, _, _, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio) = instance;
+    let &(_, _, _, _, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard) = instance;
     let center = splat.center();
     let delta = center - origin;
     let distance = delta.length().max(1.0e-6);
     let inv_distance = 1.0 / distance;
     let pixel_scale = if err_ratio > 0.0 && splat.has_error() {
         // athenea's projectedError, at the sphere's nearest point.
-        splat.eps.to_f32() / (distance - splat.rho.to_f32()).max(ERROR_NEAR) * err_ratio
+        let p = splat.eps.to_f32() / (distance - splat.rho.to_f32()).max(ERROR_NEAR) * err_ratio;
+        if size_guard > 0.0 { p.max(splat.size() * inv_distance * size_guard) } else { p }
     } else {
         splat.size() * inv_distance
     };
@@ -844,9 +849,13 @@ pub fn dynamic_traverse_lod_trees(
     // readback: Uint32Array,
     // flag: bool,
     error_limit: Option<f32>, _back_cull_min: Option<f32>, _occlusion_cull: Option<bool>,
+    error_size_k: Option<f32>,
 ) -> anyhow::Result<Object, JsValue> {
     // (The dynamic traversal does not cull.)
     let err_ratio = error_limit.filter(|&e| e > 0.0).map_or(0.0, |e| pixel_scale_limit / e);
+    // The combined cut (`error_size_k` k > 0): P = max(P_err, P_size / k), so
+    // the error cut never keeps a node more than k tau pixels wide.
+    let size_guard = error_size_k.filter(|&k| k > 0.0 && err_ratio > 0.0).map_or(0.0, |k| err_ratio / k);
 
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
@@ -883,7 +892,7 @@ pub fn dynamic_traverse_lod_trees(
             let cone_foveate = cone_foveates[index];
             let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index]).to_radians().cos() } else { 1.0 };
             let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index]).to_radians().cos() } else { 1.0 };
-            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio)
+            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard)
         }).collect();
 
         let mut lod_chunk_max: AHashMap<u32, Vec<f32>> = AHashMap::new();

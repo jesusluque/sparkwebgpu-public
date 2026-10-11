@@ -230,6 +230,11 @@ export interface SparkRendererOptions {
   /** The narrowest node lodBackCull culls, in pixels. @default 1 */
   lodBackCullMinPx?: number;
   /**
+   * The combined cut with lodErrorTau (WgpuLod's lodErrorSizeK): refine
+   * while max(P_err, P_size / k) > tau. 0: the error cut alone. @default 0
+   */
+  lodErrorSizeK?: number;
+  /**
    * athenea's occlusion masks (.athc OCCL): hidden nodes left out with
    * their subtrees (WebGPU). @default false
    */
@@ -494,6 +499,7 @@ export class SparkRenderer extends THREE.Mesh {
   lodErrorTau: number;
   lodBackCull: boolean;
   lodBackCullMinPx: number;
+  lodErrorSizeK: number;
   lodOcclusionCull: boolean;
   lodErrorTauAuto: boolean | import("./webgpu/WgpuLod").LodTauAutoOptions;
   lodInflate: boolean;
@@ -696,6 +702,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.lodErrorTau = options.lodErrorTau ?? 0;
     this.lodBackCull = options.lodBackCull ?? false;
     this.lodBackCullMinPx = options.lodBackCullMinPx ?? 1;
+    this.lodErrorSizeK = options.lodErrorSizeK ?? 0;
     this.lodOcclusionCull = options.lodOcclusionCull ?? false;
     this.lodErrorTauAuto = options.lodErrorTauAuto ?? false;
     this.lodInflate = options.lodInflate ?? false;

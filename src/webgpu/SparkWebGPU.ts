@@ -624,6 +624,7 @@ export class SparkWebGPU {
     l.lodErrorTau = spark.lodErrorTau;
     l.lodBackCull = spark.lodBackCull;
     l.lodBackCullMinPx = spark.lodBackCullMinPx;
+    l.lodErrorSizeK = spark.lodErrorSizeK;
     l.lodOcclusionCull = spark.lodOcclusionCull;
     l.lodErrorTauAuto = spark.lodErrorTauAuto;
     l.lodTraverseMode = spark.lodTraverseMode;

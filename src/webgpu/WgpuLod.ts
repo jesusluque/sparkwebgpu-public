@@ -63,6 +63,13 @@ export interface WgpuLodOptions {
   /** The narrowest node lodBackCull culls, in pixels. @default 1 */
   lodBackCullMinPx?: number;
   /**
+   * The combined cut, with lodErrorTau > 0 on trees with error bounds
+   * (LODE): a node is refined while max(P_err, P_size / k) > tau, P_size its
+   * LoD size in pixels, so the error cut never keeps a node more than k tau
+   * pixels wide. 0: the error cut alone. @default 0
+   */
+  lodErrorSizeK?: number;
+  /**
    * athenea's occlusion masks (`.athc` section OCCL and codebook, `decimate
    * --occlusion-mask`): a node is left out with its subtree when the eye is
    * outside the asset's box and the four cells toward the eye on the 16 x
@@ -299,6 +306,7 @@ export class WgpuLod {
     errorLimit: number;
     backCull: number;
     occlusion: boolean;
+    sizeK: number;
     maxSplats: number;
   };
   private lastPixelLimit?: number;
@@ -322,6 +330,7 @@ export class WgpuLod {
       lodErrorTau: 0,
       lodBackCull: false,
       lodBackCullMinPx: 1,
+      lodErrorSizeK: 0,
       lodOcclusionCull: false,
       lodErrorTauAuto: false,
       behindFoveate: 0.2,
@@ -625,6 +634,7 @@ export class WgpuLod {
         this.lastLod.errorLimit !== errorLimit ||
         this.lastLod.backCull !== this.backCullMin ||
         this.lastLod.occlusion !== o.lodOcclusionCull ||
+        this.lastLod.sizeK !== o.lodErrorSizeK ||
         this.lastLod.maxSplats !== maxSplats
       ) {
         this.dirty = true;
@@ -889,6 +899,7 @@ export class WgpuLod {
       errorLimit,
       backCull: this.backCullMin,
       occlusion: this.options.lodOcclusionCull,
+      sizeK: this.options.lodErrorSizeK,
       maxSplats,
     };
     await this.traverse(
@@ -978,6 +989,7 @@ export class WgpuLod {
         errorLimit: errorLimit > 0 ? errorLimit : undefined,
         backCullMin: this.backCullMin >= 0 ? this.backCullMin : undefined,
         occlusionCull: o.lodOcclusionCull,
+        errorSizeK: o.lodErrorSizeK > 0 ? o.lodErrorSizeK : undefined,
       });
     this.stats.culled = culledCount ?? 0;
     this.stats.occluded = occludedCount ?? 0;
@@ -1101,6 +1113,7 @@ export class WgpuLod {
       errorLimit: errorLimit > 0 ? errorLimit : undefined,
       backCullMin: this.backCullMin >= 0 ? this.backCullMin : undefined,
       occlusionCull: o.lodOcclusionCull,
+      errorSizeK: o.lodErrorSizeK > 0 ? o.lodErrorSizeK : undefined,
     });
     for (const [id, { numSplats, indices }] of Object.entries(keyIndices)) {
       const m = byId.get(id);

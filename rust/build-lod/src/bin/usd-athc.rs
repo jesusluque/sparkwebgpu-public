@@ -1127,6 +1127,63 @@ fn write_athl(
     }))
 }
 
+/// A tree whose rows are not in its own order (`decimate --tree-coverage`
+/// writes its store's order but keeps `lodParent` as the tree's indices):
+/// each row's tree index from its run of leaves (`lodStart`, `lodSize`: a
+/// leaf's is its own index; a merge's run is its children's, and no two
+/// nodes share one), and `lodParent` turned into rows. A tree in its own
+/// order (every leaf's run starts at its row) comes back as it is.
+fn rows_parent(path: &str, parent: Vec<i32>, start: &[u32], size: &[u32]) -> Result<Vec<i32>> {
+    let n = parent.len();
+    if start.len() != n || size.len() != n || (0..n).all(|r| size[r] != 1 || start[r] as usize == r) {
+        return Ok(parent);
+    }
+    // Each tree merge's children rows, by the parent index they name.
+    let mut kids: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+    for r in 0..n {
+        kids.entry(parent[r] as u32).or_default().push(r);
+    }
+    let mut tree_of = vec![u32::MAX; n];
+    let mut by_run: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for r in 0..n {
+        if size[r] == 1 {
+            tree_of[r] = start[r];
+        }
+    }
+    for (&j, rows) in &kids {
+        let lo = rows.iter().map(|&r| start[r]).min().unwrap();
+        let sum: u64 = rows.iter().map(|&r| size[r] as u64).sum();
+        // A root names itself: its own row is in the group, its run holding
+        // every other's (children's runs are disjoint).
+        let own = rows.iter().find(|&&r| {
+            rows.len() > 1
+                && rows.iter().all(|&q| q == r || (start[q] >= start[r] && start[q] + size[q] <= start[r] + size[r]))
+        });
+        let run = (lo, if own.is_some() { (sum / 2) as u32 } else { sum as u32 });
+        if run.1 > 1 {
+            by_run.insert(run, j);
+        }
+    }
+    for r in 0..n {
+        if size[r] > 1 {
+            tree_of[r] = *by_run.get(&(start[r], size[r])).ok_or_else(|| {
+                let near: Vec<_> = by_run.keys().filter(|k| k.0 == start[r]).collect();
+                let leaves_here = (0..n).filter(|&q| size[q] == 1 && start[q] >= start[r] && start[q] < start[r] + size[r]).count();
+                anyhow!("{path}: row {r} (run {} + {}, parent {}) matches no merge's run of leaves; runs at that start {:?}; leaf rows inside {}", start[r], size[r], parent[r], near, leaves_here)
+            })?;
+        }
+    }
+    let mut row_of = vec![u32::MAX; n];
+    for r in 0..n {
+        if tree_of[r] as usize >= n || row_of[tree_of[r] as usize] != u32::MAX {
+            bail!("{path}: rows and tree indices do not match one to one");
+        }
+        row_of[tree_of[r] as usize] = r as u32;
+    }
+    eprintln!("{path}: rows in another order than the tree's; lodParent mapped to rows by the leaves' runs");
+    Ok((0..n).map(|r| row_of[parent[r] as usize] as i32).collect())
+}
+
 /// Whether a cloud's merged nodes get no back-face cone: only a closed piece
 /// (`athenea:splat:closed` 1, or `--closed`) gets one; `--double-sided`
 /// takes it away whatever the primvar says.
@@ -1159,6 +1216,7 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
         eprintln!("warning: {tree_path} does not say athenea:splat:lodTree = true");
     }
     let file_parent: Vec<i32> = prim.ints("athenea:splat:lodParent")?.into_iter().map(|v| v as i32).collect();
+    let file_parent = rows_parent(tree_path, file_parent, &prim.ints("athenea:splat:lodStart")?, &prim.ints("athenea:splat:lodSize")?)?;
     let file_cost = prim.floats(&["athenea:splat:lodCost"])?;
     let total = file_parent.len();
     // The leaves: the nodes nothing merged into, before the merges. A tree
@@ -1240,8 +1298,14 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     // `coverage` is then the composited coverage, read as the opacity. With
     // `--node-coverage` on a tree without it, the opacities are read as they
     // are (the mass-ratio `coverage` left aside).
-    let marked = prim.get("athenea:splat:coverageMass").is_some();
-    let node_coverage = marked || flag("--node-coverage") || prim.bool("athenea:splat:treeCoverage");
+    // `--mass-coverage`: the mass ratio instead, as before her composited
+    // coverage (for comparisons).
+    let mass = flag("--mass-coverage");
+    if mass && prim.get("athenea:splat:coverageMass").is_some() {
+        streams.coverage = prim.floats(&["athenea:splat:coverageMass"])?;
+    }
+    let marked = !mass && prim.get("athenea:splat:coverageMass").is_some();
+    let node_coverage = !mass && (marked || flag("--node-coverage") || prim.bool("athenea:splat:treeCoverage"));
     if node_coverage && !marked {
         streams.coverage.clear();
     }
@@ -1250,6 +1314,63 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     }
     if streams.count != total {
         bail!("{tree_path}: {} gaussians, {} lodParent", streams.count, total);
+    }
+    // A merge must stay (its row stands for its leaves): her composited
+    // coverage can fall under the 1/255 the packing drops (held just above),
+    // and a merge of hers can come with two axes exactly 0 (a degenerate
+    // merge, nothing covered): only one flat axis is a surfel, so the second
+    // gets a thousandth of the widest.
+    {
+        let mut degenerate = 0;
+        for k in 0..total {
+            if !has_kids[k] || streams.scales.len() != 3 * total {
+                continue;
+            }
+            let s3 = &mut streams.scales[3 * k..3 * k + 3];
+            if s3.iter().filter(|&&v| v == 0.0).count() > 1 {
+                let w = s3.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
+                let mut first = true;
+                for v in s3.iter_mut() {
+                    if *v == 0.0 {
+                        if first {
+                            first = false;
+                        } else {
+                            *v = 1e-3 * w;
+                        }
+                    }
+                }
+                degenerate += 1;
+            }
+        }
+        if degenerate > 0 {
+            eprintln!("{degenerate} merges with two flat axes given a thin second axis");
+        }
+    }
+    {
+        let floor = 1.01 / 255.0;
+        let mut raised = 0;
+        for k in 0..total {
+            if !has_kids[k] {
+                continue;
+            }
+            let mut low = false;
+            if let Some(v) = streams.opacities.get_mut(k) {
+                if v.is_nan() || *v < floor {
+                    *v = floor;
+                    low = true;
+                }
+            }
+            if let Some(v) = streams.coverage.get_mut(k) {
+                if v.is_nan() || *v < floor {
+                    *v = floor;
+                    low = true;
+                }
+            }
+            raised += low as usize;
+        }
+        if raised > 0 {
+            eprintln!("{raised} merges covering under 1/255 held at it");
+        }
     }
     let transfer = match arg(args, "--transfer").unwrap_or("full") {
         "full" => TransferKeep::Full,

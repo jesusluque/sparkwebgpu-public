@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • band pages (WebGPU)</title>
+  <style>
+    body { margin: 0; background-color: black; }
+    canvas { display: block; }
+    .overlay { position: fixed; margin: 12px; top: 0; color: white; font-family: monospace; white-space: pre; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "@sparkjsdev/spark/webgpu": "../../dist/spark.webgpu.module.js"
+      }
+    }
+  </script>
+  <div class="overlay" id="status">loading…</div>
+  <script type="module">
+    // athenea's merge trees streamed by error-band pages (thread CK): the six
+    // pieces of pieces/t42 as paged .athc trees (usd-athc --tree --pages),
+    // drawn through WgpuLod's band pager at tau px, against the same files
+    // decoded whole (every node resident) and cut at the same tau.
+    //
+    //   ?base=/r2/        where <piece>.athc are (tools/validate-corvette/serve.mjs, R2_DIR)
+    //   ?pieces=Hood,...  which (default the six)
+    //   ?tau=1            the error cut, pixels
+    //   ?budget=56        the pool, MB of resident nodes (BYTES_A_NODE each)
+    //   ?ref=0            no whole-file reference
+    //   ?auto=1           tau breathing with the budget (LodTauController)
+    //
+    // window.__band: { view(v), settle(), measure(), compare(), stats() } for
+    // tools/band-pages/run.mjs.
+    import * as THREE from "three/webgpu";
+    import { PackedSplats, PagedSplats } from "@sparkjsdev/spark";
+    import { WgpuLod, WgpuSplatRenderer, splatRequiredLimits } from "@sparkjsdev/spark/webgpu";
+
+    const params = new URLSearchParams(location.search);
+    const base = params.get("base") ?? "/r2/";
+    const pieces = (params.get("pieces") ?? "Hood,Front_Fender,Headlights_Cover,Front_Logo,F_Grill,Door_001").split(",");
+    const tau = Number(params.get("tau") ?? 1);
+    // GPU bytes a resident node holds in this harness: packed core (16),
+    // athcGroup (8), the material (normal 4, pbr 4, lobes 12).
+    const BYTES_A_NODE = 44;
+    const budgetBytes = Number(params.get("budget") ?? 56) * 1e6;
+    const slot = Number(params.get("slot") ?? 3072);
+    const status = document.getElementById("status");
+    const fail = (e) => { window.__band = { error: String(e?.stack ?? e) }; status.textContent = String(e); };
+    window.addEventListener("error", (e) => fail(e.error ?? e.message));
+    window.addEventListener("unhandledrejection", (e) => fail(e.reason));
+
+    const adapter = await navigator.gpu.requestAdapter();
+    const renderer = new THREE.WebGPURenderer({ requiredLimits: splatRequiredLimits(adapter) });
+    renderer.setPixelRatio(1);
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setClearColor(0x000000, 1);
+    document.body.appendChild(renderer.domElement);
+    await renderer.init();
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 0.05, 1000);
+
+    // athenea's stage is Z-up.
+    const car = new THREE.Group();
+    car.rotation.x = -Math.PI / 2;
+    scene.add(car);
+    car.updateMatrixWorld(true);
+
+    const lodOptions = {
+      lodErrorTau: tau,
+      lodErrorTauAuto: params.get("auto") === "1",
+      lodSplatCount: 50_000_000,
+      // athenea's test has no foveation: neither here.
+      behindFoveate: 1, coneFoveate: 1, coneFov0: 0, coneFov: 0,
+    };
+    const splatsA = new WgpuSplatRenderer(renderer);
+    const lodA = new WgpuLod(splatsA, {
+      ...lodOptions,
+      bandPageSplats: slot,
+      maxPagedSplats: Math.floor(budgetBytes / BYTES_A_NODE / slot) * slot,
+    });
+    const meshesA = [];
+    const layouts = [];
+    for (const p of pieces) {
+      const paged = new PagedSplats({ rootUrl: `${base}${p}.athc` });
+      const holder = new THREE.Object3D();
+      car.add(holder);
+      holder.updateMatrixWorld(true);
+      meshesA.push(await lodA.add(paged, holder));
+      layouts.push((await paged.athcLayoutPromise).layout);
+    }
+    let splatsB = null, lodB = null;
+    const meshesB = [];
+    if (params.get("ref") !== "0") {
+      splatsB = new WgpuSplatRenderer(renderer);
+      lodB = new WgpuLod(splatsB, lodOptions);
+      for (const p of pieces) {
+        const packed = new PackedSplats({ url: `${base}${p}.athc` });
+        const holder = new THREE.Object3D();
+        car.add(holder);
+        holder.updateMatrixWorld(true);
+        meshesB.push(await lodB.add(packed, holder));
+      }
+    }
+    const pager = () => lodA.pager;
+
+    const size = () => ({ x: renderer.domElement.width, y: renderer.domElement.height });
+    const raf = () => new Promise((r) => requestAnimationFrame(r));
+    const idle = () => new Promise((r) => setTimeout(r, 0));
+
+    function view(v) {
+      const { width, height } = v;
+      if (width && (renderer.domElement.width !== width || renderer.domElement.height !== height)) {
+        renderer.setSize(width, height);
+      }
+      const s = size();
+      camera.aspect = s.x / s.y;
+      camera.fov = (2 * Math.atan((Math.tan((v.hfov * Math.PI) / 360) * s.y) / s.x) * 180) / Math.PI;
+      camera.updateProjectionMatrix();
+      camera.position.fromArray(v.position);
+      camera.lookAt(new THREE.Vector3().fromArray(v.target));
+      camera.updateMatrixWorld();
+    }
+
+    function frame() {
+      lodA.update(camera, size());
+      lodB?.update(camera, size());
+      renderer.render(scene, camera);
+      splatsA.render(camera);
+    }
+
+    // Until the band pager has every needed page and the traversals stop.
+    async function settle(maxMs = 60000) {
+      const t0 = performance.now();
+      const s0 = { ...pager().bandStats };
+      let frames = 0;
+      let quiet = 0;
+      while (performance.now() - t0 < maxMs) {
+        frame();
+        frames++;
+        await raf();
+        await idle();
+        const s = pager().bandStats;
+        const done = !lodA.pending && !pager().isPending() && s.starved === 0 &&
+          s.neededPages <= s.residentPages && (!lodB || !lodB.pending);
+        quiet = done ? quiet + 1 : 0;
+        if (quiet >= 3) break;
+      }
+      const s = pager().bandStats;
+      return {
+        settled: quiet >= 3,
+        ms: performance.now() - t0,
+        frames,
+        pagesRequested: s.pagesRequested - s0.pagesRequested,
+        ranges: s.ranges - s0.ranges,
+        bytesRead: s.bytesRead - s0.bytesRead,
+        evicted: s.evicted - s0.evicted,
+      };
+    }
+
+    // The paged cut as global node ids (rows[chunk].first + offset), per piece.
+    function pagedCut(k) {
+      const m = meshesA[k];
+      const rows = layouts[k].pages;
+      const P = pager();
+      const out = new Set();
+      for (const idx of m.lastIndices) {
+        const slotIndex = Math.floor(idx / P.pageSplats);
+        const at = P.pageToSplatsChunk[slotIndex];
+        if (!at || at.splats !== m.splats) { out.add(-1 - idx); continue; }
+        out.add(rows[at.chunk].first + (idx - slotIndex * P.pageSplats));
+      }
+      return out;
+    }
+
+    function stats() {
+      const s = pager().bandStats;
+      const perPiece = meshesA.map((m, k) => ({ piece: pieces[k], cut: m.lastIndices.length }));
+      return {
+        tau: lodA.stats.tau,
+        cut: lodA.stats.lodSplats,
+        perPiece,
+        neededPages: s.neededPages,
+        neededNodes: s.neededNodes,
+        residentPages: s.residentPages,
+        residentNodes: s.residentNodes,
+        residentBytes: s.residentNodes * BYTES_A_NODE,
+        poolPages: pager().maxPages,
+        poolBytes: pager().maxSplats * BYTES_A_NODE,
+        totals: { pagesRequested: s.pagesRequested, ranges: s.ranges, bytesRead: s.bytesRead, evicted: s.evicted },
+        refCut: lodB?.stats.lodSplats ?? null,
+      };
+    }
+
+    // The two cuts node for node, and the two images in float.
+    async function compare() {
+      const cuts = meshesA.map((m, k) => {
+        const a = pagedCut(k);
+        const b = new Set(meshesB[k] ? meshesB[k].lastIndices : []);
+        let onlyA = 0, onlyB = 0;
+        for (const v of a) if (!b.has(v)) onlyA++;
+        for (const v of b) if (!a.has(v)) onlyB++;
+        return { piece: pieces[k], paged: a.size, full: b.size, onlyPaged: onlyA, onlyFull: onlyB };
+      });
+      const s = size();
+      const target = new THREE.RenderTarget(s.x, s.y, { type: THREE.HalfFloatType });
+      const read = async (splats) => {
+        renderer.setRenderTarget(target);
+        renderer.render(scene, camera);
+        splats.render(camera, target);
+        renderer.setRenderTarget(null);
+        await idle();
+        const px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, s.x, s.y);
+        const stride = (Math.ceil((s.x * px.BYTES_PER_ELEMENT * 4) / 256) * 256) / px.BYTES_PER_ELEMENT;
+        const out = new Float32Array(s.x * s.y * 4);
+        const h2f = (h) => {
+          const e = (h >> 10) & 31, m = h & 1023, sg = h & 32768 ? -1 : 1;
+          return e === 0 ? sg * m * 2 ** -24 : e === 31 ? NaN : sg * (1 + m / 1024) * 2 ** (e - 15);
+        };
+        for (let y = 0; y < s.y; y++)
+          for (let i = 0; i < s.x * 4; i++) {
+            const v = px[y * stride + i];
+            out[y * s.x * 4 + i] = px instanceof Float32Array ? v : h2f(v);
+          }
+        return out;
+      };
+      const a = await read(splatsA);
+      let image = null;
+      if (splatsB) {
+        const b = await read(splatsB);
+        let se = 0, ref = 0, maxd = 0, sumA = 0, sumB = 0, differ = 0;
+        for (let i = 0; i < a.length; i += 4)
+          for (let c = 0; c < 3; c++) {
+            const d = a[i + c] - b[i + c];
+            se += d * d;
+            ref += b[i + c] * b[i + c];
+            maxd = Math.max(maxd, Math.abs(d));
+            sumA += a[i + c];
+            sumB += b[i + c];
+            if (Math.abs(d) > 1 / 512) differ++;
+          }
+        image = { relMSE: ref > 0 ? se / ref : 0, maxDiff: maxd, ratio: sumB > 0 ? sumA / sumB : 1, channelsOver2e9: differ };
+      }
+      target.dispose();
+      return { cuts, image };
+    }
+
+    // Report the overlay.
+    setInterval(() => {
+      const s = pager()?.bandStats;
+      if (!s) return;
+      status.textContent = `tau ${lodA.stats.tau.toFixed(2)} cut ${lodA.stats.lodSplats}\nneeded ${s.neededPages} pages ${s.neededNodes} nodes\nresident ${s.residentPages} pages ${s.residentNodes} nodes\nrequested ${s.pagesRequested} in ${s.ranges} ranges, ${(s.bytesRead / 1e6).toFixed(1)} MB`;
+    }, 300);
+
+    window.__band = { ready: true, view, settle, stats, compare, frame, lodA, lodB };
+  </script>
+</body>
+</html>

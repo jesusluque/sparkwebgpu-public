@@ -19,9 +19,11 @@ import { ExtSplats } from "../ExtSplats";
 import { PackedSplats } from "../PackedSplats";
 import { PagedSplats } from "../PagedSplats";
 import { SplatWorker } from "../SplatWorker";
+import { type AthcV3Layout, isAthcPaged } from "../athc";
 import { isAndroid, isIos, isMobile, isOculus, isVisionPro } from "../utils";
 import { GpuSplatSource } from "./GpuSplatSource";
 import { LodFade } from "./LodFade";
+import { WgpuBandPager } from "./WgpuBandPager";
 import { WgpuSplatPager } from "./WgpuSplatPager";
 import type { WgpuSplatMesh, WgpuSplatRenderer } from "./WgpuSplatRenderer";
 import {
@@ -89,6 +91,13 @@ export interface WgpuLodOptions {
   pagedExtSplats?: boolean;
   /** Page pool size, capped by the device's storage binding size. */
   maxPagedSplats?: number;
+  /**
+   * athenea's error-band pages (a paged .athc tree, FLAG_PAGED; thread CK):
+   * splats a pool slot holds (at least the file's largest page). The pool
+   * is `maxPagedSplats` (its residency budget, in nodes) in slots of this.
+   * @default 3072
+   */
+  bandPageSplats?: number;
   /** @default 3 */
   numLodFetchers?: number;
   /**
@@ -231,12 +240,20 @@ export class WgpuLod {
   readonly options: Required<
     Omit<
       WgpuLodOptions,
-      "lodSplatCount" | "onDirty" | "lodRaycast" | "pagedAttributes"
+      | "lodSplatCount"
+      | "onDirty"
+      | "lodRaycast"
+      | "pagedAttributes"
+      | "bandPageSplats"
     >
   > &
     Pick<
       WgpuLodOptions,
-      "lodSplatCount" | "onDirty" | "lodRaycast" | "pagedAttributes"
+      | "lodSplatCount"
+      | "onDirty"
+      | "lodRaycast"
+      | "pagedAttributes"
+      | "bandPageSplats"
     >;
   readonly meshes: WgpuLodMesh[] = [];
   pager?: WgpuSplatPager;
@@ -282,6 +299,10 @@ export class WgpuLod {
     maxSplats: number;
   };
   private lastPixelLimit?: number;
+  /** The error cut's limit of the last traversal (band paging tests by it). */
+  private lastErrorLimit = 0;
+  /** A pixel in the traversal's angle units (tau 1). */
+  private pixelAngle = 0;
   private lastRaycastTime = Number.NEGATIVE_INFINITY;
   /** lodBackCull's narrowest node, in the limit's angle units (-1: off). */
   private backCullMin = -1;
@@ -328,7 +349,14 @@ export class WgpuLod {
     let source: GpuSplatSource;
     if (splats instanceof PagedSplats) {
       const { meta } = await splats.getRadMeta();
-      splats.pager = this.ensurePager();
+      // athenea's band pages: a pool of small slots of their own.
+      let band: AthcV3Layout | null = null;
+      if (splats.athcLayoutPromise) {
+        const { layout } = await splats.athcLayoutPromise;
+        if (isAthcPaged(layout)) band = layout as AthcV3Layout;
+      }
+      splats.pager = this.ensurePager(band !== null);
+      if (band) (splats.pager as WgpuBandPager).addTree(splats, band);
       // The .rad's extra attributes, paged with its chunks.
       const attributes = (meta as { attributes?: RadAttributeMeta[] })
         .attributes;
@@ -460,9 +488,18 @@ export class WgpuLod {
     }
   }
 
-  private ensurePager() {
+  private ensurePager(band = this.pager instanceof WgpuBandPager) {
+    if (this.pager && band !== this.pager instanceof WgpuBandPager) {
+      throw new Error(
+        "WgpuLod: athenea's band-paged trees and other paged splats in one WgpuLod",
+      );
+    }
     if (!this.pager) {
-      this.pager = new WgpuSplatPager(this.renderer.device, {
+      const Pager = band ? WgpuBandPager : WgpuSplatPager;
+      this.pager = new Pager(this.renderer.device, {
+        ...(band && this.options.bandPageSplats
+          ? { pageSplats: this.options.bandPageSplats }
+          : {}),
         extSplats: this.options.pagedExtSplats,
         maxSplats: this.options.maxPagedSplats,
         numFetchers: this.options.numLodFetchers,
@@ -553,7 +590,12 @@ export class WgpuLod {
     let tau = o.lodErrorTau;
     if (tau > 0 && o.lodErrorTauAuto) {
       const pager = this.pager;
-      const fill = pager ? pager.pagesInUse / pager.maxPages : null;
+      // A band pager: how full its needed set would make the pool.
+      const fill = pager
+        ? pager instanceof WgpuBandPager
+          ? pager.neededFill
+          : pager.pagesInUse / pager.maxPages
+        : null;
       this.tauController.frame(
         performance.now(),
         fill,
@@ -567,6 +609,7 @@ export class WgpuLod {
     this.backCullMin = o.lodBackCull
       ? pixelScaleLimit * Math.max(0, o.lodBackCullMinPx)
       : -1;
+    this.pixelAngle = pixelScaleLimit;
     pixelScaleLimit *= o.lodRenderScale;
 
     camera.updateMatrixWorld();
@@ -730,6 +773,7 @@ export class WgpuLod {
     if (this.pager && this.pagerId === undefined) {
       const { lodId } = await worker.call("newLodTree", {
         capacity: this.pager.maxSplats,
+        slot: this.pager.pageSplats,
       });
       this.pagerId = lodId;
     }
@@ -818,7 +862,8 @@ export class WgpuLod {
         this.lodUpdates.push({
           lodId: record.lodId,
           pageBase: page * this.pager.pageSplats,
-          chunkBase: chunk * this.pager.pageSplats,
+          // The virtual space keeps 65 536 indices a chunk.
+          chunkBase: chunk * 65536,
           count: numSplats,
           lodTreeData: lodTree,
           lodErrorData: lodError,
@@ -889,6 +934,7 @@ export class WgpuLod {
     errorLimit = 0,
   ) {
     const o = this.options;
+    this.lastErrorLimit = errorLimit;
     const cameraToWorld = new THREE.Matrix4().compose(
       viewPos,
       viewQuat,
@@ -987,6 +1033,30 @@ export class WgpuLod {
       }));
     // Root chunks first, nearest mesh first; then the traversal's requests.
     paged.sort((a, b) => a.distance - b.distance);
+    if (pager instanceof WgpuBandPager) {
+      // athenea's band pages: the needed set from each tree's page table
+      // (the eye in its object space, the error limit over its lodScale).
+      // Without the error cut, tau 1.
+      const limit =
+        this.lastErrorLimit > 0 ? this.lastErrorLimit : this.pixelAngle;
+      const views = [];
+      for (const m of lodMeshes) {
+        if (!(m.splats instanceof PagedSplats) || !pager.isBand(m.splats))
+          continue;
+        const eye = viewPos
+          .clone()
+          .applyMatrix4(m.object.matrixWorld.clone().invert());
+        views.push({
+          splats: m.splats,
+          eye: [eye.x, eye.y, eye.z],
+          limit: limit / (m.lodScale ?? 1),
+        });
+      }
+      pager.setViews(views);
+      pager.autoDrive = this.options.enableLodFetching;
+      if (this.options.enableLodFetching) pager.driveFetchers();
+      return;
+    }
     pager.fetchPriority = paged.map(({ splats }) => ({ splats, chunk: 0 }));
     for (const [lodId, chunk] of chunks) {
       const splats = this.lodIdToSplats.get(lodId);

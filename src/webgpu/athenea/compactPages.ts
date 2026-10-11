@@ -643,6 +643,16 @@ export class CompactBandStreamer {
       });
       this.stats.landed += 1;
     }
+    if (this.evictedSlots.size) {
+      // The pages just evicted are gone from the pool: out of the draw list
+      // now, before a frame drawn while the traversal runs reads their slots.
+      const keep = this.drawList.filter(
+        (i) => !this.evictedSlots.has(Math.floor(i / this.slotNodes)),
+      );
+      this.evictedSlots.clear();
+      this.drawList = keep;
+      path?.setDrawList(keep);
+    }
     for (const r of this.evictedRanges) ranges.unshift(r);
     this.evictedRanges = [];
     if (ranges.length) await lod("updateCompactLodTrees", { ranges });
@@ -755,6 +765,7 @@ export class CompactBandStreamer {
   }
 
   private evictedRanges: Record<string, unknown>[] = [];
+  private evictedSlots = new Set<number>();
 
   /** A free slot, else one evicted from the last plan's order. */
   private takeSlot(): number | undefined {
@@ -768,6 +779,7 @@ export class CompactBandStreamer {
       key.slotOf.delete(page);
       key.kids.delete(page);
       this.slotOwner[slot] = null;
+      this.evictedSlots.add(slot);
       this.evictedRanges.push({
         lodId: key.lodId,
         pageBase: slot * this.slotNodes,

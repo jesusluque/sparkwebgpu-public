@@ -712,6 +712,18 @@ whole car's ~100 parts would read ~3 MB of dictionaries. `athc-convert
 materials too when the table already holds them (every material of the
 piece must be in it).
 
+**Our own basis** (thread CR): `fit-compact-basis <piece.athc>... --out
+basis` (`athc_basis_fit.rs`) fits a joint CPCA in athenea's layout (C 256,
+K 8, int4 weights) to the full transfer of every node of the pieces given:
+per-block energy norms, k-means of the joint vectors (k-means++ seeds, Lloyd
+over every node), per-cluster PCA of each block, and the scale per
+direction with the least error through the int4 code and the GPU's int8
+grid. `--compare other.json` prints the same per-piece, per-block relMSE
+for another basis, and `--held-out piece.athc` measures a piece it was not
+fitted on. Fitted on the six t48 pieces it beats q97 on all of them, but a
+held-out piece comes out 10 to 400 times worse (relMSE 1.6e-2 to 0.58):
+fit it on every piece of the asset it will encode.
+
 A compact reader (`CompactBandStreamer`, `src/webgpu/athenea/compactPages.ts`;
 `openCompactAsset(url)` and the option `asset` for shared tables) reads the
 tables with the page table, then only `CMPC` runs: each page goes into a

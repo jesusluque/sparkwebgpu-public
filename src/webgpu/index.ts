@@ -136,6 +136,7 @@ export {
   type CompactAssetTables,
   type CompactPieceTables,
   type LodCall,
+  compactSlotLayout,
   gunzipStream,
   openCompactAsset,
   openCompactPiece,

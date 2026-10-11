@@ -156,6 +156,33 @@ describe("NodeSlotAllocator", () => {
     expect(a.use(9)).toBe(-1);
     expect(a.allocate(10)).toBe(s);
   });
+
+  it("takes a released slot before evicting an idle node (one deque)", () => {
+    const a = new NodeSlotAllocator(4);
+    frame(a, [1, 2, 3, 4]);
+    frame(a, [1, 2]); // 3, 4 idle
+    frame(a, [1, 2]);
+    a.begin();
+    a.release(a.use(2));
+    a.commit();
+    const f = frame(a, [1, 5]);
+    expect(a.use(3)).toBeGreaterThanOrEqual(0); // 3 still held
+    expect(f[1]).toBeGreaterThanOrEqual(0);
+    expect(a.stats.evicted).toBe(0);
+  });
+
+  it("keeps its hysteresis across the u16 stamps' renumbering", () => {
+    const a = new NodeSlotAllocator(4);
+    const f1 = frame(a, [1, 2]);
+    for (let k = 0; k < 0x10010; k++) frame(a, [1]);
+    // 2 idle all along, 1 in every cut: both keep their slots.
+    const f = frame(a, [1, 2, 3]);
+    expect(f[0]).toBe(f1[0]);
+    expect(f[1]).toBe(f1[1]);
+    const g = frame(a, [4]); // 1, 2, 3 in the last cut: 4 takes the free one
+    expect(f).not.toContain(g[0]);
+    expect(g[0]).toBeGreaterThanOrEqual(0);
+  });
 });
 
 describe("NodeIndex", () => {

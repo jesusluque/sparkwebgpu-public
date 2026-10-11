@@ -193,35 +193,13 @@ function popcount(v: number) {
  * idle FIFO, and a slot wanted with none free is taken from its head (the
  * node that left the cut longest ago), never from this frame's cut.
  */
-/** A stack of slots in an Int32Array (thread CU: no JS array of numbers). */
-class SlotStack {
-  a = new Int32Array(64);
-  n = 0;
-  push(s: number) {
-    if (this.n === this.a.length) {
-      const b = new Int32Array(this.a.length * 2);
-      b.set(this.a);
-      this.a = b;
-    }
-    this.a[this.n++] = s;
-  }
-  pop(): number | undefined {
-    return this.n > 0 ? this.a[--this.n] : undefined;
-  }
-  /** The slots kept by `keep`, in order. */
-  filter(keep: (s: number) => boolean) {
-    let m = 0;
-    for (let k = 0; k < this.n; k++)
-      if (keep(this.a[k])) this.a[m++] = this.a[k];
-    this.n = m;
-  }
-}
-
 /**
- * The idle slots, oldest first: a ring of the capacity with a flag a slot
- * (each slot in it once; thread CU: the JS array grew by every frame's).
+ * The allocator's slots to take, as one ring of the capacity with a flag a
+ * slot (each slot in it once): free slots at the front, taken first, and
+ * idle ones (a node still in them) at the back, oldest first (thread CU
+ * round 4: the free list was a stack of its own, 4 bytes a slot more).
  */
-class SlotFifo {
+class SlotDeque {
   q: Int32Array;
   inQ: Uint8Array;
   head = 0;
@@ -230,10 +208,19 @@ class SlotFifo {
     this.q = new Int32Array(Math.max(capacity, 1));
     this.inQ = new Uint8Array(Math.max(capacity, 1));
   }
+  /** An idle slot, behind the others. */
   push(s: number) {
     if (this.inQ[s]) return;
     this.inQ[s] = 1;
     this.q[(this.head + this.len) % this.q.length] = s;
+    this.len += 1;
+  }
+  /** A free slot, in front (taken next). */
+  unshift(s: number) {
+    if (this.inQ[s]) return;
+    this.inQ[s] = 1;
+    this.head = (this.head + this.q.length - 1) % this.q.length;
+    this.q[this.head] = s;
     this.len += 1;
   }
   shift(): number | undefined {
@@ -244,29 +231,40 @@ class SlotFifo {
     this.inQ[s] = 0;
     return s;
   }
-  /** Its slots, oldest first (a copy). */
+  /** Its slots, front first (a copy). */
   toArray() {
     const out = new Int32Array(this.len);
     for (let k = 0; k < this.len; k++)
       out[k] = this.q[(this.head + k) % this.q.length];
     return out;
   }
-  /** Rebuilt for `capacity` slots with the slots `keep` keeps, in order. */
-  rebuild(capacity: number, keep: (s: number) => boolean) {
+  /**
+   * Rebuilt for `capacity` slots: `front` (in order) then its own slots
+   * that `keep` keeps, in order.
+   */
+  rebuild(
+    capacity: number,
+    keep: (s: number) => boolean,
+    front: ArrayLike<number> = [],
+  ) {
     const old = this.toArray();
     this.q = new Int32Array(Math.max(capacity, 1));
     this.inQ = new Uint8Array(Math.max(capacity, 1));
     this.head = 0;
     this.len = 0;
+    for (let k = 0; k < front.length; k++) this.push(front[k]);
     for (const s of old) if (s < capacity && keep(s)) this.push(s);
   }
 }
 
+/** Stamps are u16 frames; renumbered before they wrap (thread CU round 4). */
+const STAMP_WRAP = 0xfff0;
+
 export class NodeSlotAllocator {
   private keyOf: Int32Array;
-  private stamp: Uint32Array;
-  private free = new SlotStack();
-  private idle: SlotFifo;
+  private stamp: Uint16Array;
+  /** Free slots in front, idle ones behind. */
+  private idle: SlotDeque;
   readonly slotOf: NodeIndex;
   /** The frame being built (`begin`); a slot stamped with it is in its cut. */
   frame = 1;
@@ -280,9 +278,9 @@ export class NodeSlotAllocator {
   ) {
     this.slotOf = new NodeIndex(places);
     this.keyOf = new Int32Array(capacity).fill(-1);
-    this.stamp = new Uint32Array(capacity);
-    this.idle = new SlotFifo(capacity);
-    for (let s = capacity - 1; s >= 0; s--) this.free.push(s);
+    this.stamp = new Uint16Array(capacity);
+    this.idle = new SlotDeque(capacity);
+    for (let s = 0; s < capacity; s++) this.idle.push(s);
   }
 
   /** Slots in use (a node in them, in the cut or idle). */
@@ -295,23 +293,38 @@ export class NodeSlotAllocator {
     if (capacity <= this.capacity) return;
     const keyOf = new Int32Array(capacity).fill(-1);
     keyOf.set(this.keyOf);
-    const stamp = new Uint32Array(capacity);
+    const stamp = new Uint16Array(capacity);
     stamp.set(this.stamp);
     this.keyOf = keyOf;
     this.stamp = stamp;
-    // The new slots taken lowest first (after any already free).
-    const free = new SlotStack();
-    for (let s = capacity - 1; s >= this.capacity; s--) free.push(s);
-    for (let k = 0; k < this.free.n; k++) free.push(this.free.a[k]);
-    this.free = free;
-    this.idle.rebuild(capacity, () => true);
+    // The new slots taken first, lowest first.
+    const added = new Int32Array(capacity - this.capacity);
+    for (let k = 0; k < added.length; k++) added[k] = this.capacity + k;
+    this.idle.rebuild(capacity, () => true, added);
     this.capacity = capacity;
   }
 
   /** A new frame's cut begins. */
   begin() {
+    if (this.frame >= STAMP_WRAP) this.renumber();
     this.frame += 1;
     this.lastCutAt = 0;
+  }
+
+  /**
+   * Stamps back to small numbers before the u16 wraps: this frame's 3,
+   * the last cut's 2, any other 1 (they only ever compare equal).
+   */
+  private renumber() {
+    const st = this.stamp;
+    const f = this.frame;
+    const l = this.lastCutStamp;
+    for (let s = 0; s < st.length; s++) {
+      const v = st[s];
+      st[s] = v === 0 ? 0 : v === f ? 3 : l > 0 && v === l ? 2 : 1;
+    }
+    if (l > 0) this.lastCutStamp = 2;
+    this.frame = 3;
   }
 
   /** The slot of `key` if it is held (and in this frame's cut from now), else -1. */
@@ -345,11 +358,16 @@ export class NodeSlotAllocator {
 
   /** A slot for `key` (not held), in this frame's cut; -1: none left. */
   allocate(key: number) {
-    let s = this.free.pop();
+    let s: number | undefined;
     while (s === undefined && this.idle.len > 0) {
       const c = this.idle.shift() as number;
-      // Back in a cut since it went idle, or already taken: skip it.
-      if (this.stamp[c] === this.frame || this.keyOf[c] < 0) continue;
+      // Free (in front, or let go while idle): take it.
+      if (this.keyOf[c] < 0) {
+        s = c;
+        break;
+      }
+      // Back in a cut since it went idle: skip it.
+      if (this.stamp[c] === this.frame) continue;
       if (this.isInLastCut(c)) continue;
       this.slotOf.delete(this.keyOf[c]);
       this.stats.evicted += 1;
@@ -432,7 +450,7 @@ export class NodeSlotAllocator {
     if (key < 0) return;
     this.slotOf.delete(key);
     this.keyOf[s] = -1;
-    this.free.push(s);
+    this.idle.unshift(s);
   }
 
   /**
@@ -451,13 +469,13 @@ export class NodeSlotAllocator {
         (this.lastCutStamp > 0 && stamp[s] === this.lastCutStamp));
     // Room below: free slots, then idle ones (not live).
     const roomSet = new Set<number>();
-    for (let k = 0; k < this.free.n; k++) {
-      const s = this.free.a[k];
+    const idle = this.idle.toArray();
+    for (let k = 0; k < idle.length; k++) {
+      const s = idle[k];
       if (s < capacity && keyOf[s] < 0) roomSet.add(s);
     }
     let need = 0;
     for (let s = capacity; s < this.capacity; s++) if (live(s)) need += 1;
-    const idle = this.idle.toArray();
     for (let k = 0; k < idle.length && roomSet.size < need; k++) {
       const s = idle[k];
       if (s < capacity && keyOf[s] >= 0 && !live(s)) roomSet.add(s);
@@ -503,7 +521,6 @@ export class NodeSlotAllocator {
     this.curN = cur.length;
     this.idle.rebuild(capacity, (s) => !used.has(s));
     this.lastCutAt = 0;
-    this.free.filter((s) => s < capacity && keyOf[s] < 0 && !used.has(s));
     this.keyOf = keyOf.slice(0, capacity);
     this.stamp = stamp.slice(0, capacity);
     this.capacity = capacity;
@@ -519,9 +536,9 @@ export class NodeSlotAllocator {
   get bytes() {
     return (
       this.slotOf.bytes +
-      this.capacity * 13 +
-      this.free.a.byteLength +
-      this.cur.byteLength
+      this.capacity * 11 +
+      this.cur.byteLength +
+      this.lastCut.byteLength
     );
   }
 
@@ -530,12 +547,11 @@ export class NodeSlotAllocator {
     this.keyOf.fill(-1);
     this.stamp.fill(0);
     this.slotOf.clear();
-    this.idle = new SlotFifo(this.capacity);
+    this.idle = new SlotDeque(this.capacity);
+    for (let s = 0; s < this.capacity; s++) this.idle.push(s);
     this.lastCut = new Uint32Array(0);
     this.lastCutAt = 0;
     this.curN = 0;
-    this.free = new SlotStack();
-    for (let s = this.capacity - 1; s >= 0; s--) this.free.push(s);
   }
 }
 

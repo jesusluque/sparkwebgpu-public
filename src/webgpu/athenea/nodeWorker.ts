@@ -198,6 +198,8 @@ export class NodeCutter {
   private moves: Uint32Array | null = null;
   /** The last cuts' sizes. */
   private recent: number[] = [];
+  /** A view that stays: the pool down to its cut (thread CU). */
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private asked = new Set<number>();
   private fetches = 0;
   private stats: CutterStats = {
@@ -315,15 +317,15 @@ export class NodeCutter {
     let n = 0;
     for (const p of m.parts) n += p.numSplats;
     // The pool after a large cut (thread CU): its size the largest of the
-    // last cuts and a tenth, once that frees over a megabyte; the nodes in
+    // last cuts and 6 %, once that frees over a megabyte; the nodes in
     // use past it move down (the GPU copies them with the resize).
     this.recent.push(n);
-    if (this.recent.length > 32) this.recent.shift();
+    if (this.recent.length > 8) this.recent.shift();
     const most = Math.max(...this.recent);
-    const target = Math.max(1024, Math.ceil(most * 1.1));
+    const target = Math.max(1024, Math.ceil(most * 1.06));
     if (
-      this.recent.length >= 8 &&
-      alloc.capacity > most * 1.3 &&
+      this.recent.length >= 4 &&
+      alloc.capacity > most * 1.15 &&
       (alloc.capacity - target) * NODE_RECORD_WORDS * 4 > 1 << 20
     ) {
       const moves = alloc.shrink(target);
@@ -332,6 +334,8 @@ export class NodeCutter {
         this.moves = moves;
       }
     }
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => this.idleShrink(n), 1500);
     if (n > alloc.capacity && alloc.capacity < this.o.maxCapacity) {
       const next = Math.min(
         Math.ceil(Math.max(n * 1.06, alloc.capacity * 1.1)),
@@ -613,6 +617,54 @@ export class NodeCutter {
     }
     void gen;
     this.schedule();
+  }
+
+  /**
+   * No new cut for a while: the pool shrinks to this cut and 6 % (the
+   * largest of the last cuts held it up while the view moved).
+   */
+  private idleShrink(n: number) {
+    this.idleTimer = null;
+    const alloc = this.alloc;
+    const target = Math.max(1024, Math.ceil(n * 1.06));
+    if (this.queueAt < this.queueLen || this.scheduled) {
+      this.idleTimer = setTimeout(() => this.idleShrink(n), 500);
+      return;
+    }
+    if (
+      this.grow ||
+      this.moves ||
+      alloc.capacity <= n * 1.1 ||
+      (alloc.capacity - target) * NODE_RECORD_WORDS * 4 <= 1 << 20
+    )
+      return;
+    const moves = alloc.shrink(target);
+    if (!moves) return;
+    this.recent = [n];
+    // The held cut's slots follow their moves.
+    if (moves.length) {
+      const to = new Map<number, number>();
+      for (let k = 0; k < moves.length; k += 2) to.set(moves[k], moves[k + 1]);
+      for (const a of [this.base, this.out]) {
+        for (let i = 0; i < a.length; i++) {
+          const t = to.get(a[i]);
+          if (t !== undefined) a[i] = t;
+        }
+      }
+    }
+    // The list names the moved slots: a new one with the resize.
+    const drawList = this.buildDrawList();
+    this.lastListAt = performance.now();
+    this.fillStats();
+    this.post({
+      t: "frame",
+      grow: target,
+      moves,
+      slots: new Uint32Array(0),
+      records: new Uint8Array(0),
+      drawList,
+      stats: { ...this.stats },
+    });
   }
 
   /** Group x to pack (the queue grows as runs come). */

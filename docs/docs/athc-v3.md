@@ -893,6 +893,42 @@ Memory once settled (GPU + traversal WASM + the node worker's heap and
 buffers + the traversal worker's heap): 62.5 MB at Camera, 76 close-up,
 64 far (the main page's own heap, three.js and the domes, apart: ~40 MB).
 
+Round 3 (thread CU), for 55 MB at tau 3:
+
+- **traversal records by class** in the WASM tree (`lod_tree.rs`
+  `LodNodes::Quant`, built from the 12-byte words at load: no change to
+  the file): 2 bits a node pick a leaf or a merge, with or without a cone;
+  each record holds the centre at 9 bits an axis in its page's box, a
+  9-bit index into its page's occlusion palette (511: no mask), and a
+  merge's eps (8), rho (7), children's place (12) and page delta (9), a
+  cone's theta (6) and axis (5+5 for a leaf, 10 for a merge): 5, 7, 9 or
+  11 bytes, a byte offset every 32 nodes. The whole car: 10.4 MB for
+  1.15M nodes resident (the 12-byte words: 13.8 MB). The occlusion box
+  test stays conservative on the 9-bit centres (0 nodes culled by the
+  quantization alone, `car_occlusion`);
+- the **record pool shrinks** after a large cut: to 6 % over the largest
+  of the last cuts once that frees over a megabyte, or to 6 % over the
+  cut when the view has stayed 1.5 s; the nodes in use past the new size
+  move down (the GPU copies them with the resize) and the held cut and
+  the draw list follow;
+- no depth texture on the compact path (`depth: false`; nothing reads it)
+  and, on a phone, the visible dome in rg11b10ufloat at the same
+  resolution (half the half-float's bytes, mips packed on the CPU). The
+  relight's environment was already half precision;
+- the node worker's run groups and queue are typed arrays, and the slot
+  allocator's free stack and idle FIFO too.
+
+On the emulated iPhone (v6 data, tau 3, the same orbit): frame max / p99
+17.3 / 17.2 ms at Camera, 19.0 / 18.5 close-up, 19.6 / 18.7 far; the cut
+missing a frame 4.3 % (0.24 % of its screen area), 6.4 % (0.30 %), 1.3 %
+(0.11 %). Memory once settled: 55.1 MB at Camera, 59.0 close-up, 49.1 far.
+
+`car-compact-tx-v6` carries athenea's per-material roughness (her
+`kMaterialRoughnessMark`, 35ae3cb): on the material's pbr word, bit 26
+says it is there and bits 27-31 hold round(v * 31); the materials are a
+piece's table, so it costs nothing a node (`usd-athc` reads
+`primvars:athenea:splat:materialRoughness`).
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only

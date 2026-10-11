@@ -31,7 +31,13 @@ import {
   readAthcLayout,
   readRange,
 } from "../../athc";
-import { BAND_NEAR, type BandMesh, planBand } from "../WgpuBandPager";
+import {
+  BAND_NEAR,
+  type BandMesh,
+  type Foveation,
+  pageFoveate,
+  planBand,
+} from "../WgpuBandPager";
 import type { CompactCloud, CompactLayout, CompactRelitPath } from "./compact";
 
 /** Bytes a node in a CMPC section, by plane (rust athc_compact PLANE_WIDTHS). */
@@ -453,6 +459,13 @@ export interface CompactBandOptions {
   tau?: number;
   /** Fit tau to the pool when the needed set does not (bandTauToFit). */
   tauToFit?: boolean;
+  /**
+   * Spark's foveation (thread CS): nodes outside the view cut coarser, and
+   * the pages planned with the same weight (pageFoveate). Default: full
+   * detail within the camera's diagonal field + 8 degrees, coneFoveate 0.4
+   * at 30 degrees more, behindFoveate 0.2 (WgpuLod's). null: none (CN's).
+   */
+  foveation?: Partial<Foveation> | null;
   maxRangeBytes?: number;
   /** Fetches in flight. */
   fetchers?: number;
@@ -662,8 +675,22 @@ export class CompactBandStreamer {
     const tanY = Math.tan((camera.fov * Math.PI) / 360);
     const pixel = (2 * tanY) / height;
     const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
+    const fov = this.foveationFor(camera);
+    const forward = new THREE.Vector3()
+      .setFromMatrixColumn(camera.matrixWorld, 2)
+      .negate()
+      .normalize();
+    const eyeArr = [eye.x, eye.y, eye.z];
+    const fwdArr = [forward.x, forward.y, forward.z];
+    const foveateFor = (p: PieceState) =>
+      fov
+        ? (page: number) => pageFoveate(p.rows[page], eyeArr, fwdArr, fov)
+        : undefined;
     if (this.options.tauToFit) {
-      this.tau = Math.max(this.options.tau ?? 1, this.tauToFitNow(eye, pixel));
+      this.tau = Math.max(
+        this.options.tau ?? 1,
+        this.tauToFitNow(eye, pixel, foveateFor),
+      );
     }
     this.stats.tau = this.tau;
     const errorLimit = pixel * this.tau;
@@ -677,10 +704,10 @@ export class CompactBandStreamer {
         rootPage: root,
         viewToObjectCols: camera.matrixWorld.elements.slice(),
         lodScale: 1,
-        behindFoveate: 1,
-        coneFov0: 0,
-        coneFov: 0,
-        coneFoveate: 1,
+        behindFoveate: fov ? fov.behindFoveate : 1,
+        coneFov0: fov ? fov.coneFov0 : 0,
+        coneFov: fov ? fov.coneFov : 0,
+        coneFoveate: fov ? fov.coneFoveate : 1,
       };
     }
     let list = new Uint32Array(0);
@@ -731,6 +758,7 @@ export class CompactBandStreamer {
       pageBytes: p.pageBytes,
       eye: [eye.x, eye.y, eye.z],
       limit: errorLimit,
+      foveate: foveateFor(p),
       resident: (page) => p.slotOf.has(page),
       inFlight: (page) => p.inFlight.has(page),
       children: (page) => p.kids.get(page),
@@ -793,9 +821,33 @@ export class CompactBandStreamer {
     return undefined;
   }
 
-  private tauToFitNow(eye: THREE.Vector3, pixel: number) {
+  /** The foveation for this camera (options.foveation), or null. */
+  private foveationFor(camera: THREE.PerspectiveCamera): Foveation | null {
+    const o = this.options.foveation;
+    if (o === null) return null;
+    const tanY = Math.tan((camera.fov * Math.PI) / 360);
+    const diag =
+      (2 *
+        Math.atan(tanY * Math.sqrt(1 + camera.aspect * camera.aspect)) *
+        180) /
+      Math.PI;
+    const coneFov0 = o?.coneFov0 ?? Math.min(diag + 8, 179);
+    return {
+      coneFov0,
+      coneFov: o?.coneFov ?? Math.min(coneFov0 + 30, 180),
+      coneFoveate: o?.coneFoveate ?? 0.4,
+      behindFoveate: o?.behindFoveate ?? 0.2,
+    };
+  }
+
+  private tauToFitNow(
+    eye: THREE.Vector3,
+    pixel: number,
+    foveateFor: (p: PieceState) => ((page: number) => number) | undefined,
+  ) {
     const t: number[] = [];
     for (const p of this.pieces) {
+      const fv = foveateFor(p);
       p.rows.forEach((row, page) => {
         if (page === 0) return;
         let d2 = 0;
@@ -804,7 +856,8 @@ export class CompactBandStreamer {
           const v = Math.max(row.lo[k] - e, 0, e - row.hi[k]);
           d2 += v * v;
         }
-        t.push(row.epsMax / Math.max(Math.sqrt(d2), BAND_NEAR) / pixel);
+        const f = fv ? fv(page) : 1;
+        t.push((f * row.epsMax) / Math.max(Math.sqrt(d2), BAND_NEAR) / pixel);
       });
     }
     const room = this.options.slots - this.pieces.length;

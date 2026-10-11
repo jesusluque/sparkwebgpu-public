@@ -62,6 +62,67 @@ export function pageNeeded(
   return row.epsMax / Math.max(pageDistance(row, eye), near) > limit;
 }
 
+/**
+ * Spark's foveation (lod_tree.rs compute_pixel_scale) of a direction whose
+ * cosine to the view's forward is `dot`: 1 inside coneFov0, down to
+ * coneFoveate at coneFov, to behindFoveate at 90 degrees and behind.
+ */
+export interface Foveation {
+  coneFov0: number;
+  coneFov: number;
+  coneFoveate: number;
+  behindFoveate: number;
+}
+
+export function foveateOf(dot: number, f: Foveation) {
+  const dot0 =
+    f.coneFov0 > 0
+      ? Math.cos((0.5 * Math.min(f.coneFov0, 180) * Math.PI) / 180)
+      : 1;
+  const dot1 = Math.min(
+    f.coneFov > 0
+      ? Math.cos((0.5 * Math.min(f.coneFov, 180) * Math.PI) / 180)
+      : 1,
+    dot0,
+  );
+  if (dot <= 0) return f.behindFoveate;
+  if (dot >= dot0) return 1;
+  if (dot >= dot1) {
+    const t = (dot - dot1) / Math.max(dot0 - dot1, 1e-9);
+    return f.coneFoveate + (1 - f.coneFoveate) * t;
+  }
+  const t = dot / Math.max(dot1, 1e-9);
+  return f.behindFoveate + (f.coneFoveate - f.behindFoveate) * t;
+}
+
+/**
+ * The most a page's nodes are foveated (its box's nearest direction to the
+ * forward): the bound the page test needs, never under any node's.
+ */
+export function pageFoveate(
+  row: AthcPageRow,
+  eye: ArrayLike<number>,
+  forward: ArrayLike<number>,
+  f: Foveation,
+) {
+  let d2 = 0;
+  let r2 = 0;
+  let dot = 0;
+  const c = [0, 0, 0];
+  for (let k = 0; k < 3; k++) {
+    c[k] = 0.5 * (row.lo[k] + row.hi[k]) - eye[k];
+    const h = 0.5 * (row.hi[k] - row.lo[k]);
+    d2 += c[k] * c[k];
+    r2 += h * h;
+    dot += c[k] * forward[k];
+  }
+  if (d2 <= r2) return 1;
+  const d = Math.sqrt(d2);
+  const angle = Math.acos(Math.max(-1, Math.min(1, dot / d)));
+  const nearest = Math.max(0, angle - Math.asin(Math.sqrt(r2) / d));
+  return foveateOf(Math.cos(nearest), f);
+}
+
 /** One mesh's pages as the planner sees them. */
 export interface BandMesh<K = unknown> {
   key: K;
@@ -72,6 +133,11 @@ export interface BandMesh<K = unknown> {
   eye: ArrayLike<number>;
   /** errorLimit / lodScale: needed when epsMax / dist passes it. */
   limit: number;
+  /**
+   * The traversal's foveation of each page at most (1: none): epsMax /
+   * dist is weighed by it, as the traversal weighs its nodes (default 1).
+   */
+  foveate?: (page: number) => number;
   resident: (page: number) => boolean;
   inFlight: (page: number) => boolean;
   /** Pages (other than itself) a resident page's nodes have children in. */
@@ -132,7 +198,8 @@ export function planBand<K>(
     const set = new Set<number>();
     m.rows.forEach((row, p) => {
       const d = pageDistance(row, m.eye);
-      if (p !== 0 && !(row.epsMax / Math.max(d, BAND_NEAR) > m.limit)) {
+      const f = m.foveate ? m.foveate(p) : 1;
+      if (p !== 0 && !((f * row.epsMax) / Math.max(d, BAND_NEAR) > m.limit)) {
         return;
       }
       set.add(p);
@@ -146,7 +213,7 @@ export function planBand<K>(
       const priority =
         p === 0
           ? Number.POSITIVE_INFINITY
-          : row.epsMin /
+          : (f * row.epsMin) /
             Math.max(d, BAND_NEAR) /
             Math.max(1, m.pageBytes[p] ?? 1);
       missing.push({ m, page: p, priority, distance: d });
@@ -164,7 +231,8 @@ export function planBand<K>(
     const out: number[] = [];
     for (let p = m.rows.length - 1; p > 0; p--) {
       if (set.has(p) || !m.resident(p) || m.inCut?.(p)) continue;
-      if (pageNeeded(m.rows[p], m.eye, m.limit * BAND_KEEP)) continue;
+      const f = m.foveate ? m.foveate(p) : 1;
+      if (pageNeeded(m.rows[p], m.eye, (m.limit * BAND_KEEP) / f)) continue;
       out.push(p);
     }
     const going = new Set(out);

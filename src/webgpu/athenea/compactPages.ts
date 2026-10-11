@@ -54,10 +54,10 @@ import {
   parseRunsContainer,
   unpackRunsContainer,
 } from "./compactNodes";
-import type { RunBatch, RunJob, RunReply } from "./runWorker";
-import RunWorker from "./runWorker?worker&inline";
+import type { CutMsg, CutPart, FromCutter, ToCutter } from "./nodeWorker";
+import NodeWorker from "./nodeWorker?worker&inline";
 
-import { COMPACT_PLANE_WIDTHS } from "./compactRecords";
+import { COMPACT_PLANE_WIDTHS, compactPlaneOffset } from "./compactRecords";
 
 export { COMPACT_PLANE_WIDTHS };
 export const COMPACT_NODE_BYTES = 64;
@@ -104,11 +104,7 @@ const TABLE_ASSET_MATERIALS = 16;
 const TABLE_ASSET_OCCLUSION = 32;
 
 /** Byte offset of plane k in a section of n nodes. */
-export function compactPlaneOffset(k: number, n: number) {
-  let at = 0;
-  for (let j = 0; j < k; j++) at += COMPACT_PLANE_WIDTHS[j];
-  return at * n;
-}
+export { compactPlaneOffset };
 
 /** A piece's compact tables (rust athc_compact CompactTables). */
 export interface CompactPieceTables {
@@ -510,6 +506,8 @@ export interface CompactPiece {
   prefix: Uint8Array;
   /** Bytes [offset, offset + bytes) of the file. */
   read: (offset: number, bytes: number) => Promise<Uint8Array>;
+  /** The file's absolute URL (the node pool's worker reads runs by Range itself). */
+  url?: string;
 }
 
 export interface CompactBandOptions {
@@ -610,19 +608,23 @@ export interface CompactBandOptions {
      */
     aheadMs?: number;
     /**
-     * CMPC v4: inflate and pack the runs in a worker (thread CU), default
-     * true: the main thread only writes the records, as they come back.
+     * CMPC v4: the node pool's CPU side in a worker (nodeWorker.ts, thread
+     * CU), default true: slots, runs, inflates, packing and draw lists; the
+     * main thread only writes the records and sets the lists it sends.
      */
     decoder?: boolean;
-    /** The decoder: runs sent and not back at most (default 2048), and runs a message (32). */
-    decodeAhead?: number;
-    decodeBatch?: number;
     /** Runs inflated an update at most (the frame's decode budget); default 256. */
     inflatesPerUpdate?: number;
   };
 }
 
 type Row = AthcPageRow & { tier4Bytes: number; compact: number[] };
+
+/** A streamed traversal's cut (the node pool's worker): chunks of any instance. */
+interface StreamedCut {
+  parts?: CutPart[];
+  culled?: Uint32Array[];
+}
 
 /** The traversal's neighbours of each cut node (the node pool). */
 interface CutNeighbours {
@@ -734,6 +736,16 @@ export class CompactBandStreamer {
     /** Node pool: the view ahead's traversal ms, and the dropped runs it asked for. */
     aheadMs: 0,
     prefetchRuns: 0,
+    /** The update's synchronous main-thread chunks (ms by phase) and the longest. */
+    chunks: {} as Record<string, number>,
+    maxChunk: 0,
+    /** The worker's last cut's own ms, and its slices so far. */
+    workerCutMs: 0,
+    workerSlices: 0,
+    sub: {} as Record<string, number>,
+    /** The longest refresh and decoder reply handling (reset by the reader). */
+    refreshMax: 0,
+    onRunsMax: 0,
     /** Node pool, the run decoder: cut nodes whose records are on their way; the decoder's ms, inflates and records written, in all. */
     inFlight: 0,
     decoderMs: 0,
@@ -756,6 +768,7 @@ export class CompactBandStreamer {
     this.slotNodes = options.slotNodes ?? 3072;
     this.tau = options.tau ?? 1;
     const tables = pieces.map((p) => compactTablesOf(p, options.asset));
+    this.tablesV3 = tables.some((t) => t.version >= 3);
     const np = options.nodePool;
     if (np) {
       const heads = pieces.map((p) =>
@@ -779,8 +792,44 @@ export class CompactBandStreamer {
         max,
       );
       this.pool = pool;
-      this.nodes = new NodeSlotAllocator(pool.capacity, this.slotNodes);
-      if (
+      const runsPieces = pieces.some((p) => {
+        const k = p.layout.sections.findIndex(
+          (x) => (x.id as string) === "CMPC",
+        );
+        return (
+          (p.layout.sections[k] as { encoding?: number }).encoding ===
+          ENCODING_COMPACT_RUNS
+        );
+      });
+      const remote =
+        runsPieces && np.decoder !== false && typeof Worker !== "undefined";
+      if (!remote) {
+        this.nodes = new NodeSlotAllocator(pool.capacity, this.slotNodes);
+      }
+      if (remote) {
+        // The node pool's CPU side in a worker (thread CU, nodeWorker.ts).
+        const w: Worker = new NodeWorker();
+        w.onmessage = (e: MessageEvent<FromCutter>) => this.onCutter(e.data);
+        this.remote = w;
+        const pagePiece = new Uint16Array(this.pageOwner.length);
+        this.pageOwner.forEach((o, g) => {
+          pagePiece[g] = o.piece;
+        });
+        this.post({
+          t: "init",
+          capacity: pool.capacity,
+          maxCapacity: max,
+          slotNodes: this.slotNodes,
+          runBudget: np.runBudget ?? Number.POSITIVE_INFINITY,
+          inflatedRuns: np.inflatedRuns ?? 128,
+          protect: np.protect !== "none",
+          priority: np.priority !== false,
+          pagePiece,
+          // Runs fetched by the main thread (a worker's fetches waited behind its slices).
+          urls: pieces.map(() => ""),
+          runFetchers: np.runFetchers ?? 12,
+        });
+      } else if (
         pieces.some((p) => {
           const k = p.layout.sections.findIndex(
             (x) => (x.id as string) === "CMPC",
@@ -795,11 +844,6 @@ export class CompactBandStreamer {
           np.runBudget ?? Number.POSITIVE_INFINITY,
           np.inflatedRuns ?? 256,
         );
-        if (np.decoder !== false && typeof Worker !== "undefined") {
-          const w: Worker = new RunWorker();
-          w.onmessage = (e: MessageEvent<RunReply>) => this.onRuns(e.data);
-          this.decoder = w;
-        }
       } else {
         this.payload = new PagePayloadStore(
           np.decodedPages ?? 8,
@@ -884,6 +928,9 @@ export class CompactBandStreamer {
       // The node pool: runs coming again, or cut nodes not yet uploaded.
       this.runFetches > 0 ||
       this.wantedRuns.size > 0 ||
+      this.unpacking > 0 ||
+      this.remoteBusy ||
+      this.remoteFetches > 0 ||
       this.stats.missing > this.stats.noSlot
     );
   }
@@ -900,6 +947,17 @@ export class CompactBandStreamer {
     path?: CompactRelitPath,
   ) {
     const lod = this.options.lod;
+    // The main thread's synchronous chunks of this update (thread CU).
+    let c0 = performance.now();
+    const chunks: Record<string, number> = {};
+    const chunk = (name: string) => {
+      const t = performance.now();
+      chunks[name] = (chunks[name] ?? 0) + (t - c0);
+      c0 = t;
+    };
+    const resume = () => {
+      c0 = performance.now();
+    };
     // 1. Landed pages into slots.
     const ranges: Record<string, unknown>[] = [];
     const landed = this.landed;
@@ -909,7 +967,13 @@ export class CompactBandStreamer {
       piece.inFlight.delete(page);
       if (piece.slotOf.has(page)) continue;
       const slot = this.takeSlot();
-      if (slot === undefined) continue; // no room: dropped, asked again
+      if (slot === undefined) {
+        // No room: dropped, asked again.
+        if (this.remote) {
+          this.post({ t: "drop", g: this.pageBase[piece.index] + page });
+        }
+        continue;
+      }
       const row = piece.rows[page];
       const { input, box } =
         this.pool instanceof CompactPagePool
@@ -940,7 +1004,7 @@ export class CompactBandStreamer {
       });
       this.stats.landed += 1;
     }
-    if (this.evictedSlots.size && this.nodes) {
+    if (this.evictedSlots.size && (this.nodes || this.remote)) {
       // Node pool: the records outlive their page (keyed by page and place).
       this.evictedSlots.clear();
     }
@@ -956,7 +1020,9 @@ export class CompactBandStreamer {
     }
     for (const r of this.evictedRanges) ranges.unshift(r);
     this.evictedRanges = [];
+    chunk("land");
     if (ranges.length) await lod("updateCompactLodTrees", { ranges });
+    resume();
 
     // 2. The cut over the resident pages.
     camera.updateMatrixWorld();
@@ -1013,41 +1079,47 @@ export class CompactBandStreamer {
     let near: CutNeighbours | undefined;
     if (Object.keys(instances).length) {
       const t0 = performance.now();
+      chunk("plan");
+      const traversal = (await lod("traverseLodTrees", {
+        maxSplats:
+          this.pool instanceof CompactNodePool
+            ? this.pool.maxCapacity
+            : this.options.slots * this.slotNodes,
+        pixelScaleLimit: pixel,
+        instances,
+        traverseMode: "standard",
+        errorLimit,
+        // Negative: any size, pruned with the subtree (spark-rs).
+        backCullMin: this.options.backCull === false ? undefined : -1,
+        occlusionCull: this.options.occlusion === true,
+        neighbours: !!this.runs || !!this.remote,
+        // The budget never binds the cut (it fits the pool): any order.
+        unordered: true,
+        // The worker takes the cut in chunks (never whole in the WASM heap).
+        stream: !!this.remote,
+      })) as StreamedCut & {
+        keyIndices: Record<
+          string,
+          {
+            numSplats: number;
+            indices: Uint32Array;
+            parents?: Uint32Array;
+            firstKids?: Uint32Array;
+            kidCounts?: Uint32Array;
+            culled?: Uint32Array;
+            screens?: Uint32Array;
+          }
+        >;
+        culledCount?: number;
+        occludedCount?: number;
+        chunks?: [number, number][];
+        wasmMs?: number;
+      };
       const { keyIndices, culledCount, occludedCount, chunks, wasmMs } =
-        (await lod("traverseLodTrees", {
-          maxSplats:
-            this.pool instanceof CompactNodePool
-              ? this.pool.maxCapacity
-              : this.options.slots * this.slotNodes,
-          pixelScaleLimit: pixel,
-          instances,
-          traverseMode: "standard",
-          errorLimit,
-          // Negative: any size, pruned with the subtree (spark-rs).
-          backCullMin: this.options.backCull === false ? undefined : -1,
-          occlusionCull: this.options.occlusion === true,
-          neighbours: !!this.runs,
-          // The budget never binds the cut (it fits the pool): any order.
-          unordered: true,
-        })) as {
-          keyIndices: Record<
-            string,
-            {
-              numSplats: number;
-              indices: Uint32Array;
-              parents?: Uint32Array;
-              firstKids?: Uint32Array;
-              kidCounts?: Uint32Array;
-              culled?: Uint32Array;
-              screens?: Uint32Array;
-            }
-          >;
-          culledCount?: number;
-          occludedCount?: number;
-          chunks?: [number, number][];
-          wasmMs?: number;
-        };
+        traversal;
+      const streamed = traversal;
       this.stats.traverseMs = performance.now() - t0;
+      resume();
       this.stats.traverseWasmMs = wasmMs ?? 0;
       // The pages the traversal asked for, by tree (spark-rs touched).
       if (this.pruning() && chunks) {
@@ -1063,7 +1135,8 @@ export class CompactBandStreamer {
       }
       this.stats.culled = culledCount ?? 0;
       this.stats.occluded = occludedCount ?? 0;
-      const parts = Object.values(keyIndices).map((k) =>
+      if (this.remote) this.postCut(streamed as StreamedCut);
+      const parts = (this.remote ? [] : Object.values(keyIndices)).map((k) =>
         k.indices.subarray(0, k.numSplats),
       );
       list = new Uint32Array(parts.reduce((n, p) => n + p.length, 0));
@@ -1145,20 +1218,27 @@ export class CompactBandStreamer {
       }
     }
     if (path) this.lastPath = path;
+    chunk("cut");
     if (this.nodes) list = this.toNodeSlots(list, path, near);
+    // The new list at once (records written from now on are its own); the
+    // worker's come with its records (onCutter).
+    if (!this.remote) {
+      this.drawList = list;
+      this.stats.cut = list.length;
+      path?.setDrawList(list);
+    }
+    chunk("slots");
     // The view a moment ahead (thread CU): its cut's dropped runs asked
     // for now, so they are here when the camera is.
-    const ahead = this.runs ? this.predictView(view) : null;
+    const ahead = this.runs || this.remote ? this.predictView(view) : null;
     if (ahead && Object.keys(instances).length) {
-      await this.prefetchAhead(ahead, instances, pixel, errorLimit);
+      await this.prefetchAhead(ahead, instances, pixel, errorLimit, resume);
+      chunk("ahead");
     } else this.stats.prefetchRuns = 0;
     if (this.runs) {
       this.runs.trim();
       this.fetchRuns();
     }
-    this.drawList = list;
-    this.stats.cut = list.length;
-    path?.setDrawList(list);
 
     // 3. The needed set, requests, eviction order.
     const meshes: BandMesh<PieceState>[] = this.pieces.map((p) => ({
@@ -1207,6 +1287,9 @@ export class CompactBandStreamer {
       if (r.pages.some((page) => r.key.inFlight.has(page))) continue;
       this.fetchRun(r.key, r.pages);
     }
+    chunk("pages");
+    this.stats.chunks = chunks;
+    this.stats.maxChunk = Math.max(...Object.values(chunks));
   }
 
   /** A landed page, node pool: its payload kept on the CPU, its traversal input. */
@@ -1224,7 +1307,9 @@ export class CompactBandStreamer {
   ) {
     const row = piece.rows[page];
     const g = this.pageBase[piece.index] + page;
-    if (this.runs && l.container) {
+    if (this.remote) {
+      // Its runs are in the worker already.
+    } else if (this.runs && l.container) {
       this.runs.put(g, l.container, l.fileAt ?? 0, l.planes);
     } else {
       (this.payload as PagePayloadStore).put(
@@ -1284,13 +1369,9 @@ export class CompactBandStreamer {
     const kb = this.slotKeyBases();
     const keys = new Int32Array(n);
     const out = new Int32Array(n).fill(-1);
-    // The run decoder (worker): a slot whose record is on its way is held
-    // but not drawn yet (as a miss, not asked for again).
-    const decoder = this.decoder;
-    const pending = this.pendingFlags(alloc.capacity);
     const failed = new Uint8Array(n);
     let failedN = 0;
-    let inFlight = 0;
+    const inFlight = 0;
     // Misses as key * 2^23 + k (exact in a double; a cut under 2^23).
     const SH = 8388608;
     const missKeys = new Float64Array(n);
@@ -1301,15 +1382,9 @@ export class CompactBandStreamer {
       keys[k] = key;
       const s = alloc.use(key);
       if (s < 0) missKeys[missN++] = key * SH + k;
-      else {
-        out[k] = s;
-        if (pending[s]) {
-          failed[k] = 1;
-          failedN += 1;
-          inFlight += 1;
-        }
-      }
+      else out[k] = s;
     }
+    const tLoop = performance.now();
     const miss = missKeys.subarray(0, missN).sort();
     // The groups (a run's misses, v4, or a page's), in key order.
     const gStart: number[] = [];
@@ -1359,13 +1434,7 @@ export class CompactBandStreamer {
     const ready = new Int32Array(missN);
     let readyN = 0;
     this.deferred = false;
-    // The decoder's budget: runs sent and not back, at most decodeAhead.
-    let sendable = decoder
-      ? Math.max(
-          0,
-          (this.options.nodePool?.decodeAhead ?? 2048) - this.runsInFlight,
-        )
-      : 0;
+
     const cap =
       this.options.nodePool?.uploadsPerUpdate ?? Number.POSITIVE_INFINITY;
     const inflateCap = this.options.nodePool?.inflatesPerUpdate ?? 256;
@@ -1390,12 +1459,6 @@ export class CompactBandStreamer {
             this.wantRun(g, r);
             ok = false;
             missDropped += e - q;
-          } else if (decoder) {
-            if (sendable <= 0) {
-              this.deferred = true;
-              ok = false;
-              missDeferred += e - q;
-            } else sendable -= 1;
           } else if (!runs.isInflated(g, r)) {
             // The decode budget: runs not inflated yet, at most inflateCap.
             if (inflating >= inflateCap) {
@@ -1415,6 +1478,7 @@ export class CompactBandStreamer {
         }
       }
     }
+    const tDecide = performance.now();
     // Slots for the ready (in key order: a run's nodes together).
     const got = new Int32Array(readyN);
     const gotSlot = new Float64Array(readyN);
@@ -1432,17 +1496,6 @@ export class CompactBandStreamer {
       out[k] = s;
       gotSlot[gotN] = s * SH + gotN;
       got[gotN++] = k;
-    }
-    if (decoder && runs) {
-      // To the decoder, largest first, in batches (the first back first);
-      // drawn when their records are written (`refresh`).
-      this.sendRuns(got.subarray(0, gotN), keys, out, pending);
-      for (let x = 0; x < gotN; x++) {
-        failed[got[x]] = 1;
-        failedN += 1;
-        inFlight += 1;
-      }
-      gotN = 0;
     }
     // Each record's place in slot order (one write a run of slots).
     const bySlot = gotSlot.subarray(0, gotN).sort();
@@ -1544,12 +1597,19 @@ export class CompactBandStreamer {
       }
     }
     this.cutState = { keys, out, near, kb, n, base, failedList, allArea };
+    const tB = performance.now();
     const result = this.buildDrawList();
+    this.stats.sub.build = performance.now() - tB;
     this.stats.missDropped = missDropped;
     this.stats.missDeferred = missDeferred;
     this.stats.inFlight = inFlight;
     this.stats.noSlot = noSlot;
+    const tC = performance.now();
     alloc.commit(result);
+    this.stats.sub.commit = performance.now() - tC;
+    this.stats.sub.loop = tLoop - t0;
+    this.stats.sub.decide = tDecide - tLoop;
+    this.stats.sub.alloc = tB - tDecide - (this.stats.sub.send ?? 0);
     this.stats.packMs = performance.now() - t0 - this.stats.decodeMs;
     return result;
   }
@@ -1581,7 +1641,6 @@ export class CompactBandStreamer {
     const st = this.cutState as NonNullable<typeof this.cutState>;
     const { keys, out, near, kb } = st;
     const alloc = this.nodes as NodeSlotAllocator;
-    const pending = this.pendingFlags(alloc.capacity);
     const N = this.slotNodes;
     const screens = near?.screens;
     // Misses whose records are now written: drawn from now on.
@@ -1589,7 +1648,7 @@ export class CompactBandStreamer {
     let resolved = 0;
     for (let x = 0; x < fl.length; x++) {
       const s = out[fl[x]];
-      if (s >= 0 && !pending[s] && alloc.keyIn(s) === keys[fl[x]]) resolved++;
+      if (s >= 0 && alloc.keyIn(s) === keys[fl[x]]) resolved++;
     }
     if (resolved) {
       const base = new Uint32Array(st.base.length + resolved);
@@ -1599,7 +1658,7 @@ export class CompactBandStreamer {
       for (let x = 0; x < fl.length; x++) {
         const k = fl[x];
         const s = out[k];
-        if (s >= 0 && !pending[s] && alloc.keyIn(s) === keys[k]) {
+        if (s >= 0 && alloc.keyIn(s) === keys[k]) {
           base[b0++] = s;
           alloc.use(keys[k]);
         } else fl[f0++] = k;
@@ -1630,7 +1689,7 @@ export class CompactBandStreamer {
       };
       const held = (i: number) => {
         const s = alloc.use(i + kb[(i / N) | 0]);
-        return s >= 0 && !pending[s] ? s : -1;
+        return s;
       };
       for (let x = 0; x < misses.length; x++) {
         const k = misses[x];
@@ -1685,179 +1744,6 @@ export class CompactBandStreamer {
     this.stats.substituted = substituted;
     return result;
   }
-
-  // ---------------------------------------------- the run decoder (worker)
-
-  /** The run decoder (nodePool.decoder): CMPC v4 runs inflated and packed off the main thread. */
-  private decoder: Worker | null = null;
-  /** Runs sent to the decoder and not back. */
-  private runsInFlight = 0;
-  private batchId = 0;
-  private batches = new Map<
-    number,
-    { runs: number; slots: Int32Array; keys: Int32Array; counts: number[] }
-  >();
-  private pending = new Uint8Array(0);
-  /** Records written since the draw list was last built. */
-  private fresh = 0;
-  private lastPath: CompactRelitPath | undefined;
-
-  /** A flag a node slot: its record is on its way (grown with the pool). */
-  private pendingFlags(capacity: number) {
-    if (this.pending.length < capacity) {
-      const p = new Uint8Array(capacity);
-      p.set(this.pending);
-      this.pending = p;
-    }
-    return this.pending;
-  }
-
-  /**
-   * The cut's ready misses (`got`: cut indices, in groups of a run, the
-   * groups largest first) to the decoder in batches of `decodeBatch` (32)
-   * runs: their slots wait (pending) for the records.
-   */
-  private sendRuns(
-    got: Int32Array,
-    keys: Int32Array,
-    out: Int32Array,
-    pending: Uint8Array,
-  ) {
-    const runs = this.runs as RunPayloadStore;
-    const worker = this.decoder as Worker;
-    const per = this.options.nodePool?.decodeBatch ?? 32;
-    let jobs: RunJob[] = [];
-    let slots: number[] = [];
-    let ks: number[] = [];
-    let counts: number[] = [];
-    const flush = () => {
-      if (!jobs.length) return;
-      const id = ++this.batchId;
-      this.batches.set(id, {
-        runs: jobs.length,
-        slots: Int32Array.from(slots),
-        keys: Int32Array.from(ks),
-        counts,
-      });
-      this.runsInFlight += jobs.length;
-      worker.postMessage({ id, jobs } satisfies RunBatch);
-      jobs = [];
-      slots = [];
-      ks = [];
-      counts = [];
-    };
-    let j = 0;
-    while (j < got.length) {
-      const key0 = keys[got[j]];
-      const g = key0 >>> 12;
-      const info = runs.runInfo(g) as { n: number; run: number };
-      const r = ((key0 & 4095) / info.run) | 0;
-      let e = j + 1;
-      while (e < got.length) {
-        const key = keys[got[e]];
-        if (key >>> 12 !== g || (((key & 4095) / info.run) | 0) !== r) break;
-        e++;
-      }
-      const base = r * info.run;
-      const bytes = runs.runBytes(g, r);
-      const locals = new Uint16Array(e - j);
-      for (let x = j; x < e; x++) {
-        const k = got[x];
-        locals[x - j] = (keys[k] & 4095) - base;
-        slots.push(out[k]);
-        ks.push(keys[k]);
-        pending[out[k]] = 1;
-      }
-      jobs.push({
-        key: g * 64 + r,
-        page: g,
-        base,
-        m: Math.min(info.run, info.n - base),
-        bytes: bytes ?? undefined,
-        // Dropped but still inflated here (a page's runs as it landed).
-        planes: bytes ? undefined : (runs.inflatedPlanes(g, r) ?? undefined),
-        locals,
-      });
-      counts.push(e - j);
-      if (jobs.length >= per) flush();
-      j = e;
-    }
-    flush();
-  }
-
-  /** A batch back from the decoder: the records of the slots still waiting for them written. */
-  private onRuns(reply: RunReply) {
-    const b = this.batches.get(reply.id);
-    if (!b) return;
-    this.batches.delete(reply.id);
-    this.runsInFlight -= b.runs;
-    const alloc = this.nodes as NodeSlotAllocator;
-    const pool = this.pool as CompactNodePool;
-    const pending = this.pendingFlags(alloc.capacity);
-    const R = NODE_RECORD_WORDS * 4;
-    const lost = new Uint8Array(b.slots.length);
-    if (reply.lost.length) {
-      let at = 0;
-      const starts = b.counts.map((c) => {
-        const s0 = at;
-        at += c;
-        return s0;
-      });
-      for (const x of reply.lost) {
-        for (let y = 0; y < b.counts[x]; y++) lost[starts[x] + y] = 1;
-      }
-    }
-    // The live ones, in slot order (one write a run of slots).
-    const SH = 8388608;
-    const live = new Float64Array(b.slots.length);
-    let ln = 0;
-    for (let y = 0; y < b.slots.length; y++) {
-      const s = b.slots[y];
-      if (!pending[s] || alloc.keyIn(s) !== b.keys[y]) continue;
-      if (lost[y]) {
-        pending[s] = 0;
-        alloc.release(s);
-        continue;
-      }
-      live[ln++] = s * SH + y;
-    }
-    const order = live.subarray(0, ln).sort();
-    const slots = new Uint32Array(ln);
-    const records = new Uint8Array(ln * R);
-    for (let x = 0; x < ln; x++) {
-      const v = order[x];
-      const y = v % SH;
-      slots[x] = (v - y) / SH;
-      records.set(reply.records.subarray(y * R, y * R + R), x * R);
-      pending[slots[x]] = 0;
-    }
-    if (ln) pool.writeRecords(slots, records);
-    this.fresh += ln;
-    this.stats.decoderMs += reply.ms;
-    this.stats.decoderInflates += reply.inflates;
-    this.stats.uploadedAsync += ln;
-  }
-
-  /**
-   * Each frame (the node pool with the run decoder): the records written
-   * since the last draw list join it, their parents and children out.
-   */
-  refresh(path?: CompactRelitPath) {
-    if (!this.fresh || !this.cutState) return false;
-    // At most every other frame unless much came (the list is rebuilt).
-    const now = performance.now();
-    const much = this.fresh * 50 > this.cutState.n;
-    if (!much && now - this.lastRefresh < 30) return false;
-    this.lastRefresh = now;
-    this.fresh = 0;
-    const result = this.buildDrawList();
-    this.drawList = result;
-    this.stats.cut = result.length;
-    (path ?? this.lastPath)?.setDrawList(result);
-    return true;
-  }
-
-  private lastRefresh = 0;
 
   private seenEpoch = 0;
   private seen = new Uint32Array(0);
@@ -1939,6 +1825,7 @@ export class CompactBandStreamer {
     instances: Record<string, unknown>,
     pixel: number,
     errorLimit: number,
+    resume?: () => void,
   ) {
     const runs = this.runs as RunPayloadStore;
     const alloc = this.nodes as NodeSlotAllocator;
@@ -1950,7 +1837,7 @@ export class CompactBandStreamer {
       };
     }
     const t0 = performance.now();
-    const { keyIndices } = (await this.options.lod("traverseLodTrees", {
+    const ahead_ = (await this.options.lod("traverseLodTrees", {
       maxSplats:
         this.pool instanceof CompactNodePool
           ? this.pool.maxCapacity
@@ -1963,10 +1850,24 @@ export class CompactBandStreamer {
       occlusionCull: this.options.occlusion === true,
       neighbours: false,
       unordered: true,
-    })) as {
+      stream: !!this.remote,
+    })) as StreamedCut & {
       keyIndices: Record<string, { numSplats: number; indices: Uint32Array }>;
     };
     this.stats.aheadMs = performance.now() - t0;
+    resume?.();
+    const keyIndices = ahead_.keyIndices;
+    if (this.remote) {
+      const parts = (ahead_.parts ?? []).map((k) => ({
+        numSplats: k.numSplats,
+        indices: k.indices,
+      }));
+      this.post(
+        { t: "ahead", kb: this.slotKeyBases(), parts },
+        parts.map((p) => p.indices.buffer),
+      );
+      return;
+    }
     const N = this.slotNodes;
     const kb = this.slotKeyBases();
     let wanted = 0;
@@ -1992,6 +1893,174 @@ export class CompactBandStreamer {
       }
     }
     this.stats.prefetchRuns = wanted;
+  }
+
+  // ------------------------------------- the node pool's worker (thread CU)
+
+  /** The node pool's CPU side (nodeWorker.ts), for CMPC v4 pieces. */
+  private remote: Worker | null = null;
+  private lastPath: CompactRelitPath | undefined;
+  /** Pages posted to the worker, not landed back yet. */
+  private unpacking = 0;
+  private remoteBusy = false;
+  private remoteStats: Record<string, number | boolean> = {};
+  private keysWaiting = new Map<number, (k: Int32Array) => void>();
+  private remoteKeys: Int32Array | null = null;
+
+  private post(m: ToCutter, transfer: Transferable[] = []) {
+    this.remote?.postMessage(m, transfer);
+  }
+
+  /** The worker's messages: records and draw lists, landed pages, runs to fetch. */
+  /** Main-thread ms in the worker's messages since the reader reset it (thread CU). */
+  cutterMs = 0;
+  cutterMsgs = 0;
+  cutterTypes: Record<string, number> = {};
+
+  private onCutter(m: FromCutter) {
+    const t0 = performance.now();
+    try {
+      this.onCutterInner(m);
+    } finally {
+      this.cutterMs += performance.now() - t0;
+      this.cutterMsgs += 1;
+      this.cutterTypes[m.t] = (this.cutterTypes[m.t] ?? 0) + 1;
+    }
+  }
+
+  private onCutterInner(m: FromCutter) {
+    if (m.t === "frame") {
+      const pool = this.pool as CompactNodePool;
+      if (m.grow > pool.capacity && pool.grow(m.grow)) {
+        this.lastPath?.setPagedCloud(pool);
+      }
+      if (m.slots.length) pool.writeRecords(m.slots, m.records);
+      if (m.drawList) {
+        // Owned by the path (no copy); the list it replaces goes back to the
+        // worker for its next one (no allocation churn on this thread: the
+        // GC paused frames for 7-13 ms).
+        const path = this.lastPath;
+        const old = path?.drawListHeld;
+        this.drawList = m.drawList;
+        path?.setDrawList(m.drawList, true);
+        if (old && old !== m.drawList && path?.drawListHeld === m.drawList) {
+          this.post({ t: "recycle", buffer: old.buffer as ArrayBuffer }, [
+            old.buffer,
+          ]);
+        }
+      }
+      const st = m.stats;
+      this.remoteStats = { ...st };
+      this.remoteBusy = st.busy;
+      const s = this.stats;
+      s.cut = m.drawList ? m.drawList.length : s.cut;
+      s.missing = st.missing;
+      s.missDropped = st.missDropped;
+      s.missDeferred = st.missDeferred;
+      s.substituted = st.substituted;
+      s.holes = st.holes;
+      s.missingArea = st.missingArea;
+      s.holeArea = st.holeArea;
+      s.uploaded = st.uploaded;
+      s.decodes = st.decodes;
+      s.decodeMs = st.decodeMs;
+      s.noSlot = st.noSlot;
+      s.runRanges = st.runRanges;
+      s.runBytes = st.runBytesRead;
+      s.prefetchRuns = st.prefetchRuns;
+      s.packMs = st.sliceMs;
+      s.workerCutMs = st.cutMs;
+      s.workerSlices = st.slices;
+    } else if (m.t === "landed") {
+      this.unpacking -= 1;
+      const o = this.pageOwner[m.g];
+      const piece = this.pieces[o.piece];
+      this.landed.push({
+        piece,
+        page: o.page,
+        raw: null,
+        stored: null,
+        input: m.input,
+      });
+    } else if (m.t === "want") {
+      for (const spans of m.ranges) this.runQueue.push(spans);
+      this.fetchQueued();
+    } else if (m.t === "keys") {
+      this.remoteKeys = m.keys;
+      this.keysWaiting.get(m.id)?.(m.keys);
+      this.keysWaiting.delete(m.id);
+    }
+  }
+
+  /** The worker's runs to fetch (a page's at a time), 12 Ranges in flight. */
+  private runQueue: [number, number, number, number][][] = [];
+  private remoteFetches = 0;
+
+  private fetchQueued() {
+    while (this.remoteFetches < 16 && this.runQueue.length) {
+      const m = this.runQueue.shift() as [number, number, number, number][];
+      this.remoteFetches += 1;
+      this.fetchWanted(m).finally(() => {
+        this.remoteFetches -= 1;
+        this.fetchQueued();
+      });
+    }
+  }
+
+  private fetchWanted(spans: [number, number, number, number][]) {
+    const first = spans[0];
+    const last = spans[spans.length - 1];
+    const piece = this.pieces[this.pageOwner[first[0]].piece].piece;
+    const at = first[2];
+    return piece
+      .read(at, last[2] + last[3] - at)
+      .then((data) => {
+        // The Range whole (transferred): the worker cuts its runs out.
+        const buf =
+          data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+            ? data
+            : data.slice();
+        this.post({ t: "runs", data: buf, at, spans }, [buf.buffer]);
+      })
+      .catch((e) => {
+        console.warn(e);
+        this.post({
+          t: "runs",
+          asked: spans.map(([g, r]) => g * 64 + r),
+        });
+      });
+  }
+
+  /** The worker's slot keys (for nodeOf), fetched now. */
+  async fetchKeys() {
+    if (!this.remote) return null;
+    const id = Math.random();
+    const p = new Promise<Int32Array>((ok) => this.keysWaiting.set(id, ok));
+    this.post({ t: "keys", id });
+    return p;
+  }
+
+  /** A cut's parts (the traversal's chunks, transferred) to the worker. */
+  private postCut(cut: StreamedCut) {
+    const parts: CutPart[] = [...(cut.parts ?? [])];
+    for (const c of cut.culled ?? []) {
+      parts.push({ numSplats: 0, indices: new Uint32Array(0), culled: c });
+    }
+    const transfer: Transferable[] = [];
+    for (const p of parts) {
+      for (const a of [
+        p.indices,
+        p.parents,
+        p.firstKids,
+        p.kidCounts,
+        p.culled,
+        p.screens,
+      ]) {
+        if (a && !transfer.includes(a.buffer)) transfer.push(a.buffer);
+      }
+    }
+    const msg: CutMsg = { t: "cut", kb: this.slotKeyBases(), parts };
+    this.post(msg, transfer);
   }
 
   /** Nodes left for the next update by the decode budget. */
@@ -2089,6 +2158,9 @@ export class CompactBandStreamer {
       key.kids.delete(page);
       this.payload?.drop(this.pageBase[key.index] + page);
       this.runs?.drop(this.pageBase[key.index] + page);
+      if (this.remote) {
+        this.post({ t: "drop", g: this.pageBase[key.index] + page });
+      }
       this.slotOwner[slot] = null;
       this.evictedSlots.add(slot);
       this.evictedRanges.push({
@@ -2129,13 +2201,16 @@ export class CompactBandStreamer {
    * pages it asked for (planBand's `wanted`).
    */
   private pruning() {
-    const v3 = this.pool.pieces.some((t) => t.version >= 3);
+    const v3 = this.tablesV3;
     const occlusion = (this.options.asset?.occlusion.length ?? 0) > 0;
     return (
       (v3 && this.options.backCull !== false) ||
       (v3 && occlusion && this.options.occlusion === true)
     );
   }
+
+  /** Some piece's tables are CMPT 3 (cones, occlusion indices). */
+  private tablesV3 = false;
 
   /** tau fell at the last update (pruned planning): not settled yet. */
   converging = false;
@@ -2199,6 +2274,22 @@ export class CompactBandStreamer {
             span.offset - start,
             span.offset - start + span.stored,
           );
+          if (p.runs && this.remote) {
+            // The worker unpacks it (its runs kept there) and sends the
+            // traversal's input back ("landed").
+            const c = stored.slice();
+            this.unpacking += 1;
+            this.post(
+              {
+                t: "page",
+                g: this.pageBase[p.index] + page,
+                container: c,
+                fileAt: span.offset,
+              },
+              [c.buffer],
+            );
+            continue;
+          }
           if (p.runs) {
             // CMPC v4: the traversal's member gunzipped, the runs inflated
             // once (the positions the traversal reads are in them).
@@ -2286,12 +2377,26 @@ export class CompactBandStreamer {
         gpuTables: b.tables + b.heads,
         gpuSlots: b.records,
         gpuHeads: b.heads,
-        gpuRecordsUsed: (this.nodes?.used ?? 0) * NODE_RECORD_WORDS * 4,
+        gpuRecordsUsed:
+          ((this.remote
+            ? (this.remoteStats.nodesHeld as number)
+            : this.nodes?.used) ?? 0) *
+          NODE_RECORD_WORDS *
+          4,
         cpuTraversal,
-        cpuCompressed: this.runs?.bytes ?? this.payload?.compressedBytes ?? 0,
-        cpuDecoded: this.runs?.inflatedBytes ?? this.payload?.decodedBytes ?? 0,
-        /** The node pool's JS index (slots by node) and per-slot arrays. */
-        cpuNodeIndex: this.nodes?.bytes ?? 0,
+        cpuCompressed:
+          (this.remote
+            ? (this.remoteStats.runBytesHeld as number)
+            : (this.runs?.bytes ?? this.payload?.compressedBytes)) ?? 0,
+        cpuDecoded:
+          (this.remote
+            ? (this.remoteStats.inflatedBytes as number)
+            : (this.runs?.inflatedBytes ?? this.payload?.decodedBytes)) ?? 0,
+        /** The node pool's index (slots by node) and per-slot arrays (in the worker with one). */
+        cpuNodeIndex:
+          (this.remote
+            ? (this.remoteStats.indexBytes as number)
+            : this.nodes?.bytes) ?? 0,
       };
     }
     return {
@@ -2303,6 +2408,12 @@ export class CompactBandStreamer {
 
   /** The (piece, page, node) of draw-list entry i (a slot index, or a node slot), or null. */
   nodeOf(i: number) {
+    if (this.remote) {
+      const key = this.remoteKeys ? this.remoteKeys[i] : -1;
+      if (key === undefined || key < 0) return null;
+      const g = Math.floor(key / PAGE_PLACES);
+      return { ...this.pageOwner[g], node: key - g * PAGE_PLACES };
+    }
     if (this.nodes) {
       const key = this.nodes.keyIn(i);
       if (key < 0) return null;
@@ -2317,8 +2428,8 @@ export class CompactBandStreamer {
 
   dispose() {
     this.pool.dispose();
-    this.decoder?.terminate();
-    this.decoder = null;
+    this.remote?.terminate();
+    this.remote = null;
   }
 }
 
@@ -2336,6 +2447,8 @@ export async function openCompactPiece(
     prefix,
     read: async (offset, bytes) =>
       (await readRange({ url }, offset, bytes)).data,
+    url:
+      typeof location !== "undefined" ? new URL(url, location.href).href : url,
   };
 }
 

@@ -140,12 +140,40 @@ describe("NodeIndex", () => {
     expect(x.get(5 * 4096 + 7)).toBe(11);
     expect(x.slot(5 * 4096 + 8)).toBe(-1);
     expect(x.get(9000 * 4096 + 1)).toBe(13);
-    expect(x.bytes).toBe(2 * 3072 * 4);
+    expect(x.bytes).toBeLessThan(2 * 1024);
     x.delete(5 * 4096 + 7);
     x.delete(5 * 4096 + 3000);
     expect(x.size).toBe(1);
-    expect(x.bytes).toBe(3072 * 4);
     expect(x.slot(-5)).toBe(-1);
+  });
+
+  it("matches a Map over random sets and deletes (rank order kept)", () => {
+    const x = new NodeIndex(3072);
+    const ref = new Map<number, number>();
+    let seed = 3;
+    const rnd = () => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return seed;
+    };
+    for (let step = 0; step < 40000; step++) {
+      const key = (rnd() % 7) * 4096 + (rnd() % 3072);
+      if (ref.has(key) && rnd() % 3 === 0) {
+        x.delete(key);
+        ref.delete(key);
+      } else {
+        const s = rnd() % 100000;
+        x.set(key, s);
+        ref.set(key, s);
+      }
+      if (step % 4999 === 0) {
+        for (let g = 0; g < 7; g++) {
+          for (let k = 0; k < 3072; k++) {
+            expect(x.slot(g * 4096 + k)).toBe(ref.get(g * 4096 + k) ?? -1);
+          }
+        }
+      }
+    }
+    expect(x.size).toBe(ref.size);
   });
 });
 

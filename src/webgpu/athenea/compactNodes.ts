@@ -17,11 +17,12 @@
 
 import { gunzipSync, inflateSync } from "fflate";
 import type { CompactCloud, CompactLayout } from "./compact";
-import { type CompactPieceTables, compactPlaneOffset } from "./compactPages";
+import type { CompactPieceTables } from "./compactPages";
 import {
   COMPACT_PLANE_WIDTHS,
   NODE_RECORD_WORDS,
   RECORD_FIELDS,
+  compactPlaneOffset,
   packRunRecords,
   runPlaneOffsets,
 } from "./compactRecords";
@@ -60,43 +61,81 @@ function planeOffsets(n: number) {
  * last node goes. About 16 KB a page, where a Map takes ~40 bytes a node.
  */
 export class NodeIndex {
-  /** A page's places (by page number: an array index, not a Map lookup). */
-  private pages: (Int32Array | undefined)[] = [];
-  private counts: number[] = [];
+  /**
+   * A page's held places as a bitmap with the bits before each word
+   * counted, and the slots in place order (thread CU): a lookup is a bit
+   * and a popcount, a page about 0.6 KB plus 4 bytes a node held (the
+   * cut's pages hold ~20 % of their nodes; an Int32Array of every place was
+   * 12 KB a page, 6-8 MB for the whole car).
+   */
+  private pages: (IndexPage | undefined)[] = [];
   private held = 0;
+  private slotBytes = 0;
   size = 0;
 
   /** Places a page holds at most (a pool slot's nodes). */
   constructor(readonly places = PAGE_PLACES) {}
 
   get(key: number): number | undefined {
-    const p = this.pages[key >>> 12];
-    if (p === undefined) return undefined;
-    const s = p[key & 4095];
+    const s = this.slot(key);
     return s < 0 ? undefined : s;
   }
 
   /** The slot of `key`, or -1 (get without the undefined). */
   slot(key: number): number {
     const p = this.pages[key >>> 12];
-    return p === undefined ? -1 : p[key & 4095];
+    if (p === undefined) return -1;
+    const k = key & 4095;
+    const w = k >>> 5;
+    const word = p.bits[w];
+    const bit = 1 << (k & 31);
+    if ((word & bit) === 0) return -1;
+    return p.slots[p.pre[w] + popcount(word & (bit - 1))];
+  }
+
+  /** The slots page g holds (a copy), or undefined. */
+  slotsIn(g: number): Int32Array | undefined {
+    const p = this.pages[g];
+    return p ? p.slots.slice(0, p.n) : undefined;
   }
 
   set(key: number, slot: number) {
     const g = key >>> 12;
     let p = this.pages[g];
     if (p === undefined) {
-      p = new Int32Array(this.places).fill(-1);
+      const words = Math.ceil(this.places / 32);
+      p = {
+        bits: new Int32Array(words),
+        pre: new Uint16Array(words),
+        slots: new Int32Array(16),
+        n: 0,
+      };
       this.pages[g] = p;
-      this.counts[g] = 0;
       this.held += 1;
+      this.slotBytes += 16 * 4;
     }
     const k = key & 4095;
-    if (p[k] < 0) {
-      this.counts[g] += 1;
-      this.size += 1;
+    const w = k >>> 5;
+    const bit = 1 << (k & 31);
+    const r = p.pre[w] + popcount(p.bits[w] & (bit - 1));
+    if (p.bits[w] & bit) {
+      p.slots[r] = slot;
+      return;
     }
-    p[k] = slot;
+    if (p.n === p.slots.length) {
+      const grown = new Int32Array(
+        Math.min(this.places, Math.ceil(p.slots.length * 1.5) + 8),
+      );
+      grown.set(p.slots);
+      this.slotBytes += (grown.length - p.slots.length) * 4;
+      p.slots = grown;
+    }
+    p.slots.copyWithin(r + 1, r, p.n);
+    p.slots[r] = slot;
+    p.n += 1;
+    p.bits[w] |= bit;
+    for (let x = w + 1; x < p.pre.length; x++) p.pre[x] += 1;
+    this.size += 1;
   }
 
   delete(key: number) {
@@ -104,27 +143,47 @@ export class NodeIndex {
     const p = this.pages[g];
     if (p === undefined) return;
     const k = key & 4095;
-    if (p[k] < 0) return;
-    p[k] = -1;
-    this.counts[g] -= 1;
+    const w = k >>> 5;
+    const bit = 1 << (k & 31);
+    if ((p.bits[w] & bit) === 0) return;
+    const r = p.pre[w] + popcount(p.bits[w] & (bit - 1));
+    p.slots.copyWithin(r, r + 1, p.n);
+    p.n -= 1;
+    p.bits[w] &= ~bit;
+    for (let x = w + 1; x < p.pre.length; x++) p.pre[x] -= 1;
     this.size -= 1;
-    if (this.counts[g] === 0) {
+    if (p.n === 0) {
       this.pages[g] = undefined;
       this.held -= 1;
+      this.slotBytes -= p.slots.length * 4;
     }
   }
 
   clear() {
     this.pages = [];
-    this.counts = [];
     this.held = 0;
+    this.slotBytes = 0;
     this.size = 0;
   }
 
   /** Bytes held by the index. */
   get bytes() {
-    return this.held * this.places * 4;
+    return this.held * Math.ceil(this.places / 32) * 6 + this.slotBytes;
   }
+}
+
+interface IndexPage {
+  bits: Int32Array;
+  pre: Uint16Array;
+  slots: Int32Array;
+  n: number;
+}
+
+/** Set bits of a 32-bit word. */
+function popcount(v: number) {
+  let x = v - ((v >>> 1) & 0x55555555);
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return (Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24) & 0xff;
 }
 
 /**
@@ -280,6 +339,26 @@ export class NodeSlotAllocator {
     this.lastCutStamp = this.frame;
   }
 
+  /**
+   * Page g left the traversal (thread CU): its nodes not used this frame
+   * nor the last go back to the free list (their page's index array with
+   * them), so the index holds about the resident pages only.
+   */
+  releasePage(g: number) {
+    const p = this.slotOf.slotsIn(g);
+    if (!p) return 0;
+    let n = 0;
+    for (let k = 0; k < p.length; k++) {
+      const s = p[k];
+      if (s < 0 || this.stamp[s] === this.frame || this.isInLastCut(s)) {
+        continue;
+      }
+      this.release(s);
+      n += 1;
+    }
+    return n;
+  }
+
   /** Slot s back to the free list (a node that could not be written). */
   release(s: number) {
     const key = this.keyOf[s];
@@ -432,12 +511,12 @@ export class CompactNodePool {
   capacity: number;
   /** Each piece's codebook and materials (words in the buffer). */
   readonly pieceBase: { codebook: number; materials: number }[] = [];
-  private tables: Uint32Array;
-  private heads: Uint32Array;
+  private headBytes: number;
 
   constructor(
     readonly device: GPUDevice,
-    readonly pieces: CompactPieceTables[],
+    /** Not kept (thread CU): they hold the pieces' prefixes, on the GPU from here. */
+    pieces: CompactPieceTables[],
     /** Each piece's page heads (12 words a page: the page-table row's words 17..28). */
     pageHeads: ArrayLike<number>[][],
     capacity: number,
@@ -481,11 +560,11 @@ export class CompactNodePool {
     });
     this.tableWords = this.headTable;
     this.recordsBase = this.headTable + heads.length;
-    this.tables = new Uint32Array(tables);
-    this.heads = heads;
+    const tableWords = new Uint32Array(tables);
+    this.headBytes = heads.byteLength;
     this.capacity = Math.max(1024, Math.min(capacity, maxCapacity));
     this.buffer = this.createBuffer(this.capacity);
-    device.queue.writeBuffer(this.buffer, 0, this.tables);
+    device.queue.writeBuffer(this.buffer, 0, tableWords);
     device.queue.writeBuffer(this.buffer, this.headTable * 4, heads);
     const words = nodeRecordLayout();
     const layout: CompactLayout = {
@@ -539,7 +618,7 @@ export class CompactNodePool {
   bytes() {
     return {
       tables: this.headTable * 4,
-      heads: this.heads.byteLength,
+      heads: this.headBytes,
       records: this.capacity * NODE_RECORD_WORDS * 4,
       total: (this.recordsBase + this.capacity * NODE_RECORD_WORDS) * 4,
     };
@@ -739,6 +818,12 @@ interface RunPage {
   /** Each run's class and the update it was last classed at. */
   cls: Uint8Array;
   stamp: Uint32Array;
+  /**
+   * Not trimmed before this update (thread CU): a page that just landed
+   * waits for the cuts that can use it (its traversal input lands an update
+   * later when the store is in a worker).
+   */
+  grace: number;
 }
 
 /**
@@ -766,6 +851,17 @@ export class RunPayloadStore {
     public budget = Number.POSITIVE_INFINITY,
     /** Inflated runs kept. */
     public inflatedRuns = 256,
+    /** Updates a landed page's runs are not trimmed (0: CT's; the worker's store 2). */
+    public landGrace = 0,
+    /** Updates a run marked for a cut stays (1: this update's, CT's). */
+    public keepCut = 1,
+    /**
+     * Runs kept inflated (thread CU): a page's as it lands (inflated then
+     * anyway for the positions), a run fetched again as it comes; the
+     * budget counts their inflated bytes (deflate saved only ~25 %, at
+     * ~31 us of fflate a run to pack it).
+     */
+    public raw = false,
   ) {}
 
   private key(page: number, r: number) {
@@ -778,6 +874,12 @@ export class RunPayloadStore {
     const head = parseRunsContainer(c);
     const bytes: Uint8Array[] = [];
     for (let r = 0; r < head.runs; r++) {
+      if (this.raw && planes) {
+        // Kept inflated (thread CU): no inflate to pack its records.
+        bytes.push(planes[r]);
+        this.bytes += planes[r].byteLength;
+        continue;
+      }
       const [a, b] = runSpan(head, r);
       bytes.push(c.slice(a, b));
       this.bytes += b - a;
@@ -789,9 +891,10 @@ export class RunPayloadStore {
       head,
       bytes,
       cls: new Uint8Array(head.runs).fill(RUN_OTHER),
+      grace: this.frame + this.landGrace,
       stamp: new Uint32Array(head.runs).fill(this.frame),
     });
-    if (planes) {
+    if (planes && !this.raw) {
       planes.forEach((p, r) => this.remember(this.key(page, r), p));
     }
   }
@@ -839,10 +942,15 @@ export class RunPayloadStore {
     const who: [number, RunPage, number][] = [];
     let k = 0;
     for (const [page, p] of this.pages) {
+      if (this.frame < p.grace) continue;
       for (let r = 0; r < p.bytes.length; r++) {
         if (!p.bytes[r]) continue;
         const cls = p.stamp[r] === this.frame ? p.cls[r] : RUN_OTHER;
         if (cls === RUN_CUT) continue;
+        // A cut's (or the view ahead's) runs of the last updates stay too.
+        if (p.cls[r] === RUN_CUT && this.frame - p.stamp[r] < this.keepCut) {
+          continue;
+        }
         const age = Math.min(p.stamp[r], 0xffffff);
         keys[k] = ((2 - cls) * 0x1000000 + age) * 0x4000000 + who.length;
         who.push([page, p, r]);
@@ -889,6 +997,7 @@ export class RunPayloadStore {
       rp.stamp[r] = this.frame;
       rp.cls[r] = RUN_OTHER;
     }
+    if (this.raw) return b;
     const t0 = performance.now();
     const p = inflateSync(b);
     this.stats.inflateMs += performance.now() - t0;
@@ -923,9 +1032,16 @@ export class RunPayloadStore {
   }
 
   /** A dropped run fetched again. */
-  putRun(page: number, r: number, bytes: Uint8Array) {
+  putRun(page: number, r: number, stored: Uint8Array) {
     const p = this.pages.get(page);
     if (!p || p.bytes[r]) return;
+    let bytes = stored;
+    if (this.raw) {
+      const t0 = performance.now();
+      bytes = inflateSync(stored);
+      this.stats.inflateMs += performance.now() - t0;
+      this.stats.inflates += 1;
+    }
     p.bytes[r] = bytes;
     this.bytes += bytes.byteLength;
     this.stats.fetched += 1;

@@ -850,7 +850,11 @@ export class CompactRelitPath {
    * tree); null: every gaussian. The list lives after the projections in
    * the frame buffer (4 B an entry), which grows to hold it.
    */
-  setDrawList(indices: Uint32Array | null) {
+  setDrawList(
+    indices: Uint32Array | null,
+    /** The caller gives the array up (no copy kept; thread CU). */
+    owned = false,
+  ) {
     if (!indices) {
       if (this.listCount !== -1) this.listVersion += 1;
       this.listCount = -1;
@@ -860,7 +864,7 @@ export class CompactRelitPath {
     // The same cut again (a LoD traversal of an unmoved eye): nothing to
     // upload, and a still frame stays still (no shade).
     if (this.listCopy && sameWords(this.listCopy, indices)) return;
-    this.listCopy = indices.slice();
+    this.listCopy = owned ? indices : indices.slice();
     this.listVersion += 1;
     const need = (this.projWords + indices.length) * 4;
     if (this.frame.size < need) {
@@ -880,6 +884,11 @@ export class CompactRelitPath {
       );
     }
     this.listCount = indices.length;
+  }
+
+  /** The list kept (owned or copied), to recycle when replaced. */
+  get drawListHeld(): Uint32Array | null {
+    return this.listCopy;
   }
 
   /** Gaussians the cull walks: the draw list's, else the cloud's. */

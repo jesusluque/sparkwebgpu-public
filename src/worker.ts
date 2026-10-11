@@ -854,6 +854,7 @@ function traverseLodTrees({
   errorSizeK,
   neighbours,
   unordered,
+  stream,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -879,6 +880,11 @@ function traverseLodTrees({
    * not bind (else the traversal runs again in order), about 2.4x faster.
    */
   unordered?: boolean;
+  /**
+   * The cut in chunks (`parts`, any instance; `culled` apart), never whole
+   * in the WASM heap (the node pool's worker, thread CU).
+   */
+  stream?: boolean;
   instances: Record<
     string,
     {
@@ -949,6 +955,7 @@ function traverseLodTrees({
     errorSizeK,
     neighbours,
     unordered,
+    stream,
   ) as {
     culledCount?: number;
     occludedCount?: number;
@@ -962,6 +969,10 @@ function traverseLodTrees({
   };
   const { instanceIndices, chunks, pixelLimit, culledCount, occludedCount } =
     result;
+  const { parts, culled } = result as unknown as {
+    parts?: unknown[];
+    culled?: unknown[];
+  };
   const wasmMs = performance.now() - wasm0;
 
   const indices = keyInstances.reduce(
@@ -983,6 +994,8 @@ function traverseLodTrees({
     culledCount,
     occludedCount,
     wasmMs,
+    parts,
+    culled,
   };
 }
 

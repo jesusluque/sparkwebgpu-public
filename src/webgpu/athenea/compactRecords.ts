@@ -12,6 +12,13 @@ export const COMPACT_PLANE_WIDTHS = [
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 ] as const;
 
+/** Plane k's first byte in a section of n nodes. */
+export function compactPlaneOffset(k: number, n: number) {
+  let at = 0;
+  for (let j = 0; j < k; j++) at += COMPACT_PLANE_WIDTHS[j];
+  return at * n;
+}
+
 /** Words a node record: the GPU's 40 bytes, then its origin word. */
 export const NODE_RECORD_WORDS = 11;
 

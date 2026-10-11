@@ -12,6 +12,8 @@
 //   COMPACT_PAGES=<dir of <piece>.athc written with usd-athc --tree ... --pages
 //   --compact-basis> CPCA8_DIR=<athenea q97 data> [COMPACT_PAGES_PIECES=Hood,...]
 //   [COMPACT_PAGES_SLOTS=574] [COMPACT_PAGES_TODAY=0] [COMPACT_PAGES_SWEEP=6]
+//   [COMPACT_PAGES_BASIS=<basis .json, else CPCA8_DIR's q97>]
+//   [COMPACT_PAGES_ASSET=<the asset's .cmpa, usd-athc --compact-asset>]
 //   npx vitest run --dir test/gpu test/gpu/compactPages.test.ts
 // Prints COMPACT_PAGES_* {json} lines.
 
@@ -33,6 +35,7 @@ import {
   CompactBandStreamer,
   type CompactPiece,
   type LodCall,
+  parseCompactAsset,
 } from "../../src/webgpu/athenea/compactPages";
 import {
   encodeJointCpca,
@@ -54,6 +57,16 @@ const PIECES = (
   "Hood,Front_Fender,Headlights_Cover,Front_Logo,F_Grill,Door_001"
 ).split(",");
 const CPCA_DIR = process.env.CPCA8_DIR ?? "";
+// The joint basis today's cpca8 run encodes with (default athenea's q97 in
+// CPCA8_DIR); a set on our own basis names its .json (thread CR).
+const BASIS_JSON =
+  process.env.COMPACT_PAGES_BASIS ??
+  (CPCA_DIR ? `${CPCA_DIR}/cpca_joint_C256_K8.json` : "");
+// The asset's table (.cmpa) when the pieces' basis is the asset's.
+const ASSET = process.env.COMPACT_PAGES_ASSET ?? "";
+const asset = ASSET
+  ? parseCompactAsset(new Uint8Array(readFileSync(ASSET)))
+  : null;
 const TODAY = process.env.COMPACT_PAGES_TODAY !== "0";
 const SWEEP = Number(process.env.COMPACT_PAGES_SWEEP ?? 6);
 const TAU = Number(process.env.COMPACT_PAGES_TAU ?? 1);
@@ -192,6 +205,7 @@ function openPiece(name: string, io: Io): CompactPiece & { fileBytes: number } {
     name,
     layout,
     prefix,
+    asset,
     fileBytes: size,
     read: async (offset, bytes) => {
       io.ranges += 1;
@@ -519,13 +533,11 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
     B.dispose();
 
     // C: today's relight on the same cut, decoded from tiers 1-3.
-    if (TODAY && CPCA_DIR) {
-      const json = JSON.parse(
-        readFileSync(`${CPCA_DIR}/cpca_joint_C256_K8.json`, "utf8"),
-      );
+    if (TODAY && BASIS_JSON) {
+      const json = JSON.parse(readFileSync(BASIS_JSON, "utf8"));
       const basis = parseJointCpca(
         json,
-        new Uint8Array(readFileSync(`${CPCA_DIR}/cpca_joint_C256_K8.bin`)),
+        new Uint8Array(readFileSync(BASIS_JSON.replace(/\.json$/, ".bin"))),
       );
       const want = views.filter((x) => x.compare);
       // The cut's nodes, by piece, as file indices (page order).

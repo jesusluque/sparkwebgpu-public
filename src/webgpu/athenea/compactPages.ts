@@ -138,7 +138,7 @@ export function parseCompactTables(
   if (w[2] !== COMPACT_NODE_BYTES || w[3] !== COMPACT_PLANE_WIDTHS.length) {
     throw new Error("compact tables: another layout");
   }
-  let basis = w.slice(w[13], w[13] + w[14]);
+  let basis: Uint32Array = w.slice(w[13], w[13] + w[14]);
   if (w[10] & TABLE_ASSET_BASIS) {
     if (!asset) throw new Error("compact tables: the basis is the asset's");
     if (

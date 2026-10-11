@@ -358,6 +358,14 @@ fn main() -> Result<()> {
             let bytes: u64 = layout.blocks.iter().map(|b| b.tier_range(&layout.sections, tier).1).sum();
             println!("  tier {tier}: {:.1} MB", bytes as f64 / 1e6);
         }
+        // The material's own roughness on the pbr word (athenea 35ae3cb,
+        // bits 26..31): what the relight's polishField reads.
+        let words: Vec<u32> = file.chunks.iter().chain(file.levels.iter().map(|(_, b)| b)).flat_map(|b| {
+            let w = b.pbr.len().checked_div(b.n).unwrap_or(0);
+            (0..if w > 0 { b.n } else { 0 }).map(move |i| b.pbr[i * w])
+        }).collect();
+        let marked = words.iter().filter(|&&w| (w >> 26) & 1 != 0).count();
+        println!("  material roughness marked on {marked} of {} pbr words", words.len());
         return Ok(());
     }
     let Some(output) = paths.get(1) else { bail!("no output path") };

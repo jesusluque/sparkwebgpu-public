@@ -236,6 +236,12 @@ uint shadowWords() {
     return hasAttr(relightParams.shadowBits) && !hasFlag(kRelightNoCells) ? relightParams.shadowWords : 0u;
 }
 
+/// The material's own roughness (athenea's pbrMaterialRoughness, pbr bits
+/// 26..31), -1 where the cloud does not carry it.
+float ownRoughnessOf(uint i) {
+    return hasAttr(relightParams.pbr) ? pbrMaterialRoughness(poolWord(relightParams.pbr, i, 0u)) : -1.0;
+}
+
 /// The surface splat_project's relitToward builds, from this mesh's buffers.
 SplatSurface surfaceOf<let kCpca : int>(uint i, Gsplat g, float3x3 r, float3 cloudNormal, float3 colour) {
     const float4 w0 = relightParams.row0;
@@ -716,7 +722,14 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
     // gaussian is wide. After the footprint prefilter, so the prefilter's
     // own widening is held too (before it, the splat term re-widened a fold
     // past 0.3 again without pixelDetail).
-    if (curved && hasFlag(kRelightCoatFold) && surface.lobes.coatWeight > 0.0) {
+    // Only on a lacquer whose material is as rough as a paint's
+    // (kPolishFieldRoughness, its own roughness off the pbr word, not the
+    // stored one; athenea-pieces' splat_project): on chrome, glass and the
+    // rough metals, already at or past the path trace, it lit what the trace
+    // shows dark (thread CV, by region: chrome -1.4 dB, rim spokes -0.5). A
+    // cloud without the mark keeps its coat.
+    if (curved && hasFlag(kRelightCoatFold) && surface.lobes.coatWeight > 0.0 &&
+        ownRoughnessOf(i) >= kPolishFieldRoughness) {
         const float coat = surface.lobes.coatRoughness;
         surface.lobes.coatRoughness = max(unwidened(coat, spread), min(coat, kCoatFoldRoughness));
     }

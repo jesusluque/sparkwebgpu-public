@@ -17,11 +17,12 @@
 
 import { gunzipSync, inflateSync } from "fflate";
 import type { CompactCloud, CompactLayout } from "./compact";
-import { type CompactPieceTables, compactPlaneOffset } from "./compactPages";
+import type { CompactPieceTables } from "./compactPages";
 import {
   COMPACT_PLANE_WIDTHS,
   NODE_RECORD_WORDS,
   RECORD_FIELDS,
+  compactPlaneOffset,
   packRunRecords,
   runPlaneOffsets,
 } from "./compactRecords";
@@ -739,6 +740,12 @@ interface RunPage {
   /** Each run's class and the update it was last classed at. */
   cls: Uint8Array;
   stamp: Uint32Array;
+  /**
+   * Not trimmed before this update (thread CU): a page that just landed
+   * waits for the cuts that can use it (its traversal input lands an update
+   * later when the store is in a worker).
+   */
+  grace: number;
 }
 
 /**
@@ -766,6 +773,17 @@ export class RunPayloadStore {
     public budget = Number.POSITIVE_INFINITY,
     /** Inflated runs kept. */
     public inflatedRuns = 256,
+    /** Updates a landed page's runs are not trimmed (0: CT's; the worker's store 2). */
+    public landGrace = 0,
+    /** Updates a run marked for a cut stays (1: this update's, CT's). */
+    public keepCut = 1,
+    /**
+     * Runs kept inflated (thread CU): a page's as it lands (inflated then
+     * anyway for the positions), a run fetched again as it comes; the
+     * budget counts their inflated bytes (deflate saved only ~25 %, at
+     * ~31 us of fflate a run to pack it).
+     */
+    public raw = false,
   ) {}
 
   private key(page: number, r: number) {
@@ -778,6 +796,12 @@ export class RunPayloadStore {
     const head = parseRunsContainer(c);
     const bytes: Uint8Array[] = [];
     for (let r = 0; r < head.runs; r++) {
+      if (this.raw && planes) {
+        // Kept inflated (thread CU): no inflate to pack its records.
+        bytes.push(planes[r]);
+        this.bytes += planes[r].byteLength;
+        continue;
+      }
       const [a, b] = runSpan(head, r);
       bytes.push(c.slice(a, b));
       this.bytes += b - a;
@@ -789,9 +813,10 @@ export class RunPayloadStore {
       head,
       bytes,
       cls: new Uint8Array(head.runs).fill(RUN_OTHER),
+      grace: this.frame + this.landGrace,
       stamp: new Uint32Array(head.runs).fill(this.frame),
     });
-    if (planes) {
+    if (planes && !this.raw) {
       planes.forEach((p, r) => this.remember(this.key(page, r), p));
     }
   }
@@ -839,10 +864,15 @@ export class RunPayloadStore {
     const who: [number, RunPage, number][] = [];
     let k = 0;
     for (const [page, p] of this.pages) {
+      if (this.frame < p.grace) continue;
       for (let r = 0; r < p.bytes.length; r++) {
         if (!p.bytes[r]) continue;
         const cls = p.stamp[r] === this.frame ? p.cls[r] : RUN_OTHER;
         if (cls === RUN_CUT) continue;
+        // A cut's (or the view ahead's) runs of the last updates stay too.
+        if (p.cls[r] === RUN_CUT && this.frame - p.stamp[r] < this.keepCut) {
+          continue;
+        }
         const age = Math.min(p.stamp[r], 0xffffff);
         keys[k] = ((2 - cls) * 0x1000000 + age) * 0x4000000 + who.length;
         who.push([page, p, r]);
@@ -889,6 +919,7 @@ export class RunPayloadStore {
       rp.stamp[r] = this.frame;
       rp.cls[r] = RUN_OTHER;
     }
+    if (this.raw) return b;
     const t0 = performance.now();
     const p = inflateSync(b);
     this.stats.inflateMs += performance.now() - t0;
@@ -923,9 +954,16 @@ export class RunPayloadStore {
   }
 
   /** A dropped run fetched again. */
-  putRun(page: number, r: number, bytes: Uint8Array) {
+  putRun(page: number, r: number, stored: Uint8Array) {
     const p = this.pages.get(page);
     if (!p || p.bytes[r]) return;
+    let bytes = stored;
+    if (this.raw) {
+      const t0 = performance.now();
+      bytes = inflateSync(stored);
+      this.stats.inflateMs += performance.now() - t0;
+      this.stats.inflates += 1;
+    }
     p.bytes[r] = bytes;
     this.bytes += bytes.byteLength;
     this.stats.fetched += 1;

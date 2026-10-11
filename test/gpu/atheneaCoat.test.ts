@@ -571,6 +571,17 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       expect(rougher).toBe(0);
       expect(after).toBeLessThan(before);
       unwidened.done();
+      // athenea 35ae3cb's polishField (default on) on a cloud without the
+      // material's own roughness: every record bit for bit as with it off.
+      const fieldOff = await plugin(car, true, 0, {
+        unwiden: false,
+        polishField: false,
+      });
+      const off = new Uint32Array(fieldOff.got.buffer);
+      let fieldDiff = 0;
+      for (let k = 0; k < off.length; k++) if (off[k] !== words[k]) fieldDiff++;
+      expect(fieldDiff).toBe(0);
+      fieldOff.done();
       detail.done();
     }, 300_000);
   },

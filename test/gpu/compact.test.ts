@@ -363,7 +363,7 @@ describe.skipIf(!wideDevice).each([8, 4])(
       });
       const plain = await compactRun(d, cloud, {
         ...run,
-        path: { sheetFade: -1 },
+        path: { sheetFade: -1, polishField: false },
       });
       const colours = compare(
         got.colours as Float32Array,

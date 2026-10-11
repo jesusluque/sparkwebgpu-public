@@ -230,7 +230,9 @@ export interface AtheneaRelightOptions {
    * usd-athc from primvars:athenea:splat:materialRoughness) is read, and a
    * polish whose material is at least 0.3 rough asks its own lobe's cells
    * and the reflected field answers what they close. Clouds without the
-   * mark are unchanged.
+   * mark are unchanged (bit for bit). Default true (athenea: the door's
+   * classes against the path trace, whole door 0.91 -> 1.01, its near floor
+   * 0.90 -> 1.02).
    */
   polishField?: boolean;
   /** For investigations: the lighting's parts left out, or a debug view. */
@@ -510,7 +512,7 @@ export function atheneaRelightPlugin(
     sheetFloor: "relight",
     unwiden: true,
     coatFold: false,
-    polishField: false,
+    polishField: true,
     cpcaBatch: CPCA_BATCH,
     releaseSky: false,
     frame: null,

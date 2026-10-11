@@ -696,7 +696,7 @@ export interface CompactPathOptions {
   cullBacksFacing?: number;
   /** The relight plugin's coatFold (athenea 35ae3cb): needs the curvature. */
   coatFold?: boolean;
-  /** The relight plugin's polishField (athenea 35ae3cb): pbr bits 26..31. */
+  /** The relight plugin's polishField (athenea 35ae3cb): pbr bits 26..31; default true. */
   polishField?: boolean;
 }
 
@@ -765,7 +765,7 @@ export class CompactRelitPath {
       cullBacks: false,
       cullBacksFacing: -0.2,
       coatFold: false,
-      polishField: false,
+      polishField: true,
       ...options,
       frame: options.frame ?? null,
     };

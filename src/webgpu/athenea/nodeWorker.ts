@@ -211,7 +211,8 @@ export class NodeCutter {
     waitingRuns: 0,
     busy: false,
   };
-  private seen = new Uint32Array(0);
+  /** A frame's mark a slot (an epoch byte, cleared as it wraps). */
+  private seen = new Uint8Array(0);
   private seenEpoch = 0;
   private kidScratch = new Int32Array(64);
 
@@ -240,6 +241,7 @@ export class NodeCutter {
         break;
       case "drop":
         this.runs.drop(m.g);
+        this.alloc.releasePage(m.g);
         break;
       case "runs":
         for (const { g, r, bytes } of m.items) this.gotRun(g, r, bytes);
@@ -286,70 +288,84 @@ export class NodeCutter {
     for (const p of m.parts) n += p.numSplats;
     if (n > alloc.capacity && alloc.capacity < this.o.maxCapacity) {
       const next = Math.min(
-        Math.ceil(Math.max(n * 1.1, alloc.capacity * 1.25)),
+        Math.ceil(Math.max(n * 1.06, alloc.capacity * 1.1)),
         this.o.maxCapacity,
       );
       alloc.grow(next);
       this.grow = next;
     }
     alloc.begin();
-    const keys = new Int32Array(n);
-    const out = new Int32Array(n).fill(-1);
-    const failed = new Uint8Array(n);
-    const parents = new Uint32Array(n);
-    const firstKids = new Uint32Array(n);
-    const kidCounts = new Uint32Array(n);
-    const hasScreens = m.parts.every((p) => p.screens);
-    const screens = hasScreens ? new Float32Array(n) : undefined;
-    const missKeys = new Float64Array(n);
+    // Thread CU: only the misses' data is kept (indexed by miss), the held
+    // nodes' slots go straight into the drawn base; the parts (transferred)
+    // are let go with the message.
+    const base = new Uint32Array(n);
+    let b0 = 0;
+    const missAt = new Int32Array(n);
+    const missKeyAll = new Int32Array(n);
     let missN = 0;
-    let at = 0;
     let allArea = 0;
     runs.begin();
-    for (const p of m.parts) {
+    const protect = this.o.protect;
+    const markI = (i: number) => {
+      if (i === 0xffffffff) return;
+      const key = i + kb[(i / N) | 0];
+      if (key >= 0) runs.mark(key >>> 12, key & 4095, RUN_CUT);
+    };
+    m.parts.forEach((p, pi) => {
       const c = p.numSplats;
       const idx = p.indices;
-      if (p.parents) parents.set(p.parents.subarray(0, c), at);
-      if (p.firstKids) firstKids.set(p.firstKids.subarray(0, c), at);
-      if (p.kidCounts) kidCounts.set(p.kidCounts.subarray(0, c), at);
-      if (screens && p.screens) {
-        screens.set(
-          new Float32Array(p.screens.buffer, p.screens.byteOffset, c),
-          at,
-        );
-      }
+      const sc = p.screens
+        ? new Float32Array(p.screens.buffer, p.screens.byteOffset, c)
+        : null;
       for (let j = 0; j < c; j++) {
         const i = idx[j];
-        const k = at + j;
         const key = i + kb[(i / N) | 0];
-        keys[k] = key;
+        if (sc) allArea += sc[j] * sc[j];
         const s = alloc.use(key);
-        if (s < 0) missKeys[missN++] = key * SH + k;
-        else out[k] = s;
+        if (s < 0) {
+          missAt[missN] = pi * SH + j;
+          missKeyAll[missN++] = key;
+        } else base[b0++] = s;
+        if (protect) {
+          runs.mark(key >>> 12, key & 4095, RUN_CUT);
+          if (p.parents) markI(p.parents[j]);
+          const f = p.firstKids?.[j] ?? 0xffffffff;
+          if (f !== 0xffffffff) {
+            for (let k = 0; k < (p.kidCounts?.[j] ?? 0); k++) markI(f + k);
+          }
+        }
       }
       // The culled nodes' runs next to keep (the rest go first).
       for (const i of p.culled ?? []) {
         const key = i + kb[(i / N) | 0];
         if (key >= 0) runs.mark(key >>> 12, key & 4095, RUN_CULLED);
       }
-      at += c;
+    });
+    const hasScreens = m.parts.every((p) => p.screens || !p.numSplats);
+    const keys = missKeyAll.slice(0, missN);
+    const out = new Int32Array(missN).fill(-1);
+    const failed = new Uint8Array(missN).fill(1);
+    const parents = new Uint32Array(missN);
+    const firstKids = new Uint32Array(missN);
+    const kidCounts = new Uint32Array(missN);
+    const screens = hasScreens ? new Float32Array(missN) : undefined;
+    const missKeys = new Float64Array(missN);
+    const scr = m.parts.map((p) =>
+      p.screens
+        ? new Float32Array(p.screens.buffer, p.screens.byteOffset, p.numSplats)
+        : null,
+    );
+    for (let x = 0; x < missN; x++) {
+      const pi = (missAt[x] / SH) | 0;
+      const j = missAt[x] - pi * SH;
+      const p = m.parts[pi];
+      parents[x] = p.parents ? p.parents[j] : 0xffffffff;
+      firstKids[x] = p.firstKids ? p.firstKids[j] : 0xffffffff;
+      kidCounts[x] = p.kidCounts ? p.kidCounts[j] : 0;
+      if (screens) screens[x] = (scr[pi] as Float32Array)[j];
+      missKeys[x] = keys[x] * SH + x;
     }
-    if (screens) for (let k = 0; k < n; k++) allArea += screens[k] * screens[k];
     const near = { parents, firstKids, kidCounts, screens };
-    if (this.o.protect) {
-      const mark = (i: number) => {
-        if (i === 0xffffffff) return;
-        const key = i + kb[(i / N) | 0];
-        if (key >= 0) runs.mark(key >>> 12, key & 4095, RUN_CUT);
-      };
-      for (let k = 0; k < n; k++) {
-        runs.mark(keys[k] >>> 12, keys[k] & 4095, RUN_CUT);
-        mark(parents[k]);
-        const f = firstKids[k];
-        if (f !== 0xffffffff)
-          for (let c = 0; c < kidCounts[k]; c++) mark(f + c);
-      }
-    }
     const miss = missKeys.subarray(0, missN).sort();
     // The groups (a run's misses), largest on screen first.
     const groups: { a: number; b: number; g: number; r: number; w: number }[] =
@@ -378,7 +394,6 @@ export class NodeCutter {
       q = e;
     }
     if (screens && this.o.priority) groups.sort((x, y) => y.w - x.w);
-    for (let y = 0; y < missN; y++) failed[miss[y] % SH] = 1;
     this.queue = [];
     this.queueAt = 0;
     this.waiting = new Map();
@@ -407,15 +422,9 @@ export class NodeCutter {
     this.kb = kb;
     this.allArea = allArea;
     const fl = new Int32Array(missN);
-    const base = new Uint32Array(n - missN);
-    let f0 = 0;
-    let b0 = 0;
-    for (let k = 0; k < n; k++) {
-      if (failed[k]) fl[f0++] = k;
-      else base[b0++] = out[k];
-    }
+    for (let x = 0; x < missN; x++) fl[x] = x;
     this.failedList = fl;
-    this.base = base;
+    this.base = base.slice(0, b0);
     this.stats.missDropped = dropped;
     this.stats.cut = n;
     this.fetchRuns();
@@ -630,9 +639,13 @@ export class NodeCutter {
     let result: Uint32Array;
     if (misses.length && near) {
       if (this.seen.length < alloc.capacity)
-        this.seen = new Uint32Array(alloc.capacity);
+        this.seen = new Uint8Array(alloc.capacity);
       const seen = this.seen;
-      const epoch = ++this.seenEpoch;
+      if (++this.seenEpoch > 255) {
+        seen.fill(0);
+        this.seenEpoch = 1;
+      }
+      const epoch = this.seenEpoch;
       let subs = new Uint32Array(Math.max(64, misses.length * 2));
       let sn = 0;
       const push = (s: number) => {

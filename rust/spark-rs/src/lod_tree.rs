@@ -959,12 +959,13 @@ fn traverse_core(
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
     error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
-    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink,
+    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink, stream: bool,
 ) -> Result<TraverseOut, String> {
     // Unordered (a stack): the same cut unless the budget binds, then again in order.
-    let (out, budget_hit) = traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered, sink)?;
+    let (out, budget_hit) = traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered, sink, stream)?;
     if unordered && budget_hit {
-        return traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, false, sink).map(|r| r.0);
+        sink.reset();
+        return traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, false, sink, stream).map(|r| r.0);
     }
     Ok(out)
 }
@@ -978,7 +979,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
     error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
-    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink,
+    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink, stream: bool,
 ) -> Result<(TraverseOut, bool), String> {
     // With `neighbours` (the node pool, thread CT): each cut node's parent and
     // its children (when resident), and the culled nodes, by instance.
@@ -1089,7 +1090,14 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
         };
 
         let culled = |inst: u32, index: u32| -> bool { back_cull_min.is_some() && culled_s(inst, &instances[inst as usize].1.get(index as usize)) };
+        // Streamed (thread CU): the cut leaves in chunks as it grows, so the
+        // heap never holds it whole (its high-water is the WASM memory's).
+        let mut streamed = 0usize;
         while let Some(&(OrderedFloat(pixel_scale), inst_index, paged_index, parent)) = frontier.peek() {
+            if stream && output.len() >= STREAM_CHUNK {
+                streamed += output.len();
+                stream_out(output, &instances, &slots, neighbours, sink);
+            }
             min_pixel_scale = min_pixel_scale.min(pixel_scale);
             if pixel_scale <= pixel_scale_limit {
                 if !frontier.lifo {
@@ -1208,7 +1216,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
             num_splats = new_num_splats - hidden_here as usize;
         }
 
-        let output_size = output.len();
+        let output_size = output.len() + streamed;
         let frontier_size = frontier.len();
 
         for (_, inst_index, paged_index, parent) in frontier.drain() {
@@ -1224,7 +1232,15 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
 
         // A stack whose budget bound: run again in order, nothing emitted.
         let lod_ids_out: Vec<u32> = instances.iter().map(|i| i.0).collect();
-        if !(budget_hit && frontier.lifo) {
+        if stream && !(budget_hit && frontier.lifo) {
+            stream_out(output, &instances, &slots, neighbours, sink);
+            if neighbours {
+                for c in culled_out.chunks(STREAM_CHUNK) {
+                    let ids: Vec<u32> = c.iter().map(|o| o.1).collect();
+                    sink.put(0, 4, 0, &ids);
+                }
+            }
+        } else if !(budget_hit && frontier.lifo) {
             // The cut and its neighbours to the sink, instance by instance, in
             // chunks (thread CU: no whole copies in the heap, whose high-water
             // the WASM memory keeps).
@@ -1311,6 +1327,50 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
     }
 }
 
+/// Nodes a streamed chunk of the cut.
+const STREAM_CHUNK: usize = 16384;
+
+/// The cut so far (any instance) to the sink as one chunk of each field
+/// (streamed: indices are pool indices, the instance does not matter), and
+/// cleared.
+fn stream_out(output: &mut Vec<(u32, u32, u32)>, instances: &[Inst<'_>], slots: &[u32], neighbours: bool, sink: &mut dyn CutSink) {
+    if output.is_empty() {
+        return;
+    }
+    let n = output.len();
+    let mut f: [Vec<u32>; 6] = Default::default();
+    f[0].reserve(n);
+    for &(inst, paged_index, parent) in output.iter() {
+        f[0].push(paged_index);
+        if neighbours {
+            let instance = &instances[inst as usize];
+            f[1].push(parent);
+            let node = instance.1.get(paged_index as usize);
+            let (first, count) = if node.child_count > 0 {
+                let chunk = (node.child_start >> 16) as usize;
+                match instance.3.get(chunk) {
+                    Some(&page) if page != 0xFFFFFFFF => (page * slots[inst as usize] + (node.child_start & 0xffff), node.child_count as u32),
+                    _ => (u32::MAX, 0),
+                }
+            } else {
+                (u32::MAX, 0)
+            };
+            f[2].push(first);
+            f[3].push(count);
+            let r = if node.child_count > 0 || parent == u32::MAX { node.rho.to_f32() } else { 0.5 * instance.1.get(parent as usize).rho.to_f32() };
+            let delta = node.center() - instance.4;
+            let d = delta.length().max(1.0e-6);
+            f[5].push((r / d * foveate_of(delta, 1.0 / d, instance)).to_bits());
+        }
+    }
+    for (k, b) in f.iter().enumerate() {
+        if !b.is_empty() {
+            sink.put(0, k, 0, b);
+        }
+    }
+    output.clear();
+}
+
 /// Where the traversal's cut goes (thread CU): `start` an instance with its
 /// cut's and culled nodes' counts, then `put` chunks of a field (0 the
 /// indices, 1 parents, 2 first children, 3 their counts, 4 the culled
@@ -1318,6 +1378,8 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
 trait CutSink {
     fn start(&mut self, inst: usize, cut: usize, culled: usize);
     fn put(&mut self, inst: usize, field: usize, at: usize, data: &[u32]);
+    /// Forget what was put (a streamed traversal that runs again).
+    fn reset(&mut self) {}
 }
 
 /// The cut in Vecs (the native benches and tests).
@@ -1336,6 +1398,9 @@ impl CutSink for VecSink {
     }
 
     fn put(&mut self, inst: usize, field: usize, _at: usize, data: &[u32]) {
+        if self.fields.len() <= inst {
+            self.fields.resize_with(inst + 1, Default::default);
+        }
         self.fields[inst][field].extend_from_slice(data);
     }
 }
@@ -1384,11 +1449,16 @@ pub fn traverse_lod_trees(
     error_size_k: Option<f32>, neighbours: Option<bool>,
     // The compact path (thread CU): a stack, not the heap (the same cut while the budget does not bind).
     unordered: Option<bool>,
+    // The node pool's worker (thread CU): the cut in chunks (`parts`), any instance, never whole in the heap.
+    stream: Option<bool>,
 ) -> anyhow::Result<Object, JsValue> {
     let neighbours_on = neighbours.unwrap_or(false);
+    let stream = stream.unwrap_or(false);
     let mut sink = JsSink { neighbours: neighbours_on, arrays: vec![], counts: vec![] };
+    let mut ssink = JsStreamSink { parts: Array::new(), culled: Array::new() };
     let out = STATE.with_borrow_mut(|state| {
-        traverse_core(state, max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered.unwrap_or(false), &mut sink)
+        let s: &mut dyn CutSink = if stream { &mut ssink } else { &mut sink };
+        traverse_core(state, max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered.unwrap_or(false), s, stream)
     }).map_err(|e| JsValue::from_str(&e))?;
     let TraverseOut { lod_ids: out_ids, touched, min_pixel_scale, output_size, frontier_size, leaf_count, culled_count, occluded_count } = out;
     let instance_indices = Array::new();
@@ -1422,7 +1492,46 @@ pub fn traverse_lod_trees(
     Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
     Reflect::set(&result, &JsValue::from_str("culledCount"), &JsValue::from(culled_count)).unwrap();
     Reflect::set(&result, &JsValue::from_str("occludedCount"), &JsValue::from(occluded_count)).unwrap();
+    if stream {
+        Reflect::set(&result, &JsValue::from_str("parts"), &ssink.parts).unwrap();
+        Reflect::set(&result, &JsValue::from_str("culled"), &ssink.culled).unwrap();
+    }
     Ok(result)
+}
+
+/// The streamed cut in JS: a part a chunk ({numSplats, indices, parents,
+/// firstKids, kidCounts, screens}), the culled nodes' chunks apart.
+struct JsStreamSink {
+    parts: Array,
+    culled: Array,
+}
+
+impl CutSink for JsStreamSink {
+    fn start(&mut self, _: usize, _: usize, _: usize) {}
+
+    fn put(&mut self, _inst: usize, field: usize, _at: usize, data: &[u32]) {
+        let a = Uint32Array::new_with_length(data.len() as u32);
+        a.copy_from(data);
+        if field == 4 {
+            self.culled.push(&a);
+            return;
+        }
+        if field == 0 {
+            let part = Object::new();
+            Reflect::set(&part, &JsValue::from_str("numSplats"), &JsValue::from(data.len() as u32)).unwrap();
+            Reflect::set(&part, &JsValue::from_str("indices"), &a).unwrap();
+            self.parts.push(&part);
+            return;
+        }
+        let name = ["indices", "parents", "firstKids", "kidCounts", "culled", "screens"][field];
+        let last = self.parts.get(self.parts.length() - 1);
+        Reflect::set(&last, &JsValue::from_str(name), &a).unwrap();
+    }
+
+    fn reset(&mut self) {
+        self.parts = Array::new();
+        self.culled = Array::new();
+    }
 }
 
 type Inst<'a> = (u32, Ref<'a, LodNodes>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32, f32);
@@ -2048,6 +2157,38 @@ fn unpack_quant(q: &QuantNode, p: &PageQuant, bits: &CompactQuant) -> LodSplat {
 }
 
 #[cfg(test)]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// Bytes allocated now and at most (thread CU: the WASM heap's high-water).
+    pub static NOW: AtomicUsize = AtomicUsize::new(0);
+    pub static PEAK: AtomicUsize = AtomicUsize::new(0);
+    pub struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let n = NOW.fetch_add(l.size(), Ordering::Relaxed) + l.size();
+            PEAK.fetch_max(n, Ordering::Relaxed);
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            NOW.fetch_sub(l.size(), Ordering::Relaxed);
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+            if size > l.size() {
+                let n = NOW.fetch_add(size - l.size(), Ordering::Relaxed) + size - l.size();
+                PEAK.fetch_max(n, Ordering::Relaxed);
+            } else {
+                NOW.fetch_sub(l.size() - size, Ordering::Relaxed);
+            }
+            unsafe { System.realloc(p, l, size) }
+        }
+    }
+    #[global_allocator]
+    static A: Counting = Counting;
+}
+
+#[cfg(test)]
 mod quant_tests {
     use super::*;
     use spark_lib::athc_compact::{traversal_input, TraversalNode};
@@ -2270,6 +2411,11 @@ mod quant_tests {
             (pool, pieces)
         });
         let _ = pool;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mb = |b: usize| b as f64 / 1048576.0;
+        let landed = super::counting::NOW.load(Relaxed);
+        eprintln!("landed: {:.1} MB now, {:.1} MB peak", mb(landed), mb(super::counting::PEAK.load(Relaxed)));
+        super::counting::PEAK.store(landed, Relaxed);
         let st = |p: [f32; 3]| Vec3A::new(p[0], -p[2], p[1]);
         let (cam, tgt, far) = ([4.378f32, 1.676, 5.854], [0.0f32, 0.553, 0.252], [13.4994f32, 4.0228, 17.5284]);
         let close = [0, 1, 2].map(|k| cam[k] + 0.55 * (tgt[k] - cam[k]));
@@ -2288,6 +2434,7 @@ mod quant_tests {
             let ones = vec![1.0f32; n];
             for tau in [3.0f32, 2.5] {
                 let mut sets = vec![];
+                let _ = landed;
                 for unordered in [false, true] {
                     let mut times = vec![];
                     let mut out = TraverseOut::default();
@@ -2296,7 +2443,7 @@ mod quant_tests {
                         let t0 = std::time::Instant::now();
                         sink = VecSink::default();
                         out = STATE.with_borrow_mut(|state| {
-                            traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), unordered, &mut sink)
+                            traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), unordered, &mut sink, false)
                         })
                         .unwrap();
                         times.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -2317,6 +2464,36 @@ mod quant_tests {
                     sets.push((set, culled, out.occluded_count));
                 }
                 assert!(sets[0] == sets[1], "the stack's cut is not the heap's");
+                // Streamed: the same entries (the instance aside), the same culled.
+                {
+                    let mut vs = VecSink::default();
+                    STATE.with_borrow_mut(|state| {
+                        traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), true, &mut vs, true)
+                    })
+                    .unwrap();
+                    let f = &vs.fields[0];
+                    let mut got: Vec<(u32, u32, u32, u32, u32)> = (0..f[0].len()).map(|j| (f[0][j], f[1][j], f[2][j], f[3][j], f[5][j])).collect();
+                    got.sort();
+                    let mut want: Vec<(u32, u32, u32, u32, u32)> = sets[1].0.iter().map(|e| (e.1, e.2, e.3, e.4, e.5)).collect();
+                    want.sort();
+                    let mut culled = f[4].clone();
+                    culled.sort();
+                    assert!(got == want && culled == sets[1].1, "the streamed cut differs");
+                }
+                // The traversal's own heap (a sink that keeps nothing).
+                struct Null;
+                impl CutSink for Null {
+                    fn start(&mut self, _: usize, _: usize, _: usize) {}
+                    fn put(&mut self, _: usize, _: usize, _: usize, _: &[u32]) {}
+                }
+                drop(sets);
+                let before = super::counting::NOW.load(Relaxed);
+                super::counting::PEAK.store(before, Relaxed);
+                STATE.with_borrow_mut(|state| {
+                    traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), true, &mut Null, true)
+                })
+                .unwrap();
+                eprintln!("  traversal: kept {:.1} MB over the tree, peak {:.1} MB over its start", mb(super::counting::NOW.load(Relaxed) - landed), mb(super::counting::PEAK.load(Relaxed) - before));
             }
         }
     }

@@ -54,7 +54,7 @@ import {
   parseRunsContainer,
   unpackRunsContainer,
 } from "./compactNodes";
-import type { CutMsg, FromCutter, ToCutter } from "./nodeWorker";
+import type { CutMsg, CutPart, FromCutter, ToCutter } from "./nodeWorker";
 import NodeWorker from "./nodeWorker?worker&inline";
 
 import { COMPACT_PLANE_WIDTHS, compactPlaneOffset } from "./compactRecords";
@@ -620,6 +620,12 @@ export interface CompactBandOptions {
 
 type Row = AthcPageRow & { tier4Bytes: number; compact: number[] };
 
+/** A streamed traversal's cut (the node pool's worker): chunks of any instance. */
+interface StreamedCut {
+  parts?: CutPart[];
+  culled?: Uint32Array[];
+}
+
 /** The traversal's neighbours of each cut node (the node pool). */
 interface CutNeighbours {
   parents: Uint32Array;
@@ -762,6 +768,7 @@ export class CompactBandStreamer {
     this.slotNodes = options.slotNodes ?? 3072;
     this.tau = options.tau ?? 1;
     const tables = pieces.map((p) => compactTablesOf(p, options.asset));
+    this.tablesV3 = tables.some((t) => t.version >= 3);
     const np = options.nodePool;
     if (np) {
       const heads = pieces.map((p) =>
@@ -1073,40 +1080,44 @@ export class CompactBandStreamer {
     if (Object.keys(instances).length) {
       const t0 = performance.now();
       chunk("plan");
+      const traversal = (await lod("traverseLodTrees", {
+        maxSplats:
+          this.pool instanceof CompactNodePool
+            ? this.pool.maxCapacity
+            : this.options.slots * this.slotNodes,
+        pixelScaleLimit: pixel,
+        instances,
+        traverseMode: "standard",
+        errorLimit,
+        // Negative: any size, pruned with the subtree (spark-rs).
+        backCullMin: this.options.backCull === false ? undefined : -1,
+        occlusionCull: this.options.occlusion === true,
+        neighbours: !!this.runs || !!this.remote,
+        // The budget never binds the cut (it fits the pool): any order.
+        unordered: true,
+        // The worker takes the cut in chunks (never whole in the WASM heap).
+        stream: !!this.remote,
+      })) as StreamedCut & {
+        keyIndices: Record<
+          string,
+          {
+            numSplats: number;
+            indices: Uint32Array;
+            parents?: Uint32Array;
+            firstKids?: Uint32Array;
+            kidCounts?: Uint32Array;
+            culled?: Uint32Array;
+            screens?: Uint32Array;
+          }
+        >;
+        culledCount?: number;
+        occludedCount?: number;
+        chunks?: [number, number][];
+        wasmMs?: number;
+      };
       const { keyIndices, culledCount, occludedCount, chunks, wasmMs } =
-        (await lod("traverseLodTrees", {
-          maxSplats:
-            this.pool instanceof CompactNodePool
-              ? this.pool.maxCapacity
-              : this.options.slots * this.slotNodes,
-          pixelScaleLimit: pixel,
-          instances,
-          traverseMode: "standard",
-          errorLimit,
-          // Negative: any size, pruned with the subtree (spark-rs).
-          backCullMin: this.options.backCull === false ? undefined : -1,
-          occlusionCull: this.options.occlusion === true,
-          neighbours: !!this.runs || !!this.remote,
-          // The budget never binds the cut (it fits the pool): any order.
-          unordered: true,
-        })) as {
-          keyIndices: Record<
-            string,
-            {
-              numSplats: number;
-              indices: Uint32Array;
-              parents?: Uint32Array;
-              firstKids?: Uint32Array;
-              kidCounts?: Uint32Array;
-              culled?: Uint32Array;
-              screens?: Uint32Array;
-            }
-          >;
-          culledCount?: number;
-          occludedCount?: number;
-          chunks?: [number, number][];
-          wasmMs?: number;
-        };
+        traversal;
+      const streamed = traversal;
       this.stats.traverseMs = performance.now() - t0;
       resume();
       this.stats.traverseWasmMs = wasmMs ?? 0;
@@ -1124,7 +1135,7 @@ export class CompactBandStreamer {
       }
       this.stats.culled = culledCount ?? 0;
       this.stats.occluded = occludedCount ?? 0;
-      if (this.remote) this.postCut(keyIndices);
+      if (this.remote) this.postCut(streamed as StreamedCut);
       const parts = (this.remote ? [] : Object.values(keyIndices)).map((k) =>
         k.indices.subarray(0, k.numSplats),
       );
@@ -1826,7 +1837,7 @@ export class CompactBandStreamer {
       };
     }
     const t0 = performance.now();
-    const { keyIndices } = (await this.options.lod("traverseLodTrees", {
+    const ahead_ = (await this.options.lod("traverseLodTrees", {
       maxSplats:
         this.pool instanceof CompactNodePool
           ? this.pool.maxCapacity
@@ -1839,13 +1850,15 @@ export class CompactBandStreamer {
       occlusionCull: this.options.occlusion === true,
       neighbours: false,
       unordered: true,
-    })) as {
+      stream: !!this.remote,
+    })) as StreamedCut & {
       keyIndices: Record<string, { numSplats: number; indices: Uint32Array }>;
     };
     this.stats.aheadMs = performance.now() - t0;
     resume?.();
+    const keyIndices = ahead_.keyIndices;
     if (this.remote) {
-      const parts = Object.values(keyIndices).map((k) => ({
+      const parts = (ahead_.parts ?? []).map((k) => ({
         numSplats: k.numSplats,
         indices: k.indices,
       }));
@@ -2005,22 +2018,12 @@ export class CompactBandStreamer {
     return p;
   }
 
-  /** A cut's parts (the traversal's arrays, transferred) to the worker. */
-  private postCut(
-    keyIndices: Record<
-      string,
-      {
-        numSplats: number;
-        indices: Uint32Array;
-        parents?: Uint32Array;
-        firstKids?: Uint32Array;
-        kidCounts?: Uint32Array;
-        culled?: Uint32Array;
-        screens?: Uint32Array;
-      }
-    >,
-  ) {
-    const parts = Object.values(keyIndices);
+  /** A cut's parts (the traversal's chunks, transferred) to the worker. */
+  private postCut(cut: StreamedCut) {
+    const parts: CutPart[] = [...(cut.parts ?? [])];
+    for (const c of cut.culled ?? []) {
+      parts.push({ numSplats: 0, indices: new Uint32Array(0), culled: c });
+    }
     const transfer: Transferable[] = [];
     for (const p of parts) {
       for (const a of [
@@ -2176,13 +2179,16 @@ export class CompactBandStreamer {
    * pages it asked for (planBand's `wanted`).
    */
   private pruning() {
-    const v3 = this.pool.pieces.some((t) => t.version >= 3);
+    const v3 = this.tablesV3;
     const occlusion = (this.options.asset?.occlusion.length ?? 0) > 0;
     return (
       (v3 && this.options.backCull !== false) ||
       (v3 && occlusion && this.options.occlusion === true)
     );
   }
+
+  /** Some piece's tables are CMPT 3 (cones, occlusion indices). */
+  private tablesV3 = false;
 
   /** tau fell at the last update (pruned planning): not settled yet. */
   converging = false;

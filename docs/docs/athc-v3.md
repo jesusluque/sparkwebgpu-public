@@ -435,12 +435,13 @@ merges' opacity.
 
 ### Two opacities a merged node (`LODM`, flag bit 10)
 
-athenea's coverage trees (pieces/t21f) carry both opacities of each merge:
+athenea's coverage trees (pieces/t47) carry both opacities of each merge:
 `opacity` is the composited coverage of its leaves fitted over its core,
-`primvars:athenea:splat:coverageMass` the mass ratio W / A. Under Spark's
-mass-keeping draw the coverage is right while a merge resolves on screen
-and under-covers once merges are sub-pixel and blurred together; the mass
-ratio held at 0.99 is right there (research/errcut.md, rounds 3 and 4). With
+`primvars:athenea:splat:coverageMass` the mass ratio W / A. Her raster
+ranks the coverage first near and the mass far; the switch below lets a
+player pick by size on screen. In Spark's mass-keeping draw the mass ratio
+held at 0.99 was as good or better nearly everywhere, and the switch gained
+at most 0.06 dB (research/errcut.md, round 4), so it is off by default. With
 header flag bit 10 (`FLAG_LOD_MASS`) a file keeps both: the stored opacity
 (the coverage, with `FLAG_NODE_COVERAGE`) and, in a tier-1 section after
 `OCCL`, one f32 an element: a level group's mass ratio clamped to

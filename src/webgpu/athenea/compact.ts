@@ -637,6 +637,20 @@ export interface CompactPathOptions {
   /** Debug: the albedo, no relight. */
   plain?: boolean;
   /**
+   * Shade the drawn slots by cluster (default true): a counting sort of the
+   * sorted slots by their CPCA cluster first, so a warp reads one
+   * cluster's basis and projections (4 B a sort slot, 2 KiB). The colours
+   * are the same: each slot is shaded into its own place.
+   */
+  binByCluster?: boolean;
+  /**
+   * Each listed gaussian keeps its own sort slot (culled ones draw as
+   * nothing), so equal depths keep the list's order and an image repeats
+   * exactly (the atomic append orders them anew each frame). For checks;
+   * the sort and shade then walk every listed gaussian.
+   */
+  stableOrder?: boolean;
+  /**
    * Opaque splats whose stored face looks away (cosine under
    * `cullBacksFacing`, -0.2) are not sorted, shaded or drawn: the relight
    * plugin's cullBacks, here before the sort (half a closed car).
@@ -664,6 +678,8 @@ export class CompactRelitPath {
   private data: GPUBuffer | null = null;
   private frame: GPUBuffer;
   private drawUniform: GPUBuffer;
+  /** binByCluster: counts, starts, then the drawn slots by cluster. */
+  private bins: GPUBuffer | null = null;
   private pipeline: ReflectedRenderPipeline | null = null;
   private pipelineFormat = "";
   private projectedKey = "";
@@ -698,6 +714,8 @@ export class CompactRelitPath {
       faint: true,
       releaseSky: true,
       plain: false,
+      binByCluster: true,
+      stableOrder: false,
       cullBacks: false,
       cullBacksFacing: -0.2,
       ...options,
@@ -739,7 +757,8 @@ export class CompactRelitPath {
       cloud.data.byteOffset,
       cloud.data.byteLength,
     );
-    const words = cloud.layout.clusters * K.kCompactProjWords;
+    const words =
+      cloud.layout.clusters * K.kCompactProjWords + K.kCompactSunWords;
     this.projWords = words;
     this.listCount = -1;
     if (this.frame.size < words * 4) {
@@ -799,6 +818,8 @@ export class CompactRelitPath {
       (o.faint ? K.kCompactFaint : 0) |
       (o.plain ? K.kCompactPlain : 0) |
       (o.cullBacks ? K.kCompactCullBacks : 0) |
+      (o.binByCluster && !o.plain ? K.kCompactBinned : 0) |
+      (o.stableOrder ? K.kCompactStableOrder : 0) |
       (this.listCount >= 0 ? K.kCompactDrawList : 0)
     );
   }
@@ -985,7 +1006,12 @@ export class CompactRelitPath {
     this.device.queue.writeBuffer(
       this.sorter.drawArgs,
       0,
-      new Uint32Array([4, 0, 0, 0]),
+      new Uint32Array([
+        4,
+        this.options.stableOrder ? Math.min(this.listed, this.capacity) : 0,
+        0,
+        0,
+      ]),
     );
     const buffers = this.buffers();
     {
@@ -1027,6 +1053,43 @@ export class CompactRelitPath {
     const others = [...all.keys, ...all.vals].filter((b) => b !== sorted.vals);
     const rec = [sorted.vals, ...others];
     this.records = rec;
+    const binned = this.options.binByCluster && !this.options.plain;
+    if (binned) {
+      const bytes = (2 * K.kCompactBins + this.capacity) * 4;
+      if (!this.bins || this.bins.size < bytes) {
+        this.bins?.destroy();
+        this.bins = createStorage(this.device, bytes, "compact bins");
+      }
+      const bins = this.bins;
+      const pass = encoder.beginComputePass({
+        label: "compact.bin",
+        timestampWrites: profiler?.timestampWrites("compact.bin"),
+      });
+      const slots = {
+        compactData: buffers.compactData,
+        sortCount: this.sorter.drawArgs,
+        rec0: rec[0],
+        bins,
+      };
+      this.registry
+        .get(compactModule, "atheneaCompactBinCount")
+        .dispatchIndirect(
+          pass,
+          { buffers: slots, uniforms: params.data },
+          this.sorter.dispatchArgs,
+        );
+      this.registry
+        .get(compactModule, "atheneaCompactBinScan")
+        .dispatch(pass, { grid: [K.kCompactBins], buffers: { bins } });
+      this.registry
+        .get(compactModule, "atheneaCompactBinScatter")
+        .dispatchIndirect(
+          pass,
+          { buffers: slots, uniforms: params.data },
+          this.sorter.dispatchArgs,
+        );
+      pass.end();
+    }
     {
       const pass = encoder.beginComputePass({
         label: "compact.shade",
@@ -1042,6 +1105,8 @@ export class CompactRelitPath {
             rec1: rec[1],
             rec2: rec[2],
             rec3: rec[3],
+            // Off, the shade reads none of it: any read-only buffer binds.
+            binsIn: binned && this.bins ? this.bins : buffers.compactData,
           },
           uniforms: params.data,
         },
@@ -1163,11 +1228,14 @@ export class CompactRelitPath {
     this.capacity = Math.min(n, Math.ceil(drawn * (1 + margin)));
     (this.sorter as unknown as { capacity: number }).capacity = 0;
     (this.sorter as unknown as { destroyBuffers(): void }).destroyBuffers();
+    this.bins?.destroy();
+    this.bins = null;
     this.frameKey = "";
   }
 
   dispose() {
     this.data?.destroy();
+    this.bins?.destroy();
     this.frame.destroy();
     this.drawUniform.destroy();
     this.sorter.destroy();

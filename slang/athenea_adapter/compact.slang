@@ -60,6 +60,7 @@ public static const uint kCompactPiece = 16384;
 public static const uint kCompactMaterialWords = 4;
 public static const uint kCompactClusterWords = 504;   // 1008 halves
 public static const uint kCompactProjWords = 144;
+public static const uint kCompactSunWords = 8;          // the sun after the projections
 public static const uint kCompactWorkgroup = 256;
 public static const uint kCompactRounds = 4;           // slots a thread (the sort's TILE / 256)
 public static const uint kCompactDispatchRow = 65535u * 256u;
@@ -75,6 +76,10 @@ public static const uint kCompactFaint = 8u;       // faint splats keep their ma
 public static const uint kCompactPlain = 16u;      // debug: the albedo, no relight
 public static const uint kCompactCullBacks = 32u;  // opaque splats whose stored face looks away are not drawn
 public static const uint kCompactDrawList = 64u;   // the cull walks a list of gaussians (a LoD cut) in compactFrame
+public static const uint kCompactBinned = 128u;    // the shade walks the drawn slots by cluster (binsIn)
+public static const uint kCompactBins = 256u;      // clusters a cloud may have (u8 ids)
+public static const uint kCompactStableOrder = 256u; // each listed gaussian its own slot (culled: ~0), for repeatable images
+public static const uint kCompactNone = 0xFFFFFFFFu;
 
 public struct CompactParams {
     public uint  count;
@@ -150,9 +155,20 @@ StructuredBuffer<uint>              draw1;
 StructuredBuffer<uint>              draw2;
 StructuredBuffer<uint>              draw3;
 RWStructuredBuffer<float4>          debugOut;
+RWStructuredBuffer<Atomic<uint>>    bins;      ///< kCompactBinned: counts, starts (kCompactBins each), then the slots by cluster
+StructuredBuffer<uint>              binsIn;    ///< the same, read by the shade
 ConstantBuffer<CompactParams>       compactParams;
 
 bool hasFlag(uint f) { return (compactParams.flags & f) != 0u; }
+
+/// The dome's sun (envSun's disc and irradiance), copied after the
+/// projections by the project pass: the shade then binds no envSun.
+float4 frameFloat4(uint at) {
+    return float4(asfloat(compactFrame[at]), asfloat(compactFrame[at + 1u]), asfloat(compactFrame[at + 2u]),
+                  asfloat(compactFrame[at + 3u]));
+}
+float4 sunDisc() { return frameFloat4(compactParams.tableBase + compactParams.clusters * kCompactProjWords); }
+float3 sunIrradiance() { return frameFloat4(compactParams.tableBase + compactParams.clusters * kCompactProjWords + 4u).rgb; }
 
 // ---------------------------------------------------------------- the planes
 
@@ -311,8 +327,8 @@ void compactViewless(SplatSurface s, uint c, uint2 wd, uint2 wi, uint dome, bool
     if (withIndirect) {
         front += gathered;
     }
-    const float4 disc = envSun[dome * 2];
-    const float3 irradiance = disc.w > 0.0 ? envSun[dome * 2 + 1].rgb : float3(0.0);
+    const float4 disc = sunDisc();
+    const float3 irradiance = disc.w > 0.0 ? sunIrradiance() : float3(0.0);
     const float cosine = max(dot(s.normal, disc.xyz), 0.0);
     sunShare = disc.w > 0.0 ? splatOpenToward(s, compactData, compactData, disc.xyz) : 1.0;
     front += irradiance * (cosine * sunShare * kOverPiSun);
@@ -393,6 +409,66 @@ float3 fieldAlong(float field[48], float3 d, float roughness) {
     return max(sum, float3(0.0));
 }
 
+/// The reflected block read along directions without rebuilding it into
+/// registers: the field's values are made two coefficients at a time (each
+/// value as reflectedBlock makes it, the mean then the eight directions in
+/// order) and summed straight into fieldAlongPair's polish and coat along
+/// `m` and, with `through`, fieldAlong's value along `t` -- the same sums in
+/// the same order as rebuilding the block then reading it, with a handful
+/// of registers instead of 48 (the rebuilt block spilled).
+void reflectedAlong(uint cluster, uint2 w, float3 m, float roughness, float coatRoughness, bool through, float3 t,
+                    out float3 polish, out float3 coat, out float3 along) {
+    const float a = roughness * roughness;
+    const float b = coatRoughness * coatRoughness;
+    const float a2 = a * a, b2 = b * b;
+    float q[8];
+    [unroll] for (uint k = 0; k < 8u; ++k) {
+        q[k] = weightOf(k < 4u ? w.x : w.y, k & 3u);
+    }
+    const uint base = compactParams.basis + cluster * kCompactClusterWords;
+    polish = float3(0.0);
+    coat = float3(0.0);
+    along = float3(0.0);
+    // exp(-band a^2) by band (bands 0, 2, 6, 12), as fieldAlongPair takes it.
+    float ga[4], gb[4];
+    [unroll] for (uint n = 0; n < 4u; ++n) {
+        const float band = n == 0u ? 0.0 : (n == 1u ? 2.0 : (n == 2u ? 6.0 : 12.0));
+        ga[n] = exp(-band * a2);
+        gb[n] = exp(-band * b2);
+    }
+    [unroll] for (uint jp = 0; jp < 8u; ++jp) {
+        // Values 6 jp .. 6 jp + 5: coefficients 2 jp and 2 jp + 1, three words.
+        float v[6];
+        [unroll] for (uint h = 0; h < 3u; ++h) {
+            const uint at = 576u + 6u * jp + 2u * h;
+            const uint mean = compactData[base + (at >> 1u)];
+            float lo = f16tof32(mean & 0xFFFFu);
+            float hi = f16tof32(mean >> 16u);
+            [unroll] for (uint k = 0; k < 8u; ++k) {
+                const uint word = compactData[base + ((at + (1u + k) * 48u) >> 1u)];
+                lo += q[k] * f16tof32(word & 0xFFFFu);
+                hi += q[k] * f16tof32(word >> 16u);
+            }
+            v[2u * h] = lo;
+            v[2u * h + 1u] = hi;
+        }
+        [unroll] for (uint e = 0; e < 2u; ++e) {
+            const uint j = 2u * jp + e;
+            const float3 f = float3(v[3u * e], v[3u * e + 1u], v[3u * e + 2u]);
+            const uint n = j < 1u ? 0u : (j < 4u ? 1u : (j < 9u ? 2u : 3u));
+            const float3 value = f * envBasisValue(j, m);
+            polish += value * ga[n];
+            coat += value * gb[n];
+            if (through) {
+                along += f * (ga[n] * envBasisValue(j, t));
+            }
+        }
+    }
+    polish = max(polish, float3(0.0));
+    coat = max(coat, float3(0.0));
+    along = max(along, float3(0.0));
+}
+
 // -------------------------------------- athenea's relitByDome, TX under a dome
 // (splat_relight.slang at txf 89a04d9: its helpers below are module-internal
 // there, so copied as they are; the transfer's reads come from the rebuilt
@@ -428,25 +504,20 @@ float3 transmittedShareOf(SplatSurface s, float nDotV) {
 /// relitByDome<2> for a TX cloud (cells and field) with the kept terms in
 /// hand, nothing traced, no slope (pixelDetail off): a gaussian's light.
 float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, float3 front, float3 coupling,
-                    float sunShare, float field[48], float openness, float lensCurvature) {
+                    float sunShare, float3 fieldPolish, float3 fieldCoat, float3 fieldThrough, float openness,
+                    float lensCurvature) {
     const uint side = compactParams.envBaseSide;
     const float nDotV = max(dot(s.normal, wo), 1.0e-4);
     const float3 mirror = reflect(-wo, s.normal);
     const SplatLayers layers = splatLayers(s, nDotV);
     const bool coated = s.lobes.coatWeight > 0.0;
-    const float4 disc = envSun[dome * 2];
-    const float3 irradiance = disc.w > 0.0 ? envSun[dome * 2 + 1].rgb : float3(0.0);
+    const float4 disc = sunDisc();
+    const float3 irradiance = disc.w > 0.0 ? sunIrradiance() : float3(0.0);
     const bool cells = s.cellWords >= 8u;
     const bool hasField = cells && withIndirect;
-    float3 fieldPolish = float3(0.0);
-    float3 fieldCoat = float3(0.0);
-    if (hasField) {
-        fieldAlongPair(field, mirror, s.roughness, coated ? s.lobes.coatRoughness : s.roughness, fieldPolish,
-                       fieldCoat);
-    }
     float3 behind = transmittedBehindOf(s, wo, dome);
     if (hasField && transmittedWeightOf(s) > 0.0 && s.ior > 1.0) {
-        const float3 white = fieldAlong(field, -wo, s.roughness);
+        const float3 white = fieldThrough;
         const float open = smoothstep(0.5, 0.85, dot(white, float3(0.2126, 0.7152, 0.0722)));
         const float3 sharp =
             lensCurvature > 0.0
@@ -461,7 +532,7 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
         const float openBehind = splatConeOpen(s, compactData, through, min(1.4 * atan(alpha), 1.2), -s.normal);
         const float open = openBehind >= 0.0 ? openBehind : 0.0;
         behind = (open * envRadiance(envTexels, dome, through, s.roughness, side) +
-                  (1.0 - open) * coupling * fieldAlong(field, through, s.roughness)) *
+                  (1.0 - open) * coupling * fieldThrough) *
                  s.exitThrough;
     }
     const float3 passes = transmittedShareOf(s, nDotV);
@@ -527,15 +598,19 @@ float coveredGlass(float a, float n) {
     return 1.0 + 0.25 * (d - 1.0);
 }
 
-/// Splat i's relit colour (linear) and alpha (-1: its own), as relight.slang's
-/// relitColour<2, 2> (the joint CPCA under one dome, no slope).
-public float4 shadeColour(uint i, CompactSplat g) {
+/// A gaussian's surface for the relight: everything relitByDome reads that
+/// is not the transfer's terms, with the footprint prefilter applied.
+struct CompactSurface {
+    SplatSurface surface;
+    float lensCurvature;
+    uint cluster;
+};
+
+CompactSurface surfaceOf(uint i, CompactSplat g) {
+    CompactSurface o;
     const float3x3 r = splatRotation(g.quaternion);
     const float3 stored = normalOf(i);
     const float3 colour = cloudLight(g.rgba.rgb, hasFlag(kCompactLinear));
-    if (hasFlag(kCompactPlain)) {
-        return float4(colour, -1.0);
-    }
     const float3 cloudNormal = splatShadingNormal(r, g.scales, g.center, compactParams.eyeObject.xyz, false, 0u);
     // splatShadingNormal with a stored normal: put on the disc's side.
     const float3 disc = cloudNormal;
@@ -577,23 +652,13 @@ public float4 shadeColour(uint i, CompactSplat g) {
     surface.shadowBits = uint2(0u);
     surface.cellWords = 8u;
     surface.cellBase = cellBaseOf(i);
-    // The kept terms, from the clusters' projections.
-    const uint c = fieldAt(compactParams.cluster, 1u, i);
-    const uint2 wd = weightsOf(i, 0u);
-    const uint2 wi = weightsOf(i, 1u);
-    const uint2 wr = weightsOf(i, 2u);
-    const bool indirect = hasFlag(kCompactIndirect);
-    float3 front;
-    float3 coupling;
-    float sunShare;
-    compactViewless(surface, c, wd, wi, 0u, indirect, front, coupling, sunShare);
     // The curvature: the lens of a solid glass, and the footprint prefilter.
-    float lensCurvature = 0.0;
+    o.lensCurvature = 0.0;
     if (hasFlag(kCompactCurvature)) {
         const float3 shapeUV = curvatureOf(i);
         const float3 axisN = float3(r[0][2], r[1][2], r[2][2]);
         const float faces = dot(n, axisN) >= 0.0 ? 1.0 : -1.0;
-        lensCurvature = faces * 0.5 * (shapeUV.x + shapeUV.z);
+        o.lensCurvature = faces * 0.5 * (shapeUV.x + shapeUV.z);
         if (compactParams.footprint > 0.0) {
             surface.roughness = footprintOf(surface.roughness, shapeUV, g.scales, compactParams.footprint,
                                             compactParams.footprintClamp);
@@ -601,11 +666,51 @@ public float4 shadeColour(uint i, CompactSplat g) {
                                                       compactParams.footprint, compactParams.footprintClamp);
         }
     }
-    float field[48];
-    reflectedBlock(c, wr, field);
+    o.surface = surface;
+    o.cluster = fieldAt(compactParams.cluster, 1u, i);
+    return o;
+}
+
+/// The eye's direction from a surface.
+float3 eyeFrom(SplatSurface s) { return normalize(compactParams.eyeWorld.xyz - s.position); }
+
+/// The reflected field along the mirror (polish, coat) and, for a
+/// transmitting splat, along the way through: what relitCompact reads.
+void reflectedTerms(CompactSurface c, uint2 wr, out float3 polish, out float3 coat, out float3 through) {
+    const SplatSurface s = c.surface;
+    const float3 wo = eyeFrom(s);
+    const float3 mirror = reflect(-wo, s.normal);
+    const bool coated = s.lobes.coatWeight > 0.0;
+    reflectedAlong(c.cluster, wr, mirror, s.roughness, coated ? s.lobes.coatRoughness : s.roughness,
+                   transmittedWeightOf(s) > 0.0, -wo, polish, coat, through);
+}
+
+/// Splat i's relit colour (linear) and alpha (-1: its own), as relight.slang's
+/// relitColour<2, 2> (the joint CPCA under one dome, no slope).
+public float4 shadeColour(uint i, CompactSplat g) {
+    if (hasFlag(kCompactPlain)) {
+        return float4(cloudLight(g.rgba.rgb, hasFlag(kCompactLinear)), -1.0);
+    }
+    const CompactSurface cs = surfaceOf(i, g);
+    SplatSurface surface = cs.surface;
+    const uint c = cs.cluster;
+    // The kept terms, from the clusters' projections.
+    const uint2 wd = weightsOf(i, 0u);
+    const uint2 wi = weightsOf(i, 1u);
+    const bool indirect = hasFlag(kCompactIndirect);
+    float3 front;
+    float3 coupling;
+    float sunShare;
+    compactViewless(surface, c, wd, wi, 0u, indirect, front, coupling, sunShare);
+    float3 polish = float3(0.0);
+    float3 coat = float3(0.0);
+    float3 through = float3(0.0);
+    if (indirect) {
+        reflectedTerms(cs, weightsOf(i, 2u), polish, coat, through);
+    }
     const float openness = opennessValue(c, wd);
-    float3 light = relitCompact(surface, normalize(compactParams.eyeWorld.xyz - surface.position), 0u, indirect, front,
-                                coupling, sunShare, field, openness, lensCurvature);
+    float3 light = relitCompact(surface, eyeFrom(surface), 0u, indirect, front, coupling, sunShare, polish, coat,
+                                through, openness, cs.lensCurvature);
     float alpha = -1.0;
     if (surface.thinWalled && surface.transmission > 0.5) {
         const float alphaOwn = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
@@ -625,6 +730,13 @@ public float4 shadeColour(uint i, CompactSplat g) {
 [numthreads(64, 1, 1)]
 void atheneaCompactProject(uint3 tid: SV_DispatchThreadID) {
     const uint c = tid.x;
+    if (c == 0u) {
+        const uint at = compactParams.tableBase + compactParams.clusters * kCompactProjWords;
+        [unroll] for (uint k = 0; k < 4u; ++k) {
+            compactFrameOut[at + k] = asuint(envSun[0][k]);
+            compactFrameOut[at + 4u + k] = asuint(envSun[1][k]);
+        }
+    }
     if (c >= compactParams.clusters) {
         return;
     }
@@ -685,23 +797,16 @@ bool inFrustum(float3 v) {
 
 uint gaussianIndex(uint3 tid) { return tid.x + tid.y * kCompactDispatchRow; }
 
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
-    const uint t = gaussianIndex(tid);
-    if (t >= compactParams.count) {
-        return;
-    }
-    // With a draw list (a LoD cut chosen on the host), thread t culls its
-    // t-th entry; else gaussian t.
-    const uint i = hasFlag(kCompactDrawList) ? compactFrame[compactParams.drawList + t] : t;
+/// A gaussian's sort key (24 bits, far first), or kCompactNone where it is
+/// not drawn: transparent, outside the frustum, or a culled back.
+uint cullKeyOf(uint i) {
     if (fieldAt(compactParams.opacity, 1u, i) == 0u) {
-        return;
+        return kCompactNone;
     }
     const float3 p = positionOf(i);
     const float3 v = toView(p);
     if (!inFrustum(v)) {
-        return;
+        return kCompactNone;
     }
     // relight.slang's culledBack: an opaque splat (no transmission, not a
     // thin sheet) whose stored face looks away from the eye is a closed
@@ -712,14 +817,40 @@ void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
             const float3 toEye = compactParams.eyeObject.xyz - p;
             const float far = length(toEye);
             if (far > 0.0 && dot(normalOf(i), toEye / far) < compactParams.cullFacing) {
-                return;
+                return kCompactNone;
             }
         }
     }
-    const float key = (1u << kCompactKeyBits) - 1u - min(length(v) * compactParams.keyScale, 16777215.0);
+    return uint((1u << kCompactKeyBits) - 1u - min(length(v) * compactParams.keyScale, 16777215.0));
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
+    const uint t = gaussianIndex(tid);
+    if (t >= compactParams.count) {
+        return;
+    }
+    // With a draw list (a LoD cut chosen on the host), thread t culls its
+    // t-th entry; else gaussian t.
+    const uint i = hasFlag(kCompactDrawList) ? compactFrame[compactParams.drawList + t] : t;
+    const bool stable = hasFlag(kCompactStableOrder);
+    if (stable && t >= compactParams.capacity) {
+        return;
+    }
+    const uint key = cullKeyOf(i);
+    if (stable) {
+        // The radix sort is stable: equal keys keep the list's order.
+        sortKeys[t] = key == kCompactNone ? 0u : key;
+        sortVals[t] = key == kCompactNone ? kCompactNone : i;
+        return;
+    }
+    if (key == kCompactNone) {
+        return;
+    }
     const uint slot = sortArgs[1].add(1u);
     if (slot < compactParams.capacity) {
-        sortKeys[slot] = uint(key);
+        sortKeys[slot] = key;
         sortVals[slot] = i;
     }
 }
@@ -844,11 +975,23 @@ uint packCentre(float2 c) {
 void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
     const uint count = min(sortCount[1], compactParams.capacity);
     for (uint pass = 0u; pass < kCompactRounds; ++pass) {
-        const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
+        uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
         if (slot >= count) {
             return;
         }
+        const uint t = slot;
+        if (hasFlag(kCompactBinned)) {
+            slot = binsIn[2u * kCompactBins + t];
+        }
         const uint i = rec0[slot];
+        if (i == kCompactNone) {
+            // A culled entry of kCompactStableOrder: drawn as nothing.
+            rec0[slot] = 0u;
+            rec1[slot] = 0u;
+            rec2[slot] = 0u;
+            rec3[slot] = 0u;
+            continue;
+        }
         CompactSplat g = readCompact(i);
         const float3 v = toView(g.center);
         const float4 lit = shadeColour(i, g);
@@ -868,6 +1011,65 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         rec1[slot] = (f32tof16(sigma.x) & 0xFFFFu) | (uint(round(angle / 3.14159265358979 * 65535.0)) << 16u);
         rec2[slot] = (f32tof16(sigma.y) & 0xFFFFu) | ((f32tof16(lod ? -alpha : alpha) & 0xFFFFu) << 16u);
         rec3[slot] = packRgb9e5(max(lit.rgb, float3(0.0)));
+    }
+}
+
+// The drawn slots by cluster (kCompactBinned): a counting sort of the
+// sorted slots by their gaussian's cluster, so the shade's neighbouring
+// threads read the same cluster's basis and projections (a warp of mixed
+// clusters read hundreds of scattered words a thread). The order within a
+// cluster does not matter: each slot is shaded into its own place.
+
+uint drawnClusterOf(uint slot) {
+    const uint i = rec0[slot];
+    return i == kCompactNone ? 0u : fieldAt(compactParams.cluster, 1u, i);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaCompactBinCount(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
+    const uint count = min(sortCount[1], compactParams.capacity);
+    for (uint pass = 0u; pass < kCompactRounds; ++pass) {
+        const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
+        if (slot >= count) {
+            return;
+        }
+        bins[drawnClusterOf(slot)].add(1u);
+    }
+}
+
+groupshared uint binScan[kCompactBins];
+
+/// The clusters' starts (exclusive sums of the counts), the counts cleared
+/// for the next frame.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaCompactBinScan(uint3 lid: SV_GroupThreadID) {
+    const uint t = lid.x;
+    const uint n = bins[t].load();
+    binScan[t] = n;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint step = 1u; step < kCompactBins; step <<= 1u) {
+        const uint add = t >= step ? binScan[t - step] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        binScan[t] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    bins[kCompactBins + t].store(binScan[t] - n);
+    bins[t].store(0u);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void atheneaCompactBinScatter(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
+    const uint count = min(sortCount[1], compactParams.capacity);
+    for (uint pass = 0u; pass < kCompactRounds; ++pass) {
+        const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
+        if (slot >= count) {
+            return;
+        }
+        const uint at = bins[kCompactBins + drawnClusterOf(slot)].add(1u);
+        bins[2u * kCompactBins + at].store(slot);
     }
 }
 

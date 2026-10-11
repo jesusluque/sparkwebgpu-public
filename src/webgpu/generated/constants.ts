@@ -200,6 +200,9 @@ export const drawSplatShape = {
   MARK_SHEET: 16384,
   SHEET_ALPHA: 0.1,
   SHEET_VARYING: 8,
+  SHEET_FLOORED: 16,
+  SHEET_OWN: 12,
+  SHEET_STEPS: 1023,
   SURFEL_FILTER_INV_SQUARE: 2,
 } as const;
 

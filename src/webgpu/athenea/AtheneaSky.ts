@@ -47,7 +47,14 @@ export interface SkyImage {
   width: number;
   height: number;
   /** width * height * channels floats. */
-  data: Float32Array;
+  data?: Float32Array;
+  /**
+   * The floats made again when an upload wants them, in place of `data`
+   * (thread CU: a page keeps the 1.6 MB RGBE file of a 1k dome, not its
+   * 8 MB of floats; the decode must give the same floats every call). With
+   * it, `data` is let go once uploaded.
+   */
+  decode?: () => Float32Array;
   /** 3 (rgb) or 4 (rgba); default 4. */
   channels?: 3 | 4;
 }
@@ -213,7 +220,8 @@ export class AtheneaSky {
       usage: base > 0 ? usage | GPUTextureUsage.COPY_SRC : usage,
     });
     const rgba = new Float32Array(w * h * 4);
-    if (image) {
+    const data = image ? (image.data ?? image.decode?.()) : undefined;
+    if (image && data) {
       const n = image.channels ?? 4;
       // athenea's texture rows count up from the bottom (domeUv: v = 1 is
       // +Y, and texel row 0 is v = 0): the file's top row goes last.
@@ -221,15 +229,17 @@ export class AtheneaSky {
         for (let x = 0; x < w; x++) {
           const from = n * ((h - 1 - y) * w + x);
           const to = 4 * (y * w + x);
-          rgba[to] = image.data[from];
-          rgba[to + 1] = image.data[from + 1];
-          rgba[to + 2] = image.data[from + 2];
+          rgba[to] = data[from];
+          rgba[to + 1] = data[from + 1];
+          rgba[to + 2] = data[from + 2];
           rgba[to + 3] = 1;
         }
       }
     } else {
       rgba.fill(1);
     }
+    // Floats that can be made again: not kept past their upload.
+    if (image?.decode && image.data) image.data = undefined;
     this.device.queue.writeTexture(
       { texture },
       rgba,

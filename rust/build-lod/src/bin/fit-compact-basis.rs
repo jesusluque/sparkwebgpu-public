@@ -12,6 +12,9 @@
 //! reflected), the transfer's relMSE through the fitted basis at int4 -- and
 //! through `--compare` (e.g. athenea's q97, a LOCAL comparison only).
 //! `--held-out <piece.athc>` (repeatable): measured, not fitted on.
+//! `--sample S` (thread CS, the whole car): fit on every S-th node of each
+//! piece only (RAM: 448 bytes a fitted node), then measure every node, one
+//! piece in memory at a time.
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -22,7 +25,7 @@ use spark_lib::athc_compact::JointBasis;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let valued = ["--out", "--clusters", "--iters", "--seed", "--seed-sample", "--compare", "--report", "--held-out"];
+    let valued = ["--out", "--clusters", "--iters", "--seed", "--seed-sample", "--compare", "--report", "--held-out", "--sample"];
     let held: Vec<String> =
         args.iter().enumerate().filter(|(_, a)| *a == "--held-out").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
     let mut files = Vec::new();
@@ -56,13 +59,14 @@ fn main() -> Result<()> {
         o.seed_sample = v.parse()?;
     }
 
-    // The transfer of every node, by piece.
-    let mut pieces: Vec<(String, std::ops::Range<usize>)> = Vec::new();
-    let mut x: Vec<f32> = Vec::new();
-    for f in files.iter().chain(&held) {
-        let bytes = std::fs::read(f).with_context(|| f.clone())?;
-        let file = spark_lib::athc_v3::read_v3(&bytes).with_context(|| f.clone())?;
-        let first = x.len() / 112;
+    let sample: usize = arg("--sample").map(|v| v.parse()).transpose()?.unwrap_or(1).max(1);
+    // A piece's transfer, every node (leaves and merges), as f32.
+    let load = |f: &str, stride: usize| -> Result<Vec<f32>> {
+        let bytes = std::fs::read(f).with_context(|| f.to_string())?;
+        let file = spark_lib::athc_v3::read_v3(&bytes).with_context(|| f.to_string())?;
+        drop(bytes);
+        let mut x = Vec::new();
+        let mut i = 0usize;
         for b in file.levels.iter().map(|(_, b)| b).chain(&file.chunks) {
             if b.n == 0 {
                 continue;
@@ -70,20 +74,31 @@ fn main() -> Result<()> {
             if b.transfer.len() != 56 * b.n {
                 bail!("{f}: not the full transfer (112 values a node)");
             }
-            for w in &b.transfer {
-                let (lo, hi) = (low_half(*w), high_half(*w));
-                x.push(if lo.is_finite() { lo } else { 0.0 });
-                x.push(if hi.is_finite() { hi } else { 0.0 });
+            for node in b.transfer.chunks_exact(56) {
+                if i % stride == 0 {
+                    for w in node {
+                        let (lo, hi) = (low_half(*w), high_half(*w));
+                        x.push(if lo.is_finite() { lo } else { 0.0 });
+                        x.push(if hi.is_finite() { hi } else { 0.0 });
+                    }
+                }
+                i += 1;
             }
         }
-        let name = std::path::Path::new(f).file_stem().unwrap().to_string_lossy().to_string();
-        eprintln!("{name}: {} nodes", x.len() / 112 - first);
-        pieces.push((name, first..x.len() / 112));
-    }
+        Ok(x)
+    };
+    let stem = |f: &str| std::path::Path::new(f).file_stem().unwrap().to_string_lossy().to_string();
 
-    let fitted = pieces.iter().take(files.len()).map(|(_, r)| r.end).max().unwrap_or(0);
-    let (basis, fit) = fit_joint_basis(&x[..fitted * 112], &o)?;
+    // The fit's sample: every `sample`-th node of each fitted piece.
+    let mut x: Vec<f32> = Vec::new();
+    for f in &files {
+        let before = x.len() / 112;
+        x.extend(load(f, sample)?);
+        eprintln!("{}: {} nodes sampled (1 in {sample})", stem(f), x.len() / 112 - before);
+    }
+    let (basis, fit) = fit_joint_basis(&x, &o)?;
     eprintln!("fit: {}", serde_json::to_string(&fit)?);
+    drop(x);
 
     let compare = match arg("--compare") {
         Some(j) => {
@@ -92,26 +107,42 @@ fn main() -> Result<()> {
         }
         None => None,
     };
-    let rel = |b: &JointBasis, r: &std::ops::Range<usize>| {
-        let (e, f) = transfer_error(b, &x[r.start * 112..r.end * 112], o.levels, o.threads);
-        let all = e.iter().sum::<f64>() / f.iter().sum::<f64>().max(1e-30);
-        json!({ "all": all, "direct": e[0] / f[0].max(1e-30), "indirect": e[1] / f[1].max(1e-30), "reflected": e[2] / f[2].max(1e-30) })
+    // Every node of every piece, one piece at a time; sums kept for the total.
+    let ratio = |e: &[f64; 3], f: &[f64; 3]| {
+        json!({ "all": e.iter().sum::<f64>() / f.iter().sum::<f64>().max(1e-30), "direct": e[0] / f[0].max(1e-30), "indirect": e[1] / f[1].max(1e-30), "reflected": e[2] / f[2].max(1e-30) })
     };
     let mut rows = Vec::new();
-    let all = ("ALL fitted".to_string(), 0..fitted);
-    for (k, (name, r)) in pieces.iter().chain(std::iter::once(&all)).enumerate() {
-        let row = json!({
-            "piece": name,
-            "heldOut": k >= files.len() && k < pieces.len(),
-            "nodes": r.len(),
-            "ours": rel(&basis, r),
-            "compare": compare.as_ref().map(|c| rel(c, r)),
-        });
+    let mut tot = [([0f64; 3], [0f64; 3]); 2];
+    let mut tot_nodes = 0usize;
+    for (k, f) in files.iter().chain(&held).enumerate() {
+        let x = load(f, 1)?;
+        let n = x.len() / 112;
+        let mut row = json!({ "piece": stem(f), "heldOut": k >= files.len(), "nodes": n });
+        for (j, b) in std::iter::once(Some(&basis)).chain(std::iter::once(compare.as_ref())).enumerate() {
+            let Some(b) = b else { continue };
+            let (e, fs) = transfer_error(b, &x, o.levels, o.threads);
+            if k < files.len() {
+                for q in 0..3 {
+                    tot[j].0[q] += e[q];
+                    tot[j].1[q] += fs[q];
+                }
+            }
+            row[if j == 0 { "ours" } else { "compare" }] = ratio(&e, &fs);
+        }
+        if k < files.len() {
+            tot_nodes += n;
+        }
         println!("{}", serde_json::to_string(&row)?);
         rows.push(row);
     }
+    let mut all = json!({ "piece": "ALL fitted", "heldOut": false, "nodes": tot_nodes, "ours": ratio(&tot[0].0, &tot[0].1) });
+    if compare.is_some() {
+        all["compare"] = ratio(&tot[1].0, &tot[1].1);
+    }
+    println!("{}", serde_json::to_string(&all)?);
+    rows.push(all);
 
-    let names: Vec<&str> = pieces.iter().take(files.len()).map(|(n, _)| n.as_str()).collect();
+    let names: Vec<String> = files.iter().map(|f| stem(f)).collect();
     let (j, bin) = basis_json_bin(
         &basis,
         json!({
@@ -121,6 +152,7 @@ fn main() -> Result<()> {
             "clustersUsed": fit.clusters_used,
             "weightLevels": o.levels,
             "seed": o.seed,
+            "sample": sample,
         }),
     );
     std::fs::write(format!("{out}.json"), j)?;

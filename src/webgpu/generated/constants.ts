@@ -28,6 +28,7 @@ export const atheneaAdapterCompact = {
   kCompactBins: 256,
   kCompactStableOrder: 256,
   kCompactNone: 4294967295,
+  kCompactSheetAlpha: 0.1,
 } as const;
 
 /** slang/athenea_adapter/cpca.slang */

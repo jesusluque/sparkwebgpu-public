@@ -1208,12 +1208,17 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
 }
 
 /// The merged nodes in virtual order (root, then every level), one block,
-/// each widened to tile its cell (`widen_merged`).
+/// each widened to tile its cell (`widen_merged`); a producer's merged thin
+/// sheets (FLAG_NODE_COVERAGE) refined first (`refine_sheets_first`).
 pub fn merged_block(file: &AthcFile, tree: &VirtualTree) -> AthcBlock {
     let extent = file.header.extent;
+    let covered = file.header.has(FLAG_NODE_COVERAGE);
     let mut all = if tree.synth_root {
         let mut root = merge_root(&file.levels[0].1, file.header.sh_words as usize);
         widen_levels(file, &mut root, extent);
+        if covered {
+            refine_sheets_first(&mut root);
+        }
         root
     } else {
         AthcBlock::default()
@@ -1221,9 +1226,62 @@ pub fn merged_block(file: &AthcFile, tree: &VirtualTree) -> AthcBlock {
     for (level, block) in &file.levels {
         let mut block = block.clone();
         widen_levels(file, &mut block, extent / (1u64 << *level) as f32);
+        if covered {
+            refine_sheets_first(&mut block);
+        }
         all.append(&block);
     }
     all
+}
+
+// --- a producer's merged thin sheets: refined first --------------------------
+//
+// A thin sheet is drawn at athenea's floor (kSheetAlpha, 0.1) whatever its
+// own opacity: each gaussian takes a tenth of what is behind it. The t47
+// headlight cover's leaves (0.0055 each, 76 486) stack some fifteen deep at
+// that floor, evenly (the bake's grid), into a smooth tint. athenea's merges
+// of them (coverage 0.008-0.1, FLAG_NODE_COVERAGE: their opacities are hers,
+// neither uncapped nor widened) are floored one by one at the same 0.1:
+// fewer, larger gaussians, placed as her pair merges fell, whose stacking
+// varies from cell to cell, and what the glass lets through varies with it.
+// Drawn large -- a LoD budget under the scene's splats (the iPhone's 600k for
+// /pieces' 857k, or ?lod=100000 on a desktop), close up -- the cover turned
+// into brown blotches the size of the merged cells (thread CM). Neither
+// widening the merges to tile their cells nor flooring each at its leaves'
+// stack cured it where a cut mixes merges with leaves (a widened merge among
+// leaves is a lighter spot with a darker ring). So the LoD is told such a
+// merge is SHEET_LOD_GAIN times its size (`lod_size`, as LODS does): a cut
+// refines the glass before anything else and draws its merges only when they
+// are a fraction of its smallest splat on screen, where the blotches are under
+// a pixel. The octree files (every other published set) are left as they are.
+
+/// How much larger a producer's merged thin sheet tells the LoD it is than
+/// its size (`refine_sheets_first`).
+pub const SHEET_LOD_GAIN: f32 = 4.0;
+
+/// A producer's merged thin sheets' LoD size (`lod_size`: its own where it
+/// has one, else Spark's geometric size) times SHEET_LOD_GAIN; anything else
+/// keeps its own (0: geometric). A block without sheets is left as it is.
+pub fn refine_sheets_first(block: &mut AthcBlock) {
+    if block.pbr.is_empty() || block.n == 0 || !(0..block.n).any(|i| is_sheet(block, i)) {
+        return;
+    }
+    if block.lod_size.len() != block.n {
+        block.lod_size = vec![0.0; block.n];
+    }
+    for i in 0..block.n {
+        if !is_sheet(block, i) {
+            continue;
+        }
+        let w = &block.shape[i * 4..i * 4 + 4];
+        let scale = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()];
+        let size = if block.lod_size[i] > 0.0 {
+            block.lod_size[i]
+        } else {
+            crate::athc_lod_error::geometric_size(scale, block.positions[i * 4 + 3])
+        };
+        block.lod_size[i] = SHEET_LOD_GAIN * size;
+    }
 }
 
 // --- coverage: merged opacity past athenea's 0.99 ---------------------------
@@ -2453,6 +2511,45 @@ impl<T: SplatReceiver> ChunkReceiver for AthcDecoder<T> {
 mod tests {
     use super::*;
     use crate::decoder::SplatInit;
+
+    #[test]
+    fn only_a_producers_merged_sheets_are_refined_first() {
+        // Thread CM: athenea's merged headlight glass, drawn large, blotched.
+        // two_cards' levels as thin sheets (and one opaque node): with
+        // FLAG_NODE_COVERAGE the sheets tell the LoD SHEET_LOD_GAIN times
+        // their geometric size and the opaque node its own (0); without
+        // (the octree files) no LoD size at all, the decode as before.
+        let mut file = AthcFile::read(TWO_CARDS).unwrap();
+        let sheet_pbr = (255u32 << 16) | (1 << 24);
+        for (_, b) in file.levels.iter_mut() {
+            b.pbr = vec![sheet_pbr; b.n];
+        }
+        file.levels[0].1.pbr[0] = 0;
+        let tree = VirtualTree::of_file(&file, true).unwrap();
+        let plain = merged_block(&file, &tree);
+        assert!(plain.lod_size.is_empty());
+        file.header.flags |= FLAG_NODE_COVERAGE;
+        let covered = merged_block(&file, &tree);
+        assert_eq!(covered.n, plain.n);
+        assert_eq!(covered.lod_size.len(), covered.n);
+        let first = if tree.synth_root { 1 } else { 0 };
+        assert!(!is_sheet(&covered, first), "the opaque node");
+        for i in 0..covered.n {
+            if !is_sheet(&covered, i) {
+                assert_eq!(covered.lod_size[i], 0.0);
+                continue;
+            }
+            let w = &covered.shape[i * 4..i * 4 + 4];
+            let scale = [low_half(w[1]).exp(), high_half(w[1]).exp(), low_half(w[2]).exp()];
+            let size = crate::athc_lod_error::geometric_size(scale, covered.positions[i * 4 + 3]);
+            assert!((covered.lod_size[i] / (SHEET_LOD_GAIN * size) - 1.0).abs() < 1e-6, "{i}");
+        }
+        // A block with a LoD size of its own (LODS) keeps it, times the gain.
+        let mut b = covered.slice(first + 1, 1);
+        b.lod_size = vec![0.25];
+        refine_sheets_first(&mut b);
+        assert_eq!(b.lod_size, vec![0.25 * SHEET_LOD_GAIN]);
+    }
 
     #[test]
     fn merged_solid_glass_keeps_a_coverage_past_one() {

@@ -17,6 +17,7 @@
         "three": "../js/vendor/three/build/three.module.js",
         "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
         "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
         "@sparkjsdev/spark": "../../dist/spark.module.js",
         "@sparkjsdev/spark/webgpu": "../../dist/spark.webgpu.module.js"
       }
@@ -32,7 +33,9 @@
     //   ?base=/r2/        where <piece>.athc are (tools/validate-corvette/serve.mjs, R2_DIR)
     //   ?pieces=Hood,...  which (default the six)
     //   ?tau=1            the error cut, pixels
-    //   ?budget=56        the pool, MB of resident nodes (BYTES_A_NODE each)
+    //   ?nodes=1500000    the pool (its budget), in nodes
+    //   ?attrs=all|material|none   the streams the pool keeps (default all:
+    //                     every stream of the file, the relight's included)
     //   ?ref=0            no whole-file reference
     //   ?auto=1           tau breathing with the budget (LodTauController)
     //
@@ -46,10 +49,9 @@
     const base = params.get("base") ?? "/r2/";
     const pieces = (params.get("pieces") ?? "Hood,Front_Fender,Headlights_Cover,Front_Logo,F_Grill,Door_001").split(",");
     const tau = Number(params.get("tau") ?? 1);
-    // GPU bytes a resident node holds in this harness: packed core (16),
-    // athcGroup (8), the material (normal 4, pbr 4, lobes 12).
-    const BYTES_A_NODE = 44;
-    const budgetBytes = Number(params.get("budget") ?? 56) * 1e6;
+    const poolNodes = Number(params.get("nodes") ?? 1_500_000);
+    const attrs = params.get("attrs") ?? "all";
+    const attributes = attrs === "none" ? [] : attrs === "material" ? ["normalOct", "emission", "pbr", "lobes"] : "all";
     const slot = Number(params.get("slot") ?? 3072);
     const status = document.getElementById("status");
     const fail = (e) => { window.__band = { error: String(e?.stack ?? e) }; status.textContent = String(e); };
@@ -83,7 +85,8 @@
     const lodA = new WgpuLod(splatsA, {
       ...lodOptions,
       bandPageSplats: slot,
-      maxPagedSplats: Math.floor(budgetBytes / BYTES_A_NODE / slot) * slot,
+      maxPagedSplats: Math.ceil(poolNodes / slot) * slot,
+      pagedAttributes: { attributes },
     });
     const meshesA = [];
     const layouts = [];
@@ -130,6 +133,11 @@
 
     function frame() {
       lodA.update(camera, size());
+      // The reference at the paged cut's tau (which breathes with ?auto=1).
+      if (lodB && lodA.stats.tau > 0) {
+        lodB.options.lodErrorTauAuto = false;
+        lodB.options.lodErrorTau = lodA.stats.tau;
+      }
       lodB?.update(camera, size());
       renderer.render(scene, camera);
       splatsA.render(camera);
@@ -179,8 +187,16 @@
       return out;
     }
 
+    // GPU bytes a pool slot's splat takes: core, SH, attributes.
+    function bytesPerNode() {
+      const P = pager();
+      const attrib = P.attribs ? P.attribs.layout.strideWords * 4 : 0;
+      return (P.pools.core.wordsPerSplat + P.pools.sh.wordsPerSplat) * 4 + attrib;
+    }
+
     function stats() {
       const s = pager().bandStats;
+      const BYTES_A_NODE = bytesPerNode();
       const perPiece = meshesA.map((m, k) => ({ piece: pieces[k], cut: m.lastIndices.length }));
       return {
         tau: lodA.stats.tau,
@@ -193,6 +209,8 @@
         residentBytes: s.residentNodes * BYTES_A_NODE,
         poolPages: pager().maxPages,
         poolBytes: pager().maxSplats * BYTES_A_NODE,
+        bytesPerNode: BYTES_A_NODE,
+        attributes: pager().attribs?.layout.specs.map((x) => `${x.name}:${x.components}`) ?? [],
         totals: { pagesRequested: s.pagesRequested, ranges: s.ranges, bytesRead: s.bytesRead, evicted: s.evicted },
         refCut: lodB?.stats.lodSplats ?? null,
       };

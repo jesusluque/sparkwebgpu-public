@@ -340,24 +340,28 @@ export class WgpuSplatPager extends SplatPager {
   ) {
     const base = page * this.pageSplats;
     const core = this.pools.core;
-    const count = packedArray.length / 4;
+    // A decoded page's arrays may be padded past its splats (texture rows):
+    // a slot smaller than 65 536 (WgpuBandPager) takes no more than it holds.
+    const count = Math.min(packedArray.length / 4, this.pageSplats);
+    const packed = packedArray.subarray(0, count * 4);
+    const ext = extArray?.subarray(0, count * 4);
     this.pageCounts[page] = count;
     this.uploaded[page] = this.pageToSplatsChunk[page];
     for (const source of this.sources) source.version += 1;
-    this.mirror(this.packedTexture, base, packedArray);
-    if (extArray) this.mirror(this.extTexture, base, extArray);
+    this.mirror(this.packedTexture, base, packed);
+    if (ext) this.mirror(this.extTexture, base, ext);
     // Every page, so one without attributes clears the previous tenant's.
     this.uploadAttribs(page, count, attribs);
-    if (extArray) {
+    if (ext) {
       // Ext pages arrive as two arrays; the pool interleaves a and b.
       const words = new Uint32Array(count * 8);
       for (let i = 0; i < count; i++) {
-        words.set(packedArray.subarray(4 * i, 4 * i + 4), 8 * i);
-        words.set(extArray.subarray(4 * i, 4 * i + 4), 8 * i + 4);
+        words.set(packed.subarray(4 * i, 4 * i + 4), 8 * i);
+        words.set(ext.subarray(4 * i, 4 * i + 4), 8 * i + 4);
       }
       this.write(core, base, words);
     } else {
-      this.write(core, base, packedArray);
+      this.write(core, base, packed);
     }
 
     const numSh = Math.min(shArrays.length, 3);

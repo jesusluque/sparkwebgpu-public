@@ -201,17 +201,16 @@ export function athcBandPageBytes(
 ): number {
   const ids = sectionsFor(layout, want, true, true);
   const block = layout.blocks[page];
-  const ks = layout.sections
-    .map((s, k) => (ids.includes(s.id) ? k : -1))
-    .filter((k) => k >= 0);
-  const last = block.spans[ks[ks.length - 1]];
-  return last.offset + last.stored - block.spans[ks[0]].offset;
+  return layout.sections.reduce(
+    (n, s, k) => n + (ids.includes(s.id) ? block.spans[k].stored : 0),
+    0,
+  );
 }
 
 /**
  * Band pages `pages` (consecutive) of a paged tree with the streams `streams`
- * (the pool's specs): ONE Range request from the first page's first section
- * through the last page's last section wanted. Each page as a kind-2 ATHV
+ * (the pool's specs): one Range request a tier wanted, each from the first
+ * page's first section of the tier through the last page's last. Each page as a kind-2 ATHV
  * page of its tree sections (CORE, SHRS, LODE, OCCL, TREE) for the loader
  * worker, and its streams as attribute columns. `bytes`: what was read.
  */
@@ -223,6 +222,8 @@ export async function fetchAthcBandPages(
   keepLinear: boolean,
 ): Promise<{
   bytes: number;
+  /** Range requests made (one a tier wanted). */
+  ranges: number;
   pages: { page: number; bytes: Uint8Array; streams: AttribPool | null }[];
 }> {
   for (let k = 1; k < pages.length; k++) {
@@ -235,29 +236,39 @@ export async function fetchAthcBandPages(
   const picks = layout.sections
     .map((section, k) => ({ section, k }))
     .filter(({ section }) => ids.includes(section.id));
-  const firstBlock = layout.blocks[pages[0]];
-  const lastBlock = layout.blocks[pages[pages.length - 1]];
-  const start = firstBlock.spans[picks[0].k].offset;
-  const lastSpan = lastBlock.spans[picks[picks.length - 1].k];
-  const { data } = await readRange(
-    options,
-    start,
-    lastSpan.offset + lastSpan.stored - start,
+  // The file is laid out by tier (athc_pages.rs): a tier's sections of
+  // consecutive pages are one run, one Range request a tier wanted.
+  const tiers = [...new Set(picks.map(({ section }) => section.tier))];
+  const runs = await Promise.all(
+    tiers.map(async (tier) => {
+      const ks = picks.filter((p) => p.section.tier === tier).map((p) => p.k);
+      const first = layout.blocks[pages[0]].spans[ks[0]];
+      const last =
+        layout.blocks[pages[pages.length - 1]].spans[ks[ks.length - 1]];
+      const start = first.offset;
+      const { data } = await readRange(
+        options,
+        start,
+        last.offset + last.stored - start,
+      );
+      return { ks, start, data };
+    }),
   );
+  const at = (k: number, span: { offset: number; stored: number }) => {
+    const run = runs.find((r) => r.ks.includes(k)) as (typeof runs)[number];
+    return run.data.subarray(
+      span.offset - run.start,
+      span.offset - run.start + span.stored,
+    );
+  };
   const out = [];
   for (const page of pages) {
     const block = layout.blocks[page];
-    const parts = picks.map(({ section, k }) => {
-      const span = block.spans[k];
-      return {
-        section,
-        stored: data.subarray(
-          span.offset - start,
-          span.offset - start + span.stored,
-        ),
-        raw: span.raw,
-      };
-    });
+    const parts = picks.map(({ section, k }) => ({
+      section,
+      stored: at(k, block.spans[k]),
+      raw: block.spans[k].raw,
+    }));
     const tree = parts.filter((p) => TREE_SECTIONS.has(p.section.id));
     const rest = parts.filter((p) => !TREE_SECTIONS.has(p.section.id));
     const bytes = athvSectionsPage(
@@ -276,7 +287,11 @@ export async function fetchAthcBandPages(
         : null,
     });
   }
-  return { bytes: data.length, pages: out };
+  return {
+    bytes: runs.reduce((n, r) => n + r.data.length, 0),
+    ranges: runs.length,
+    pages: out,
+  };
 }
 
 /**

@@ -1039,6 +1039,8 @@ fn write_v3_impl(
     let mut data = Vec::new();
     let mut entries = Vec::new();
     let mut at = data_start;
+    // A paged tree's sections, held back to be laid out by tier (below).
+    let mut held: Vec<Vec<Vec<u8>>> = Vec::new();
     for &(kind, level, first, block) in &blocks {
         let mut spans = Vec::new();
         let begin = data.len();
@@ -1078,12 +1080,43 @@ fn write_v3_impl(
             };
             let stored = if compression == COMPRESSION_GZIP { gzip(&encoded) } else { encoded };
             spans.push(SectionSpan { offset: at + (data.len() - begin) as u64, stored: stored.len() as u32, raw: raw.len() as u32 });
+            if paged {
+                if held.len() < entries.len() + 1 {
+                    held.push(Vec::new());
+                }
+                held[entries.len()].push(stored);
+                continue;
+            }
             data.extend_from_slice(&stored);
+        }
+        if paged {
+            entries.push(BlockEntry { kind, level, first, n: block.n as u32, sphere: sphere_of(block), spans });
+            continue;
         }
         let end = aligned((data.len() - begin) as u64) as usize + begin;
         data.resize(end, 0);
         at = data_start + data.len() as u64;
         entries.push(BlockEntry { kind, level, first, n: block.n as u32, sphere: sphere_of(block), spans });
+    }
+    // A paged tree's data by tier: every page's tier-1 sections, page after
+    // page, then every page's tier 2, then tier 3. A run of consecutive
+    // pages is then one Range request a tier (a page's own sections of a
+    // tier stay contiguous), and a reader of tier 1 never reads the rest.
+    if paged {
+        for tier in 1..=3 {
+            for (b, e) in entries.iter_mut().enumerate() {
+                for (k, s) in sections.iter().enumerate() {
+                    if s.tier.clamp(1, 3) != tier {
+                        continue;
+                    }
+                    let stored = std::mem::take(&mut held[b][k]);
+                    e.spans[k].offset = data_start + data.len() as u64;
+                    data.extend_from_slice(&stored);
+                }
+            }
+        }
+        let end = aligned(data.len() as u64) as usize;
+        data.resize(end, 0);
     }
 
     let mut out = Vec::with_capacity(data_start as usize + data.len());

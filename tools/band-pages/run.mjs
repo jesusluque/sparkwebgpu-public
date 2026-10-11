@@ -1,10 +1,11 @@
-// node tools/band-pages/run.mjs <out.json> [query] [--sweep N]
+// node tools/band-pages/run.mjs <out.json> [query] [--sweep N | --jump]
 // Drives examples/webgpu/band-pages.html (thread CK): athenea's six t42
 // pieces as band-paged trees against the same files decoded whole.
 //   far    athenea's CameraFar at 393x695 (a phone in portrait), cold start
-//   near   /World/Camera at 1920x1080, a jump from far
-//   sweep  far to near at 1920x1080 in N steps
-//   back   near to far at 393x695 (the pool lets the fine pages go)
+//   --sweep N (default 6): far to near (/World/Camera) at 1920x1080 in N
+//            steps, then back to far
+//   --jump:  far, near at 1920x1080 at once, far, near again (with a pool
+//            under the near view's needs: evictions and refetches)
 // Serve the repo and the .athc with tools/validate-corvette/serve.mjs
 // (VALIDATE_PORT, R2_DIR = the folder of <piece>.athc).
 import fs from "node:fs";
@@ -46,7 +47,10 @@ page.on("console", (m) => {
   if (m.type() === "error" || m.type() === "warning")
     log.push(`${m.type()}: ${m.text()}`);
 });
-page.on("pageerror", (e) => log.push(`pageerror: ${e.message}`));
+page.on("pageerror", (e) => {
+  console.log(`pageerror: ${e.stack ?? e.message}`, log.join("\n"));
+  process.exit(1);
+});
 const port = process.env.VALIDATE_PORT ?? 8147;
 const t0 = Date.now();
 console.log("loading");
@@ -78,6 +82,9 @@ if (err) {
   process.exit(1);
 }
 console.log(`loaded in ${(Date.now() - t0) / 1000} s`);
+const first = await page.evaluate(() => window.__band.stats());
+console.log(`pool ${first.poolPages} pages`);
+void `${first.poolPages} pages, ${first.bytesPerNode} B a node: ${first.attributes.join(" ")}`;
 const result = { query, loadS: (Date.now() - t0) / 1000, runs: [], log };
 async function step(name, v, compare = true) {
   const r = await page.evaluate(
@@ -99,20 +106,36 @@ async function step(name, v, compare = true) {
     ? c.cuts.reduce((n, x) => n + x.onlyPaged + x.onlyFull, 0)
     : "-";
   console.log(
-    `${name}: cut ${s.cut} (ref ${s.refCut}) needed ${s.neededPages}p/${s.neededNodes} resident ${s.residentPages}p/${s.residentNodes} (${(s.residentNodes / Math.max(1, s.cut)).toFixed(2)}x cut, ${(s.residentBytes / 1e6).toFixed(1)} MB) ` +
+    `${name}: tau ${s.tau.toFixed(3)} ${s.bytesPerNode} B/node, cut ${s.cut} (ref ${s.refCut}) needed ${s.neededPages}p/${s.neededNodes} resident ${s.residentPages}p/${s.residentNodes} (${(s.residentNodes / Math.max(1, s.cut)).toFixed(2)}x cut, ${(s.residentBytes / 1e6).toFixed(1)} MB) ` +
       `settle ${r.settle.ms.toFixed(0)} ms ${r.settle.frames} frames, +${r.settle.pagesRequested} pages in ${r.settle.ranges} ranges ${(r.settle.bytesRead / 1e6).toFixed(2)} MB, evicted ${r.settle.evicted}; ` +
       `cut diff ${diff}${c?.image ? ` relMSE ${c.image.relMSE.toExponential(2)} max ${c.image.maxDiff.toFixed(4)} ratio ${c.image.ratio.toFixed(4)}` : ""}`,
   );
 }
-await step("far 393x695", at(0, 393, 695));
-await step("near 1920x1080 (jump)", at(1, 1920, 1080));
-await step("far 393x695 (jump back)", at(0, 393, 695));
-for (let k = 0; k <= steps; k++) {
-  await step(
-    `sweep ${k}/${steps} 1920x1080`,
-    at(k / steps, 1920, 1080),
-    k === 0 || k === steps,
+const mode = flags.includes("--jump") ? "jump" : "sweep";
+await step("far 393x695 (cold)", at(0, 393, 695));
+if (mode === "jump") {
+  await step("near 1920x1080 (jump)", at(1, 1920, 1080));
+  await step("far 393x695 (jump back)", at(0, 393, 695));
+  await step("near 1920x1080 (jump again)", at(1, 1920, 1080));
+  // Turned: the camera 1.5 m to its left, looking at the grille end.
+  const side = at(1, 1920, 1080);
+  side.position = side.position.map(
+    (v, i) => v + [-0.7880107, 0, 0.6156615][i] * 1.5,
   );
+  side.target = side.target.map(
+    (v, i) => v + [-0.7880107, 0, 0.6156615][i] * 2.5,
+  );
+  await step("side 1920x1080 (jump)", side);
+  await step("near 1920x1080 (jump back)", at(1, 1920, 1080));
+} else {
+  for (let k = 1; k <= steps; k++) {
+    await step(
+      `sweep ${k}/${steps} 1920x1080`,
+      at(k / steps, 1920, 1080),
+      k === steps || k === 1,
+    );
+  }
+  await step("far 393x695 (back)", at(0, 393, 695));
 }
 fs.writeFileSync(out, JSON.stringify(result, null, 2));
 if (log.length) console.log(log.slice(0, 20).join("\n"));

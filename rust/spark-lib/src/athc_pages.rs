@@ -58,8 +58,9 @@ pub const ROOT_PARENT_ERROR: f32 = 3.0e38;
 /// 1  nodes   2 first node in page order
 /// 3  box lo xyz   6 box hi xyz (f32): holds the spheres a node's need is tested on
 /// 9  largest parent error   10 smallest (f32, world units; a root's 3e38)
-/// 11 the page's first byte (u64, two words)
-/// 13 bytes from there through tier 1's sections, tier 2's, tier 3's
+/// 11 the page's first (tier-1) byte (u64, two words)
+/// 13 the bytes of its tier-1 sections, tier-2's, tier-3's (the file is laid
+///    out by tier: each a run of its own)
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,10 +116,17 @@ impl PageRow {
 
     /// The page's byte ranges from its block's entry: where it starts, and
     /// the bytes through each tier's last section.
+    ///
+    /// A paged file lays its data out by tier (`write_v3_paged`): a page's
+    /// sections of one tier are contiguous, and tier t of consecutive pages
+    /// one run. `offset` is the page's first tier-1 byte, `tier_bytes[t-1]`
+    /// the bytes of its tier-t sections (each a run starting at its first
+    /// section's span).
     pub fn fill_ranges(&mut self, e: &BlockEntry, sections: &[Section]) {
         self.offset = e.spans.first().map_or(0, |s| s.offset);
-        for t in 1..=3 {
-            self.tier_bytes[t - 1] = e.tier_range(sections, t as u32).1 as u32;
+        for t in 1..=3u32 {
+            self.tier_bytes[t as usize - 1] =
+                sections.iter().zip(&e.spans).filter(|(s, _)| s.tier.clamp(1, 3) == t).map(|(_, sp)| sp.stored).sum();
         }
     }
 
@@ -630,7 +638,7 @@ pub fn check_paged(pages: &[AthcBlock], rows: &[PageRow]) -> Result<Vec<u32>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::athc::{ln_scale, pack_halves, AthcFile, AthcHeader, ExtraHeader};
     use crate::athc_lod_cut::NodeBounds;
@@ -789,6 +797,28 @@ mod tests {
         assert!(e >= nb.iter().map(|b| b.eps).fold(0.0, f32::max));
         assert!(r > 0.3, "{r}");
         assert_eq!(paged.rows[0].eps_max, ROOT_PARENT_ERROR);
+    }
+
+    /// A small paged tree written as v3 (gzip, byte planes), for decoder tests.
+    pub(crate) fn sample_paged_file() -> Vec<u8> {
+        use crate::athc_v3::{write_v3_paged, COMPRESSION_GZIP, ENCODING_BYTE_PLANES};
+        let (b, parent, start, size) = tree(300);
+        let nb = bounds(&b, &parent, &size);
+        let page = her_pages(&parent, &nb, &start, 40);
+        let ids: Vec<u32> = (0..b.n as u32).collect();
+        let mut b = b;
+        b.sh = vec![0; b.n];
+        let input = PageInput { block: &b, parent: &parent, page: &page, bounds: &nb, ids: &ids, first_leaf: &start, sh_words: 1, page_box: PageBox::Parents };
+        let paged = pack_pages(&input).unwrap();
+        let file = AthcFile {
+            header: AthcHeader { flags: crate::athc::FLAG_PAGED | crate::athc::FLAG_NODE_COVERAGE, bounds_min: [0.0; 3], bounds_max: [3.0, 0.0, 0.0], ..Default::default() },
+            extra: ExtraHeader::default(),
+            levels: Vec::new(),
+            starts: Vec::new(),
+            chunks: paged.pages,
+            occlusion_codebook: Vec::new(),
+        };
+        write_v3_paged(&file, &paged.rows, COMPRESSION_GZIP, &|_| ENCODING_BYTE_PLANES, None, None).unwrap().0
     }
 
     #[test]

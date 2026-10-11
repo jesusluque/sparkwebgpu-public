@@ -482,9 +482,8 @@ without reading its nodes (`lodPageInfo`: band, nodes, first;
 - every block is a page (block kind 2, `first` its first node in page
   order); no levels, no starts, `chunks` the pages, `chunkSplats` the
   largest page;
-- every node, leaves and merges, with all its sections (a page is one
-  Range request for any tier: tier 1 is `CORE`, `SHRS`, `LODE`, `OCCL`,
-  `TREE`); the merges' `LODE` are athenea's bounded errors over her whole
+- every node, leaves and merges, with all its sections (tier 1 is `CORE`,
+  `SHRS`, `LODE`, `OCCL`, `TREE`); the merges' `LODE` are athenea's bounded errors over her whole
   tree (as `--lod-errors`), a leaf's 0; the merges turned so their third
   axis is the normal (`orient_merged`, what the decoder does to a
   producer's coverage), stored as the decoder will read them;
@@ -510,8 +509,16 @@ without reading its nodes (`lodPageInfo`: band, nodes, first;
 0  band (athenea's bandOf of the largest parent error)   1 nodes   2 first node
 3  box lo xyz   6 box hi xyz (f32)
 9  largest parent error   10 smallest (f32; a root's 3e38)
-11 the page's first byte (u64)   13 bytes through tier 1, tier 2, tier 3
+11 the page's first byte (u64)   13 the bytes of its tier 1, tier 2, tier 3
 ```
+
+The data is laid out BY TIER, not page by page: every page's tier-1
+sections, page after page, then every page's tier 2, then tier 3 (no page
+alignment in between). A page's sections of one tier are contiguous, so a
+run of consecutive pages is one Range request a tier, and a reader of tier
+1 alone never reads a byte of the material or the transfer. (Page by page,
+a Range over pages p..q read q-p pages' transfers in between: on the six
+t42 pieces a tier-1 reader fetched 74 MB for the near view instead of 12.)
 
 The table is recomputed from the nodes as the traversal reads them (the
 LODE words, f16 rounded up: within 0.3 % of athenea's but where the packer

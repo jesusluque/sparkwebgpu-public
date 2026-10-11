@@ -72,7 +72,10 @@ export interface WgpuLodOptions {
   /**
    * tau that breathes with a budget (thread CG, Nanite-style), with
    * lodErrorTau > 0: a detail scale s in [min, 1] divides tau (the cut
-   * coarsens under pressure, never finer than lodErrorTau). Every
+   * coarsens under pressure, never finer than lodErrorTau). With athenea's
+   * band pages (WgpuBandPager) the pool's budget is met at once instead:
+   * tau is at least the smallest whose needed pages fit the pool (from the
+   * page table), and the scale answers the frame time alone. Every
    * intervalMs at most, s x 0.97 when the frame time (an EMA of update()'s
    * interval) passes frameMs or the page pool is fuller than `high`, s x 1.01
    * when the pool is under `low` and the frame time under 0.85 frameMs;
@@ -590,18 +593,17 @@ export class WgpuLod {
     let tau = o.lodErrorTau;
     if (tau > 0 && o.lodErrorTauAuto) {
       const pager = this.pager;
-      // A band pager: how full its needed set would make the pool.
-      const fill = pager
-        ? pager instanceof WgpuBandPager
-          ? pager.neededFill
-          : pager.pagesInUse / pager.maxPages
-        : null;
+      // A band pager fits its budget by the page table at once (tauToFit);
+      // the controller then answers the frame time alone.
+      const band = pager instanceof WgpuBandPager;
+      const fill = pager && !band ? pager.pagesInUse / pager.maxPages : null;
       this.tauController.frame(
         performance.now(),
         fill,
         o.lodErrorTauAuto === true ? {} : o.lodErrorTauAuto,
       );
       tau /= this.tauController.scale;
+      if (band) tau = Math.max(tau, pager.tauToFit());
     }
     this.stats.tau = tau;
     const errorLimit = tau > 0 ? pixelScaleLimit * tau : 0;
@@ -1050,6 +1052,7 @@ export class WgpuLod {
           splats: m.splats,
           eye: [eye.x, eye.y, eye.z],
           limit: limit / (m.lodScale ?? 1),
+          unit: this.pixelAngle / (m.lodScale ?? 1),
         });
       }
       pager.setViews(views);

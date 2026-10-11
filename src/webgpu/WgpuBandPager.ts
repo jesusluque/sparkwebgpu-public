@@ -241,6 +241,38 @@ export interface BandView {
   eye: ArrayLike<number>;
   /** errorLimit / lodScale. */
   limit: number;
+  /** The limit at tau 1 (a pixel in the traversal's angle units / lodScale). */
+  unit?: number;
+}
+
+/**
+ * The smallest tau whose needed set fits `capacity` pages: a page is needed
+ * while tau < epsMax / (max(dist, near) unit), so the needed set at tau is
+ * the pages over it; tau fits at the (capacity - roots + 1)-th largest
+ * threshold. 0 when everything fits.
+ */
+export function bandTauToFit(
+  meshes: readonly {
+    rows: readonly AthcPageRow[];
+    eye: ArrayLike<number>;
+    unit: number;
+  }[],
+  capacity: number,
+): number {
+  const t: number[] = [];
+  for (const m of meshes) {
+    if (!(m.unit > 0)) continue;
+    m.rows.forEach((row, p) => {
+      if (p === 0) return;
+      t.push(
+        row.epsMax / Math.max(pageDistance(row, m.eye), BAND_NEAR) / m.unit,
+      );
+    });
+  }
+  const room = capacity - meshes.length;
+  if (t.length <= room) return 0;
+  t.sort((a, b) => b - a);
+  return t[Math.max(0, room)] * (1 + 1e-6);
 }
 
 /** The pool of athenea's band pages (see the module). */
@@ -295,6 +327,19 @@ export class WgpuBandPager extends WgpuSplatPager {
   /** The views of the next plan: one per drawn band-paged mesh. */
   setViews(views: BandView[]) {
     this.views = views;
+  }
+
+  /**
+   * The smallest tau whose needed set fits the pool, for the last views
+   * (bandTauToFit): what tau breathes to when the budget does not fit.
+   */
+  tauToFit(): number {
+    const meshes = [];
+    for (const v of this.views) {
+      const t = this.tables.get(v.splats);
+      if (t && v.unit) meshes.push({ rows: t.rows, eye: v.eye, unit: v.unit });
+    }
+    return bandTauToFit(meshes, this.maxPages);
   }
 
   private pageBytes(splats: PagedSplats) {
@@ -369,13 +414,13 @@ export class WgpuBandPager extends WgpuSplatPager {
     const entries = pages.map((chunk) => ({ splats, chunk }));
     this.fetchers.push(...entries);
     const s = this.bandStats;
-    s.ranges += 1;
     s.pagesRequested += pages.length;
     splats
       .fetchDecodeBandPages(pages)
       .then(
-        ({ bytes, pages: decoded }) => {
+        ({ bytes, ranges, pages: decoded }) => {
           s.bytesRead += bytes;
+          s.ranges += ranges;
           if (
             splats.abortController.signal.aborted ||
             !entries.every((e) => this.fetchers.includes(e))

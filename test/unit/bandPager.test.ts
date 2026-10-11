@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AthcPageRow } from "../../src/athc";
 import {
   type BandMesh,
+  bandTauToFit,
   pageNeeded,
   planBand,
 } from "../../src/webgpu/WgpuBandPager";
@@ -126,5 +127,23 @@ describe("band pages (athenea's error-band paging)", () => {
       100,
     );
     expect(coming.evictable.map((e) => e.page)).toEqual([3]);
+  });
+
+  it("finds the smallest tau whose needed pages fit the pool", () => {
+    const eye = [2, 0.15, 0];
+    const unit = 0.001;
+    // At tau 1 every page is needed (8 with the root).
+    const all = planBand([mesh(eye, unit)], 100);
+    expect(all.neededPages).toBe(8);
+    expect(bandTauToFit([{ rows, eye, unit }], 8)).toBe(0);
+    for (const capacity of [2, 4, 6, 7]) {
+      const tau = bandTauToFit([{ rows, eye, unit }], capacity);
+      expect(tau).toBeGreaterThan(1);
+      const plan = planBand([mesh(eye, unit * tau)], 100);
+      expect(plan.neededPages).toBeLessThanOrEqual(capacity);
+      // A hair finer and it would not fit.
+      const finer = planBand([mesh(eye, unit * tau * 0.999)], 100);
+      expect(finer.neededPages).toBeGreaterThan(capacity);
+    }
   });
 });

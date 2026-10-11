@@ -345,7 +345,7 @@ export class PagedSplats implements SplatSource {
       throw new Error("PagedSplats: not a paged .athc tree");
     }
     const kept = this.keptSpecs() ?? [];
-    const { bytes, pages } = await fetchAthcBandPages(
+    const { bytes, ranges, pages } = await fetchAthcBandPages(
       paging.layout as AthcV3Layout,
       chunks,
       this.fetchOptions(),
@@ -358,7 +358,7 @@ export class PagedSplats implements SplatSource {
         data: await this.decodePage(p.bytes, p.streams, p.page, null),
       })),
     );
-    return { bytes, pages: decoded };
+    return { bytes, ranges, pages: decoded };
   }
 
   async fetchDecodeChunk(chunk: number) {

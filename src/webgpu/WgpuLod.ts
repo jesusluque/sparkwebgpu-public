@@ -825,7 +825,7 @@ export class WgpuLod {
         // A paged .athc v3's codebook is in its tables.
         const { layout } = await splats.athcLayoutPromise;
         const v3 = layout as {
-          occlusionCodebook?: number[];
+          occlusionCodebook?: ArrayLike<number>;
           header: { boundsMin: number[]; boundsMax: number[] };
         };
         if (v3.occlusionCodebook?.length) {

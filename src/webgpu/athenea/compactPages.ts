@@ -918,7 +918,16 @@ export class CompactBandStreamer {
         });
       }
     }
+    // The asset's tables are on the GPU (the pool's buffer, copied on a
+    // resize) and in the WASM: its arrays go (thread CU: ~0.9 MB held).
+    this.assetOcclusion = occlusion !== null;
+    if (asset) {
+      (this.options as { asset?: CompactAssetTables }).asset = undefined;
+    }
   }
+
+  /** The asset table had an occlusion codebook (kept past init). */
+  private assetOcclusion = false;
 
   /** Fetching or landed pages not yet in the pool. */
   get busy() {
@@ -2205,7 +2214,8 @@ export class CompactBandStreamer {
    */
   private pruning() {
     const v3 = this.tablesV3;
-    const occlusion = (this.options.asset?.occlusion.length ?? 0) > 0;
+    const occlusion =
+      this.assetOcclusion || (this.options.asset?.occlusion.length ?? 0) > 0;
     return (
       (v3 && this.options.backCull !== false) ||
       (v3 && occlusion && this.options.occlusion === true)
@@ -2444,6 +2454,7 @@ export async function openCompactPiece(
   name = url,
 ): Promise<CompactPiece> {
   const { layout, prefix } = await readAthcLayout({ url });
+  shareOcclusionCodebook(layout as { occlusionCodebook?: ArrayLike<number> });
   return {
     name,
     layout: layout as AthcV3Layout,
@@ -2453,6 +2464,29 @@ export async function openCompactPiece(
     url:
       typeof location !== "undefined" ? new URL(url, location.href).href : url,
   };
+}
+
+/** The occlusion codebooks the pieces' layouts hold, one of each. */
+const occlusionCodebooks: Uint32Array[] = [];
+
+/**
+ * A layout's occlusion codebook as one typed array the pieces with the same
+ * share (thread CU: the asset's, as a JS array of numbers in each of a car's
+ * nine layouts, was 4.3 MB of the page's heap). WgpuLod reads it with
+ * `new Uint32Array(...)` as before.
+ */
+function shareOcclusionCodebook(layout: {
+  occlusionCodebook?: ArrayLike<number>;
+}) {
+  const book = layout.occlusionCodebook;
+  if (!book || book instanceof Uint32Array) return;
+  const words = Uint32Array.from(book);
+  const same = occlusionCodebooks.find(
+    (b) => b.length === words.length && b.every((v, i) => v === words[i]),
+  );
+  if (!same && occlusionCodebooks.length >= 8) occlusionCodebooks.shift();
+  if (!same) occlusionCodebooks.push(words);
+  layout.occlusionCodebook = same ?? words;
 }
 
 /**

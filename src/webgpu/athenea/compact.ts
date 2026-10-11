@@ -869,7 +869,12 @@ export class CompactRelitPath {
     }
     // The same cut again (a LoD traversal of an unmoved eye): nothing to
     // upload, and a still frame stays still (no shade).
-    if (this.listCopy && sameWords(this.listCopy, indices)) return;
+    if (this.listCopy && sameWords(this.listCopy, indices)) {
+      // An owned list replaces the kept one (thread CU: the caller recycles
+      // the old; keeping it held two copies of the cut).
+      if (owned) this.listCopy = indices;
+      return;
+    }
     this.listCopy = owned ? indices : indices.slice();
     this.listVersion += 1;
     const need = (this.projWords + indices.length) * 4;

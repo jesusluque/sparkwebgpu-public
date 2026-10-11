@@ -1310,6 +1310,22 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     // a G over the merge's core, does not (thread CJ: a far fender's
     // coverage 0.63 against the leaves' 0.85, with the mass ratio 0.86).
     let capped = flag("--mass-capped");
+    // Both opacities (thread CL): a tree with `coverageMass` keeps it as each
+    // merge's second opacity, held at 0.99 (v3 section LODM), beside the
+    // stored one; the player draws a merge at it while the merge is under
+    // `opacitySwitchPx` on screen (sub-pixel merges composite as their
+    // mass), at the stored coverage above. `--no-lod-mass` leaves it out.
+    let lod_mass: Option<Vec<f32>> =
+        if !capped && !flag("--mass-coverage") && !flag("--no-lod-mass") && prim.get("athenea:splat:coverageMass").is_some() {
+            let m = prim.floats(&["athenea:splat:coverageMass"])?;
+            (m.len() == total).then(|| {
+                (0..total)
+                    .map(|k| if has_kids[k] && m[k].is_finite() { m[k].clamp(1.01 / 255.0, 0.99) } else { 0.0 })
+                    .collect()
+            })
+        } else {
+            None
+        };
     if capped {
         let mass_ratio = if prim.get("athenea:splat:coverageMass").is_some() {
             prim.floats(&["athenea:splat:coverageMass"])?
@@ -1476,6 +1492,14 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
         };
         packed.block.occlusion = old.iter().map(|&o| if in_tree[o as usize] < entries { in_tree[o as usize] + 1 } else { 0 }).collect();
         eprintln!("occlusion masks: {} entries", entries);
+    }
+    if let Some(m) = &lod_mass {
+        let in_tree: Vec<f32> = match &perm {
+            Some(order) => order.iter().map(|&o| m[o as usize]).collect(),
+            None => m.clone(),
+        };
+        packed.block.lod_mass = old.iter().map(|&o| in_tree[o as usize].to_bits()).collect();
+        eprintln!("second opacities (coverageMass held at 0.99): {} merges", in_tree.iter().filter(|&&v| v > 0.0).count());
     }
     // `--pages`: her error-band pages (`decimate --tree-pages`), every node
     // of the tree in the file page by page (athc_pages).

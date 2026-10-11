@@ -114,6 +114,7 @@ export type AthcSection = {
     | "LODS"
     | "LODE"
     | "OCCL"
+    | "LODM"
     | "TREE"
     | "SKIN"
     | "MATL"
@@ -188,7 +189,15 @@ export function isAthcPaged(layout: AnyAthcLayout): boolean {
 }
 
 /** Sections a band page hands the loader worker (the tree's own). */
-const TREE_SECTIONS = new Set(["CORE", "SHRS", "LODS", "LODE", "OCCL", "TREE"]);
+const TREE_SECTIONS = new Set([
+  "CORE",
+  "SHRS",
+  "LODS",
+  "LODE",
+  "OCCL",
+  "LODM",
+  "TREE",
+]);
 
 /**
  * Bytes a band page fetch reads for `want`: from its first byte through the
@@ -211,7 +220,7 @@ export function athcBandPageBytes(
  * Band pages `pages` (consecutive) of a paged tree with the streams `streams`
  * (the pool's specs): one Range request a tier wanted, each from the first
  * page's first section of the tier through the last page's last. Each page as a kind-2 ATHV
- * page of its tree sections (CORE, SHRS, LODE, OCCL, TREE) for the loader
+ * page of its tree sections (CORE, SHRS, LODE, OCCL, LODM, TREE) for the loader
  * worker, and its streams as attribute columns. `bytes`: what was read.
  */
 export async function fetchAthcBandPages(
@@ -414,6 +423,9 @@ export function athcNeeds(
     // athenea's occlusion indices (levels and chunks alike): the traversal's.
     case "OCCL":
       return true;
+    // The merged nodes' second opacities (generate's opacity switch). A
+    // chunk's are 0: see sectionsFor.
+    case "LODM":
     // A paged tree's children (athc_pages.rs): the traversal's.
     case "TREE":
       return true;
@@ -811,7 +823,7 @@ function sectionsFor(
       (id) =>
         athcNeeds(layout, id, want) &&
         (core || (id !== "CORE" && id !== "SHRS")) &&
-        (levels || (id !== "LODS" && id !== "LODE")),
+        (levels || (id !== "LODS" && id !== "LODE" && id !== "LODM")),
     );
 }
 

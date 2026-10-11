@@ -501,6 +501,10 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         one(&mut all.shadow_bits, &root.shadow_bits);
         one(&mut all.curvature, &root.curvature);
         one(&mut all.skin, &root.skin);
+        // No second opacity of its own (the copied row was its first root's).
+        if !all.lod_mass.is_empty() {
+            all.lod_mass[i] = 0;
+        }
         // Its bounds: the roots' largest error, its sphere round theirs, no cone.
         let c = [all.positions[i * 4], all.positions[i * 4 + 1], all.positions[i * 4 + 2]];
         let mut eps = 0.0f32;
@@ -906,7 +910,9 @@ pub(crate) mod tests {
     #[test]
     fn a_paged_file_comes_back_from_v3_with_its_table() {
         use crate::athc_v3::{parse_v3, read_v3, write_v3_paged, COMPRESSION_GZIP, ENCODING_BYTE_PLANES};
-        let (b, parent, start, size) = tree(300);
+        let (mut b, parent, start, size) = tree(300);
+        // A second opacity on every merge (LODM), none on the leaves.
+        b.lod_mass = (0..b.n).map(|k| if size[k] > 1 { (0.5 + 0.001 * k as f32).to_bits() } else { 0 }).collect();
         let nb = bounds(&b, &parent, &size);
         let page = her_pages(&parent, &nb, &start, 40);
         let ids: Vec<u32> = (0..b.n as u32).collect();
@@ -940,7 +946,13 @@ pub(crate) mod tests {
                 assert!(a.lod_error == b.lod_error || a.lod_error.is_empty() && b.lod_error.iter().all(|&w| w == 0));
                 assert_eq!(a.positions, b.positions);
                 assert_eq!(a.tail, b.tail);
+                if !a.lod_mass.is_empty() || b.lod_mass.iter().any(|&w| w != 0) {
+                    assert_eq!(a.lod_mass, b.lod_mass);
+                }
             }
+            assert!(layout.header.has(crate::athc::FLAG_LOD_MASS));
+            assert_eq!(layout.sections.iter().find(|s| s.id == crate::athc_v3::SectionId::LodMass).map(|s| s.tier), Some(1));
+            assert!(back.chunks.iter().any(|c| !c.lod_mass.is_empty()));
             check_paged(&back.chunks, &layout.pages).unwrap();
         }
     }

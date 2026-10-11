@@ -261,10 +261,10 @@ export const reflection = {
           "components": 1
         },
         {
-          "name": "pad2",
+          "name": "opacitySwitchPx",
           "offset": 92,
           "size": 4,
-          "scalar": "uint32",
+          "scalar": "float32",
           "components": 1
         },
         {

@@ -569,6 +569,17 @@ impl SplatReceiver for ExtSplatsData {
         self.buffer_dirty = true;
     }
 
+    // A merged node's second opacity (.athc LODM) in a.w's high half, which
+    // an ext source leaves 0 (generate's GEN_OPACITY_SWITCH reads it).
+    fn set_lod_mass(&mut self, base: usize, count: usize, mass: &[f32]) {
+        self.prepare_buffers(base, count);
+        for i in 0..count {
+            let w = &mut self.buffer_a[i * 4 + 3];
+            *w = (*w & 0xffff) | ((half::f16::from_f32(mass[i].max(0.0)).to_bits() as u32) << 16);
+        }
+        self.buffer_dirty = true;
+    }
+
     fn set_rgb(&mut self, base: usize, count: usize, rgb: &[f32]) {
         self.prepare_buffers(base, count);
         for i in 0..count {

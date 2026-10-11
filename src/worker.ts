@@ -798,6 +798,7 @@ function traverseLodTrees({
   errorLimit,
   backCullMin,
   occlusionCull,
+  errorSizeK,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -811,6 +812,8 @@ function traverseLodTrees({
   backCullMin?: number;
   /** Leave out what athenea's occlusion masks hide from the eye. */
   occlusionCull?: boolean;
+  /** The combined cut: P = max(P_err, P_size / k) (lod_tree.rs). */
+  errorSizeK?: number;
   instances: Record<
     string,
     {
@@ -877,6 +880,7 @@ function traverseLodTrees({
     errorLimit,
     backCullMin,
     occlusionCull,
+    errorSizeK,
   ) as {
     culledCount?: number;
     occludedCount?: number;

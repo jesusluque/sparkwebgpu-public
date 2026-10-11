@@ -40,6 +40,10 @@ static const uint GEN_COV_TRANSFORM = 1024u; // covBasis transforms the CovSplat
 static const uint GEN_CULL = 2048u;      // drop splats the draw would skip
 static const uint GEN_LOD_FADE = 65536u; // lodIndices carry a fade in their top byte (LodFade)
 static const uint GEN_ADDITIVE = 131072u; // additive splats (ext, not cov): a.w's high half 1.0
+// A merged node's second opacity (.athc LODM: its mass ratio held at 0.99,
+// in an ext source's a.w high half; 0 none) drawn while the node is at most
+// switchPx on screen; above it, the stored one (the producer's coverage).
+static const uint GEN_OPACITY_SWITCH = 262144u;
 static const uint GEN_LOD_INDEX_MASK = 0x00FFFFFFu;
 // The accumulator's marks in a.w's high half (ext, not covariance; the
 // draw reads them in splat_shape.slang): additive (GEN_ADDITIVE), and a
@@ -57,8 +61,9 @@ struct GenerateParams {
 
     uint srcCount;    // splats in the source
     uint shStride;    // uint4s per splat in sh; 0: all degrees (3 packed, 4 ext)
-    uint pad1;
-    uint pad2;
+    float switchFocalPx; // GEN_OPACITY_SWITCH: the focal length in pixels
+    float switchPx;      // and the size on screen (2 max sigma) under which
+                         // a node takes its second opacity
 
     float4 rotate;          // object to world quaternion
     float4 translateScale;  // xyz translation, w uniform scale
@@ -106,7 +111,18 @@ bool hasFlag(uint f) { return (params.flags & f) != 0u; }
 
 Gsplat readSource(uint index) {
     if (hasFlag(GEN_SRC_EXT)) {
-        return readExtSplat(src[2u * index], src[2u * index + 1u], int(index));
+        Gsplat e = readExtSplat(src[2u * index], src[2u * index + 1u], int(index));
+        if (hasFlag(GEN_OPACITY_SWITCH)) {
+            // Its size on screen: twice its widest sigma over its distance,
+            // both in object space (as the LoD traversal's size / distance).
+            const float second = unpackHalf2x16(src[2u * index].w).y;
+            const float sigma = max(e.scales.x, max(e.scales.y, e.scales.z));
+            const float dist = max(length(e.center - params.viewObject.xyz), 1.0e-6);
+            if (second > 0.0 && 2.0 * sigma * params.switchFocalPx <= params.switchPx * dist) {
+                e.rgba.a = second;
+            }
+        }
+        return e;
     }
     Gsplat s = readPackedSplat(src[index], int(index), params.encoding);
     if (hasFlag(GEN_LOD_OPACITY)) {

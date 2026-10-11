@@ -1060,11 +1060,16 @@ export class WgpuLod {
         const eye = viewPos
           .clone()
           .applyMatrix4(m.object.matrixWorld.clone().invert());
+        // The pool slots the cut draws from: never evicted under it.
+        const cutSlots = new Set<number>();
+        const slot = pager.pageSplats;
+        for (const i of m.lastIndices) cutSlots.add(Math.floor(i / slot));
         views.push({
           splats: m.splats,
           eye: [eye.x, eye.y, eye.z],
           limit: limit / (m.lodScale ?? 1),
           unit: this.pixelAngle / (m.lodScale ?? 1),
+          cutSlots,
         });
       }
       pager.setViews(views);

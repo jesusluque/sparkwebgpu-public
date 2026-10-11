@@ -76,7 +76,26 @@ export interface BandMesh<K = unknown> {
   inFlight: (page: number) => boolean;
   /** Pages (other than itself) a resident page's nodes have children in. */
   children: (page: number) => readonly number[] | undefined;
+  /**
+   * Resident pages holding a node of the current cut (never evicted: the
+   * dependency rule then keeps their ancestors' pages too). Default none.
+   */
+  inCut?: (page: number) => boolean;
 }
+
+/** What the pool can take, for planBand (the pager's own state). */
+export interface BandRoom {
+  /** Free slots. */
+  free: number;
+  /** Pages fetched or being fetched that are not in the pool yet. */
+  pending: number;
+}
+
+/**
+ * A page needed at limit x BAND_KEEP is not evicted (hysteresis: tau
+ * breathing a little does not swap pages out and back in).
+ */
+export const BAND_KEEP = 0.8;
 
 export interface BandPlan<K = unknown> {
   /** Needed pages of each mesh (by key). */
@@ -97,6 +116,7 @@ export function planBand<K>(
   meshes: readonly BandMesh<K>[],
   capacity: number,
   maxRangeBytes = 8 << 20,
+  room?: BandRoom,
 ): BandPlan<K> {
   const needed = new Map<K, Set<number>>();
   let neededPages = 0;
@@ -134,10 +154,45 @@ export function planBand<K>(
     needed.set(m.key, set);
   }
   missing.sort((a, b) => b.priority - a.priority || a.distance - b.distance);
+  // Evictable: resident, not needed (not even at BAND_KEEP x the limit),
+  // not in the cut, not page 0, no resident child page that stays; highest
+  // index first (finest band first). Never a needed page: a full pool
+  // takes no new page at a needed one's expense.
+  const evictable: BandPlan<K>["evictable"] = [];
+  for (const m of meshes) {
+    const set = needed.get(m.key) as Set<number>;
+    const out: number[] = [];
+    for (let p = m.rows.length - 1; p > 0; p--) {
+      if (set.has(p) || !m.resident(p) || m.inCut?.(p)) continue;
+      if (pageNeeded(m.rows[p], m.eye, m.limit * BAND_KEEP)) continue;
+      out.push(p);
+    }
+    const going = new Set(out);
+    // Children before parents (higher index first): a page stays while a
+    // child page of it stays.
+    for (const p of out) {
+      const kids = m.children(p) ?? [];
+      if (
+        kids.some(
+          (c) => c !== p && (m.inFlight(c) || (m.resident(c) && !going.has(c))),
+        )
+      ) {
+        going.delete(p);
+      }
+    }
+    for (const p of out)
+      if (going.has(p)) evictable.push({ key: m.key, page: p });
+  }
+  // Across meshes: by page index, highest first.
+  evictable.sort((a, b) => b.page - a.page);
   // Within the budget: what is needed and resident (or coming) stays, the
-  // best of the rest fills the free capacity.
-  const room = Math.max(0, capacity - residentNeeded);
-  const chosen = missing.slice(0, room);
+  // best of the rest fills what the pool can take -- its free slots and
+  // the evictable pages, less what is still on its way -- and no more (a
+  // page fetched without a slot would be fetched again and again).
+  const slots = room
+    ? Math.max(0, room.free + evictable.length - room.pending)
+    : Math.max(0, capacity - residentNeeded);
+  const chosen = missing.slice(0, slots);
   // Consecutive chosen pages of a mesh: one Range request, at the place of
   // its best page.
   const byMesh = new Map<BandMesh<K>, Map<number, number>>();
@@ -184,34 +239,6 @@ export function planBand<K>(
     flush();
   }
   const order = requests.map((_, k) => k).sort((a, b) => ranks[a] - ranks[b]);
-  // Evictable: resident, not needed, not page 0, no resident child page
-  // that stays; highest index first (finest band first).
-  const evictable: BandPlan<K>["evictable"] = [];
-  for (const m of meshes) {
-    const set = needed.get(m.key) as Set<number>;
-    const out: number[] = [];
-    for (let p = m.rows.length - 1; p > 0; p--) {
-      if (set.has(p) || !m.resident(p)) continue;
-      out.push(p);
-    }
-    const going = new Set(out);
-    for (const p of out) {
-      const kids = m.children(p) ?? [];
-      // A child page that is resident and not itself going holds nodes
-      // whose parents are here.
-      if (
-        kids.some(
-          (c) => c !== p && (m.inFlight(c) || (m.resident(c) && !going.has(c))),
-        )
-      ) {
-        going.delete(p);
-      }
-    }
-    for (const p of out)
-      if (going.has(p)) evictable.push({ key: m.key, page: p });
-  }
-  // Across meshes: by page index, highest first.
-  evictable.sort((a, b) => b.page - a.page);
   return {
     needed,
     neededPages,
@@ -243,6 +270,8 @@ export interface BandView {
   limit: number;
   /** The limit at tau 1 (a pixel in the traversal's angle units / lodScale). */
   unit?: number;
+  /** Pool pages (slots) holding a node of the current cut. */
+  cutSlots?: ReadonlySet<number>;
 }
 
 /**
@@ -273,6 +302,30 @@ export function bandTauToFit(
   if (t.length <= room) return 0;
   t.sort((a, b) => b - a);
   return t[Math.max(0, room)] * (1 + 1e-6);
+}
+
+/**
+ * athenea's order (Nanite's): tau first, then the requests. Each mesh's
+ * limit raised to the tau whose needed set fits `capacity` (bandTauToFit,
+ * from `unit`, the limit at tau 1), then planBand. Returns the plan and the
+ * tau it fitted (0 when everything fits).
+ */
+export function planBandFitted<K>(
+  meshes: readonly (BandMesh<K> & { unit?: number })[],
+  capacity: number,
+  maxRangeBytes = 8 << 20,
+  room?: BandRoom,
+): { plan: BandPlan<K>; fit: number } {
+  const fit = bandTauToFit(
+    meshes
+      .filter((m) => (m.unit ?? 0) > 0)
+      .map((m) => ({ rows: m.rows, eye: m.eye, unit: m.unit as number })),
+    capacity,
+  );
+  const fitted = meshes.map((m) =>
+    m.unit ? { ...m, limit: Math.max(m.limit, fit * m.unit) } : m,
+  );
+  return { plan: planBand(fitted, capacity, maxRangeBytes, room), fit };
 }
 
 /** The pool of athenea's band pages (see the module). */
@@ -361,23 +414,51 @@ export class WgpuBandPager extends WgpuSplatPager {
 
   /** Plans and starts fetches (in place of SplatPager's chunk queue). */
   driveFetchers() {
-    const meshes: BandMesh<PagedSplats>[] = [];
+    // tau first: the needed set at the views' limits must fit the pool
+    // before anything is asked for, or the pool would take pages only to
+    // drop needed ones (the limits raised to bandTauToFit's).
+    const fit = this.tauToFit();
+    const meshes: (BandMesh<PagedSplats> & { unit?: number })[] = [];
     for (const v of this.views) {
       const t = this.tables.get(v.splats);
       if (!t) continue;
       const kids = this.kids.get(v.splats);
+      const cut = v.cutSlots;
       meshes.push({
         key: v.splats,
         rows: t.rows,
         pageBytes: this.pageBytes(v.splats),
         eye: v.eye,
         limit: v.limit,
+        unit: v.unit,
         resident: (p) => this.getSplatsChunk(v.splats, p) !== undefined,
         inFlight: (p) => this.inFlight(v.splats, p),
         children: (p) => kids?.get(p),
+        inCut: cut
+          ? (p) => {
+              const slot = this.getSplatsChunk(v.splats, p)?.page;
+              return slot !== undefined && cut.has(slot);
+            }
+          : undefined,
       });
     }
-    const plan = planBand(meshes, this.maxPages, this.maxRangeBytes);
+    // A fetched page still waiting for a slot that no view needs any more
+    // is let go (it would hold the pool's room).
+    for (let i = this.fetched.length - 1; i >= 0; i--) {
+      const f = this.fetched[i];
+      const v = this.views.find((w) => w.splats === f.splats);
+      const t = this.tables.get(f.splats);
+      if (!v || !t) continue;
+      const lim = v.unit ? Math.max(v.limit, fit * v.unit) : v.limit;
+      const row = t.rows[f.chunk];
+      if (f.chunk !== 0 && row && !pageNeeded(row, v.eye, lim * BAND_KEEP)) {
+        this.fetched.splice(i, 1);
+      }
+    }
+    const { plan } = planBandFitted(meshes, this.maxPages, this.maxRangeBytes, {
+      free: this.pageFreelist.length,
+      pending: this.fetchers.length + this.fetched.length,
+    });
     this.neededFill = plan.neededPages / this.maxPages;
     const s = this.bandStats;
     s.neededPages = plan.neededPages;
@@ -464,6 +545,9 @@ export class WgpuBandPager extends WgpuSplatPager {
     }
     byPage.set(chunk, [...pages]);
   }
+
+  /** A fetched page without a slot waits (SplatPager.keepUnplaced). */
+  protected keepUnplaced = true;
 
   protected allocateFreeable(): number | undefined {
     const page = super.allocateFreeable();

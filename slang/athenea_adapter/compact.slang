@@ -165,7 +165,7 @@ public struct CompactParams {
     public float4 view1;
     public float4 view2;
     public float4 focal;       ///< pixels: focal x, focal y (negative: rows go down), centre x, centre y
-    public float4 viewport;    ///< width, height
+    public float4 viewport;    ///< width, height; checks: z coatFloor, w debugBits
 };
 
 StructuredBuffer<uint>              compactData;
@@ -794,6 +794,12 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
         }
     }
     o.surface = surface;
+    // Check only (thread CW, CompactPathOptions.coatFloor): the roughnesses
+    // held at least to viewport.z.
+    if (compactParams.viewport.z > 0.0) {
+        o.surface.roughness = max(o.surface.roughness, compactParams.viewport.z);
+        o.surface.lobes.coatRoughness = max(o.surface.lobes.coatRoughness, compactParams.viewport.z);
+    }
     o.cluster = fieldAt(compactParams.cluster, 1u, i);
     o.index = i;
     return o;
@@ -1072,6 +1078,11 @@ bool projectCompact(CompactSplat g, float3 v, uint index, bool sheet, inout floa
     angle = 0.0;
     lod = false;
     float a0 = alpha;
+    // Check only (thread CW, CompactPathOptions.debugBits & 1): a merged
+    // node's LoD opacity held to 1.
+    if ((uint(compactParams.viewport.w) & 1u) != 0u) {
+        a0 = min(a0, 1.0);
+    }
     if (a0 > 1.0) {
         a0 = min(a0 * 4.0 - 3.0, 5.0);
         lod = true;

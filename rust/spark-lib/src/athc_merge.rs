@@ -1249,7 +1249,14 @@ pub fn error_cut_tree(file: &AthcFile, tree: &MergeTree, keep: usize, o: &ErrorO
     }
     let per = file.header.chunk_splats.max(1) as usize;
     let chunks: Vec<AthcBlock> = (0..splats.n).step_by(per).map(|s| splats.slice(s, per.min(splats.n - s))).collect();
-    let mut out = AthcFile { header: kept.header, extra: kept.extra, levels: kept.levels[..levels - 1].to_vec(), starts, chunks };
+    let mut out = AthcFile {
+        header: kept.header,
+        extra: kept.extra,
+        levels: kept.levels[..levels - 1].to_vec(),
+        starts,
+        chunks,
+        occlusion_codebook: kept.occlusion_codebook.clone(),
+    };
     out.header.count = splats.n as u32;
     out.header.chunks = out.chunks.len() as u32;
     out.header.levels = (levels - 1) as u32;

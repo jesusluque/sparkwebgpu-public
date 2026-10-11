@@ -109,6 +109,8 @@ struct LodSplat {
     rho: f16,
     theta: f16,
     cone_axis: u16,
+    /// athenea's occlusion mask: its tree's codebook entry + 1, 0 none.
+    occlusion: u16,
 }
 
 impl LodSplat {
@@ -203,6 +205,71 @@ struct LodTree {
     splats: Rc<RefCell<Vec<LodSplat>>>,
     page_to_chunk: Vec<u32>,
     chunk_to_page: Vec<u32>,
+    /// athenea's occlusion codebook (8 words an entry) and the asset's box.
+    occlusion: Option<(Vec<u32>, [f32; 6])>,
+}
+
+/// Whether node `s` is hidden from `eye` by athenea's occlusion mask
+/// (`decimate --occlusion-mask`): the eye outside the asset's box, and the
+/// four cells toward it on the 16 x 16 octahedral grid (splatCellsOpen's:
+/// octEncode(dir) x 16 - 0.5, the cells clamped, those of weight 0 left out)
+/// all closed in its entry. `dir` from the node toward the eye, in the
+/// asset's own frame (the tree's object space).
+fn occluded(s: &LodSplat, eye: Vec3A, occlusion: &(Vec<u32>, [f32; 6])) -> bool {
+    let (codebook, b) = occlusion;
+    if s.occlusion == 0 {
+        return false;
+    }
+    let entry = (s.occlusion - 1) as usize * 8;
+    if entry + 8 > codebook.len() {
+        return false;
+    }
+    let inside = eye.x >= b[0] && eye.y >= b[1] && eye.z >= b[2] && eye.x <= b[3] && eye.y <= b[4] && eye.z <= b[5];
+    if inside {
+        return false;
+    }
+    let d = eye - s.center();
+    let l1 = d.x.abs() + d.y.abs() + d.z.abs();
+    if l1 <= 1.0e-20 {
+        return false;
+    }
+    let n = d / l1;
+    let p = if n.z >= 0.0 {
+        [n.x, n.y]
+    } else {
+        [(1.0 - n.y.abs()) * if n.x >= 0.0 { 1.0 } else { -1.0 }, (1.0 - n.x.abs()) * if n.y >= 0.0 { 1.0 } else { -1.0 }]
+    };
+    let at = [(p[0] * 0.5 + 0.5) * 16.0 - 0.5, (p[1] * 0.5 + 0.5) * 16.0 - 0.5];
+    let lo = [at[0].floor(), at[1].floor()];
+    let f = [at[0] - lo[0], at[1] - lo[1]];
+    for k in 0..4u32 {
+        let (kx, ky) = ((k & 1) as f32, (k >> 1) as f32);
+        let w = (if kx > 0.0 { f[0] } else { 1.0 - f[0] }) * (if ky > 0.0 { f[1] } else { 1.0 - f[1] });
+        if w <= 0.0 {
+            continue;
+        }
+        let cx = ((lo[0] + kx) as i32).clamp(0, 15) as usize;
+        let cy = ((lo[1] + ky) as i32).clamp(0, 15) as usize;
+        let bit = cy * 16 + cx;
+        if (codebook[entry + (bit >> 5)] >> (bit & 31)) & 1 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// A tree's occlusion codebook (athenea's, 8 words an entry) and the
+/// asset's box (min xyz, max xyz) in the tree's object space.
+#[wasm_bindgen]
+pub fn set_lod_occlusion_codebook(lod_id: u32, codebook: Uint32Array, bounds: &[f32]) -> Result<(), JsValue> {
+    if bounds.len() != 6 {
+        return Err(JsValue::from_str("occlusion bounds: 6 floats"));
+    }
+    STATE.with_borrow_mut(|state| {
+        let tree = state.lod_trees.get_mut(&lod_id).ok_or_else(|| JsValue::from_str("no such LoD tree"))?;
+        tree.occlusion = Some((codebook.to_vec(), bounds.try_into().unwrap()));
+        Ok(())
+    })
 }
 
 struct LodState {
@@ -233,7 +300,7 @@ thread_local! {
     static STATE: RefCell<LodState> = RefCell::new(LodState::new());
 }
 
-fn set_lod_tree_data(state: &mut LodState, lod_id: u32, page_base: u32, _chunk_base: u32, count: u32, lod_tree_data: &Uint32Array, lod_error: Option<&Uint32Array>) {
+fn set_lod_tree_data(state: &mut LodState, lod_id: u32, page_base: u32, _chunk_base: u32, count: u32, lod_tree_data: &Uint32Array, lod_error: Option<&Uint32Array>, lod_occlusion: Option<&Uint32Array>) {
     let lod_tree = state.lod_trees.get(&lod_id).unwrap();
     let mut splats = lod_tree.splats.borrow_mut();
 
@@ -274,6 +341,13 @@ fn set_lod_tree_data(state: &mut LodState, lod_id: u32, page_base: u32, _chunk_b
                 splats[page_base as usize + index as usize + i].set_error([words[2 * i], words[2 * i + 1]]);
             }
         }
+        if let Some(occlusion) = lod_occlusion {
+            let mut words = vec![0u32; chunk as usize];
+            occlusion.subarray(index, index + chunk).copy_to(&mut words);
+            for i in 0..chunk as usize {
+                splats[page_base as usize + index as usize + i].occlusion = words[i].min(u16::MAX as u32) as u16;
+            }
+        }
         index += chunk;
     }
 }
@@ -287,7 +361,7 @@ pub fn new_lod_tree(capacity: u32) -> Result<Object, JsValue> {
         let page_capacity = capacity.div_ceil(65536);
         let page_to_chunk = Vec::with_capacity(page_capacity as usize);
         let chunk_to_page: Vec<u32> = Vec::with_capacity(page_capacity as usize);
-        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page });
+        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None });
         state.next_id += 1;
 
         let result = Object::new();
@@ -307,7 +381,7 @@ pub fn new_shared_lod_tree(orig_lod_id: u32) -> Result<Object, JsValue> {
 
         let new_lod_id = state.next_id;
         state.next_id += 1;
-        state.lod_trees.insert(new_lod_id, LodTree { splats, page_to_chunk, chunk_to_page });
+        state.lod_trees.insert(new_lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None });
 
         let result = Object::new();
         Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(new_lod_id)).unwrap();
@@ -316,7 +390,7 @@ pub fn new_shared_lod_tree(orig_lod_id: u32) -> Result<Object, JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array, lod_error: Option<Uint32Array>) -> Result<Object, JsValue> {
+pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array, lod_error: Option<Uint32Array>, lod_occlusion: Option<Uint32Array>) -> Result<Object, JsValue> {
     STATE.with_borrow_mut(|state| {
         let lod_id = state.next_id;
         let pages = num_splats.div_ceil(65536);
@@ -324,10 +398,10 @@ pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array, lod_error: Option<U
         let splats = Rc::new(RefCell::new(splats));
         let page_to_chunk = (0..pages).collect();
         let chunk_to_page: Vec<u32> = (0..pages).collect();
-        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page });
+        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None });
         state.next_id += 1;
 
-        set_lod_tree_data(state, lod_id, 0, 0, num_splats, &lod_tree, lod_error.as_ref());
+        set_lod_tree_data(state, lod_id, 0, 0, num_splats, &lod_tree, lod_error.as_ref(), lod_occlusion.as_ref());
 
         let result = Object::new();
         Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(lod_id)).unwrap();
@@ -344,10 +418,11 @@ pub fn dispose_lod_tree(lod_id: u32) {
 }
 
 #[wasm_bindgen]
-pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32], counts: &[u32], lod_trees: &Array, lod_errors: Option<Array>) -> Result<Object, JsValue> {
+pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32], counts: &[u32], lod_trees: &Array, lod_errors: Option<Array>, lod_occlusions: Option<Array>) -> Result<Object, JsValue> {
     STATE.with_borrow_mut(|state| {
         for (k, (&lod_id, &page_base, &chunk_base, &count, lod_tree_data)) in izip!(lod_ids, page_bases, chunk_bases, counts, lod_trees.iter()).enumerate() {
             let lod_error = lod_errors.as_ref().map(|a| a.get(k as u32)).filter(|e| !e.is_falsy()).map(Uint32Array::from);
+            let lod_occlusion = lod_occlusions.as_ref().map(|a| a.get(k as u32)).filter(|e| !e.is_falsy()).map(Uint32Array::from);
             let lod_tree = state.lod_trees.get_mut(&lod_id).unwrap();
             let pages = count.div_ceil(65536);
             let base_page = page_base >> 16;
@@ -372,7 +447,7 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
                 }
 
                 let lod_tree_data = Uint32Array::from(lod_tree_data);
-                set_lod_tree_data(state, lod_id, page_base, chunk_base, count, &lod_tree_data, lod_error.as_ref());
+                set_lod_tree_data(state, lod_id, page_base, chunk_base, count, &lod_tree_data, lod_error.as_ref(), lod_occlusion.as_ref());
             }
         }
 
@@ -474,7 +549,7 @@ pub fn traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
-    error_limit: Option<f32>, back_cull_min: Option<f32>,
+    error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
 ) -> anyhow::Result<Object, JsValue> {
     // The error cut (spark-lib athc_lod_cut): a node with bounds is measured
     // by its projected error, P = eps / max(d - rho, near), scaled so that
@@ -510,7 +585,7 @@ pub fn traverse_lod_trees(
         let LodState { lod_trees, frontier, output, touched, touched_set, .. } = state;
         let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
             let lod_tree = lod_trees.get(&lod_id).unwrap();
-            let LodTree { splats, page_to_chunk, chunk_to_page } = &lod_tree;
+            let LodTree { splats, page_to_chunk, chunk_to_page, .. } = &lod_tree;
             let i16 = index * 16;
             let forward = Vec3A::from_slice(&view_to_objects[(i16 + 8)..(i16 + 11)]).normalize().map(|x| -x);
             let origin = Vec3A::from_slice(&view_to_objects[(i16 + 12)..(i16 + 15)]);
@@ -522,6 +597,15 @@ pub fn traverse_lod_trees(
             let cone_dot = cone_dot.min(cone_dot0);
             (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio)
         }).collect();
+        // Each instance's occlusion codebook, when culling by it.
+        let occlusions: Vec<Option<&(Vec<u32>, [f32; 6])>> = lod_ids
+            .iter()
+            .map(|id| if occlusion_cull.unwrap_or(false) { lod_trees.get(id).and_then(|t| t.occlusion.as_ref()) } else { None })
+            .collect();
+        let hidden = |inst: u32, index: u32| -> bool {
+            occlusions[inst as usize].is_some_and(|o| occluded(&instances[inst as usize].1[index as usize], instances[inst as usize].4, o))
+        };
+        let mut occluded_count = 0u32;
 
         let mut num_splats = 0;
         let mut culled_count = 0u32;
@@ -536,6 +620,10 @@ pub fn traverse_lod_trees(
             let root_page = root_pages[inst_index];
             let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
             let root_index = root_page << 16;
+            if hidden(inst_index as u32, root_index) {
+                occluded_count += 1;
+                continue;
+            }
             let pixel_scale = compute_pixel_scale(&splats[root_index as usize], instance);
             frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
             num_splats += 1;
@@ -609,10 +697,16 @@ pub fn traverse_lod_trees(
                 continue;
             }
 
+            let mut hidden_here = 0;
             for child in child_start..child_start + child_count as u32 {
                 let child_chunk = (child >> 16) as usize;
                 let child_page = chunk_to_page[child_chunk];
                 let paged_index = (child_page << 16) | (child & 0xffff);
+                // Occluded from the eye (athenea's mask): gone with its subtree.
+                if hidden(inst_index, paged_index) {
+                    hidden_here += 1;
+                    continue;
+                }
                 let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
                 if pixel_scale <= pixel_scale_limit {
                     // In the cut: drawn, unless a coarse node facing away.
@@ -626,7 +720,8 @@ pub fn traverse_lod_trees(
                 }
             }
 
-            num_splats = new_num_splats;
+            occluded_count += hidden_here;
+            num_splats = new_num_splats - hidden_here as usize;
         }
 
         let output_size = output.len();
@@ -688,6 +783,7 @@ pub fn traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
         Reflect::set(&result, &JsValue::from_str("culledCount"), &JsValue::from(culled_count)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("occludedCount"), &JsValue::from(occluded_count)).unwrap();
         Ok(result)
     })
 }
@@ -736,7 +832,7 @@ pub fn dynamic_traverse_lod_trees(
     cone_fov0s: &[f32], cone_fovs: &[f32],
     // readback: Uint32Array,
     // flag: bool,
-    error_limit: Option<f32>, _back_cull_min: Option<f32>,
+    error_limit: Option<f32>, _back_cull_min: Option<f32>, _occlusion_cull: Option<bool>,
 ) -> anyhow::Result<Object, JsValue> {
     // (The dynamic traversal does not cull.)
     let err_ratio = error_limit.filter(|&e| e > 0.0).map_or(0.0, |e| pixel_scale_limit / e);
@@ -766,7 +862,7 @@ pub fn dynamic_traverse_lod_trees(
         let LodState { lod_trees, .. } = state;
         let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
             let lod_tree = lod_trees.get(&lod_id).unwrap();
-            let LodTree { splats, page_to_chunk, chunk_to_page } = &lod_tree;
+            let LodTree { splats, page_to_chunk, chunk_to_page, .. } = &lod_tree;
             let i16 = index * 16;
             let forward = Vec3A::from_slice(&view_to_objects[(i16 + 8)..(i16 + 11)]).normalize().map(|x| -x);
             let origin = Vec3A::from_slice(&view_to_objects[(i16 + 12)..(i16 + 15)]);

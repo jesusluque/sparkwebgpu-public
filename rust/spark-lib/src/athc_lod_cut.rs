@@ -366,6 +366,52 @@ pub fn athenea_tree_errors(
     nb
 }
 
+/// athenea's occlusion rule (`decimate --occlusion-mask`, the player's): a
+/// node with codebook entry `stored - 1` (0: none) is hidden from `eye` when
+/// the eye is outside the asset's box (min xyz, max xyz) and the four cells
+/// toward it on the 16 x 16 octahedral grid -- splatCellsOpen's:
+/// `octEncode(dir) * 16 - 0.5`, the cells clamped to [0, 15], those of
+/// bilinear weight 0 left out -- are all closed in the entry (bit y * 16 + x,
+/// 1 open). `dir` from the node's centre toward the eye, in the asset's frame.
+/// The traversal (spark-rs lod_tree.rs `occluded`) is the same code.
+pub fn occlusion_hides(codebook: &[u32], stored: u32, bounds: [f32; 6], centre: [f32; 3], eye: [f32; 3]) -> bool {
+    if stored == 0 {
+        return false;
+    }
+    let entry = (stored - 1) as usize * crate::athc::OCCLUSION_WORDS;
+    if entry + crate::athc::OCCLUSION_WORDS > codebook.len() {
+        return false;
+    }
+    if (0..3).all(|k| eye[k] >= bounds[k] && eye[k] <= bounds[3 + k]) {
+        return false;
+    }
+    let d = [eye[0] - centre[0], eye[1] - centre[1], eye[2] - centre[2]];
+    let l1 = d[0].abs() + d[1].abs() + d[2].abs();
+    if l1 <= 1.0e-20 {
+        return false;
+    }
+    let n = d.map(|v| v / l1);
+    let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+    let p = if n[2] >= 0.0 { [n[0], n[1]] } else { [(1.0 - n[1].abs()) * sign(n[0]), (1.0 - n[0].abs()) * sign(n[1])] };
+    let at = [(p[0] * 0.5 + 0.5) * 16.0 - 0.5, (p[1] * 0.5 + 0.5) * 16.0 - 0.5];
+    let lo = [at[0].floor(), at[1].floor()];
+    let f = [at[0] - lo[0], at[1] - lo[1]];
+    for k in 0..4u32 {
+        let (kx, ky) = ((k & 1) as f32, (k >> 1) as f32);
+        let w = (if kx > 0.0 { f[0] } else { 1.0 - f[0] }) * (if ky > 0.0 { f[1] } else { 1.0 - f[1] });
+        if w <= 0.0 {
+            continue;
+        }
+        let cx = ((lo[0] + kx) as i32).clamp(0, 15) as usize;
+        let cy = ((lo[1] + ky) as i32).clamp(0, 15) as usize;
+        let bit = cy * 16 + cx;
+        if (codebook[entry + (bit >> 5)] >> (bit & 31)) & 1 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(feature = "athc")]
 pub use build::*;
 
@@ -774,6 +820,50 @@ mod tests {
         plain.header.flags &= !FLAG_NODE_COVERAGE;
         let m = merged_block(&plain, &tree);
         assert!((first..m.n).any(|i| m.positions[i * 4 + 3] != 0.37));
+    }
+
+    /// athenea's occlusion rule: the four cells toward the eye, all closed.
+    #[test]
+    fn occlusion_reads_the_cells_toward_the_eye() {
+        // Entry 0 all closed, entry 1 open only round +z (octEncode(+z) is the
+        // square's centre: cells 7..8 x 7..8).
+        let mut codebook = vec![0u32; 16];
+        for (x, y) in [(7, 7), (8, 7), (7, 8), (8, 8)] {
+            let bit = y * 16 + x;
+            codebook[8 + (bit >> 5)] |= 1 << (bit & 31);
+        }
+        let b = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let c = [0.0, 0.0, 0.0];
+        assert!(occlusion_hides(&codebook, 1, b, c, [0.0, 0.0, 5.0]), "all closed");
+        assert!(!occlusion_hides(&codebook, 2, b, c, [0.0, 0.0, 5.0]), "open toward +z");
+        assert!(occlusion_hides(&codebook, 2, b, c, [5.0, 0.0, 0.0]), "closed toward +x");
+        assert!(!occlusion_hides(&codebook, 1, b, c, [0.0, 0.0, 0.5]), "the eye inside the box");
+        assert!(!occlusion_hides(&codebook, 0, b, c, [0.0, 0.0, 5.0]), "no index");
+    }
+
+    /// The occlusion section and the codebook through v3, the merged pages
+    /// and the whole-file decoder.
+    #[test]
+    fn occlusion_goes_through_v3_and_the_merged_pages() {
+        let f = fixture("door_occlusion.athc");
+        assert_eq!(f.occlusion_codebook.len(), 256 * 8);
+        assert!(f.levels.iter().map(|(_, b)| b).chain(&f.chunks).all(|b| b.occlusion.len() == b.n));
+        let bytes = crate::athc_v3::write_v3(&f, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let back = crate::athc_v3::read_v3(&bytes).unwrap();
+        assert_eq!(back.occlusion_codebook, f.occlusion_codebook);
+        for ((_, a), (_, b)) in back.levels.iter().zip(&f.levels) {
+            assert_eq!(a.occlusion, b.occlusion);
+        }
+        assert_eq!(back.chunks[0].occlusion, f.chunks[0].occlusion);
+        let layout = crate::athc_v3::parse_v3(&bytes).unwrap();
+        assert_eq!(layout.occlusion_codebook, f.occlusion_codebook);
+        let mut head = f.header.to_bytes().to_vec();
+        head.extend_from_slice(&f.extra.to_bytes());
+        let (tree, pages) = crate::athc::merged_pages_of(&f, &head).unwrap();
+        assert_eq!(pages.len(), 1);
+        let flags = u32::from_le_bytes(pages[0][152..156].try_into().unwrap());
+        assert_ne!(flags & crate::athc::ATHV_OCCLUSION, 0);
+        assert!(tree.merged as usize > f.levels.iter().map(|(_, b)| b.n).sum::<usize>() - 1);
     }
 
     /// athenea's definitions on a hand tree: leaves 0, a merge r |cost|

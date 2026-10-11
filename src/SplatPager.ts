@@ -96,6 +96,8 @@ export class SplatPager {
     lodTree?: Uint32Array;
     /** The LoD error cut's bounds, two words a node (athc_lod_cut.rs). */
     lodError?: Uint32Array;
+    /** athenea's occlusion indices, a word a node (rust athc_lod_cut.rs). */
+    lodOcclusion?: Uint32Array;
   }[];
 
   private readonly fetchers: { splats: PagedSplats; chunk: number }[];
@@ -757,6 +759,7 @@ export class SplatPager {
         numSplats,
         lodTree: extra.lodTree as Uint32Array,
         lodError: extra.lodError as Uint32Array | undefined,
+        lodOcclusion: extra.lodOcclusion as Uint32Array | undefined,
       });
 
       if (isExtResult(data, this.extSplats)) {

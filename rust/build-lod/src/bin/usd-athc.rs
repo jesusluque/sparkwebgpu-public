@@ -1430,10 +1430,31 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
         let rows: Vec<u32> = old.iter().map(|o| kept.binary_search(o).unwrap() as u32).collect();
         packed.block = spark_lib::athc_build::reorder(&packed.block, &rows);
     }
+    // athenea's occlusion masks (`decimate --occlusion-mask`): an index a
+    // gaussian into a codebook of 8-word entries; stored entry + 1 (0: none).
+    let occlusion_index = prim.ints("athenea:splat:occlusionIndex")?;
+    let occlusion_codebook = prim.ints("athenea:splat:occlusionCodebook")?;
+    if !occlusion_index.is_empty() && !flag("--no-occlusion") {
+        if occlusion_index.len() != total || occlusion_codebook.is_empty() || occlusion_codebook.len() % 8 != 0 {
+            bail!("{tree_path}: occlusionIndex of {} for {} gaussians, codebook of {} words", occlusion_index.len(), total, occlusion_codebook.len());
+        }
+        let entries = (occlusion_codebook.len() / 8) as u32;
+        let in_tree: Vec<u32> = match &perm {
+            Some(order) => order.iter().map(|&o| occlusion_index[o as usize]).collect(),
+            None => occlusion_index.clone(),
+        };
+        packed.block.occlusion = old.iter().map(|&o| if in_tree[o as usize] < entries { in_tree[o as usize] + 1 } else { 0 }).collect();
+        eprintln!("occlusion masks: {} entries", entries);
+    }
     let keep: Option<usize> = arg(args, "--keep-splats").map(|v| v.parse()).transpose().context("--keep-splats")?;
     let mut o = ErrorOptions::new(ErrorView::around(packed.bounds_min, packed.bounds_max));
     o.node_coverage = node_coverage;
     let (mut file, import) = levels_from_tree(&packed, &tree, keep, &o, options.chunk_splats)?;
+    if !packed.block.occlusion.is_empty() {
+        file.occlusion_codebook = occlusion_codebook.clone();
+        let with = file.levels.iter().map(|(_, b)| b).chain(&file.chunks).filter(|b| b.occlusion.len() == b.n).count();
+        eprintln!("occlusion: {} of {} blocks carry indices", with, file.levels.len() + file.chunks.len());
+    }
     if flag("--lod-sizes") {
         file = with_lod_sizes(&file, &LodSizeOptions::parse(arg(args, "--lod-size-opts").unwrap_or(""))?);
     }

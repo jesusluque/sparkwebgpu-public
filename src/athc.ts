@@ -113,6 +113,7 @@ export type AthcSection = {
     | "SHRS"
     | "LODS"
     | "LODE"
+    | "OCCL"
     | "SKIN"
     | "MATL"
     | "SHAD"
@@ -268,6 +269,9 @@ export function athcNeeds(
       return true;
     // The levels' LoD error cut bounds (athc_lod_cut.rs): the traversal's.
     case "LODE":
+      return true;
+    // athenea's occlusion indices (levels and chunks alike): the traversal's.
+    case "OCCL":
       return true;
     // A skinned cloud's rig (athc_skin.rs): read whole-file only for now;
     // a paged skinned cloud is drawn in its bind pose.

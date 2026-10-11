@@ -126,17 +126,21 @@ page 0   header, 160 bytes
          112 sectionTable (u64)  120 blockIndex  128 starts  136 dataStart
          144 skinInfluences (0: not skinned)  148 skinGradientWords
          152 skeleton (u64, the ATSK blob's offset; 0: none)
-@160     section table, 32 bytes each:
+         160 occlusion codebook (u64 offset; 0: none)   168 its entries   172 0
+             (only when the section table starts at 176 or later: a header
+             of 160 bytes has no codebook)
+@160/176 section table, 32 bytes each:
            id (fourcc), tier, encoding (0 v2 words, 1 byte planes,
            2 delta planes, 3 CPCA: transfer sections only, lossy),
            compression (0 none, 1 gzip), words a
-           element, 3 x 0
+           element, index width (OCCL: bytes an index needs, 1/2/4; else 0), 2 x 0
          block index, (32 + 16 × sectionCount) bytes each:
            kind (0 level, 1 chunk), level (1.. or 0), first element, n,
            bounding sphere of the centres (x, y, z, r),
            per section: offset (u64, absolute), stored bytes, raw bytes
 aligned  starts: u32 per finest group (as v2)
 16-aligned  a skinned cloud's skeleton (ATSK, below)
+16-aligned  the occlusion codebook: entries x 8 u32 (below)
 aligned  blocks: levels coarsest first, then chunks; each on its own page,
          its sections contiguous in table order
 ```
@@ -147,6 +151,7 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 | S0p | `SHRS` | 1 | 4 · shWords | rest harmonics |
 | S0l | `LODS` | 1 | 4 | a merged node's LoD size by error, f32 (0 in a chunk: geometric); flag bit 6 (sparkwebGPU's, below) |
 | S0e | `LODE` | 1 | 8 | a merged node's LoD error cut bounds: f16 eps, f16 rho; f16 theta, 8+8-bit cone axis (0 in a chunk); flag bit 7 (sparkwebGPU's, below) |
+| S0o | `OCCL` | 1 | 4 | athenea's occlusion mask: the element's codebook entry + 1 (0: none), in a word; flag bit 9 (below) |
 | S0s | `SKIN` | 1 | 4 · (influences + gradientWords) | a skinned cloud's rig (sparkwebGPU's, below) |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
 | S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
@@ -426,6 +431,39 @@ tree marks it -- `coverage` is then the composited coverage and the mass
 ratio has moved to `coverageMass` (pieces/t21) -- or with `--node-coverage`
 (then the opacities are read as they are), and reads `coverage` as the
 merges' opacity.
+
+### Occlusion masks (`OCCL` and the codebook, flag bit 9)
+
+athenea's `decimate --occlusion-mask N` (athenea-pieces 1000bdf) gives each
+gaussian of her tree an occlusion mask: a 16 x 16 octahedral grid of
+directions in the asset's frame (bit y * 16 + x, 1 open: some leaf under it
+is seen from there), OR'd up the tree, one cell of margin, all open on
+glass, then put in a codebook of N entries (each the OR of its members, so
+it never closes what a node has open). `usd-athc --tree` reads
+`primvars:athenea:splat:occlusionIndex` (int a gaussian) and
+`occlusionCodebook` (constant int[], N x 8 u32) and writes:
+
+- `OCCL`, every block (levels and chunks): entry + 1, 0 for none (the
+  decoder's synthetic root, the groups made above her roots: never culled),
+  one word an element. The section table's sixth word says how many bytes
+  the values need (two with 256 entries, because of the 0); the other bytes
+  are 0, and `--planes` stores them as next to nothing. A codebook of 1024 to
+  4096 entries changes nothing but that width.
+- The codebook after the starts and the skeleton (the tables a pager reads
+  first), its offset and entries in the header at 160.
+
+The traversal (`lodOcclusionCull`, spark-rs `lod_tree.rs occluded`, the
+same rule as `athc_lod_cut::occlusion_hides`) leaves a node out with its
+subtree when the eye is outside the asset's box (the header's boundsMin /
+boundsMax, the splats' centres) and the four cells toward the eye --
+athenea's `splatCellsOpen`: `octEncode(dir) * 16 - 0.5`, the cells clamped
+to [0, 15], those of bilinear weight 0 left out -- are all closed in its
+entry; `dir` from the node's centre toward the eye in the tree's object
+space (the file's frame). Nothing else: the margin and glass are in the
+masks. Merged ATHV pages carry the indices after the errors (decode flag
+bit 3, `ATHV_OCCLUSION`); decoded splats as `extra.lodOcclusion`, a whole
+file's codebook and box as `extra.lodOcclusionCodebook` /
+`lodOcclusionBounds`.
 
 ### The curvature (`CURV`)
 

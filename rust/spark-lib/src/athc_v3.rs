@@ -1395,7 +1395,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
     let compact_section = sections.iter().position(|s| s.id == SectionId::Compact);
     if let Some(k) = compact_section {
         let s = &sections[k];
-        if k + 1 != sections.len() || s.tier != 4 || !(s.words as usize * 4 == crate::athc_compact::NODE_BYTES || s.words as usize * 4 == crate::athc_compact::V1_NODE_BYTES) || s.encoding != 0 {
+        if k + 1 != sections.len() || s.tier != 4 || !(s.words as usize * 4 == crate::athc_compact::NODE_BYTES || s.words as usize * 4 == crate::athc_compact::NODE_BYTES_V2 || s.words as usize * 4 == crate::athc_compact::V1_NODE_BYTES) || s.encoding != 0 {
             bail!(".athc v3: a compact section of {} words, tier {}, encoding {}, not last", s.words, s.tier, s.encoding);
         }
     }

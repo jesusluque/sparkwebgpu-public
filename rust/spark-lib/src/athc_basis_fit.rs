@@ -173,8 +173,8 @@ pub fn fit_joint_basis(x: &[f32], o: &FitOptions) -> Result<(JointBasis, FitRepo
     if x.len() % D != 0 || x.is_empty() {
         bail!("fit: {} values, not a multiple of 112", x.len());
     }
-    if o.clusters == 0 || o.clusters > 256 {
-        bail!("fit: {} clusters (1..=256: the cluster is a byte)", o.clusters);
+    if o.clusters == 0 || o.clusters > 4096 {
+        bail!("fit: {} clusters (1..=4096; the compact tier stores a byte: 256 at most there)", o.clusters);
     }
     let n = x.len() / D;
     let th = o.threads;
@@ -251,7 +251,7 @@ pub fn fit_joint_basis(x: &[f32], o: &FitOptions) -> Result<(JointBasis, FitRepo
         }
     }
     // Lloyd over every node.
-    let mut labels = vec![0u8; n];
+    let mut labels = vec![0u16; n];
     let mut sse_log = Vec::new();
     for it in 0..=o.iters {
         let norms: Vec<f32> = cent.chunks_exact(D).map(|r| r.iter().map(|v| v * v).sum()).collect();
@@ -271,7 +271,7 @@ pub fn fit_joint_basis(x: &[f32], o: &FitOptions) -> Result<(JointBasis, FitRepo
                 if err > far.1 {
                     far = (i, err);
                 }
-                lab.push(b as u8);
+                lab.push(b as u16);
                 cnt[b] += 1;
                 for v in 0..D {
                     acc[b * D + v] += z[v] as f64;

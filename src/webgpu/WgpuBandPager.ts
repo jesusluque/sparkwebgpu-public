@@ -138,6 +138,14 @@ export interface BandMesh<K = unknown> {
    * dist is weighed by it, as the traversal weighs its nodes (default 1).
    */
   foveate?: (page: number) => number;
+  /**
+   * The pages the last traversal asked for (spark-rs `touched`: those its
+   * refined nodes' children are in), when the traversal prunes what the
+   * page table cannot see -- closed parts facing away, athenea's occlusion
+   * (thread CS). A page it did not ask for is not needed, and is evictable,
+   * whatever its box says. Default: every page the box test passes.
+   */
+  wanted?: (page: number) => boolean;
   resident: (page: number) => boolean;
   inFlight: (page: number) => boolean;
   /** Pages (other than itself) a resident page's nodes have children in. */
@@ -199,7 +207,11 @@ export function planBand<K>(
     m.rows.forEach((row, p) => {
       const d = pageDistance(row, m.eye);
       const f = m.foveate ? m.foveate(p) : 1;
-      if (p !== 0 && !((f * row.epsMax) / Math.max(d, BAND_NEAR) > m.limit)) {
+      if (
+        p !== 0 &&
+        (!((f * row.epsMax) / Math.max(d, BAND_NEAR) > m.limit) ||
+          (m.wanted && !m.wanted(p)))
+      ) {
         return;
       }
       set.add(p);
@@ -232,7 +244,11 @@ export function planBand<K>(
     for (let p = m.rows.length - 1; p > 0; p--) {
       if (set.has(p) || !m.resident(p) || m.inCut?.(p)) continue;
       const f = m.foveate ? m.foveate(p) : 1;
-      if (pageNeeded(m.rows[p], m.eye, (m.limit * BAND_KEEP) / f)) continue;
+      if (
+        pageNeeded(m.rows[p], m.eye, (m.limit * BAND_KEEP) / f) &&
+        (!m.wanted || m.wanted(p))
+      )
+        continue;
       out.push(p);
     }
     const going = new Set(out);

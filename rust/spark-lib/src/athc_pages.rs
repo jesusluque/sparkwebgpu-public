@@ -505,6 +505,12 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         if !all.lod_mass.is_empty() {
             all.lod_mass[i] = 0;
         }
+        // No occlusion mask of its own either (the copied row's was its
+        // first root's: hidden whenever that root was, it took the whole
+        // forest with it; thread CS). Never occluded.
+        if !all.occlusion.is_empty() {
+            all.occlusion[i] = 0;
+        }
         // Its bounds: the roots' largest error, its sphere round theirs, no cone.
         let c = [all.positions[i * 4], all.positions[i * 4 + 1], all.positions[i * 4 + 2]];
         let mut eps = 0.0f32;
@@ -524,6 +530,12 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
     for (i, &k) in order.iter().enumerate() {
         let run: &[u32] = if k == ROOT { &roots } else { &kids[k as usize] };
         if run.is_empty() {
+            // A leaf of a closed part (athenea:splat:closed): its own cone,
+            // theta 0 about its normal, and no error (eps, rho 0) -- the
+            // compact traversal culls it from behind (thread CS).
+            if k != ROOT && bounds[k as usize].cull {
+                all.lod_error[i * 2 + 1] = bounds[k as usize].words()[1];
+            }
             continue;
         }
         let (cp, c0) = place[run[0] as usize];

@@ -36,7 +36,9 @@ use crate::splat_encode::{
 
 /// Bytes a node in a `CMPC` section (v2, thread CQ: the GPU's 40, then the
 /// traversal's 16).
-pub const NODE_BYTES: usize = 56;
+pub const NODE_BYTES: usize = 64;
+/// v2's (thread CQ): no cone, no occlusion index.
+pub const NODE_BYTES_V2: usize = 56;
 /// Bytes a node in each plane, in the order they are stored: position x, y,
 /// z (u16 in the page's box), albedo (3 x u8 sRGB), opacity (the code), ln
 /// scales (3 x u8 in the page's range, 0 = exactly 0), rotation (the ext
@@ -47,14 +49,24 @@ pub const NODE_BYTES: usize = 56;
 /// correction (3 x i16, low byte then high), the children's page (u16, from
 /// the node's own page), the children word (u32: place, count, flags) and
 /// LODE's eps and rho (f16).
-pub const PLANE_WIDTHS: [u32; 31] =
-    [2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+///
+/// v3 (thread CS) appends 8 one-byte planes to the traversal's: LODE's cone
+/// word (theta f16 | the octahedral 8+8 axis; NO_CONE: never culled; a leaf
+/// of a closed part carries its own, theta 0), athenea's occlusion index
+/// (entry + 1, 0 none; the codebook in the asset table) and 2 bytes spare.
+/// The first 31 planes are v2's, at the same offsets.
+pub const PLANE_WIDTHS: [u32; 39] = [
+    2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+];
+/// Planes of a v2 node.
+pub const PLANES_V2: usize = 31;
 pub const PLANES: usize = PLANE_WIDTHS.len();
 /// The planes the GPU keeps (the rest are the traversal's).
 pub const GPU_PLANES: usize = 15;
 /// Bytes a node the GPU keeps, and the traversal.
 pub const GPU_NODE_BYTES: usize = 40;
-pub const TRAVERSAL_NODE_BYTES: usize = 16;
+pub const TRAVERSAL_NODE_BYTES: usize = 24;
+pub const TRAVERSAL_NODE_BYTES_V2: usize = 16;
 pub const P_POS_X: usize = 0;
 pub const P_ALBEDO: usize = 3;
 pub const P_OPACITY: usize = 4;
@@ -74,6 +86,9 @@ pub const P_CHILD_PAGE: usize = 21;
 pub const P_KIDS: usize = 23;
 pub const P_EPS: usize = 27;
 pub const P_RHO: usize = 29;
+/// v3: the cone word's 4 bytes, the occlusion index's 2.
+pub const P_CONE: usize = 31;
+pub const P_OCCLUSION: usize = 35;
 /// The children word: place (bits 0-11) | count (12-23) | flags (24-31).
 pub const KIDS_PLACE_BITS: u32 = 12;
 pub const KIDS_COUNT_BITS: u32 = 12;
@@ -88,7 +103,7 @@ pub const HEAD_WORDS: usize = 12;
 pub const TABLE_MAGIC: u32 = u32::from_le_bytes(*b"CMPT");
 /// v2 (thread CQ): the traversal's 16 bytes, and tables that may live in an
 /// asset table (`CompactAsset`) the asset's pieces share.
-pub const TABLE_VERSION: u32 = 2;
+pub const TABLE_VERSION: u32 = 3;
 const TABLE_FIXED_WORDS: usize = 24;
 /// The piece's tables flags.
 pub const TABLE_LINEAR: u32 = 1;
@@ -97,6 +112,8 @@ pub const TABLE_CURVATURE: u32 = 2;
 pub const TABLE_ASSET_BASIS: u32 = 4;
 pub const TABLE_ASSET_CODEBOOK: u32 = 8;
 pub const TABLE_ASSET_MATERIALS: u32 = 16;
+/// v3: the occlusion codebook (and the asset's box) in the asset table.
+pub const TABLE_ASSET_OCCLUSION: u32 = 32;
 /// The asset table (`CompactAsset::to_bytes`, a sidecar `.cmpa`).
 pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"CMPA");
 pub const ASSET_VERSION: u32 = 1;
@@ -371,11 +388,19 @@ pub struct CompactAsset {
     pub codebook: Vec<u32>,
     /// The materials (4 words an entry), empty: per piece.
     pub materials: Vec<u32>,
+    /// athenea's occlusion codebook (8 words an entry; thread CS), the same
+    /// in every piece, and the asset's box (min xyz, max xyz) its rule tests
+    /// the eye against; empty: none.
+    pub occlusion: Vec<u32>,
+    pub occlusion_box: [f32; 6],
 }
 
 impl CompactAsset {
     pub fn flags(&self) -> u32 {
-        (!self.basis.is_empty() as u32) | (!self.codebook.is_empty() as u32) << 1 | (!self.materials.is_empty() as u32) << 2
+        (!self.basis.is_empty() as u32)
+            | (!self.codebook.is_empty() as u32) << 1
+            | (!self.materials.is_empty() as u32) << 2
+            | (!self.occlusion.is_empty() as u32) << 3
     }
 
     /// The blob: 16 fixed words (magic, version, words, flags, clusters,
@@ -386,8 +411,20 @@ impl CompactAsset {
         let basis_at = ASSET_FIXED_WORDS;
         let codebook_at = (basis_at + self.basis.len()).div_ceil(16) * 16;
         let materials_at = (codebook_at + self.codebook.len()).div_ceil(16) * 16;
-        let total = (materials_at + self.materials.len()).div_ceil(16) * 16;
+        let occlusion_at = (materials_at + self.materials.len()).div_ceil(16) * 16;
+        let occlusion_words = if self.occlusion.is_empty() { 0 } else { self.occlusion.len() + 6 };
+        let total = (occlusion_at + occlusion_words).div_ceil(16) * 16;
         let mut w = vec![0u32; total];
+        if !self.occlusion.is_empty() {
+            // Words 13, 14: the occlusion codebook's offset and entries, the
+            // box's 6 floats after it (v1 kept them 0: no occlusion).
+            w[13] = occlusion_at as u32;
+            w[14] = (self.occlusion.len() / 8) as u32;
+            w[occlusion_at..occlusion_at + self.occlusion.len()].copy_from_slice(&self.occlusion);
+            for k in 0..6 {
+                w[occlusion_at + self.occlusion.len() + k] = self.occlusion_box[k].to_bits();
+            }
+        }
         w[..13].copy_from_slice(&[
             ASSET_MAGIC,
             ASSET_VERSION,
@@ -440,6 +477,17 @@ impl CompactAsset {
             basis: words(w(7)?, w(8)? as usize)?,
             codebook: words(w(9)?, 8 * w(5)? as usize)?,
             materials: words(w(10)?, 4 * w(6)? as usize)?,
+            occlusion: if w(3)? & 8 != 0 { words(w(13)?, 8 * w(14)? as usize)? } else { Vec::new() },
+            occlusion_box: if w(3)? & 8 != 0 {
+                let at = w(13)? as usize + 8 * w(14)? as usize;
+                let mut bx = [0f32; 6];
+                for (k, v) in bx.iter_mut().enumerate() {
+                    *v = f32::from_bits(w(at + k)?);
+                }
+                bx
+            } else {
+                [0.0; 6]
+            },
         })
     }
 }
@@ -550,10 +598,11 @@ impl CompactTables {
 
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let w = words_of(b);
-        if w(0)? != TABLE_MAGIC || w(1)? != TABLE_VERSION {
-            bail!("not a compact table (CMPT v{TABLE_VERSION}; v1 files: athc-convert --compact-rebase)");
+        if w(0)? != TABLE_MAGIC || !(w(1)? == TABLE_VERSION || w(1)? == 2) {
+            bail!("not a compact table (CMPT v2 or v{TABLE_VERSION}; v1 files: athc-convert --compact-rebase)");
         }
-        if w(2)? as usize != NODE_BYTES || w(3)? as usize != PLANES || w(4)? as usize != HEAD_WORDS {
+        let (bytes, planes) = if w(1)? == 2 { (NODE_BYTES_V2, PLANES_V2) } else { (NODE_BYTES, PLANES) };
+        if w(2)? as usize != bytes || w(3)? as usize != planes || w(4)? as usize != HEAD_WORDS {
             bail!("compact tables of another layout");
         }
         let words = |at: u32, n: usize| -> Result<Vec<u32>> { (0..n).map(|k| w(at as usize + k)).collect() };
@@ -569,7 +618,7 @@ impl CompactTables {
             weight_bits: w(9)?,
             linear: flags & TABLE_LINEAR != 0,
             curvature: flags & TABLE_CURVATURE != 0,
-            asset_flags: flags & (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS),
+            asset_flags: flags & (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS | TABLE_ASSET_OCCLUSION),
             asset_id: w(16)? as u64 | (w(17)? as u64) << 32,
             asset_name: String::from_utf8_lossy(name).into_owned(),
         })
@@ -610,6 +659,10 @@ pub struct TraversalNode {
     pub eps: u16,
     pub rho: u16,
     pub size_mode: bool,
+    /// v3: LODE's cone word (NO_CONE_WORD: never culled; a leaf of a closed
+    /// part: theta 0 about its normal), athenea's occlusion index (entry + 1).
+    pub cone: u32,
+    pub occlusion: u16,
 }
 
 /// Bytes of plane `first`.. of the traversal's, its planes from `base`.
@@ -623,13 +676,15 @@ fn get_bytes_at(raw: &[u8], base: usize, first: usize, k: usize, n: usize, i: us
 
 /// Bytes a node of the traversal's input (`traversal_input`).
 pub const TRAVERSAL_INPUT_BYTES: usize = 6 + TRAVERSAL_NODE_BYTES;
+pub const TRAVERSAL_INPUT_BYTES_V2: usize = 6 + TRAVERSAL_NODE_BYTES_V2;
 
 /// What a reader hands the traversal of a page (spark-rs
 /// `update_compact_lod_trees`): the position planes then the traversal's,
 /// 22 bytes a node.
 pub fn traversal_input(raw: &[u8], n: usize) -> Vec<u8> {
+    let t = if raw.len() == n * NODE_BYTES_V2 { TRAVERSAL_NODE_BYTES_V2 } else { TRAVERSAL_NODE_BYTES };
     let mut v = raw[..6 * n].to_vec();
-    v.extend_from_slice(&raw[plane_offset(P_CENTRE, n)..plane_offset(P_CENTRE, n) + TRAVERSAL_NODE_BYTES * n]);
+    v.extend_from_slice(&raw[plane_offset(P_CENTRE, n)..plane_offset(P_CENTRE, n) + t * n]);
     v
 }
 
@@ -650,15 +705,15 @@ pub fn position_codes(raw: &[u8], n: usize, i: usize) -> [u16; 3] {
 /// Node i of page `page` (its section `raw` of n nodes, its head) as the
 /// traversal reads it.
 pub fn traversal_node(raw: &[u8], n: usize, head: &[u32], page: u32, i: usize) -> TraversalNode {
-    traversal_node_at(raw, plane_offset(P_CENTRE, n), n, head, page, i)
+    traversal_node_at(raw, plane_offset(P_CENTRE, n), n, head, page, i, raw.len() != n * NODE_BYTES_V2)
 }
 
-/// `traversal_node` of a page's `traversal_input`.
+/// `traversal_node` of a page's `traversal_input` (v2's 22 bytes a node or v3's 30).
 pub fn traversal_node_input(input: &[u8], n: usize, head: &[u32], page: u32, i: usize) -> TraversalNode {
-    traversal_node_at(input, 6 * n, n, head, page, i)
+    traversal_node_at(input, 6 * n, n, head, page, i, input.len() != n * TRAVERSAL_INPUT_BYTES_V2)
 }
 
-fn traversal_node_at(raw: &[u8], base: usize, n: usize, head: &[u32], page: u32, i: usize) -> TraversalNode {
+fn traversal_node_at(raw: &[u8], base: usize, n: usize, head: &[u32], page: u32, i: usize, v3: bool) -> TraversalNode {
     let get_bytes = |first: usize, k: usize, n: usize, i: usize| get_bytes_at(raw, base, first, k, n, i);
     let q = position_codes(raw, n, i);
     let mut centre = [0u16; 3];
@@ -677,8 +732,13 @@ fn traversal_node_at(raw: &[u8], base: usize, n: usize, head: &[u32], page: u32,
         eps: get_bytes(P_EPS, 2, n, i) as u16,
         rho: get_bytes(P_RHO, 2, n, i) as u16,
         size_mode: kids & KIDS_SIZE_MODE != 0,
+        cone: if v3 { get_bytes(P_CONE, 4, n, i) } else { NO_CONE_WORD },
+        occlusion: if v3 { get_bytes(P_OCCLUSION, 2, n, i) as u16 } else { 0 },
     }
 }
+
+/// A cone word that never culls (athc_lod_cut::NO_CONE).
+pub const NO_CONE_WORD: u32 = crate::athc_lod_cut::NO_CONE as u32;
 
 /// Writes node i's traversal planes into `raw` (its position planes already
 /// written): from the LoD tree words the decoder gives it
@@ -687,8 +747,29 @@ fn traversal_node_at(raw: &[u8], base: usize, n: usize, head: &[u32], page: u32,
 /// children; a leaf only that it is one. LODE's back-face cone (theta, axis)
 /// is not kept (a compact traversal does not cull back faces; athenea's
 /// trees hold none: theta infinite).
-pub fn put_traversal(raw: &mut [u8], n: usize, head: &[u32], page: u32, i: usize, tree: [u32; 4], lode: Option<[u32; 2]>) -> Result<()> {
+pub fn put_traversal(
+    raw: &mut [u8],
+    n: usize,
+    head: &[u32],
+    page: u32,
+    i: usize,
+    tree: [u32; 4],
+    lode: Option<[u32; 2]>,
+    occlusion: u32,
+) -> Result<()> {
     let count = tree[2] & 0xffff;
+    // v3: the cone (a leaf's [0, 0] LODE: none) and the occlusion index.
+    let cone = match lode {
+        Some([0, 0]) | None => NO_CONE_WORD,
+        Some(e) => e[1],
+    };
+    if raw.len() == n * NODE_BYTES {
+        put_bytes(raw, P_CONE, 4, n, i, cone);
+        if occlusion > 0xffff {
+            bail!("compact traversal: occlusion index {occlusion} past 16 bits");
+        }
+        put_bytes(raw, P_OCCLUSION, 2, n, i, occlusion);
+    }
     if count == 0 {
         return Ok(());
     }
@@ -1051,7 +1132,8 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
             if tree[2] & 0xffff > 0 && lode.is_none_or(|e| e[0] == 0) {
                 size_mode += 1;
             }
-            put_traversal(&mut raw, n, &head, page as u32, i, tree, lode)?;
+            let occlusion = b.occlusion.get(i).copied().unwrap_or(0);
+            put_traversal(&mut raw, n, &head, page as u32, i, tree, lode, occlusion)?;
             node += 1;
         }
         out_pages.push(raw);
@@ -1167,10 +1249,14 @@ pub fn decode_node(raw: &[u8], n: usize, head: &[u32; HEAD_WORDS], tables: &Comp
 /// (`TraversalNode`): the reference `traversal_node` must equal.
 pub fn traversal_of_words(raw: &[u8], n: usize, head: &[u32], i: usize, tree: [u32; 4], lode: Option<[u32; 2]>) -> TraversalNode {
     let count = tree[2] & 0xffff;
+    let cone = match lode {
+        Some([0, 0]) | None => NO_CONE_WORD,
+        Some(e) => e[1],
+    };
     if count == 0 {
         let q = position_codes(raw, n, i);
         let centre = [0, 1, 2].map(|k| f16::from_f32(compact_position(q[k], f32::from_bits(head[k]), f32::from_bits(head[3 + k]))).to_bits());
-        return TraversalNode { centre, ..Default::default() };
+        return TraversalNode { centre, cone, ..Default::default() };
     }
     let e = lode.unwrap_or([0, 0]);
     let size_mode = e[0] == 0;
@@ -1182,6 +1268,8 @@ pub fn traversal_of_words(raw: &[u8], n: usize, head: &[u32], i: usize, tree: [u
         eps: if size_mode { (tree[1] >> 16) as u16 } else { e[0] as u16 },
         rho: if size_mode { 0 } else { (e[0] >> 16) as u16 },
         size_mode,
+        cone,
+        occlusion: 0,
     }
 }
 
@@ -1225,13 +1313,17 @@ pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &s
                 ..Default::default()
             }
         }
-        2 => CompactTables::from_bytes(blob)?,
+        2 | 3 => CompactTables::from_bytes(blob)?,
         v => bail!("rebase: compact tables v{v}"),
     };
     if old.asset_flags != 0 {
         bail!("rebase: the piece already shares asset table {:?}", old.asset_name);
     }
-    let node_bytes = if version == 1 { V1_NODE_BYTES } else { NODE_BYTES };
+    let node_bytes = match version {
+        1 => V1_NODE_BYTES,
+        2 => NODE_BYTES_V2,
+        _ => NODE_BYTES,
+    };
     for s in &layout.sections[..k4] {
         if s.encoding == crate::athc_v3::ENCODING_CPCA {
             bail!("rebase: section {:?} in CPCA (write it again with usd-athc)", s.id);
@@ -1297,7 +1389,7 @@ pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &s
             // as the native writer makes them.
             let tree = lod_tree_words(block, i);
             let lode = (block.lod_error.len() == 2 * n).then(|| [block.lod_error[2 * i], block.lod_error[2 * i + 1]]);
-            put_traversal(&mut raw, n, &head, p as u32, i, tree, lode)?;
+            put_traversal(&mut raw, n, &head, p as u32, i, tree, lode, block.occlusion.get(i).copied().unwrap_or(0))?;
             if version == 1 {
                 // A v1 file's own words: the same node for the traversal.
                 let word = |off: usize| u32::from_le_bytes(src[off..off + 4].try_into().unwrap());
@@ -1620,13 +1712,26 @@ mod asset_tests {
             let c = centres[i];
             let tree = [c[0] as u32 | (c[1] as u32) << 16, c[2] as u32 | 0x2c00 << 16, 2, 5 << 16 | (100 + i as u32)];
             let lode = if i == 2 { None } else { Some([0x1234 | 0x0567 << 16, 0x7c00]) };
-            put_traversal(&mut raw, n, &head, 3, i, tree, lode).unwrap();
+            put_traversal(&mut raw, n, &head, 3, i, tree, lode, 0).unwrap();
             let t = traversal_node(&raw, n, &head, 3, i);
             assert_eq!(t, traversal_of_words(&raw, n, &head, i, tree, lode), "{i}");
             assert_eq!((t.child_page, t.place, t.count), (5, 100 + i as u32, 2));
             assert_eq!(t.size_mode, i == 2);
             assert_eq!(traversal_node_input(&traversal_input(&raw, n), n, &head, 3, i), t);
         }
+        // v3 (thread CS): a merge's cone, a closed leaf's own, the occlusion
+        // index; a leaf's [0, 0] LODE is no cone.
+        let mut raw = vec![0u8; n * NODE_BYTES];
+        let cone = 0x3c00 | 0x8080 << 16;
+        put_traversal(&mut raw, n, &head, 3, 0, [0, 0, 2, 5 << 16 | 100], Some([0x1234, cone]), 8193).unwrap();
+        let t = traversal_node(&raw, n, &head, 3, 0);
+        assert_eq!((t.cone, t.occlusion), (cone, 8193));
+        put_traversal(&mut raw, n, &head, 3, 1, [0, 0, 0, 0], Some([0, cone]), 7).unwrap();
+        let t = traversal_node_input(&traversal_input(&raw, n), n, &head, 3, 1);
+        assert_eq!((t.count, t.cone, t.occlusion), (0, cone, 7));
+        put_traversal(&mut raw, n, &head, 3, 2, [0, 0, 0, 0], Some([0, 0]), 0).unwrap();
+        assert_eq!(traversal_node(&raw, n, &head, 3, 2).cone, NO_CONE_WORD);
+        assert!(put_traversal(&mut raw, n, &head, 3, 2, [0, 0, 0, 0], None, 70000).is_err());
     }
 
     /// Pieces sharing an asset table: the basis once (the nodes as the
@@ -1677,10 +1782,13 @@ mod asset_tests {
     #[test]
     fn a_v1_file_rebases() {
         let v1 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/compact_pages.v1.athc")).unwrap();
-        let (v2, stats) = rebase_compact(&v1, None, "", 2).unwrap();
+        let (v3, stats) = rebase_compact(&v1, None, "", 2).unwrap();
         assert_eq!(stats.nodes, parse_v3(&v1).unwrap().header.count as usize);
         let fixture = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/compact_pages.athc")).unwrap();
-        assert_eq!(v2, fixture, "the v2 fixture is the v1 one rebased");
+        assert_eq!(v3, fixture, "the v3 fixture is the v1 one rebased");
+        // CQ's v2 fixture rebases to the same v3 (thread CS).
+        let v2 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/compact_pages.v2.athc")).unwrap();
+        assert_eq!(rebase_compact(&v2, None, "", 2).unwrap().0, fixture, "the v2 fixture rebased is the v3 one");
     }
 }
 

@@ -1725,7 +1725,17 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
                     co.asset_name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
                     co.asset = Some(asset);
                 }
-                let c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
+                let mut c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
+                // athenea's occlusion codebook once per asset (thread CS):
+                // the piece's must be the table's.
+                if let Some(a) = &co.asset {
+                    if !a.occlusion.is_empty() && !file.occlusion_codebook.is_empty() {
+                        if a.occlusion != file.occlusion_codebook {
+                            bail!("--compact-asset: the piece's occlusion codebook is not the asset table's");
+                        }
+                        c.tables.asset_flags |= spark_lib::athc_compact::TABLE_ASSET_OCCLUSION;
+                    }
+                }
                 eprintln!("compact tier: {}", serde_json::to_string(&c.stats)?);
                 Some(c)
             }

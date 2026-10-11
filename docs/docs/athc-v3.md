@@ -641,6 +641,20 @@ eps, rho        f16 each (lo, hi planes): LODE's bounds; 0 for a leaf
   guard with), the occlusion index. v1 (thread CN) kept the LoD tree's 4
   words and LODE's 2 (24 bytes, 64 a node): the same cut, node for node
   (`test/unit/compactWords.test.ts`).
+- **v3** (thread CS, `CMPT` version 3, 64 bytes a node): v2's 31 planes at
+  the same offsets, then 8 one-byte planes for the traversal: LODE's cone
+  word (theta f16 | octahedral 8+8 axis; `NO_CONE` never culls; a leaf of a
+  part athenea marks `closed` carries its own, theta 0 about its normal),
+  athenea's occlusion index (u16, entry + 1, 0 none) and 2 spare. The
+  traversal input is 30 bytes a node, the WASM node 20. With
+  `backCullMin` < 0 (the compact streamer's default, `backCull: false`
+  off) a node whose whole cone faces away (closed, not glass, n . v <
+  -sin(theta + asin(rho / d))) is pruned with its subtree, leaves included;
+  with `occlusion: true` (a set's `corvette.json` `occlusion: true`) the
+  node's mask hides it, the eye outside the asset's box. Pruning, the
+  streamer plans only the pages the traversal asked for (spark-rs
+  `touched`, `planBand`'s `wanted`): culled and hidden nodes cost no
+  residency. v2 files read as before (no cones, no indices).
 - **the page's head** in its page-table row: rows are 32 words, word 16 the
   bytes of its `CMPC`, words 17-28 the head (box lo, hi; ln scale lo, hi;
   the curvature's range; three words a reader fills: the slot's codebook
@@ -674,11 +688,22 @@ file beside the pieces (`car.cmpa`), which each piece names (`CMPT` words
 the pool keeps one basis (and one dictionary and material table when shared):
 
 ```text
-0 "CMPA"  1 version 1  2 words  3 flags (1 basis, 2 dictionary, 4 materials)
+0 "CMPA"  1 version 1  2 words  3 flags (1 basis, 2 dictionary, 4 materials, 8 occlusion)
 4 clusters  5 dictionary entries  6 materials  7 basis at  8 basis words
 9 dictionary at  10 materials at  11 12 id: FNV-1a 64 of the blob with these two words 0
-13-15 0; the arrays at 16-word boundaries
+13 occlusion codebook at  14 its entries (8 words each; the asset's box, 6 f32, after it)
+15 0; the arrays at 16-word boundaries
 ```
+
+athenea's occlusion codebook is the same in every part of an asset (her
+`decimate --occlusion-mask` over the 8 groups): `athc-convert
+--compact-asset car.cmpa --table-only` puts it in the table once, with the
+pieces' boxes' union, and `usd-athc --compact-asset` checks each piece's
+against it (`CMPT` flag 32). A piece whose roots overflow page 0 (her forest
+of a group: 4237 roots against a 3072-node slot and the 12-bit place) goes
+into N files, `usd-athc --tree ... --split-roots N:i`: whole subtrees,
+balanced by roots and nodes, her pages kept in order and merged up to
+`--split-page-nodes` (3000).
 
 ```sh
 # The pieces one by one, sharing the basis (car.cmpa written by the first,
@@ -722,15 +747,24 @@ grid. `--compare other.json` prints the same per-piece, per-block relMSE
 for another basis, and `--held-out piece.athc` measures a piece it was not
 fitted on. Fitted on the six t48 pieces it beats q97 on all of them, but a
 held-out piece comes out 10 to 400 times worse (relMSE 1.6e-2 to 0.58):
-fit it on every piece of the asset it will encode.
+fit it on every piece of the asset it will encode. Fitted on the whole car
+(thread CS, `--sample 2`: every second node, 448 bytes a fitted node of RAM;
+every node measured): relMSE 1.03e-2 (direct 1.6e-3, indirect 8.0e-3,
+reflected 1.06e-2), q97 1.69e-2; a basis per group of parts 3.4-6.2e-3,
+C 1024 (measured only: the cluster is a byte) 6.5e-3. In the image, at the
+same cut, the whole-car basis is within relMSE 1e-3 of the uncompressed
+transfer (q97 too).
 
 A compact reader (`CompactBandStreamer`, `src/webgpu/athenea/compactPages.ts`;
 `openCompactAsset(url)` and the option `asset` for shared tables) reads the
 tables with the page table, then only `CMPC` runs: each page goes into a
 pool slot of `slotNodes` (3072) nodes, its head then its planes, the GPU's 40
-bytes a node; the position and traversal planes (22 bytes a node) go to the
-WASM traversal (`update_compact_lod_trees`, one shared compact pool tree, a
-slot a page, 14 bytes a node where a full tree's `LodSplat` takes 24). The
+bytes a node; the position and traversal planes (22 bytes a node, v3 30) go
+to the WASM traversal (`update_compact_lod_trees`, one shared compact pool
+tree, a slot a page, 14 bytes a node where a full tree's `LodSplat` takes 24;
+v3 20). The eye goes to the trees' own space (`frame`: the car's turn from
+athenea's Z-up stage), and the view's cone is foveated as WgpuLod's
+(`foveation`). The
 page plan, the eviction order and tau's fit are `WgpuBandPager`'s
 (`planBand`). The traversal's cut, slot indices, is the compact path's draw
 list (`CompactRelitPath.setPagedCloud` + `setDrawList`); compact.slang reads a

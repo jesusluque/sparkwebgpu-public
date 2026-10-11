@@ -79,7 +79,6 @@ export function poolOf(
   if (s.curvature)
     pool.setColumn({ spec: SPECS.curvature, words: s.curvature });
   pool.setColumn({ spec: SPECS.shadowBits, words: s.shadowBits });
-  pool.setColumn(q8Column(s.q8.subarray(0, n * Q8_RECORD_WORDS)));
   if (s.transfer) {
     pool.setColumn({
       spec: {
@@ -92,7 +91,11 @@ export function poolOf(
       words: s.transfer,
     });
   }
-  pool.cpcaJoint = { basis, table: packJointBasis(basis), values: 112 };
+  // The full transfer (transferResident "words") or athenea's records.
+  if (!s.transfer) {
+    pool.setColumn(q8Column(s.q8.subarray(0, n * Q8_RECORD_WORDS)));
+    pool.cpcaJoint = { basis, table: packJointBasis(basis), values: 112 };
+  }
   return pool;
 }
 

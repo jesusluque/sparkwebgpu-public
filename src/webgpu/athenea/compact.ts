@@ -1005,11 +1005,7 @@ export class CompactRelitPath {
     params: UniformWriter,
     profiler: GpuProfiler | null,
   ) {
-    if (this.sky.dirty) {
-      // On a submit of its own, so its source images can go right after.
-      this.sky.prepareNow();
-      if (this.options.releaseSky) this.sky.releaseSources();
-    }
+    this.prepareSky();
     const key = `${this.sky.version}`;
     if (key === this.projectedKey) return;
     this.projectedKey = key;
@@ -1024,6 +1020,13 @@ export class CompactRelitPath {
     });
     pass.end();
     this.stats.projected += 1;
+  }
+
+  /** The dome prepared when changed, on a submit of its own (its source images can go right after). */
+  private prepareSky() {
+    if (!this.sky.dirty) return;
+    this.sky.prepareNow();
+    if (this.options.releaseSky) this.sky.releaseSources();
   }
 
   /** Forces the projections again (as a change of the lights would). */
@@ -1048,6 +1051,10 @@ export class CompactRelitPath {
     const cloud = this.cloud;
     if (!cloud) return;
     const profiler = o.profiler ?? null;
+    // The dome first: the uniform carries its prepared size (envBaseSide),
+    // which a frame's projections would otherwise read before it is set,
+    // and keep (thread CN: a fresh path's highlights came out ~10-20 % off).
+    this.prepareSky();
     const params = this.params(camera, width, height);
     // Nothing moved and the light is the same: the records in the sort's
     // buffers are this frame's, and only the draw runs.
@@ -1091,7 +1098,10 @@ export class CompactRelitPath {
         label: "compact.cull",
         timestampWrites: profiler?.timestampWrites("compact.cull"),
       });
-      const n = this.listed;
+      // Stable order sorts every slot: the cull fills those past the list.
+      const n = this.options.stableOrder
+        ? Math.max(this.listed, this.capacity)
+        : this.listed;
       const row = K.kCompactDispatchRow;
       this.registry.get(compactModule, "atheneaCompactCull").dispatch(pass, {
         grid: [Math.min(n, row), Math.ceil(n / row)],
@@ -1259,6 +1269,7 @@ export class CompactRelitPath {
     const n = cloud.layout.count;
     const out = createStorage(this.device, n * 48, "compact colours");
     const encoder = this.device.createCommandEncoder();
+    this.prepareSky();
     const params = this.params(camera, width, height);
     this.prepareLight(encoder, params, null);
     const pass = encoder.beginComputePass({ label: "compact.colours" });

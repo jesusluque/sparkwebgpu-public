@@ -328,6 +328,7 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
       slots,
       tau: TAU,
       tauToFit: process.env.COMPACT_PAGES_FIT === "1",
+      nodeOrder: true,
       gunzip,
       lod: lodCall,
     });
@@ -365,6 +366,9 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
       const camera = cameraAt(v.t, v.W, v.H);
       const tex = target(v.W, v.H);
       const st = await settle(A, pathA, camera, tex);
+      const capA = pathA.capacity;
+      const drawnA = await pathA.drawnCount();
+      process.stderr.write(`CN A ${v.name} capacity ${capA} drawn ${drawnA}\n`);
       const memory = track.snapshot();
       const image = await readImage(d, tex);
       const s = A.stats;
@@ -413,6 +417,7 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
     const B = new CompactBandStreamer(d, pieces, {
       slots: totalPages,
       tau: TAU,
+      nodeOrder: true,
       gunzip,
       lod: lodCall,
     });
@@ -428,7 +433,62 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
       frame(pathB, camera, tex);
       await d.queue.onSubmittedWorkDone();
       const image = await readImage(d, tex);
+      if (process.env.CN_DEBUG) {
+        pathB.touchLight();
+        frame(pathB, camera, tex);
+        await d.queue.onSubmittedWorkDone();
+        const again = await readImage(d, tex);
+        await B.update(cameraAt(1, v.W, v.H), v.H, pathB);
+        frame(pathB, cameraAt(1, v.W, v.H), tex);
+        await B.update(camera, v.H, pathB);
+        frame(pathB, camera, tex);
+        await d.queue.onSubmittedWorkDone();
+        const after = await readImage(d, tex);
+        process.stderr.write(
+          `CN B repeat ${v.name} ${JSON.stringify(compare(again, image))} after-other-view ${JSON.stringify(compare(after, image))} vsA-after ${JSON.stringify(compare(cuts[v.name].image, after))}\n`,
+        );
+      }
       const keys = cutKeys(B);
+      if (process.env.CN_DEBUG) {
+        // Per node: A's and B's relit colour, footprint and place.
+        await A.update(camera, v.H, pathA);
+        const cA = { list: [...A.drawList] };
+        pathA.setDrawList(null);
+        const ca = await pathA.colours(camera, v.W, v.H);
+        pathA.setDrawList(A.drawList);
+        pathB.setDrawList(null);
+        const cb = await pathB.colours(camera, v.W, v.H);
+        pathB.setDrawList(B.drawList);
+        const where = new Map<string, number>();
+        for (const i of B.drawList) {
+          const n = B.nodeOf(i);
+          if (n) where.set(`${n.piece}:${n.page}:${n.node}`, i);
+        }
+        const worst: Record<string, number> = {};
+        let shown = 0;
+        for (const i of cA.list) {
+          const n = A.nodeOf(i);
+          if (!n) continue;
+          const j = where.get(`${n.piece}:${n.page}:${n.node}`) as number;
+          for (const [name, x, y] of [
+            ["colour", ca.colours, cb.colours],
+            ["shape", ca.shapes, cb.shapes],
+            ["place", ca.places, cb.places],
+          ] as const) {
+            for (let c = 0; c < 4; c++) {
+              const dd = Math.abs(x[4 * i + c] - y[4 * j + c]);
+              if (dd > (worst[name + c] ?? 0)) worst[name + c] = dd;
+              if (name !== "colour" && dd > 0.5 && shown < 8) {
+                shown++;
+                process.stderr.write(
+                  `CN diff ${name} ${JSON.stringify(n)} i ${i} j ${j} a ${[...x.subarray(4 * i, 4 * i + 4)]} b ${[...y.subarray(4 * j, 4 * j + 4)]} ca ${[...ca.colours.subarray(4 * i, 4 * i + 4)]}\n`,
+                );
+              }
+            }
+          }
+        }
+        process.stderr.write(`CN worst ${v.name} ${JSON.stringify(worst)}\n`);
+      }
       const a = cuts[v.name];
       const setA = new Set(a.keys);
       const onlyB = keys.filter((k) => !setA.has(k)).length;
@@ -436,6 +496,8 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
       const onlyA = a.keys.filter((k) => !setB.has(k)).length;
       const out = {
         view: v.name,
+        capacityB: pathB.capacity,
+        drawnB: await pathB.drawnCount(),
         cutPaged: a.keys.length,
         cutResident: keys.length,
         onlyPaged: onlyA,
@@ -551,7 +613,13 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
           image: true,
           lodOpacity: true,
         };
-        const cpca8 = await referenceRun(d, s, n, basis, run);
+        const cpca8 = await referenceRun(
+          d,
+          { ...s, transfer: undefined },
+          n,
+          basis,
+          run,
+        );
         const words = await referenceRun(d, s, n, basis, {
           ...run,
           transferResident: "words",

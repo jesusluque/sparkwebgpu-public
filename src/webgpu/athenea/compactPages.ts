@@ -223,6 +223,7 @@ export class CompactPagePool {
   writePage(
     slot: number,
     piece: number,
+    page: number,
     n: number,
     raw: Uint8Array,
     head: ArrayLike<number>,
@@ -241,6 +242,8 @@ export class CompactPagePool {
     for (let k = 0; k < HEAD_WORDS; k++) w[k] = head[k] >>> 0;
     w[9] = this.pieceBase[piece].codebook;
     w[10] = this.pieceBase[piece].materials;
+    // The faint dither's seed: the node's place in its piece, not its slot.
+    w[11] = ((piece << 26) + page * 4096) >>> 0;
     const words = (this.cloud.layout as CompactLayout).words;
     GPU_PLANES.forEach((name, k) => {
       const from = compactPlaneOffset(k, n);
@@ -303,6 +306,12 @@ export interface CompactBandOptions {
   maxRangeBytes?: number;
   /** Fetches in flight. */
   fetchers?: number;
+  /**
+   * The draw list in node order (piece, page, place) rather than the
+   * traversal's: an image that does not depend on which slots the pages
+   * landed in (for checks; costs a sort of the cut each traversal).
+   */
+  nodeOrder?: boolean;
   /** gunzip a stored section (DecompressionStream, or node's zlib). */
   gunzip: (bytes: Uint8Array) => Promise<Uint8Array>;
   /** The WASM traversal. */
@@ -456,6 +465,7 @@ export class CompactBandStreamer {
       const { lodTree, lodError } = this.pool.writePage(
         slot,
         piece.index,
+        page,
         row.count,
         raw,
         row.compact,
@@ -531,6 +541,20 @@ export class CompactBandStreamer {
         list.set(part, at);
         at += part.length;
       }
+    }
+    if (this.options.nodeOrder) {
+      // By node (piece, page, place), not by slot: the same order whatever
+      // slots the pages landed in (equal sort keys keep it).
+      const id = new Float64Array(list.length);
+      for (let k = 0; k < list.length; k++) {
+        const slot = Math.floor(list[k] / this.slotNodes);
+        const o = this.slotOwner[slot] as { piece: number; page: number };
+        id[k] =
+          (o.piece * 65536 + o.page) * 65536 +
+          (list[k] - slot * this.slotNodes);
+      }
+      const order = Array.from(list.keys()).sort((x, y) => id[x] - id[y]);
+      list = Uint32Array.from(order, (k) => list[k]);
     }
     this.drawList = list;
     this.stats.cut = list.length;

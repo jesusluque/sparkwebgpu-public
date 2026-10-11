@@ -31,7 +31,7 @@
 // gaussians are athenea's error-band pages, each in a pool slot of slotNodes
 // (3072) at slotsBase + slot x slotWords: the slot's head (its page's box and
 // ranges, kCompactChunkWords; word 9 its piece's codebook, word 10 its
-// materials, in words) then the planes at the plane uniforms' offsets within
+// materials, in words; word 11 the faint dither's seed) then the planes at the plane uniforms' offsets within
 // the slot, slotNodes elements each. Gaussian i is slot i / slotNodes,
 // element i % slotNodes; the codebooks, materials and the basis are global
 // to a piece (the pool's tables, always resident).
@@ -219,6 +219,14 @@ uint chunkWord(uint i, uint k) {
         return compactData[compactParams.chunkTable + (i / kCompactChunk) * kCompactChunkWords + k];
     }
     return compactData[compactParams.slotsBase + (i / nodes) * compactParams.slotWords + k];
+}
+
+/// A gaussian's id for the faint splats' dither: its index, or, paged, its
+/// node's place in its piece (slot head word 11, the page's base) -- the
+/// same whatever slot the page is in.
+uint stableIndexOf(uint i) {
+    const uint nodes = compactParams.slotNodes;
+    return nodes == 0u ? i : chunkWord(i, 11u) + (i % nodes);
 }
 
 float chunkFloat(uint i, uint k) {
@@ -893,16 +901,22 @@ uint cullKeyOf(uint i) {
 [numthreads(256, 1, 1)]
 void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
     const uint t = gaussianIndex(tid);
+    const bool stable = hasFlag(kCompactStableOrder);
+    if (stable && t >= compactParams.capacity) {
+        return;
+    }
     if (t >= compactParams.count) {
+        // kCompactStableOrder sorts every slot: the ones past the list sort
+        // last (the nearest key), past the drawn count, and draw nothing.
+        if (stable) {
+            sortKeys[t] = (1u << kCompactKeyBits) - 1u;
+            sortVals[t] = kCompactNone;
+        }
         return;
     }
     // With a draw list (a LoD cut chosen on the host), thread t culls its
     // t-th entry; else gaussian t.
     const uint i = hasFlag(kCompactDrawList) ? compactFrame[compactParams.drawList + t] : t;
-    const bool stable = hasFlag(kCompactStableOrder);
-    if (stable && t >= compactParams.capacity) {
-        return;
-    }
     const uint key = cullKeyOf(i);
     if (stable) {
         // The radix sort is stable: equal keys keep the list's order.
@@ -980,7 +994,7 @@ bool projectCompact(CompactSplat g, float3 v, uint index, inout float alpha, out
         det = a * d - b * b;
         float fa = mass / sqrt(det);
         if (fa < faintTarget) {
-            uint x = (index * 0x9e3779b9u) ^ 0x85ebca6bu;
+            uint x = (stableIndexOf(index) * 0x9e3779b9u) ^ 0x85ebca6bu;
             x ^= x >> 16u;
             x *= 0x7feb352du;
             x ^= x >> 15u;

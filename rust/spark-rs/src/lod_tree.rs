@@ -941,8 +941,6 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
 #[derive(Debug, Default)]
 struct TraverseOut {
     lod_ids: Vec<u32>,
-    outputs: Vec<Vec<u32>>,
-    extra: Vec<[Vec<u32>; 5]>,
     touched: Vec<(u32, u32)>,
     min_pixel_scale: f32,
     output_size: usize,
@@ -961,12 +959,12 @@ fn traverse_core(
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
     error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
-    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool,
+    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink,
 ) -> Result<TraverseOut, String> {
     // Unordered (a stack): the same cut unless the budget binds, then again in order.
-    let (out, budget_hit) = traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered)?;
+    let (out, budget_hit) = traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered, sink)?;
     if unordered && budget_hit {
-        return traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, false).map(|r| r.0);
+        return traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, false, sink).map(|r| r.0);
     }
     Ok(out)
 }
@@ -980,7 +978,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
     error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
-    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool,
+    error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink,
 ) -> Result<(TraverseOut, bool), String> {
     // With `neighbours` (the node pool, thread CT): each cut node's parent and
     // its children (when resident), and the culled nodes, by instance.
@@ -1224,61 +1222,84 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
             }
         }
 
-        let mut instance_counts = vec![0; num_instances];
-        for &(inst_index, _, _) in output.iter() {
-            instance_counts[inst_index as usize] += 1;
-        }
-
-        let mut instance_outputs = Vec::with_capacity(num_instances);
-        for counts in instance_counts {
-            instance_outputs.push(Vec::with_capacity(counts));
-        }
-
-        for &(inst_index, paged_index, _) in output.iter() {
-            instance_outputs[inst_index as usize].push(paged_index);
-        }
-        // Each cut node's parent, its first child and their count (resident
-        // children only; u32::MAX none), and the culled nodes, by instance.
-        let mut extra: Vec<[Vec<u32>; 5]> = (0..num_instances).map(|_| Default::default()).collect();
-        if neighbours {
-            for &(inst_index, paged_index, parent) in output.iter() {
-                let e = &mut extra[inst_index as usize];
-                e[0].push(parent);
-                let instance = &instances[inst_index as usize];
-                let node = instance.1.get(paged_index as usize);
-                let (first, count) = if node.child_count > 0 {
-                    let chunk = (node.child_start >> 16) as usize;
-                    match instance.3.get(chunk) {
-                        Some(&page) if page != 0xFFFFFFFF => (page * slots[inst_index as usize] + (node.child_start & 0xffff), node.child_count as u32),
-                        _ => (u32::MAX, 0),
-                    }
-                } else {
-                    (u32::MAX, 0)
-                };
-                e[1].push(first);
-                e[2].push(count);
-                // Its size on screen (thread CU: the order its payload is
-                // decoded in): its sphere's angle (a leaf: half its parent's),
-                // foveated as the cut is; f32 bits.
-                let r = if node.child_count > 0 || parent == u32::MAX {
-                    node.rho.to_f32()
-                } else {
-                    0.5 * instance.1.get(parent as usize).rho.to_f32()
-                };
-                let delta = node.center() - instance.4;
-                let d = delta.length().max(1.0e-6);
-                e[4].push((r / d * foveate_of(delta, 1.0 / d, instance)).to_bits());
-            }
-            for &(inst_index, paged_index) in culled_out.iter() {
-                extra[inst_index as usize][3].push(paged_index);
-            }
-        }
-
+        // A stack whose budget bound: run again in order, nothing emitted.
         let lod_ids_out: Vec<u32> = instances.iter().map(|i| i.0).collect();
+        if !(budget_hit && frontier.lifo) {
+            // The cut and its neighbours to the sink, instance by instance, in
+            // chunks (thread CU: no whole copies in the heap, whose high-water
+            // the WASM memory keeps).
+            const CHUNK: usize = 16384;
+            let mut bufs: [Vec<u32>; 6] = Default::default();
+            let flush = |sink: &mut dyn CutSink, inst: usize, bufs: &mut [Vec<u32>; 6], at: usize| {
+                for (f, b) in bufs.iter_mut().enumerate() {
+                    if !b.is_empty() {
+                        sink.put(inst, f, at, b);
+                        b.clear();
+                    }
+                }
+            };
+            for (inst, instance) in instances.iter().enumerate() {
+                let cut = output.iter().filter(|o| o.0 as usize == inst).count();
+                let culled = if neighbours { culled_out.iter().filter(|o| o.0 as usize == inst).count() } else { 0 };
+                sink.start(inst, cut, culled);
+                let mut at = 0;
+                for &(inst_index, paged_index, parent) in output.iter() {
+                    if inst_index as usize != inst {
+                        continue;
+                    }
+                    bufs[0].push(paged_index);
+                    if neighbours {
+                        // Each cut node's parent, its first child and their
+                        // count (resident children only; u32::MAX none).
+                        bufs[1].push(parent);
+                        let node = instance.1.get(paged_index as usize);
+                        let (first, count) = if node.child_count > 0 {
+                            let chunk = (node.child_start >> 16) as usize;
+                            match instance.3.get(chunk) {
+                                Some(&page) if page != 0xFFFFFFFF => (page * slots[inst] + (node.child_start & 0xffff), node.child_count as u32),
+                                _ => (u32::MAX, 0),
+                            }
+                        } else {
+                            (u32::MAX, 0)
+                        };
+                        bufs[2].push(first);
+                        bufs[3].push(count);
+                        // Its size on screen (thread CU: the order its payload is
+                        // decoded in): its sphere's angle (a leaf: half its parent's),
+                        // foveated as the cut is; f32 bits.
+                        let r = if node.child_count > 0 || parent == u32::MAX {
+                            node.rho.to_f32()
+                        } else {
+                            0.5 * instance.1.get(parent as usize).rho.to_f32()
+                        };
+                        let delta = node.center() - instance.4;
+                        let d = delta.length().max(1.0e-6);
+                        bufs[5].push((r / d * foveate_of(delta, 1.0 / d, instance)).to_bits());
+                    }
+                    if bufs[0].len() == CHUNK {
+                        flush(sink, inst, &mut bufs, at);
+                        at += CHUNK;
+                    }
+                }
+                flush(sink, inst, &mut bufs, at);
+                if neighbours {
+                    let mut at = 0;
+                    for &(inst_index, paged_index) in culled_out.iter() {
+                        if inst_index as usize != inst {
+                            continue;
+                        }
+                        bufs[4].push(paged_index);
+                        if bufs[4].len() == CHUNK {
+                            flush(sink, inst, &mut bufs, at);
+                            at += CHUNK;
+                        }
+                    }
+                    flush(sink, inst, &mut bufs, at);
+                }
+            }
+        }
         Ok((TraverseOut {
             lod_ids: lod_ids_out,
-            outputs: instance_outputs,
-            extra,
             touched: touched.clone(),
             min_pixel_scale,
             output_size,
@@ -1287,6 +1308,67 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
             culled_count,
             occluded_count,
         }, budget_hit))
+    }
+}
+
+/// Where the traversal's cut goes (thread CU): `start` an instance with its
+/// cut's and culled nodes' counts, then `put` chunks of a field (0 the
+/// indices, 1 parents, 2 first children, 3 their counts, 4 the culled
+/// nodes, 5 screen angles as f32 bits) at an offset.
+trait CutSink {
+    fn start(&mut self, inst: usize, cut: usize, culled: usize);
+    fn put(&mut self, inst: usize, field: usize, at: usize, data: &[u32]);
+}
+
+/// The cut in Vecs (the native benches and tests).
+#[cfg(test)]
+#[derive(Default)]
+struct VecSink {
+    fields: Vec<[Vec<u32>; 6]>,
+}
+
+#[cfg(test)]
+impl CutSink for VecSink {
+    fn start(&mut self, inst: usize, _cut: usize, _culled: usize) {
+        if self.fields.len() <= inst {
+            self.fields.resize_with(inst + 1, Default::default);
+        }
+    }
+
+    fn put(&mut self, inst: usize, field: usize, _at: usize, data: &[u32]) {
+        self.fields[inst][field].extend_from_slice(data);
+    }
+}
+
+/// The cut in JS typed arrays, an instance's indices in rows of 16384.
+struct JsSink {
+    neighbours: bool,
+    arrays: Vec<[Option<Uint32Array>; 6]>,
+    counts: Vec<usize>,
+}
+
+impl CutSink for JsSink {
+    fn start(&mut self, inst: usize, cut: usize, culled: usize) {
+        if self.arrays.len() <= inst {
+            self.arrays.resize_with(inst + 1, Default::default);
+            self.counts.resize(inst + 1, 0);
+        }
+        self.counts[inst] = cut;
+        let rows = cut.div_ceil(16384);
+        let a = &mut self.arrays[inst];
+        a[0] = Some(Uint32Array::new_with_length((rows * 16384) as u32));
+        if self.neighbours {
+            for f in [1, 2, 3, 5] {
+                a[f] = Some(Uint32Array::new_with_length(cut as u32));
+            }
+            a[4] = Some(Uint32Array::new_with_length(culled as u32));
+        }
+    }
+
+    fn put(&mut self, inst: usize, field: usize, at: usize, data: &[u32]) {
+        if let Some(arr) = &self.arrays[inst][field] {
+            arr.subarray(at as u32, (at + data.len()) as u32).copy_from(data);
+        }
     }
 }
 
@@ -1304,30 +1386,18 @@ pub fn traverse_lod_trees(
     unordered: Option<bool>,
 ) -> anyhow::Result<Object, JsValue> {
     let neighbours_on = neighbours.unwrap_or(false);
+    let mut sink = JsSink { neighbours: neighbours_on, arrays: vec![], counts: vec![] };
     let out = STATE.with_borrow_mut(|state| {
-        traverse_core(state, max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered.unwrap_or(false))
+        traverse_core(state, max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered.unwrap_or(false), &mut sink)
     }).map_err(|e| JsValue::from_str(&e))?;
-    let neighbours = neighbours_on;
-    let TraverseOut { lod_ids: out_ids, outputs: mut instance_outputs, extra, touched, min_pixel_scale, output_size, frontier_size, leaf_count, culled_count, occluded_count } = out;
+    let TraverseOut { lod_ids: out_ids, touched, min_pixel_scale, output_size, frontier_size, leaf_count, culled_count, occluded_count } = out;
     let instance_indices = Array::new();
-
-    for (inst_index, instance_output) in instance_outputs.iter_mut().enumerate() {
-        // instance_output.sort_unstable();
-        let rows = instance_output.len().div_ceil(16384);
-        let capacity = rows * 16384;
-        let output = Uint32Array::new_with_length(capacity as u32);
-        output.subarray(0, instance_output.len() as u32).copy_from(instance_output);
-
+    for (inst_index, arrays) in sink.arrays.iter().enumerate() {
         let result = Object::new();
-        let lod_id = out_ids[inst_index];
-        Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(lod_id)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("numSplats"), &JsValue::from(instance_output.len() as u32)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
-        if neighbours {
-            let e = &extra[inst_index];
-            for (k, name) in ["parents", "firstKids", "kidCounts", "culled", "screens"].into_iter().enumerate() {
-                let a = Uint32Array::new_with_length(e[k].len() as u32);
-                a.copy_from(&e[k]);
+        Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(out_ids[inst_index])).unwrap();
+        Reflect::set(&result, &JsValue::from_str("numSplats"), &JsValue::from(sink.counts[inst_index] as u32)).unwrap();
+        for (f, name) in ["indices", "parents", "firstKids", "kidCounts", "culled", "screens"].into_iter().enumerate() {
+            if let Some(a) = &arrays[f] {
                 Reflect::set(&result, &JsValue::from_str(name), &JsValue::from(a)).unwrap();
             }
         }
@@ -2221,31 +2291,72 @@ mod quant_tests {
                 for unordered in [false, true] {
                     let mut times = vec![];
                     let mut out = TraverseOut::default();
+                    let mut sink = VecSink::default();
                     for _ in 0..5 {
                         let t0 = std::time::Instant::now();
+                        sink = VecSink::default();
                         out = STATE.with_borrow_mut(|state| {
-                            traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), unordered)
+                            traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), unordered, &mut sink)
                         })
                         .unwrap();
                         times.push(t0.elapsed().as_secs_f64() * 1000.0);
                     }
                     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let cut: usize = out.outputs.iter().map(|o| o.len()).sum();
+                    let cut: usize = sink.fields.iter().map(|o| o[0].len()).sum();
                     eprintln!("{name} tau {tau} unordered {unordered}: cut {cut} occluded {} culled {} | {:.1} ms (min {:.1})", out.occluded_count, out.culled_count, times[2], times[0]);
                     // The cut, with each node's parent and children, as a set.
-                    let mut set: Vec<(usize, u32, u32, u32, u32)> = vec![];
-                    for (k, o) in out.outputs.iter().enumerate() {
-                        for (j, &i) in o.iter().enumerate() {
-                            set.push((k, i, out.extra[k][0][j], out.extra[k][1][j], out.extra[k][2][j]));
+                    let mut set: Vec<(usize, u32, u32, u32, u32, u32)> = vec![];
+                    for (k, o) in sink.fields.iter().enumerate() {
+                        for (j, &i) in o[0].iter().enumerate() {
+                            set.push((k, i, o[1][j], o[2][j], o[3][j], o[5][j]));
                         }
                     }
                     set.sort();
-                    let mut culled: Vec<u32> = out.extra.iter().flat_map(|e| e[3].clone()).collect();
+                    let mut culled: Vec<u32> = sink.fields.iter().flat_map(|e| e[4].clone()).collect();
                     culled.sort();
                     sets.push((set, culled, out.occluded_count));
                 }
                 assert!(sets[0] == sets[1], "the stack's cut is not the heap's");
             }
         }
+    }
+
+    /// thread CU: why nodes are kept whole (not 12-byte records), on the car.
+    #[test]
+    #[ignore]
+    fn car_full_reasons() {
+        use spark_lib::athc_compact::decode_runs;
+        let Ok(dir) = std::env::var("CU_CAR_DIR") else { return };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "athc")).collect();
+        files.sort();
+        let mut r = std::collections::BTreeMap::<&str, u64>::new();
+        let mut total = 0u64;
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap();
+            let layout = parse_v3(&bytes).unwrap();
+            let k4 = layout.sections.iter().position(|s| s.id == SectionId::Compact).unwrap();
+            for (p, b) in layout.blocks.iter().enumerate() {
+                let span = b.spans[k4];
+                let (n, raw) = decode_runs(&bytes[span.offset as usize..][..span.stored as usize]).unwrap();
+                let input = traversal_input(&raw, n);
+                let head = layout.pages[p].compact;
+                let mut page: Vec<TraversalNode> = (0..n).map(|i| spark_lib::athc_compact::traversal_node_input(&input, n, &head, p as u32, i)).collect();
+                let (_, codes) = QUANT_RECORD_BITS.apply(&mut page);
+                for (t, c) in page.iter().zip(&codes) {
+                    total += 1;
+                    let why = if t.count == 0 && (t.eps != 0 || t.rho != 0) { "leaf with error" }
+                    else if pack_quant(t, c, p as u32).is_some() { continue }
+                    else if t.occlusion as u32 >= 1 << 13 { "occlusion" }
+                    else if t.size_mode { "size mode" }
+                    else if t.count == 0 { "leaf theta" }
+                    else if t.count != 2 { if t.count == 1 { "1 child" } else if t.count <= 4 { "3-4 children" } else { "5+ children" } }
+                    else if t.child_page.wrapping_sub(p as u32) & 0xffff >= 255 { "page delta" }
+                    else if c.eps == 0 { "eps code" }
+                    else { "rho/theta code" };
+                    *r.entry(why).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("{total} nodes: {r:?}");
     }
 }

@@ -368,6 +368,84 @@ export class NodeSlotAllocator {
     this.free.push(s);
   }
 
+  /**
+   * Fewer slots (thread CU: the pool after a large cut): the nodes past
+   * `capacity` used this frame or the last (drawn) move to free or idle
+   * slots below it, the others are let go. Returns the moves (from, to
+   * pairs), or null when there is not room below (nothing changed).
+   */
+  shrink(capacity: number): Uint32Array | null {
+    if (capacity >= this.capacity) return new Uint32Array(0);
+    const keyOf = this.keyOf;
+    const stamp = this.stamp;
+    const live = (s: number) =>
+      keyOf[s] >= 0 &&
+      (stamp[s] === this.frame ||
+        (this.lastCutStamp > 0 && stamp[s] === this.lastCutStamp));
+    // Room below: free slots, then idle ones (not live).
+    const roomSet = new Set<number>();
+    for (const s of this.free) if (s < capacity && keyOf[s] < 0) roomSet.add(s);
+    let need = 0;
+    for (let s = capacity; s < this.capacity; s++) if (live(s)) need += 1;
+    for (
+      let k = this.idleHead;
+      k < this.idle.length && roomSet.size < need;
+      k++
+    ) {
+      const s = this.idle[k];
+      if (s < capacity && keyOf[s] >= 0 && !live(s)) roomSet.add(s);
+    }
+    if (roomSet.size < need) return null;
+    const room = [...roomSet];
+    const moves: number[] = [];
+    const used = new Set<number>();
+    for (let s = capacity; s < this.capacity; s++) {
+      const key = keyOf[s];
+      if (key < 0) continue;
+      if (!live(s)) {
+        this.slotOf.delete(key);
+        keyOf[s] = -1;
+        continue;
+      }
+      const t = room.pop() as number;
+      used.add(t);
+      if (keyOf[t] >= 0) {
+        this.slotOf.delete(keyOf[t]);
+        this.stats.evicted += 1;
+      }
+      keyOf[t] = key;
+      stamp[t] = stamp[s];
+      this.slotOf.set(key, t);
+      keyOf[s] = -1;
+      moves.push(s, t);
+    }
+    const map = new Map<number, number>();
+    for (let k = 0; k < moves.length; k += 2) map.set(moves[k], moves[k + 1]);
+    const remap = (a: ArrayLike<number>, n: number) => {
+      const out: number[] = [];
+      for (let k = 0; k < n; k++) {
+        const s = a[k];
+        const t = s < capacity ? s : map.get(s);
+        if (t !== undefined) out.push(t);
+      }
+      return out;
+    };
+    this.lastCut = Uint32Array.from(remap(this.lastCut, this.lastCut.length));
+    const cur = remap(this.cur, this.curN);
+    this.cur.set(cur);
+    this.curN = cur.length;
+    this.idle = this.idle.slice(this.idleHead).filter((s) => s < capacity);
+    this.idleHead = 0;
+    this.lastCutAt = 0;
+    this.free = this.free.filter(
+      (s) => s < capacity && keyOf[s] < 0 && !used.has(s),
+    );
+    this.keyOf = keyOf.slice(0, capacity);
+    this.stamp = stamp.slice(0, capacity);
+    this.capacity = capacity;
+    return Uint32Array.from(moves);
+  }
+
   /** The key held in slot s, or -1. */
   keyIn(s: number) {
     return this.keyOf[s];
@@ -640,6 +718,43 @@ export class CompactNodePool {
     const buffer = this.createBuffer(next);
     const enc = this.device.createCommandEncoder({ label: "node pool grow" });
     enc.copyBufferToBuffer(this.buffer, 0, buffer, 0, this.buffer.size);
+    this.device.queue.submit([enc.finish()]);
+    this.buffer.destroy();
+    this.buffer = buffer;
+    this.capacity = next;
+    const layout = this.cloud.layout as CompactLayout;
+    this.cloud = {
+      data: this.cloud.data,
+      layout: { ...layout, count: next, bytes: this.bytes() },
+    };
+    return true;
+  }
+
+  /**
+   * Exactly `capacity` records (thread CU: the node pool's worker decides):
+   * a new buffer with the tables, the heads and the records below both
+   * capacities copied, then `moves` (from, to slot pairs: records past a
+   * smaller capacity kept in a slot below it).
+   */
+  resize(capacity: number, moves?: Uint32Array) {
+    const next = Math.min(Math.max(capacity, 1024), this.maxCapacity);
+    if (next === this.capacity && !moves?.length) return false;
+    const buffer = this.createBuffer(next);
+    const enc = this.device.createCommandEncoder({ label: "node pool resize" });
+    const keep =
+      (this.recordsBase + Math.min(next, this.capacity) * NODE_RECORD_WORDS) *
+      4;
+    enc.copyBufferToBuffer(this.buffer, 0, buffer, 0, keep);
+    const R = NODE_RECORD_WORDS * 4;
+    for (let k = 0; moves && k < moves.length; k += 2) {
+      enc.copyBufferToBuffer(
+        this.buffer,
+        this.recordsBase * 4 + moves[k] * R,
+        buffer,
+        this.recordsBase * 4 + moves[k + 1] * R,
+        R,
+      );
+    }
     this.device.queue.submit([enc.finish()]);
     this.buffer.destroy();
     this.buffer = buffer;

@@ -1931,8 +1931,11 @@ export class CompactBandStreamer {
   private onCutterInner(m: FromCutter) {
     if (m.t === "frame") {
       const pool = this.pool as CompactNodePool;
-      if (m.grow > pool.capacity && pool.grow(m.grow)) {
-        this.lastPath?.setPagedCloud(pool);
+      // The worker's size exactly (a grow, or a shrink with its moves).
+      if (m.grow && (m.grow !== pool.capacity || m.moves?.length)) {
+        if (pool.resize(m.grow, m.moves ?? undefined)) {
+          this.lastPath?.setPagedCloud(pool);
+        }
       }
       if (m.slots.length) pool.writeRecords(m.slots, m.records);
       if (m.drawList) {

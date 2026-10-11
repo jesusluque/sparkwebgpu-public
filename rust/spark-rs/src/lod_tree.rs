@@ -2553,4 +2553,44 @@ mod quant_tests {
         }
         eprintln!("{total} nodes: {r:?}");
     }
+
+    /// thread CU round 3: what an 8-byte record must hold, over the car.
+    #[test]
+    #[ignore]
+    fn car_record_stats() {
+        use spark_lib::athc_compact::decode_runs;
+        let Ok(dir) = std::env::var("CU_CAR_DIR") else { return };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "athc")).collect();
+        files.sort();
+        let (mut leaves, mut merges, mut same, mut d1, mut d16, mut wide, mut cone_m, mut cone_l, mut occl, mut pages) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut distinct_max = 0usize;
+        let mut distinct_hist = [0u64; 6];
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap();
+            let layout = parse_v3(&bytes).unwrap();
+            let k4 = layout.sections.iter().position(|s| s.id == SectionId::Compact).unwrap();
+            for (p, b) in layout.blocks.iter().enumerate() {
+                let span = b.spans[k4];
+                let (n, raw) = decode_runs(&bytes[span.offset as usize..][..span.stored as usize]).unwrap();
+                let input = traversal_input(&raw, n);
+                let head = layout.pages[p].compact;
+                let mut set = std::collections::HashSet::new();
+                pages += 1;
+                for i in 0..n {
+                    let t = spark_lib::athc_compact::traversal_node_input(&input, n, &head, p as u32, i);
+                    if t.occlusion != 0 { occl += 1; set.insert(t.occlusion); }
+                    if t.count == 0 { leaves += 1; if cone_present(t.cone) { cone_l += 1; } continue; }
+                    merges += 1;
+                    if cone_present(t.cone) { cone_m += 1; }
+                    if t.count != 2 { wide += 1; }
+                    let d = t.child_page.wrapping_sub(p as u32) & 0xffff;
+                    if d == 0 { same += 1 } else if d == 1 { d1 += 1 } else if d < 16 { d16 += 1 }
+                }
+                distinct_max = distinct_max.max(set.len());
+                let b = match set.len() { 0..=15 => 0, 16..=63 => 1, 64..=255 => 2, 256..=1023 => 3, 1024..=4095 => 4, _ => 5 };
+                distinct_hist[b] += 1;
+            }
+        }
+        eprintln!("pages {pages} leaves {leaves} merges {merges} (wide {wide}) children same page {same} next {d1} <16 {d16}; cones merges {cone_m} leaves {cone_l}; occluded {occl}; distinct occlusion a page max {distinct_max} hist(<16,<64,<256,<1k,<4k,more) {distinct_hist:?}");
+    }
 }

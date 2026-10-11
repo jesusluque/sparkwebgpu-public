@@ -15,6 +15,7 @@ import init_wasm, {
   tiny_lod_packedsplats,
   bhatt_lod_packedsplats,
   update_compact_lod_trees,
+  set_compact_quant,
   update_lod_trees,
   decode_to_extsplats,
   tiny_lod_extsplats,
@@ -52,10 +53,17 @@ const rpcHandlers = {
   getLodTreeLevel,
   nextChunk,
   wasmMemory,
+  setCompactQuant,
 };
 export type rpcHandlers = typeof rpcHandlers;
 
 let wasmExports: { memory: WebAssembly.Memory } | null = null;
+/** The compact traversal's quantization for the pages that land from now on (thread CT). */
+function setCompactQuant({ bits }: { bits: number[] }) {
+  const b = [0, 1, 2, 3, 4].map((k) => bits[k] ?? 0);
+  set_compact_quant(b[0], b[1], b[2], b[3], b[4]);
+  return {};
+}
 /** The worker's WASM heap, bytes (it never shrinks). */
 function wasmMemory() {
   return { bytes: wasmExports?.memory.buffer.byteLength ?? 0 };
@@ -844,6 +852,7 @@ function traverseLodTrees({
   backCullMin,
   occlusionCull,
   errorSizeK,
+  neighbours,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -859,6 +868,11 @@ function traverseLodTrees({
   occlusionCull?: boolean;
   /** The combined cut: P = max(P_err, P_size / k) (lod_tree.rs). */
   errorSizeK?: number;
+  /**
+   * Each cut node's parent, first child and children (resident), and the
+   * culled nodes, per instance (the node pool, thread CT).
+   */
+  neighbours?: boolean;
   instances: Record<
     string,
     {
@@ -926,6 +940,7 @@ function traverseLodTrees({
     backCullMin,
     occlusionCull,
     errorSizeK,
+    neighbours,
   ) as {
     culledCount?: number;
     occludedCount?: number;

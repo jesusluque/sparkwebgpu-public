@@ -770,6 +770,62 @@ page plan, the eviction order and tau's fit are `WgpuBandPager`'s
 list (`CompactRelitPath.setPagedCloud` + `setDrawList`); compact.slang reads a
 slot's planes and head when `slotNodes` > 0.
 
+#### CMPC v4: payload runs, and the node pool (thread CT)
+
+A compact reader of v3 keeps a whole page on the GPU (40 bytes a node) for
+every page the traversal needs, though only about a quarter of a page's
+nodes are drawn (the rest are the cut's ancestors, the nodes the culls
+prune, and the nodes below the cut a page's box reaches). v4 lets a reader
+keep the GPU's bytes for the DRAWN cut only.
+
+`athc-convert --compact-runs [--run-nodes 64] in.athc out.athc` rewrites a
+v3 file's tier 4 in place (tiers 1-3 and every table byte for byte, CPCA
+included; only the `CMPC` entry, its spans and the page rows' tier-4 bytes
+change). The section's encoding is 16 (`ENCODING_COMPACT_RUNS`), stored
+uncompressed: each page is a container,
+
+```text
+0 "CMP4"  1 nodes  2 nodes a run (64)  3 the traversal member's bytes  4 runs
+5.. each run's end (u32, bytes after the traversal member)
+the traversal's 24 planes (v3's traversal bytes a node), gzipped
+each run: raw deflate of its nodes' 15 GPU planes, plane after plane
+```
+
+The positions the traversal reads are only in the runs: a reader inflates
+a page's runs once as it lands (about 0.3 us a node), for the traversal's
+input. Tier 4 grows about 10 % (the whole car: 314 to 344 MB), as runs of
+64 compress less than a page.
+
+The node pool (`CompactBandStreamer` option `nodePool`, `compactNodes.ts`;
+`compact-car.js ?nodes=1`):
+
+- the GPU holds a record (44 bytes: the 40 and the node's page and place)
+  for each drawn node, in slots with a free list; nodes that left the cut
+  keep their slot until it is wanted. Every page's head is in a head
+  table (64 bytes a page). compact.slang reads a record when
+  `nodeWords` > 0; the image is the page pool's bit for bit;
+- the CPU keeps each resident page's runs compressed, by class: the runs
+  of the cut's nodes, their parents and their children (the traversal
+  returns them, `neighbours`) are always kept; the culled nodes' next;
+  the rest are dropped first over `runBudget`. A dropped run a new cut
+  node needs is fetched again by Range; meanwhile the node is drawn as its
+  parent, or its children, when those have records;
+- the traversal's nodes are 12-byte records (`set_compact_quant`, spark-rs
+  `QuantNode`, the default with the node pool): centre 3 x 10 bits in the
+  page's box of centres, eps 8 and rho 7 bits of log code over the page's
+  range, theta 6 bits, a merge's axis 5 + 5 bits, occlusion 13 bits, the
+  children as a place and a page delta (count 2); whatever does not fit is
+  kept whole (20 bytes). Rounding only refines more and culls less: eps,
+  rho and theta are rounded up, a merge's axis error is added to its
+  theta, and the page's largest centre error is a margin added to every
+  node's sphere. The WASM tree grows with the pages that land, not with
+  the budget.
+- on a phone (`compact-car.js`, CMPC v4 pieces) the node pool is the
+  default, with tau's floor at 3, the traversal's budget 14 MB (about 400
+  pages), runs kept by last use under 6 MB (`protect: "none"`; a run with
+  a cut node still to upload always stays), at most 256 runs inflated an
+  update; a desktop keeps the cut's neighbours' runs (`"neighbours"`).
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only

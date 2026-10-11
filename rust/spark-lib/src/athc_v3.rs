@@ -52,6 +52,10 @@ pub use crate::athc_cpca::ENCODING_CPCA;
 /// The lossless encodings are 0 ..= this.
 pub const MAX_LOSSLESS_ENCODING: u32 = ENCODING_DELTA_PLANES;
 pub const MAX_ENCODING: u32 = ENCODING_CPCA;
+/// The compact tier's own encoding (CMPC v4, thread CT): each page a
+/// container (`athc_compact::encode_runs`), the traversal's planes gzipped
+/// and the GPU's in deflate runs; stored as it is (the section uncompressed).
+pub const ENCODING_COMPACT_RUNS: u32 = 16;
 
 /// Sections, in the order they sit in every block (tier order). Within the
 /// relight tier the shadow bits come first and the transfer in the order of
@@ -942,7 +946,7 @@ fn write_v3_impl(
         if pages.is_none() {
             bail!(".athc v3: the compact tier is a paged tree's");
         }
-        if c.pages.len() != file.chunks.len() || c.pages.iter().zip(&file.chunks).any(|(p, b)| p.len() != b.n * crate::athc_compact::NODE_BYTES) {
+        if c.pages.len() != file.chunks.len() || c.pages.iter().zip(&file.chunks).any(|(p, b)| !c.runs && p.len() != b.n * crate::athc_compact::NODE_BYTES) {
             bail!(".athc v3: the compact tier's pages do not match the tree's");
         }
     }
@@ -1062,12 +1066,12 @@ fn write_v3_impl(
         }
     }
     // The compact tier: its own byte planes already, stored as they are.
-    if compact.is_some() {
+    if let Some(c) = compact {
         sections.push(Section {
             id: SectionId::Compact,
             tier: 4,
-            encoding: ENCODING_V2_WORDS,
-            compression,
+            encoding: if c.runs { ENCODING_COMPACT_RUNS } else { ENCODING_V2_WORDS },
+            compression: if c.runs { COMPRESSION_NONE } else { compression },
             words: (crate::athc_compact::NODE_BYTES / 4) as u32,
         });
     }
@@ -1143,6 +1147,19 @@ fn write_v3_impl(
             };
             if s.id.is_transfer() {
                 tx_from += s.words;
+            }
+            if s.encoding == ENCODING_COMPACT_RUNS {
+                // CMPC v4: the page's container, stored as it is.
+                spans.push(SectionSpan { offset: at + (data.len() - begin) as u64, stored: raw.len() as u32, raw: raw.len() as u32 });
+                if paged {
+                    if held.len() < entries.len() + 1 {
+                        held.push(Vec::new());
+                    }
+                    held[entries.len()].push(raw);
+                    continue;
+                }
+                data.extend_from_slice(&raw);
+                continue;
             }
             let encoded = if s.encoding == ENCODING_CPCA {
                 let o = cpca.copied().unwrap_or(crate::athc_cpca::CpcaOptions {
@@ -1395,7 +1412,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
     let compact_section = sections.iter().position(|s| s.id == SectionId::Compact);
     if let Some(k) = compact_section {
         let s = &sections[k];
-        if k + 1 != sections.len() || s.tier != 4 || !(s.words as usize * 4 == crate::athc_compact::NODE_BYTES || s.words as usize * 4 == crate::athc_compact::NODE_BYTES_V2 || s.words as usize * 4 == crate::athc_compact::V1_NODE_BYTES) || s.encoding != 0 {
+        if k + 1 != sections.len() || s.tier != 4 || !(s.words as usize * 4 == crate::athc_compact::NODE_BYTES || s.words as usize * 4 == crate::athc_compact::NODE_BYTES_V2 || s.words as usize * 4 == crate::athc_compact::V1_NODE_BYTES) || !(s.encoding == 0 || s.encoding == ENCODING_COMPACT_RUNS) {
             bail!(".athc v3: a compact section of {} words, tier {}, encoding {}, not last", s.words, s.tier, s.encoding);
         }
     }
@@ -1409,7 +1426,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
     {
         bail!(".athc v3: its sections are not those its header implies");
     }
-    if let Some(s) = sections.iter().find(|s| s.encoding > MAX_ENCODING || s.compression > COMPRESSION_GZIP) {
+    if let Some(s) = sections.iter().find(|s| (s.encoding > MAX_ENCODING && s.id != SectionId::Compact) || s.compression > COMPRESSION_GZIP) {
         bail!(".athc v3: section {:?} has encoding {} / compression {} this reader does not know", s.id, s.encoding, s.compression);
     }
     let entry = BLOCK_ENTRY_HEAD + BLOCK_ENTRY_PER_SECTION * section_count;

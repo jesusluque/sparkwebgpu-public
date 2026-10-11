@@ -2,14 +2,19 @@
 // allocator (free list, idle FIFO, the last cut's slots, growth) and the
 // pages' payload store (compressed as fetched, an LRU of decompressed).
 
-import { gzipSync } from "node:zlib";
+import { deflateRawSync, gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import {
   NODE_RECORD_WORDS,
   NodeSlotAllocator,
   PagePayloadStore,
+  RUN_CULLED,
+  RUN_CUT,
+  RunPayloadStore,
   nodeRecordLayout,
   packPageRecords,
+  parseRunsContainer,
+  unpackRunsContainer,
 } from "../../src/webgpu/athenea/compactNodes";
 import {
   COMPACT_NODE_BYTES,
@@ -185,5 +190,75 @@ describe("node records", () => {
     // The 40 payload bytes, each once.
     expect(used.size).toBe(40);
     expect(Math.max(...used)).toBe(39);
+  });
+});
+
+describe("RunPayloadStore", () => {
+  /** A container like rust encode_runs: head, ends, a traversal member, runs. */
+  function container(n: number, run: number) {
+    const runs = Math.ceil(n / run);
+    const trav = new Uint8Array(gzipSync(new Uint8Array(24 * n)));
+    const parts: Uint8Array[] = [];
+    for (let r = 0; r < runs; r++) {
+      const m = Math.min(run, n - r * run);
+      const planes = Uint8Array.from(
+        { length: 40 * m },
+        (_, i) => (i + r) & 0xff,
+      );
+      parts.push(new Uint8Array(deflateRawSync(planes)));
+    }
+    const head = new Uint32Array(5 + runs);
+    head.set([0x34504d43, n, run, trav.length, runs]);
+    let end = 0;
+    parts.forEach((p, r) => {
+      end += p.length;
+      head[5 + r] = end;
+    });
+    const out = new Uint8Array(head.byteLength + trav.length + end);
+    out.set(new Uint8Array(head.buffer), 0);
+    out.set(trav, head.byteLength);
+    let at = head.byteLength + trav.length;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
+    return { out, parts };
+  }
+
+  it("keeps the cut's runs, drops the others over budget, fetches them again", () => {
+    const { out, parts } = container(200, 64);
+    const s = new RunPayloadStore(0, 2);
+    s.put(7, out, 1000);
+    expect(s.bytes).toBe(parts.reduce((n, p) => n + p.length, 0));
+    s.begin();
+    s.mark(7, 70, RUN_CUT); // run 1
+    s.mark(7, 130, RUN_CULLED); // run 2
+    s.trim();
+    const c = s.census();
+    expect(c).toMatchObject({ runs: 4, held: 1, cut: 1 });
+    expect(s.missing(7, 0)).toBe(true);
+    expect(s.planes(7, 0)).toBeNull();
+    const p1 = s.planes(7, 1) as Uint8Array;
+    expect(p1.length).toBe(40 * 64);
+    expect(p1[0]).toBe(1);
+    // Run 3 (8 nodes) fetched again from its file span.
+    const span = s.fileSpan(7, 3) as [number, number];
+    const local = span[0] - 1000;
+    s.putRun(7, 3, out.slice(local, local + span[1]));
+    expect((s.planes(7, 3) as Uint8Array).length).toBe(40 * 8);
+    expect(s.stats.fetched).toBe(1);
+    s.drop(7);
+    expect(s.bytes).toBe(0);
+    expect(s.inflatedBytes).toBe(0);
+  });
+
+  it("unpacks a container to the traversal's input with the run positions", () => {
+    const { out } = container(100, 64);
+    const h = parseRunsContainer(out);
+    const u = unpackRunsContainer(out, h, new Uint8Array(24 * 100), true);
+    expect(u.input.length).toBe(30 * 100);
+    // posX of node 70 (run 1, local 6): run 1's planes start with posX.
+    expect(u.input[2 * 70]).toBe((2 * 6 + 1) & 0xff);
+    expect(u.raw?.length).toBe(64 * 100);
   });
 });

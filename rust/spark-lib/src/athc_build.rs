@@ -971,6 +971,7 @@ pub fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         curvature: pick(&b.curvature),
         skin: pick(&b.skin),
         lod_size: Vec::new(),
+        lod_error: Vec::new(),
     }
 }
 

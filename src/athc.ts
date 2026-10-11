@@ -112,6 +112,7 @@ export type AthcSection = {
     | "CORE"
     | "SHRS"
     | "LODS"
+    | "LODE"
     | "SKIN"
     | "MATL"
     | "SHAD"
@@ -264,6 +265,9 @@ export function athcNeeds(
     // The levels' LoD sizes by error (athc_lod_error.rs): what the
     // traversal reads. A chunk's are 0 (geometric): see sectionsFor.
     case "LODS":
+      return true;
+    // The levels' LoD error cut bounds (athc_lod_cut.rs): the traversal's.
+    case "LODE":
       return true;
     // A skinned cloud's rig (athc_skin.rs): read whole-file only for now;
     // a paged skinned cloud is drawn in its bind pose.
@@ -659,7 +663,7 @@ function sectionsFor(
       (id) =>
         athcNeeds(layout, id, want) &&
         (core || (id !== "CORE" && id !== "SHRS")) &&
-        (levels || id !== "LODS"),
+        (levels || (id !== "LODS" && id !== "LODE")),
     );
 }
 

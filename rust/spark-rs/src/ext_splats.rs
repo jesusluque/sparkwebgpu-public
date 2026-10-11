@@ -35,6 +35,8 @@ pub struct ExtSplatsData {
     child_starts: Option<Vec<u32>>,
     /// LoD sizes by error (spark-lib athc_lod_error), 0: geometric.
     lod_sizes: Option<Vec<f32>>,
+    /// LoD error cut bounds (spark-lib athc_lod_cut), LOD_ERROR_WORDS a splat.
+    lod_errors: Option<Vec<u32>>,
     buffer_a: Vec<u32>,
     buffer_b: Vec<u32>,
     buffer_base: usize,
@@ -65,6 +67,7 @@ impl ExtSplatsData {
             child_counts: None,
             child_starts: None,
             lod_sizes: None,
+            lod_errors: None,
             buffer_a: Vec::new(),
             buffer_b: Vec::new(),
             buffer_base: 0,
@@ -108,6 +111,11 @@ impl ExtSplatsData {
         }
         if let Some(lod_tree) = self.lod_tree.as_ref() {
             Reflect::set(&object, &JsValue::from_str("lodTree"), &JsValue::from(lod_tree)).unwrap();
+        }
+        if let Some(errors) = self.lod_errors.as_ref() {
+            let array = Uint32Array::new_with_length(errors.len() as u32);
+            array.copy_from(errors);
+            Reflect::set(&object, &JsValue::from_str("lodError"), &JsValue::from(array)).unwrap();
         }
         object
     }
@@ -385,6 +393,7 @@ impl SplatReceiver for ExtSplatsData {
     }
 
     fn init_splats(&mut self, init: &SplatInit) -> anyhow::Result<()> {
+        self.lod_errors = None;
         let (_, _, _, max_splats) = get_splat_tex_size(init.num_splats);
         self.max_splats = max_splats;
         self.num_splats = init.num_splats;
@@ -840,6 +849,12 @@ impl SplatReceiver for ExtSplatsData {
                 }
             }
         }
+    }
+
+    fn set_lod_error(&mut self, base: usize, count: usize, error: &[u32]) {
+        let w = crate::lod_tree::LOD_ERROR_WORDS;
+        let errors = self.lod_errors.get_or_insert_with(|| vec![0; self.num_splats * w]);
+        errors[base * w..(base + count) * w].copy_from_slice(&error[..count * w]);
     }
 
     fn set_lod_size(&mut self, base: usize, count: usize, size: &[f32]) {

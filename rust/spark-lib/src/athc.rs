@@ -91,7 +91,12 @@ pub const FLAG_TRANSFER: u32 = 32;
 /// sparkwebGPU's LoD sizes by error (`athc_lod_error`): a v3 file's `LODS`
 /// section, or a merged ATHV page's sizes. Never in a v2 file.
 pub const FLAG_LOD_SIZE: u32 = 64;
-pub const KNOWN_FLAGS: u32 = FLAG_NORMALS | FLAG_LINEAR | FLAG_EMISSION | FLAG_MATERIAL | FLAG_TRANSFER | FLAG_LOD_SIZE;
+/// sparkwebGPU's LoD error cut (`athc_lod_cut`): a v3 file's `LODE` section
+/// (each merged node's monotone error and bounding radius, two f16), or a
+/// merged ATHV page's. Never in a v2 file.
+pub const FLAG_LOD_ERROR: u32 = 128;
+pub const KNOWN_FLAGS: u32 =
+    FLAG_NORMALS | FLAG_LINEAR | FLAG_EMISSION | FLAG_MATERIAL | FLAG_TRANSFER | FLAG_LOD_SIZE | FLAG_LOD_ERROR;
 
 /// Spark's LoD pages (and athenea's default chunk): 65 536 splats.
 pub const PAGE_SPLATS: u32 = 65536;
@@ -478,6 +483,10 @@ pub struct AthcBlock {
     /// sparkwebGPU's LoD size by error (`athc_lod_error`, v3 section LODS):
     /// one a merged node, 0 for a splat (its geometric size), or empty.
     pub lod_size: Vec<f32>,
+    /// sparkwebGPU's LoD error cut (`athc_lod_cut`, v3 section LODE): two
+    /// words a merged node, f16 epsilon | f16 rho (metres), then f16 theta |
+    /// the cone's octahedral 8+8-bit axis; 0 for a splat, or empty.
+    pub lod_error: Vec<u32>,
 }
 
 fn words_of(b: &[u8], at: &mut usize, n: usize) -> Vec<u32> {
@@ -508,7 +517,7 @@ impl AthcBlock {
         let shadow_bits = opt(x.shadow_words > 0, &mut at, x.shadow_words);
         let curvature = opt(x.curvature_words > 0, &mut at, x.curvature_words);
         let skin = opt(x.skin_words() > 0, &mut at, x.skin_words());
-        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new() })
+        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new(), lod_error: Vec::new() })
     }
 
     /// Every array after positions, in file order.
@@ -563,6 +572,7 @@ impl AthcBlock {
             curvature: cut(&self.curvature),
             skin: cut(&self.skin),
             lod_size: if self.lod_size.is_empty() { Vec::new() } else { self.lod_size[start..start + n].to_vec() },
+            lod_error: if self.lod_error.is_empty() { Vec::new() } else { cut(&self.lod_error) },
         }
     }
 
@@ -587,6 +597,16 @@ impl AthcBlock {
                 self.lod_size.resize(self.n, 0.0);
             } else {
                 self.lod_size.extend_from_slice(&other.lod_size);
+            }
+        }
+        // The same for the LoD errors (0: none).
+        if !self.lod_error.is_empty() || !other.lod_error.is_empty() {
+            let w = crate::athc_lod_cut::LOD_ERROR_WORDS;
+            self.lod_error.resize((self.n - other.n) * w, 0);
+            if other.lod_error.is_empty() {
+                self.lod_error.resize(self.n * w, 0);
+            } else {
+                self.lod_error.extend_from_slice(&other.lod_error);
             }
         }
     }
@@ -1104,6 +1124,10 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     // A LoD size at least its children's (athc_lod_error).
     if !level1.lod_size.is_empty() {
         root.lod_size = vec![level1.lod_size.iter().cloned().fold(0.0, f32::max)];
+    }
+    // Its LoD error over level 1's (athc_lod_cut): no merge cost of its own.
+    if level1.lod_error.len() == level1.n * crate::athc_lod_cut::LOD_ERROR_WORDS {
+        root.lod_error = crate::athc_lod_cut::root_error(&root, level1);
     }
     root
 }
@@ -1842,6 +1866,14 @@ pub fn merged_pages_of(file: &AthcFile, header_page: &[u8]) -> Result<(VirtualTr
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
+        if !merged.lod_error.is_empty() {
+            let flags = u32::from_le_bytes(out[152..156].try_into().unwrap()) | ATHV_LOD_ERRORS;
+            out[152..156].copy_from_slice(&flags.to_le_bytes());
+            let w = crate::athc_lod_cut::LOD_ERROR_WORDS;
+            for v in &merged.lod_error[base as usize * w..(base + n) as usize * w] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         pages.push(out);
     }
     Ok((tree, pages))
@@ -1918,6 +1950,9 @@ pub const ATHV_KEEP_LINEAR: u32 = 1;
 /// An ATHV merged page's decode flags, bit 1: its nodes' LoD sizes
 /// (`AthcBlock::lod_size`, f32 each) follow its group ranges.
 pub const ATHV_LOD_SIZES: u32 = 2;
+/// An ATHV merged page's decode flags, bit 2: its nodes' LoD errors
+/// (`AthcBlock::lod_error`, a word each) follow the sizes (or the ranges).
+pub const ATHV_LOD_ERRORS: u32 = 4;
 
 /// Feeds `block`'s elements to `receiver` as splats base .. base + n, with
 /// `children` (counts, virtual starts) when they are tree nodes.
@@ -2048,6 +2083,10 @@ pub fn emit_block<T: SplatReceiver>(
     // LoD sizes by error, for the nodes that have them (0: geometric).
     if lod_tree && block.lod_size.len() == block.n && block.lod_size.iter().any(|&v| v > 0.0) {
         receiver.set_lod_size(base, block.n, &block.lod_size);
+    }
+    // LoD errors for the error cut (athc_lod_cut), for the nodes that have them.
+    if lod_tree && block.lod_error.len() == block.n * crate::athc_lod_cut::LOD_ERROR_WORDS && block.lod_error.iter().any(|&v| v != 0) {
+        receiver.set_lod_error(base, block.n, &block.lod_error);
     }
     // GROUP_ATTRIBUTE: given for merged nodes; a splat's tail is its group.
     let ranges: Vec<u32> = match groups {
@@ -2181,6 +2220,13 @@ impl<T: SplatReceiver> AthcDecoder<T> {
                     bail!("ATHV page shorter than its LoD sizes");
                 }
                 block.lod_size = words_of(b, &mut after, n).into_iter().map(f32::from_bits).collect();
+            }
+            if u32_at(b, 152) & ATHV_LOD_ERRORS != 0 {
+                let w = crate::athc_lod_cut::LOD_ERROR_WORDS;
+                if b.len() < after + 4 * w * n {
+                    bail!("ATHV page shorter than its LoD errors");
+                }
+                block.lod_error = words_of(b, &mut after, w * n);
             }
             Some(ranges)
         } else {

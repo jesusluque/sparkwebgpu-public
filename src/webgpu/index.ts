@@ -22,6 +22,8 @@ export {
 export { KernelRegistry } from "./KernelRegistry";
 export {
   WgpuLod,
+  LodTauController,
+  type LodTauAutoOptions,
   type WgpuLodMesh,
   type WgpuLodMeshOptions,
   type WgpuLodOptions,

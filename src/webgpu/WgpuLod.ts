@@ -41,6 +41,32 @@ export interface WgpuLodOptions {
   /** Minimum splat size in pixels. @default 1 */
   lodRenderScale?: number;
   lodTraverseMode?: "dynamic" | "standard";
+  /**
+   * The LoD error cut (rust spark-lib athc_lod_cut.rs, athenea's
+   * lod_tree_cut.slang): tau in pixels. A tree whose file carries the
+   * bounds (`.athc` section LODE: usd-athc / athc-convert --lod-errors) is
+   * cut where each node's projected error, eps ppu / max(d - rho, near),
+   * is at most tau and its parent's is not; other trees keep the size cut
+   * (lodRenderScale). 0: off, the size cut everywhere. @default 0
+   */
+  lodErrorTau?: number;
+  /**
+   * With the bounds' back-face cones (LODE): a merged node whose leaves all
+   * face away from the eye is dropped with its subtree. Glass, thin walls,
+   * double-sided pieces and clouds without normals carry no cone.
+   * @default false
+   */
+  lodBackCull?: boolean;
+  /**
+   * tau that breathes with a budget (thread CG, Nanite-style), with
+   * lodErrorTau > 0: a detail scale s in [min, 1] divides tau (the cut
+   * coarsens under pressure, never finer than lodErrorTau). Every
+   * intervalMs at most, s x 0.97 when the frame time (an EMA of update()'s
+   * interval) passes frameMs or the page pool is fuller than `high`, s x 1.01
+   * when the pool is under `low` and the frame time under 0.85 frameMs;
+   * between the two it holds (hysteresis). true: the defaults.
+   */
+  lodErrorTauAuto?: boolean | LodTauAutoOptions;
   /** @default 0.2 */
   behindFoveate?: number;
   /** @default 90 */
@@ -86,6 +112,51 @@ export interface WgpuLodOptions {
    * @default 0
    */
   lodFadeMs?: number;
+}
+
+export interface LodTauAutoOptions {
+  /** Frame budget, ms. @default 1000 / 50 */
+  frameMs?: number;
+  /** Pool fill (pages in use over the pool's) above which it coarsens. @default 0.85 */
+  high?: number;
+  /** ... and under which it may refine. @default 0.7 */
+  low?: number;
+  /** Least time between two steps, ms. @default 250 */
+  intervalMs?: number;
+  /** The coarsest detail scale. @default 0.3 */
+  min?: number;
+}
+
+/** The breathing tau's controller (lodErrorTauAuto), alone for tests. */
+export class LodTauController {
+  /** The detail scale: tau is divided by it. */
+  scale = 1;
+  frameEma = 0;
+  private lastFrame = 0;
+  private lastStep = Number.NEGATIVE_INFINITY;
+
+  /** A frame at `now` with the pool `fill` (0..1, or null without a pool). */
+  frame(now: number, fill: number | null, o: LodTauAutoOptions = {}): boolean {
+    const frameMs = o.frameMs ?? 1000 / 50;
+    if (this.lastFrame > 0) {
+      const dt = Math.min(now - this.lastFrame, 1000);
+      this.frameEma = this.frameEma > 0 ? 0.9 * this.frameEma + 0.1 * dt : dt;
+    }
+    this.lastFrame = now;
+    if (now - this.lastStep < (o.intervalMs ?? 250) || this.frameEma === 0) {
+      return false;
+    }
+    const f = fill ?? 0;
+    const over = f > (o.high ?? 0.85) || this.frameEma > frameMs;
+    const under = f < (o.low ?? 0.7) && this.frameEma < 0.85 * frameMs;
+    const before = this.scale;
+    if (over) this.scale *= 0.97;
+    else if (under) this.scale *= 1.01;
+    this.scale = Math.min(1, Math.max(o.min ?? 0.3, this.scale));
+    if (this.scale === before) return false;
+    this.lastStep = now;
+    return true;
+  }
 }
 
 export interface WgpuLodMeshOptions {
@@ -160,7 +231,16 @@ export class WgpuLod {
   readonly meshes: WgpuLodMesh[] = [];
   pager?: WgpuSplatPager;
   /** Time of the last traversal in ms, and the splats it selected. */
-  readonly stats = { traverseMs: 0, lodSplats: 0, traversals: 0 };
+  readonly stats = {
+    traverseMs: 0,
+    lodSplats: 0,
+    traversals: 0,
+    culled: 0,
+    /** The tau the last update used (lodErrorTau over the auto scale). */
+    tau: 0,
+  };
+  /** lodErrorTauAuto's controller. */
+  readonly tauController = new LodTauController();
 
   private worker: SplatWorker | null = null;
   private pagerId: number | undefined;
@@ -174,6 +254,7 @@ export class WgpuLod {
     chunkBase: number;
     count: number;
     lodTreeData?: Uint32Array;
+    lodErrorData?: Uint32Array;
   }[] = [];
   private dirty = true;
   private version = 0;
@@ -182,6 +263,8 @@ export class WgpuLod {
     pos: THREE.Vector3;
     quat: THREE.Quaternion;
     pixelScaleLimit: number;
+    errorLimit: number;
+    backCull: boolean;
     maxSplats: number;
   };
   private lastPixelLimit?: number;
@@ -196,6 +279,9 @@ export class WgpuLod {
       lodSplatScale: 1,
       lodRenderScale: 1,
       lodTraverseMode: "standard",
+      lodErrorTau: 0,
+      lodBackCull: false,
+      lodErrorTauAuto: false,
       behindFoveate: 0.2,
       coneFov0: 90,
       coneFov: 120,
@@ -444,6 +530,21 @@ export class WgpuLod {
         viewHeight / Math.max(1, size.y),
       );
     }
+    // The error cut's tau in the same angular units (a pixel's size),
+    // breathing with the budget when asked.
+    let tau = o.lodErrorTau;
+    if (tau > 0 && o.lodErrorTauAuto) {
+      const pager = this.pager;
+      const fill = pager ? pager.pagesInUse / pager.maxPages : null;
+      this.tauController.frame(
+        performance.now(),
+        fill,
+        o.lodErrorTauAuto === true ? {} : o.lodErrorTauAuto,
+      );
+      tau /= this.tauController.scale;
+    }
+    this.stats.tau = tau;
+    const errorLimit = tau > 0 ? pixelScaleLimit * tau : 0;
     pixelScaleLimit *= o.lodRenderScale;
 
     camera.updateMatrixWorld();
@@ -454,6 +555,8 @@ export class WgpuLod {
     if (this.lastLod) {
       if (
         this.lastLod.pixelScaleLimit !== pixelScaleLimit ||
+        this.lastLod.errorLimit !== errorLimit ||
+        this.lastLod.backCull !== o.lodBackCull ||
         this.lastLod.maxSplats !== maxSplats
       ) {
         this.dirty = true;
@@ -508,6 +611,7 @@ export class WgpuLod {
           viewPos,
           viewQuat,
           pixelScaleLimit,
+          errorLimit,
           maxSplats,
         });
       } finally {
@@ -583,12 +687,14 @@ export class WgpuLod {
       viewPos,
       viewQuat,
       pixelScaleLimit,
+      errorLimit,
       maxSplats,
     }: {
       lodMeshes: WgpuLodMesh[];
       viewPos: THREE.Vector3;
       viewQuat: THREE.Quaternion;
       pixelScaleLimit: number;
+      errorLimit: number;
       maxSplats: number;
     },
   ) {
@@ -617,6 +723,7 @@ export class WgpuLod {
         ({ lodId } = await worker.call("initLodTree", {
           numSplats: splats.numSplats ?? 0,
           lodTree: (splats.extra.lodTree as Uint32Array).slice(),
+          lodError: (splats.extra.lodError as Uint32Array | undefined)?.slice(),
         }));
       }
       this.trees.set(splats, { lodId, lastTouched: performance.now() });
@@ -626,7 +733,7 @@ export class WgpuLod {
 
     if (this.pager) {
       for (const update of this.pager.consumeLodTreeUpdates()) {
-        const { splats, page, chunk, numSplats, lodTree } = update;
+        const { splats, page, chunk, numSplats, lodTree, lodError } = update;
         const record = this.trees.get(splats);
         if (!record) continue;
         if (lodTree && chunk === 0) {
@@ -649,6 +756,7 @@ export class WgpuLod {
           chunkBase: chunk * this.pager.pageSplats,
           count: numSplats,
           lodTreeData: lodTree,
+          lodErrorData: lodError,
         });
       }
     }
@@ -661,7 +769,14 @@ export class WgpuLod {
 
     if (!this.dirty) return;
     this.dirty = false;
-    this.lastLod = { pos: viewPos, quat: viewQuat, pixelScaleLimit, maxSplats };
+    this.lastLod = {
+      pos: viewPos,
+      quat: viewQuat,
+      pixelScaleLimit,
+      errorLimit,
+      backCull: this.options.lodBackCull,
+      maxSplats,
+    };
     await this.traverse(
       worker,
       lodMeshes,
@@ -669,6 +784,7 @@ export class WgpuLod {
       viewPos,
       viewQuat,
       pixelScaleLimit,
+      errorLimit,
     );
     this.setDirty();
   }
@@ -703,6 +819,7 @@ export class WgpuLod {
     viewPos: THREE.Vector3,
     viewQuat: THREE.Quaternion,
     pixelScaleLimit: number,
+    errorLimit = 0,
   ) {
     const o = this.options;
     const cameraToWorld = new THREE.Matrix4().compose(
@@ -736,7 +853,7 @@ export class WgpuLod {
     }
 
     const t0 = performance.now();
-    const { keyIndices, chunks, pixelLimit } = await worker.call(
+    const { keyIndices, chunks, pixelLimit, culledCount } = await worker.call(
       "traverseLodTrees",
       {
         maxSplats,
@@ -744,8 +861,11 @@ export class WgpuLod {
         lastPixelLimit: this.lastPixelLimit,
         instances,
         traverseMode: o.lodTraverseMode,
+        errorLimit: errorLimit > 0 ? errorLimit : undefined,
+        backCull: o.lodBackCull,
       },
     );
+    this.stats.culled = culledCount ?? 0;
     this.stats.traverseMs = performance.now() - t0;
     this.stats.traversals += 1;
     this.lastPixelLimit = pixelLimit;
@@ -770,7 +890,14 @@ export class WgpuLod {
 
     const pager = this.pager;
     if (pager) this.fetchPages(pager, lodMeshes, chunks, viewPos);
-    await this.raycastTraverse(worker, instances, byId, total, pixelScaleLimit);
+    await this.raycastTraverse(
+      worker,
+      instances,
+      byId,
+      total,
+      pixelScaleLimit,
+      errorLimit,
+    );
   }
 
   private fetchPages(
@@ -813,6 +940,7 @@ export class WgpuLod {
     byId: Map<string, WgpuLodMesh>,
     total: number,
     pixelScaleLimit: number,
+    errorLimit = 0,
   ) {
     const o = this.options;
     const lodRaycast = o.lodRaycast ?? (isMobile() ? 10000 : 25000);
@@ -830,6 +958,8 @@ export class WgpuLod {
       pixelScaleLimit,
       instances,
       traverseMode: o.lodTraverseMode,
+      errorLimit: errorLimit > 0 ? errorLimit : undefined,
+      backCull: o.lodBackCull,
     });
     for (const [id, { numSplats, indices }] of Object.entries(keyIndices)) {
       const m = byId.get(id);

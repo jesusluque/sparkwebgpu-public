@@ -91,6 +91,8 @@ export type PackedExtra = {
   readonly sh2Codes?: Uint32Array;
   readonly sh3Codes?: Uint32Array;
   readonly lodTree?: Uint32Array;
+  /** The LoD error cut's bounds, two words a node (rust athc_lod_cut.rs). */
+  readonly lodError?: Uint32Array;
   readonly radMeta?: RadMeta;
   /**
    * Per-Gaussian attributes: AttribValues from the loader, or an AttribPool
@@ -134,6 +136,8 @@ export type ExtExtra = {
   readonly sh2Codes?: Uint32Array;
   readonly sh3Codes?: [Uint32Array, Uint32Array];
   readonly lodTree?: Uint32Array;
+  /** The LoD error cut's bounds, two words a node (rust athc_lod_cut.rs). */
+  readonly lodError?: Uint32Array;
   readonly radMeta?: RadMeta;
   /** Per-Gaussian attributes, as PackedExtra.attribs. */
   readonly attribs?: object;

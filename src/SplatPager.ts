@@ -94,6 +94,8 @@ export class SplatPager {
     chunk: number;
     numSplats: number;
     lodTree?: Uint32Array;
+    /** The LoD error cut's bounds, two words a node (athc_lod_cut.rs). */
+    lodError?: Uint32Array;
   }[];
 
   private readonly fetchers: { splats: PagedSplats; chunk: number }[];
@@ -700,6 +702,11 @@ export class SplatPager {
     this.freeablePages = Array.from(extraPages).map(({ page }) => page);
   }
 
+  /** Pages holding a chunk (the pool's fill: pagesInUse / maxPages). */
+  get pagesInUse(): number {
+    return this.maxPages - this.pageFreelist.length;
+  }
+
   private allocateFreeable(): number | undefined {
     const page = this.freeablePages.shift();
     if (page === undefined) {
@@ -749,6 +756,7 @@ export class SplatPager {
         chunk,
         numSplats,
         lodTree: extra.lodTree as Uint32Array,
+        lodError: extra.lodError as Uint32Array | undefined,
       });
 
       if (isExtResult(data, this.extSplats)) {

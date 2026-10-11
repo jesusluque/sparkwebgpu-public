@@ -251,7 +251,7 @@ export class NodeCutter {
         this.alloc.releasePage(m.g);
         break;
       case "recycle":
-        if (this.spare.length < 2) this.spare.push(m.buffer);
+        if (this.spare.length < 1) this.spare.push(m.buffer);
         break;
       case "runs":
         if (m.data && m.spans) {

@@ -867,6 +867,32 @@ with 2-frame hitches at most (CT: 53-55 fps, 60-70 ms); settled 2.6-3.1 s
 after load (CT: 5.6-7.1 s) and within the harness's 3.5 s after the orbit
 (CT: 6-63 s).
 
+Round 2 (thread CU), for no frame over 20 ms on the orbit and the phone's
+memory:
+
+- the node pool's CPU side runs in a worker (`nodeWorker.ts`, NodeCutter;
+  `nodePool.decoder`, default on): the cut's nodes to slots, the runs
+  (kept inflated, 2 MB on a phone: from 6 to 1 MB the orbit misses and
+  downloads the same), the records' packing, the draw list with its
+  substitutes, the view ahead's runs and the landed pages' unpacking. The
+  main thread posts the traversal's chunks, fetches the Ranges the worker
+  asks for (one message every 4 ms; the Range handed over whole) and
+  writes the records and the lists it gets back (adopted, the old list
+  given back for reuse: no GC pauses);
+- the traversal streams its cut in chunks (`traverse_lod_trees` `stream`)
+  and the trees of an asset share one occlusion codebook;
+- the node index is a bitmap a page with per-word counts and the held
+  slots in place order (0.6 KB a page and 4 bytes a node held);
+- a pool page that leaves the traversal frees its nodes not in use, and
+  the page plan keeps the pool's room.
+
+On the emulated iPhone (tau 3, the same orbit): frame max / p99 18.4 /
+18.3 ms at Camera, 17.5 / 17.4 close-up, 19.0 / 18.7 far; the cut missing
+a frame 4.9 % (0.27 % of its screen area), 5.7 % (0.33 %), 1.2 % (0.10 %).
+Memory once settled (GPU + traversal WASM + the node worker's heap and
+buffers + the traversal worker's heap): 62.5 MB at Camera, 76 close-up,
+64 far (the main page's own heap, three.js and the domes, apart: ~40 MB).
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only

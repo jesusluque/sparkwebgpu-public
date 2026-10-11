@@ -346,7 +346,7 @@ struct LodTree {
     page_to_chunk: Vec<u32>,
     chunk_to_page: Vec<u32>,
     /// athenea's occlusion codebook (8 words an entry) and the asset's box.
-    occlusion: Option<(Vec<u32>, [f32; 6])>,
+    occlusion: Option<Rc<(Vec<u32>, [f32; 6])>>,
     /// Splats a physical page (pool slot) holds: 65 536, or fewer for a
     /// pager of small pages (athenea's error-band pages, thread CK). The
     /// virtual index space keeps 65 536 a chunk (`child >> 16`); a resident
@@ -502,8 +502,18 @@ pub fn set_lod_occlusion_codebook(lod_id: u32, codebook: Uint32Array, bounds: &[
         return Err(JsValue::from_str("occlusion bounds: 6 floats"));
     }
     STATE.with_borrow_mut(|state| {
+        let words = codebook.to_vec();
+        let bounds: [f32; 6] = bounds.try_into().unwrap();
+        // One copy for the trees that share it (thread CU: an asset's pieces
+        // all set the same codebook; 9 copies were 2.4 MB of the WASM heap).
+        let shared = state
+            .lod_trees
+            .values()
+            .filter_map(|t| t.occlusion.as_ref())
+            .find(|o| o.0 == words && o.1 == bounds)
+            .cloned();
         let tree = state.lod_trees.get_mut(&lod_id).ok_or_else(|| JsValue::from_str("no such LoD tree"))?;
-        tree.occlusion = Some((codebook.to_vec(), bounds.try_into().unwrap()));
+        tree.occlusion = Some(shared.unwrap_or_else(|| Rc::new((words, bounds))));
         Ok(())
     })
 }
@@ -1041,7 +1051,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
         // Each instance's occlusion codebook, when culling by it.
         let occlusions: Vec<Option<&(Vec<u32>, [f32; 6])>> = lod_ids
             .iter()
-            .map(|id| if occlusion_cull.unwrap_or(false) { lod_trees.get(id).and_then(|t| t.occlusion.as_ref()) } else { None })
+            .map(|id| if occlusion_cull.unwrap_or(false) { lod_trees.get(id).and_then(|t| t.occlusion.as_deref()) } else { None })
             .collect();
         // Each node read once a visit (thread CU): the cull tests take it.
         let hidden = |inst: u32, s: &LodSplat| -> bool {
@@ -2390,12 +2400,16 @@ mod quant_tests {
             for f in &files {
                 let id = state.next_id;
                 state.next_id += 1;
-                state.lod_trees.insert(id, LodTree { splats: splats.clone(), page_to_chunk: vec![], chunk_to_page: vec![], occlusion: Some((asset.occlusion.clone(), asset.occlusion_box)), slot });
+                state.lod_trees.insert(id, LodTree { splats: splats.clone(), page_to_chunk: vec![], chunk_to_page: vec![], occlusion: Some(Rc::new((asset.occlusion.clone(), asset.occlusion_box))), slot });
                 let bytes = std::fs::read(f).unwrap();
                 let layout = parse_v3(&bytes).unwrap();
                 let k4 = layout.sections.iter().position(|s| s.id == SectionId::Compact).unwrap();
                 let mut root = 0;
+                let limit: usize = std::env::var("CU_PAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
                 for (p, b) in layout.blocks.iter().enumerate() {
+                    if p >= limit {
+                        break;
+                    }
                     let span = b.spans[k4];
                     let (n, raw) = decode_runs(&bytes[span.offset as usize..][..span.stored as usize]).unwrap();
                     let input = traversal_input(&raw, n);
@@ -2410,11 +2424,14 @@ mod quant_tests {
             }
             (pool, pieces)
         });
-        let _ = pool;
         use std::sync::atomic::Ordering::Relaxed;
         let mb = |b: usize| b as f64 / 1048576.0;
         let landed = super::counting::NOW.load(Relaxed);
-        eprintln!("landed: {:.1} MB now, {:.1} MB peak", mb(landed), mb(super::counting::PEAK.load(Relaxed)));
+        let nodes: usize = STATE.with_borrow(|state| match &*state.lod_trees.get(&pool).unwrap().splats.borrow() {
+            LodNodes::Quant { nodes, .. } => nodes.iter().map(|b| b.len()).sum::<usize>(),
+            _ => 0,
+        });
+        eprintln!("landed: {:.1} MB now ({} nodes, {:.1} MB of 12-byte records), {:.1} MB peak", mb(landed), nodes, mb(nodes * 12), mb(super::counting::PEAK.load(Relaxed)));
         super::counting::PEAK.store(landed, Relaxed);
         let st = |p: [f32; 3]| Vec3A::new(p[0], -p[2], p[1]);
         let (cam, tgt, far) = ([4.378f32, 1.676, 5.854], [0.0f32, 0.553, 0.252], [13.4994f32, 4.0228, 17.5284]);

@@ -341,6 +341,10 @@ interface MeshState {
   relitKey: string;
   /** The LoD list copied after the records (relightList). */
   listKey: string;
+  /** Where that list starts in `relit`, in uint4. */
+  listBase: number;
+  /** `relit` is shared with the other meshes of one paged pool. */
+  shared: boolean;
 }
 
 const STREAMS = [
@@ -709,21 +713,73 @@ export function atheneaRelightPlugin(
     return pixel;
   };
 
+  // Meshes drawing from one paged pool (WgpuLod's band pager: each mesh's
+  // pages in slots of its own, the source the pool's) share one buffer of
+  // records, indexed by the pool's slots: each mesh writes only the slots
+  // its LoD list draws, and its list has a region of its own after the
+  // records. One buffer of the pool's size per mesh was 6 x 31 MB on a
+  // phone. No kept terms there (they are written per splat of the source).
+  const sharedRelit = new Map<unknown, GPUBuffer>();
+  const sharingOf = (mesh: WgpuSplatMesh): WgpuSplatMesh[] | null => {
+    if (!renderer || !mesh.lodIndices || options.debug?.everySplat) return null;
+    if (isCatcher(mesh)) return null;
+    const group = renderer.meshes.filter(
+      (m) => m.source.src === mesh.source.src && m.lodIndices && !isCatcher(m),
+    );
+    return group.length > 1 && group.includes(mesh) ? group : null;
+  };
+
   const stateOf = (device: GPUDevice, mesh: WgpuSplatMesh): MeshState => {
     // The records, then room for a LoD list of every splat (relightList).
     const count = Math.max(mesh.source.count, 1);
-    const bytes = count * C.kRelightStride * 16 + Math.ceil(count / 4) * 16;
+    const listWords = Math.ceil(count / 4);
+    const group = sharingOf(mesh);
     let s = states.get(mesh);
-    if (!s || s.relit.size !== bytes) {
-      s?.relit.destroy();
-      s = {
-        relit: createStorage(device, bytes, "relit splats"),
-        pool: s?.pool ?? null,
-        viewlessKey: "",
-        relitKey: "",
-        listKey: "",
-      };
-      states.set(mesh, s);
+    if (group) {
+      const bytes = (count * C.kRelightStride + group.length * listWords) * 16;
+      let relit = sharedRelit.get(mesh.source.src);
+      if (!relit || relit.size < bytes) {
+        relit?.destroy();
+        relit = createStorage(device, bytes, "relit splats (shared)");
+        // A pool given up (reallocated): its records go.
+        for (const [src, b] of sharedRelit) {
+          if (!renderer?.meshes.some((m) => m.source.src === src)) {
+            b.destroy();
+            sharedRelit.delete(src);
+          }
+        }
+        sharedRelit.set(mesh.source.src, relit);
+      }
+      const listBase =
+        count * C.kRelightStride + group.indexOf(mesh) * listWords;
+      if (!s || s.relit !== relit || s.listBase !== listBase) {
+        if (s && !s.shared) s.relit.destroy();
+        s = {
+          relit,
+          pool: s?.pool ?? null,
+          viewlessKey: "",
+          relitKey: "",
+          listKey: "",
+          listBase,
+          shared: true,
+        };
+        states.set(mesh, s);
+      }
+    } else {
+      const bytes = (count * C.kRelightStride + listWords) * 16;
+      if (!s || s.shared || s.relit.size !== bytes) {
+        if (s && !s.shared) s.relit.destroy();
+        s = {
+          relit: createStorage(device, bytes, "relit splats"),
+          pool: s?.pool ?? null,
+          viewlessKey: "",
+          relitKey: "",
+          listKey: "",
+          listBase: count * C.kRelightStride,
+          shared: false,
+        };
+        states.set(mesh, s);
+      }
     }
     s.pool = poolOf(device, mesh, s.pool);
     return s;
@@ -889,7 +945,7 @@ export function atheneaRelightPlugin(
       curvature: id("curvature"),
       footprint: options.footprint,
       opacitySwitchPx: switchPx,
-      listBase: source.count * C.kRelightStride,
+      listBase: state.listBase,
       cpcaWords: projected ? JOINT.kJointEyeSlotWords : rebuiltWords,
       encoding: source.encoding,
       row0: row(0),
@@ -969,7 +1025,7 @@ export function atheneaRelightPlugin(
           dome: 0,
           tableBase: jointTable,
           listCount,
-          listBase: source.count * C.kRelightStride,
+          listBase: state.listBase,
           attribute: transferId,
           scratchBase: eyeScratch,
           scratchWords: JOINT.kJointEyeSlotWords,
@@ -1026,7 +1082,7 @@ export function atheneaRelightPlugin(
         const decode = UniformWriter.for(jointModule, "jointParams").setAll({
           count: source.count,
           listCount,
-          listBase: source.count * C.kRelightStride,
+          listBase: state.listBase,
           attribute: transferId,
           scratchBase: scratchBase(),
           scratchWords: rebuiltWords,
@@ -1076,7 +1132,7 @@ export function atheneaRelightPlugin(
       const decode = UniformWriter.for(cpcaModule, "cpcaParams").setAll({
         count: source.count,
         listCount,
-        listBase: source.count * C.kRelightStride,
+        listBase: state.listBase,
         attribute: transferId,
         scratchBase: scratchBase(),
         scratchWords: table.transferWords,
@@ -1117,7 +1173,7 @@ export function atheneaRelightPlugin(
       }
       params.set("threadFirst", 0);
     };
-    const kept = kTransfer >= 2 && envLights > 0;
+    const kept = kTransfer >= 2 && envLights > 0 && !state.shared;
     if (kept && state.viewlessKey !== placed) {
       run("atheneaRelightViewless", source.count, 0);
       state.viewlessKey = placed;
@@ -1126,7 +1182,7 @@ export function atheneaRelightPlugin(
     // The colours of the splats the LoD draws: a list of them when it cuts
     // some (relightList), every splat otherwise. The kept terms above stay
     // per splat of the cloud: they change only with the sky, lights or place.
-    const key = `${placed}|${flags & eyeFlags}|${identity(mesh.lodIndices)}|${mesh.lodIndices?.length ?? -1}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${options.glassCover}|${switchPx > 0 ? `${switchPx}|${p[5]}|${h}` : ""}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
+    const key = `${placed}|${flags & eyeFlags}|${identity(mesh.lodIndices)}|${mesh.lodIndices?.length ?? -1}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${options.glassCover}|${(r.options.opacitySwitchPx ?? 0) > 0 ? `${switchPx}|${p[5]}|${h}` : switchPx}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);
@@ -1136,7 +1192,7 @@ export function atheneaRelightPlugin(
       if (state.listKey !== listKey) {
         device.queue.writeBuffer(
           state.relit,
-          source.count * C.kRelightStride * 16,
+          state.listBase * 16,
           list.buffer,
           list.byteOffset,
           list.byteLength,
@@ -1295,11 +1351,13 @@ export function atheneaRelightPlugin(
       for (const m of renderer?.meshes ?? []) {
         const s = states.get(m);
         if (!s) continue;
-        s.relit.destroy();
+        if (!s.shared) s.relit.destroy();
         if (s.pool?.owned) s.pool.buffer.destroy();
         s.pool?.cpca?.buffer?.destroy();
         states.delete(m);
       }
+      for (const b of sharedRelit.values()) b.destroy();
+      sharedRelit.clear();
       sky?.destroy();
       sky = null;
       lightsBuffer?.destroy();

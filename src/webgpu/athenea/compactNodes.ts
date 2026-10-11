@@ -15,7 +15,7 @@
 //     node's origin), grown by copy when the cut outgrows it.
 // compact.slang reads a record when nodeWords > 0.
 
-import { gunzipSync } from "fflate";
+import { gunzipSync, inflateSync } from "fflate";
 import type { CompactCloud, CompactLayout } from "./compact";
 import {
   COMPACT_PLANE_WIDTHS,
@@ -531,5 +531,372 @@ export function packPageRecords(
     out[at + 41] = (origin >>> 8) & 0xff;
     out[at + 42] = (origin >>> 16) & 0xff;
     out[at + 43] = (origin >>> 24) & 0xff;
+  }
+}
+
+// ------------------------------------------------- CMPC v4 runs (thread CT)
+
+/** "CMP4": a page's CMPC v4 container (rust athc_compact encode_runs). */
+export const RUNS_MAGIC = 0x34504d43;
+/** The compact section's encoding for CMPC v4 containers. */
+export const ENCODING_COMPACT_RUNS = 16;
+const RUNS_HEAD_WORDS = 5;
+/** Bytes a node of the GPU's planes, and of the traversal's (v3). */
+const GPU_BYTES = 40;
+const TRAVERSAL_BYTES = 24;
+
+/** A CMPC v4 container's head: its nodes, nodes a run, the traversal member, each run's end. */
+export interface RunsContainer {
+  n: number;
+  run: number;
+  runs: number;
+  /** The traversal member (gzip), within the container. */
+  travAt: number;
+  travBytes: number;
+  /** The first run's byte within the container; run r is [runAt + start(r), runAt + ends[r]). */
+  runAt: number;
+  ends: Uint32Array;
+}
+
+export function parseRunsContainer(c: Uint8Array): RunsContainer {
+  const v = new DataView(c.buffer, c.byteOffset, c.byteLength);
+  if (v.getUint32(0, true) !== RUNS_MAGIC) {
+    throw new Error("CMPC v4: not a container");
+  }
+  const n = v.getUint32(4, true);
+  const run = v.getUint32(8, true);
+  const travBytes = v.getUint32(12, true);
+  const runs = v.getUint32(16, true);
+  const ends = new Uint32Array(runs);
+  for (let r = 0; r < runs; r++) {
+    ends[r] = v.getUint32(4 * (RUNS_HEAD_WORDS + r), true);
+  }
+  const travAt = 4 * (RUNS_HEAD_WORDS + runs);
+  return { n, run, runs, travAt, travBytes, runAt: travAt + travBytes, ends };
+}
+
+/** Run r's bytes within the container: [start, end). */
+export function runSpan(h: RunsContainer, r: number): [number, number] {
+  return [h.runAt + (r > 0 ? h.ends[r - 1] : 0), h.runAt + h.ends[r]];
+}
+
+/** Nodes of run r. */
+function runCount(n: number, run: number, r: number) {
+  return Math.min(run, n - r * run);
+}
+
+/** A run's planes (inflated): plane k of a run of m nodes at prefix(k) x m. */
+function runPlaneOffsets(m: number) {
+  const offs: number[] = [];
+  let at = 0;
+  for (let k = 0; k < 15; k++) {
+    offs.push(at);
+    at += COMPACT_PLANE_WIDTHS[k] * m;
+  }
+  return offs;
+}
+
+/**
+ * A container (as fetched) to the page's planes: the traversal's input
+ * (positions then the traversal's planes, 30 bytes a node) and, with
+ * `full`, the whole raw section (NODE_BYTES a node) a page pool writes.
+ * `travRaw`: the traversal member gunzipped. Returns the inflated runs too.
+ */
+export function unpackRunsContainer(
+  c: Uint8Array,
+  h: RunsContainer,
+  travRaw: Uint8Array,
+  full: boolean,
+) {
+  const { n, run, runs } = h;
+  const input = new Uint8Array(6 * n + TRAVERSAL_BYTES * n);
+  input.set(travRaw.subarray(0, TRAVERSAL_BYTES * n), 6 * n);
+  const raw = full ? new Uint8Array(64 * n) : null;
+  if (raw) raw.set(travRaw.subarray(0, TRAVERSAL_BYTES * n), GPU_BYTES * n);
+  const planes: Uint8Array[] = [];
+  for (let r = 0; r < runs; r++) {
+    const [a, b] = runSpan(h, r);
+    const p = inflateSync(c.subarray(a, b));
+    planes.push(p);
+    const m = runCount(n, run, r);
+    const offs = runPlaneOffsets(m);
+    // The positions (planes 0-2, 2 bytes each) into the traversal's input.
+    for (let k = 0; k < 3; k++) {
+      input.set(p.subarray(offs[k], offs[k] + 2 * m), 2 * k * n + 2 * r * run);
+    }
+    if (raw) {
+      for (let k = 0; k < 15; k++) {
+        const w = COMPACT_PLANE_WIDTHS[k];
+        raw.set(
+          p.subarray(offs[k], offs[k] + w * m),
+          compactPlaneOffset(k, n) + r * run * w,
+        );
+      }
+    }
+  }
+  return { input, raw, planes };
+}
+
+/**
+ * Records of nodes `locals` (places within run r's nodes) from the run's
+ * inflated planes (m nodes), packed in order into `out` from record
+ * `first`; `page` their head-table page, `base` the run's first place.
+ */
+export function packRunRecords(
+  planes: Uint8Array,
+  m: number,
+  locals: ArrayLike<number>,
+  page: number,
+  base: number,
+  out: Uint8Array,
+  first: number,
+) {
+  const offs = runPlaneOffsets(m);
+  const R = NODE_RECORD_WORDS * 4;
+  for (let k = 0; k < locals.length; k++) {
+    const j = locals[k];
+    const at = (first + k) * R;
+    for (const [, plane, off] of RECORD_FIELDS) {
+      const w = COMPACT_PLANE_WIDTHS[plane];
+      const from = offs[plane] + j * w;
+      for (let b = 0; b < w; b++) out[at + off + b] = planes[from + b];
+    }
+    const origin = (page + (base + j) * 65536) >>> 0;
+    out[at + 40] = origin & 0xff;
+    out[at + 41] = (origin >>> 8) & 0xff;
+    out[at + 42] = (origin >>> 16) & 0xff;
+    out[at + 43] = (origin >>> 24) & 0xff;
+  }
+}
+
+/** A run's priority: kept for the cut (its nodes, parents, children), culled, other. */
+export const RUN_CUT = 0;
+export const RUN_CULLED = 1;
+export const RUN_OTHER = 2;
+
+interface RunPage {
+  n: number;
+  run: number;
+  /** The container's first byte in the file, its head. */
+  fileAt: number;
+  head: RunsContainer;
+  /** Each run's deflate bytes, or null once dropped (fetched again by Range). */
+  bytes: (Uint8Array | null)[];
+  /** Each run's class and the update it was last classed at. */
+  cls: Uint8Array;
+  stamp: Uint32Array;
+}
+
+/**
+ * The resident pages' payload as CMPC v4 runs: each run's deflate bytes,
+ * kept or dropped by class under a byte budget (the cut's runs never), a
+ * small LRU of inflated runs, and the runs to fetch again.
+ */
+export class RunPayloadStore {
+  private pages = new Map<number, RunPage>();
+  /** Insertion order is recency. */
+  private inflated = new Map<number, Uint8Array>();
+  bytes = 0;
+  inflatedBytes = 0;
+  frame = 0;
+  readonly stats = {
+    inflates: 0,
+    inflateMs: 0,
+    hits: 0,
+    dropped: 0,
+    fetched: 0,
+  };
+
+  constructor(
+    /** Bytes of deflate runs kept beyond the cut's (Infinity: all). */
+    public budget = Number.POSITIVE_INFINITY,
+    /** Inflated runs kept. */
+    public inflatedRuns = 256,
+  ) {}
+
+  private key(page: number, r: number) {
+    return page * 64 + r;
+  }
+
+  /** A page landed: its container (its own copy) and runs already inflated. */
+  put(page: number, c: Uint8Array, fileAt: number, planes?: Uint8Array[]) {
+    this.drop(page);
+    const head = parseRunsContainer(c);
+    const bytes: Uint8Array[] = [];
+    for (let r = 0; r < head.runs; r++) {
+      const [a, b] = runSpan(head, r);
+      bytes.push(c.slice(a, b));
+      this.bytes += b - a;
+    }
+    this.pages.set(page, {
+      n: head.n,
+      run: head.run,
+      fileAt,
+      head,
+      bytes,
+      cls: new Uint8Array(head.runs).fill(RUN_OTHER),
+      stamp: new Uint32Array(head.runs).fill(this.frame),
+    });
+    if (planes) {
+      planes.forEach((p, r) => this.remember(this.key(page, r), p));
+    }
+  }
+
+  has(page: number) {
+    return this.pages.has(page);
+  }
+
+  /** The nodes of a page's run r, and its first place. */
+  runOf(page: number, place: number) {
+    const p = this.pages.get(page);
+    if (!p) return null;
+    const r = Math.floor(place / p.run);
+    return { r, base: r * p.run, m: runCount(p.n, p.run, r) };
+  }
+
+  /** Classes run r of a page for this update (the lowest class wins). */
+  mark(page: number, place: number, cls: number) {
+    const p = this.pages.get(page);
+    if (!p) return;
+    const r = Math.floor(place / p.run);
+    if (p.stamp[r] !== this.frame || cls < p.cls[r]) {
+      p.cls[r] = cls;
+      p.stamp[r] = this.frame;
+    }
+  }
+
+  /** A new update's classes begin. */
+  begin() {
+    this.frame += 1;
+  }
+
+  /**
+   * The runs over budget dropped: not this update's cut runs, classes
+   * other first, then culled, the longest unmarked first.
+   */
+  trim() {
+    if (this.bytes <= this.budget) return 0;
+    const cands: [number, number, number, number][] = [];
+    for (const [page, p] of this.pages) {
+      for (let r = 0; r < p.bytes.length; r++) {
+        if (!p.bytes[r]) continue;
+        const cls = p.stamp[r] === this.frame ? p.cls[r] : RUN_OTHER;
+        if (cls === RUN_CUT) continue;
+        cands.push([cls, p.stamp[r], page, r]);
+      }
+    }
+    cands.sort((a, b) => b[0] - a[0] || a[1] - b[1]);
+    let dropped = 0;
+    for (const [, , page, r] of cands) {
+      if (this.bytes <= this.budget) break;
+      const p = this.pages.get(page) as RunPage;
+      this.bytes -= (p.bytes[r] as Uint8Array).byteLength;
+      p.bytes[r] = null;
+      dropped += 1;
+    }
+    this.stats.dropped += dropped;
+    return dropped;
+  }
+
+  /** Run r's inflated planes, or null when the run was dropped. */
+  planes(page: number, r: number): Uint8Array | null {
+    const k = this.key(page, r);
+    const hit = this.inflated.get(k);
+    if (hit) {
+      this.inflated.delete(k);
+      this.inflated.set(k, hit);
+      this.stats.hits += 1;
+      return hit;
+    }
+    const b = this.pages.get(page)?.bytes[r];
+    if (!b) return null;
+    const t0 = performance.now();
+    const p = inflateSync(b);
+    this.stats.inflateMs += performance.now() - t0;
+    this.stats.inflates += 1;
+    this.remember(k, p);
+    return p;
+  }
+
+  /** Where run r is in the file, to fetch it again: [offset, bytes]. */
+  fileSpan(page: number, r: number): [number, number] | null {
+    const p = this.pages.get(page);
+    if (!p) return null;
+    const [a, b] = runSpan(p.head, r);
+    return [p.fileAt + a, b - a];
+  }
+
+  /** A dropped run fetched again. */
+  putRun(page: number, r: number, bytes: Uint8Array) {
+    const p = this.pages.get(page);
+    if (!p || p.bytes[r]) return;
+    p.bytes[r] = bytes;
+    this.bytes += bytes.byteLength;
+    this.stats.fetched += 1;
+  }
+
+  missing(page: number, r: number) {
+    const p = this.pages.get(page);
+    return !!p && !p.bytes[r] && !this.inflated.has(this.key(page, r));
+  }
+
+  private remember(k: number, p: Uint8Array) {
+    if (this.inflatedRuns <= 0) return;
+    const old = this.inflated.get(k);
+    if (old) {
+      this.inflated.delete(k);
+      this.inflatedBytes -= old.byteLength;
+    }
+    this.inflated.set(k, p);
+    this.inflatedBytes += p.byteLength;
+    while (this.inflated.size > this.inflatedRuns) {
+      const [key, v] = this.inflated.entries().next().value as [
+        number,
+        Uint8Array,
+      ];
+      this.inflated.delete(key);
+      this.inflatedBytes -= v.byteLength;
+    }
+  }
+
+  /** The page left the traversal: its runs go. */
+  drop(page: number) {
+    const p = this.pages.get(page);
+    if (!p) return;
+    for (let r = 0; r < p.bytes.length; r++) {
+      const b = p.bytes[r];
+      if (b) this.bytes -= b.byteLength;
+      const k = this.key(page, r);
+      const i = this.inflated.get(k);
+      if (i) {
+        this.inflated.delete(k);
+        this.inflatedBytes -= i.byteLength;
+      }
+    }
+    this.pages.delete(page);
+  }
+
+  /** Runs held, and by class at this update. */
+  census() {
+    const out = {
+      pages: this.pages.size,
+      runs: 0,
+      held: 0,
+      cut: 0,
+      culled: 0,
+      other: 0,
+    };
+    for (const p of this.pages.values()) {
+      for (let r = 0; r < p.bytes.length; r++) {
+        out.runs += 1;
+        if (!p.bytes[r]) continue;
+        out.held += 1;
+        const cls = p.stamp[r] === this.frame ? p.cls[r] : RUN_OTHER;
+        if (cls === RUN_CUT) out.cut += 1;
+        else if (cls === RUN_CULLED) out.culled += 1;
+        else out.other += 1;
+      }
+    }
+    return out;
   }
 }

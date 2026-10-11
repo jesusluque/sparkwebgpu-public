@@ -862,9 +862,12 @@ pub struct CompactStats {
 /// (raw, `NODE_BYTES` a node) and its head.
 pub struct CompactPages {
     pub tables: CompactTables,
+    /// Each page's CMPC: its planes (NODE_BYTES a node), or with `runs` its
+    /// CMPC v4 container (`encode_runs`).
     pub pages: Vec<Vec<u8>>,
     pub heads: Vec<[u32; HEAD_WORDS]>,
     pub stats: CompactStats,
+    pub runs: bool,
 }
 
 type Mask = [u64; 4];
@@ -1173,7 +1176,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
         size_mode_merges: size_mode,
         seconds: t.elapsed().as_secs_f32(),
     };
-    Ok(CompactPages { tables, pages: out_pages, heads, stats })
+    Ok(CompactPages { tables, pages: out_pages, heads, stats, runs: false })
 }
 
 /// One node of a compact page, decoded as compact.slang reads it (tests).
@@ -1425,7 +1428,7 @@ pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &s
     stats.materials = used_materials.len();
     stats.codebook_entries = if codebook.is_empty() { old.entries() } else { codebook.len() };
     stats.table_bytes = [4 * tables.codebook.len(), 4 * tables.materials.len(), 4 * tables.basis.len()];
-    let compact = CompactPages { tables, pages, heads, stats: stats.clone() };
+    let compact = CompactPages { tables, pages, heads, stats: stats.clone(), runs: false };
     let encodings: Vec<(SectionId, u32)> = layout.sections.iter().map(|s| (s.id, s.encoding)).collect();
     let encoding = move |id: SectionId| encodings.iter().find(|(s, _)| *s == id).map_or(0, |e| e.1);
     let (out, _) = write_v3_paged_compact(&file, &layout.pages, compression, &encoding, None, skeleton.as_ref(), &compact)?;
@@ -1445,6 +1448,170 @@ pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &s
     }
     stats.seconds = t.elapsed().as_secs_f32();
     Ok((out, stats))
+}
+
+// ------------------------------------------------------ CMPC v4 (thread CT)
+
+/// "CMP4": a page's CMPC v4 container.
+pub const RUNS_MAGIC: u32 = u32::from_le_bytes(*b"CMP4");
+/// Nodes a payload run.
+pub const RUN_NODES: usize = 64;
+/// Words before the run table: magic, nodes, nodes a run, the traversal
+/// member's bytes, runs.
+pub const RUNS_HEAD_WORDS: usize = 5;
+
+/// A page's planes (n nodes, NODE_BYTES each) as a CMPC v4 container: the
+/// head (RUNS_HEAD_WORDS words), each run's end (u32, bytes after the
+/// traversal member), the traversal's planes gzipped (24 bytes a node; the
+/// position planes the traversal also reads are in the runs), then the GPU's
+/// 40 bytes a node in runs of `run` nodes, each raw deflate of its own
+/// planes (plane after plane, the run's nodes in each). A reader keeps the
+/// runs a node of its cut may need and inflates one run at a time.
+pub fn encode_runs(raw: &[u8], n: usize, run: usize) -> Vec<u8> {
+    use miniz_oxide::deflate::compress_to_vec;
+    // The traversal's own planes (the positions are in the runs: a reader
+    // inflates the runs once as the page lands, for the traversal's input).
+    let trav = crate::athc_v3::gzip(&raw[n * GPU_NODE_BYTES..n * (GPU_NODE_BYTES + TRAVERSAL_NODE_BYTES)]);
+    let runs = n.div_ceil(run);
+    let mut payload = Vec::new();
+    let mut ends = Vec::with_capacity(runs);
+    for r in 0..runs {
+        let (a, m) = (r * run, run.min(n - r * run));
+        let mut planes = Vec::with_capacity(GPU_NODE_BYTES * m);
+        for k in 0..GPU_PLANES {
+            let w = PLANE_WIDTHS[k] as usize;
+            let at = plane_offset(k, n) + a * w;
+            planes.extend_from_slice(&raw[at..at + m * w]);
+        }
+        payload.extend_from_slice(&compress_to_vec(&planes, 9));
+        ends.push(payload.len() as u32);
+    }
+    let mut out = Vec::with_capacity(4 * (RUNS_HEAD_WORDS + runs) + trav.len() + payload.len());
+    for w in [RUNS_MAGIC, n as u32, run as u32, trav.len() as u32, runs as u32].into_iter().chain(ends) {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out.extend_from_slice(&trav);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// A CMPC v4 container back to the page's planes (NODE_BYTES a node; the
+/// traversal's planes and the GPU's, the spare planes 0).
+pub fn decode_runs(container: &[u8]) -> Result<(usize, Vec<u8>)> {
+    use miniz_oxide::inflate::decompress_to_vec;
+    let w = words_of(container);
+    if w(0)? != RUNS_MAGIC {
+        bail!("CMPC v4: not a container");
+    }
+    let (n, run, trav_bytes, runs) = (w(1)? as usize, w(2)? as usize, w(3)? as usize, w(4)? as usize);
+    let trav_at = 4 * (RUNS_HEAD_WORDS + runs);
+    let trav = crate::athc_v3::gunzip(&container[trav_at..trav_at + trav_bytes])?;
+    let mut raw = vec![0u8; n * NODE_BYTES];
+    raw[n * GPU_NODE_BYTES..n * GPU_NODE_BYTES + trav.len()].copy_from_slice(&trav);
+    let payload = trav_at + trav_bytes;
+    let mut from = 0usize;
+    for r in 0..runs {
+        let end = w(RUNS_HEAD_WORDS + r)? as usize;
+        let planes = decompress_to_vec(&container[payload + from..payload + end]).map_err(|e| anyhow!("CMPC v4: run {r}: {e:?}"))?;
+        let (a, m) = (r * run, run.min(n - r * run));
+        let mut at = 0;
+        for k in 0..GPU_PLANES {
+            let wd = PLANE_WIDTHS[k] as usize;
+            let to = plane_offset(k, n) + a * wd;
+            raw[to..to + m * wd].copy_from_slice(&planes[at..at + m * wd]);
+            at += m * wd;
+        }
+        from = end;
+    }
+    Ok((n, raw))
+}
+
+/// A paged tree's compact tier written again as CMPC v4 (`encode_runs`,
+/// runs of `run` nodes). The file is patched, not written again: tier 4 is
+/// its last data, so tiers 1-3 (CPCA included) and every table keep their
+/// bytes but for the compact section's entry (encoding, compression), its
+/// spans and the page rows' tier-4 bytes. Each container is checked to
+/// decode to the page's planes. Returns the file and tier 4's bytes before
+/// and after.
+pub fn convert_runs(bytes: &[u8], run: usize) -> Result<(Vec<u8>, [u64; 2])> {
+    use crate::athc_v3::{
+        gunzip, parse_v3, SectionId, BLOCK_ENTRY_HEAD, BLOCK_ENTRY_PER_SECTION, COMPRESSION_GZIP, COMPRESSION_NONE,
+        ENCODING_COMPACT_RUNS, SECTION_ENTRY_BYTES,
+    };
+    let layout = parse_v3(bytes)?;
+    let k4 = layout.sections.len().checked_sub(1).filter(|&k| layout.sections[k].id == SectionId::Compact).ok_or_else(|| anyhow!("runs: no compact tier"))?;
+    if layout.sections[k4].encoding != 0 {
+        bail!("runs: the compact tier is not CMPC v3 planes");
+    }
+    let [at, len] = layout.compact_table;
+    let version = words_of(&bytes[at as usize..(at + len) as usize])(1)?;
+    if version != TABLE_VERSION {
+        bail!("runs: compact tables v{version}, not v{TABLE_VERSION} (athc-convert --compact-rebase first)");
+    }
+    let compression = layout.sections[k4].compression;
+    // Tier 4 is one run at the end, in page order.
+    let start = layout.blocks.iter().map(|b| b.spans[k4].offset).min().unwrap_or(0) as usize;
+    let mut expect = start as u64;
+    for (p, b) in layout.blocks.iter().enumerate() {
+        if b.spans[k4].offset != expect {
+            bail!("runs: page {p}'s tier 4 is not where the page before it ends");
+        }
+        expect += b.spans[k4].stored as u64;
+    }
+    // Only padding after it (the writer aligns the file).
+    if bytes[expect as usize..].iter().any(|&b| b != 0) {
+        bail!("runs: {} bytes of data after tier 4", bytes.len() as u64 - expect);
+    }
+    let u32_at = |b: &[u8], a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap());
+    let u64_at = |b: &[u8], a: usize| u64::from_le_bytes(b[a..a + 8].try_into().unwrap());
+    let mut out = bytes[..start].to_vec();
+    let section_table = u64_at(bytes, 112) as usize;
+    let block_index = u64_at(bytes, 120) as usize;
+    let section_count = layout.sections.len();
+    let entry = BLOCK_ENTRY_HEAD + BLOCK_ENTRY_PER_SECTION * section_count;
+    let (page_table, row_words) = (u64_at(bytes, 176) as usize, u32_at(bytes, 188) as usize);
+    let s = section_table + SECTION_ENTRY_BYTES * k4;
+    out[s + 8..s + 12].copy_from_slice(&ENCODING_COMPACT_RUNS.to_le_bytes());
+    out[s + 12..s + 16].copy_from_slice(&COMPRESSION_NONE.to_le_bytes());
+    let mut sizes = [0u64; 2];
+    let mut data = Vec::new();
+    for (p, b) in layout.blocks.iter().enumerate() {
+        let n = b.n as usize;
+        let span = b.spans[k4];
+        let stored = &bytes[span.offset as usize..][..span.stored as usize];
+        let raw = if compression == COMPRESSION_GZIP { gunzip(stored)? } else { stored.to_vec() };
+        if raw.len() != n * NODE_BYTES {
+            bail!("runs: page {p}: {} bytes for {n} nodes", raw.len());
+        }
+        let c = encode_runs(&raw, n, run);
+        let (_, back) = decode_runs(&c)?;
+        let keep = n * (GPU_NODE_BYTES + TRAVERSAL_NODE_BYTES);
+        if back[..keep] != raw[..keep] {
+            bail!("runs: page {p} does not decode to its planes");
+        }
+        let e = block_index + entry * p + BLOCK_ENTRY_HEAD + BLOCK_ENTRY_PER_SECTION * k4;
+        out[e..e + 8].copy_from_slice(&((start + data.len()) as u64).to_le_bytes());
+        out[e + 8..e + 12].copy_from_slice(&(c.len() as u32).to_le_bytes());
+        out[e + 12..e + 16].copy_from_slice(&(c.len() as u32).to_le_bytes());
+        let r = page_table + 4 * (p * row_words + 16);
+        out[r..r + 4].copy_from_slice(&(c.len() as u32).to_le_bytes());
+        sizes[0] += span.stored as u64;
+        sizes[1] += c.len() as u64;
+        data.extend_from_slice(&c);
+    }
+    out.extend_from_slice(&data);
+    out.resize(out.len().div_ceil(4096) * 4096, 0);
+    // Read back: the same sections and pages, tier 4 the containers.
+    let new = parse_v3(&out)?;
+    if new.sections[..k4] != layout.sections[..k4] || new.sections[k4].encoding != ENCODING_COMPACT_RUNS {
+        bail!("runs: the sections changed");
+    }
+    for (p, (a, b)) in layout.blocks.iter().zip(&new.blocks).enumerate() {
+        if a.spans[..k4] != b.spans[..k4] || new.pages[p].tier4_bytes != b.spans[k4].stored {
+            bail!("runs: page {p}'s entry changed");
+        }
+    }
+    Ok((out, sizes))
 }
 
 /// An asset table for pieces (paged trees with their compact tier, v1 or
@@ -1811,5 +1978,41 @@ mod fixture {
         let out = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/compact_pages.athc");
         std::fs::write(out, &bytes).unwrap();
         eprintln!("{} bytes, {} pages, {} nodes", bytes.len(), rows.len(), c.stats.nodes);
+    }
+}
+
+#[cfg(test)]
+mod runs_tests {
+    use super::*;
+    use crate::athc_v3::{gunzip, parse_v3, SectionId, ENCODING_COMPACT_RUNS};
+
+    /// CMPC v4 (thread CT): the fixture's tier 4 as containers, every other
+    /// byte of the file the same but the compact entry, each page decoding
+    /// to its planes.
+    #[test]
+    fn runs_round_trip_the_compact_tier() {
+        let bytes = include_bytes!("../../../test/fixtures/athc/compact_pages.athc");
+        let (out, sizes) = convert_runs(bytes, RUN_NODES).unwrap();
+        assert!(sizes[1] > 0);
+        let a = parse_v3(bytes).unwrap();
+        let b = parse_v3(&out).unwrap();
+        let k4 = a.sections.iter().position(|s| s.id == SectionId::Compact).unwrap();
+        assert_eq!(b.sections[k4].encoding, ENCODING_COMPACT_RUNS);
+        for (p, (ba, bb)) in a.blocks.iter().zip(&b.blocks).enumerate() {
+            let n = ba.n as usize;
+            let raw = gunzip(&bytes[ba.spans[k4].offset as usize..][..ba.spans[k4].stored as usize]).unwrap();
+            let c = &out[bb.spans[k4].offset as usize..][..bb.spans[k4].stored as usize];
+            let (m, back) = decode_runs(c).unwrap();
+            assert_eq!(m, n);
+            let keep = n * (GPU_NODE_BYTES + TRAVERSAL_NODE_BYTES);
+            assert_eq!(back[..keep], raw[..keep], "page {p}");
+            for k in 0..k4 {
+                assert_eq!(
+                    bytes[ba.spans[k].offset as usize..][..ba.spans[k].stored as usize],
+                    out[bb.spans[k].offset as usize..][..bb.spans[k].stored as usize]
+                );
+            }
+        }
+        assert_eq!(&out[..64], &bytes[..64]);
     }
 }

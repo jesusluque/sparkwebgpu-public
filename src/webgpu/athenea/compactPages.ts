@@ -41,11 +41,18 @@ import {
 import type { CompactCloud, CompactLayout, CompactRelitPath } from "./compact";
 import {
   CompactNodePool,
+  ENCODING_COMPACT_RUNS,
   NODE_RECORD_WORDS,
   NodeSlotAllocator,
   PAGE_PLACES,
   PagePayloadStore,
+  RUN_CULLED,
+  RUN_CUT,
+  RunPayloadStore,
   packPageRecords,
+  packRunRecords,
+  parseRunsContainer,
+  unpackRunsContainer,
 } from "./compactNodes";
 
 /**
@@ -280,10 +287,17 @@ export function compactTraversalInput(raw: Uint8Array, n: number) {
 }
 
 /** The pages a page's nodes have children in (other than itself). */
-export function compactChildPages(raw: Uint8Array, n: number, page: number) {
+export function compactChildPages(
+  raw: Uint8Array,
+  n: number,
+  page: number,
+  /** Bytes a node before the traversal's planes: 40 (a section), 6 (a traversal input). */
+  before = COMPACT_GPU_NODE_BYTES,
+) {
   const pages = new Set<number>();
-  const pageAt = compactPlaneOffset(P_CHILD_PAGE, n);
-  const kidsAt = compactPlaneOffset(P_KIDS, n);
+  const shift = (before - COMPACT_GPU_NODE_BYTES) * n;
+  const pageAt = compactPlaneOffset(P_CHILD_PAGE, n) + shift;
+  const kidsAt = compactPlaneOffset(P_KIDS, n) + shift;
   for (let i = 0; i < n; i++) {
     // The count: bits 12-23 of the children word (bytes 1 and 2).
     const count = (raw[kidsAt + n + i] >> 4) | (raw[kidsAt + 2 * n + i] << 4);
@@ -487,7 +501,8 @@ export type LodCall = (
     | "updateCompactLodTrees"
     | "setLodOcclusionCodebook"
     | "traverseLodTrees"
-    | "wasmMemory",
+    | "wasmMemory"
+    | "setCompactQuant",
   args: Record<string, unknown>,
 ) => Promise<unknown>;
 
@@ -553,6 +568,11 @@ export interface CompactBandOptions {
   /** The WASM traversal. */
   lod: LodCall;
   /**
+   * The traversal nodes' quantization (thread CT, spark-rs CompactQuant):
+   * bits for the centre, eps, rho, theta and the cone's axis (0: exact).
+   */
+  quant?: number[];
+  /**
    * The node pool (thread CT, compactNodes.ts): the GPU holds the drawn
    * cut's records only (`capacity` to start, grown x1.5 up to
    * `maxCapacity`, the traversal's budget), the resident pages' payload
@@ -565,6 +585,13 @@ export interface CompactBandOptions {
     decodedPages?: number;
     /** Synchronous gunzip (default fflate's). */
     gunzipSync?: (b: Uint8Array) => Uint8Array;
+    /**
+     * CMPC v4 pieces: bytes of payload runs kept beyond those the cut may
+     * need (its nodes, their parents and children); default unbounded.
+     */
+    runBudget?: number;
+    /** Inflated runs kept (an LRU), default 256. */
+    inflatedRuns?: number;
   };
 }
 
@@ -577,6 +604,8 @@ interface PieceState {
   /** CMPC's index in the section table. */
   section: number;
   compressed: boolean;
+  /** CMPC v4: each page a container (runs). */
+  runs: boolean;
   pageBytes: number[];
   lodId: number;
   /** page -> slot, slot -> page. */
@@ -604,6 +633,8 @@ export class CompactBandStreamer {
   /** The node pool's slots and the pages' CPU payload (options.nodePool). */
   readonly nodes: NodeSlotAllocator | null = null;
   readonly payload: PagePayloadStore | null = null;
+  /** CMPC v4 pieces' payload runs (node pool). */
+  readonly runs: RunPayloadStore | null = null;
   /** Each piece's first page in the node pool's head table. */
   private pageBase: number[] = [];
   /** A head-table page's piece and page. */
@@ -616,15 +647,20 @@ export class CompactBandStreamer {
   private landed: {
     piece: PieceState;
     page: number;
-    raw: Uint8Array;
+    raw: Uint8Array | null;
     /** The section as stored (gzip), when it was. */
     stored: Uint8Array | null;
+    /** CMPC v4: the traversal's input, the container, its file offset, its inflated runs. */
+    input?: Uint8Array;
+    container?: Uint8Array;
+    fileAt?: number;
+    planes?: Uint8Array[];
   }[] = [];
   private fetching = 0;
   private lastPlan: ReturnType<typeof planBand<PieceState>> | null = null;
   tau: number;
   /** The draw list of the last traversal (slot indices). */
-  drawList = new Uint32Array(0);
+  drawList: Uint32Array = new Uint32Array(0);
   readonly stats = {
     pagesRequested: 0,
     ranges: 0,
@@ -648,8 +684,14 @@ export class CompactBandStreamer {
     decodes: 0,
     decodeMs: 0,
     packMs: 0,
-    /** Node pool: cut nodes with no payload (not drawn), at the last update. */
+    /** Node pool: cut nodes with no payload at hand, at the last update. */
     missing: 0,
+    /** Node pool: of those, drawn as their parent or children. */
+    substituted: 0,
+    /** Node pool: cut nodes with no slot (past maxCapacity). */
+    noSlot: 0,
+    /** CMPC v4: Range requests for dropped runs. */
+    runRanges: 0,
   };
 
   constructor(
@@ -684,7 +726,27 @@ export class CompactBandStreamer {
       );
       this.pool = pool;
       this.nodes = new NodeSlotAllocator(pool.capacity);
-      this.payload = new PagePayloadStore(np.decodedPages ?? 8, np.gunzipSync);
+      if (
+        pieces.some((p) => {
+          const k = p.layout.sections.findIndex(
+            (x) => (x.id as string) === "CMPC",
+          );
+          return (
+            (p.layout.sections[k] as { encoding?: number }).encoding ===
+            ENCODING_COMPACT_RUNS
+          );
+        })
+      ) {
+        this.runs = new RunPayloadStore(
+          np.runBudget ?? Number.POSITIVE_INFINITY,
+          np.inflatedRuns ?? 256,
+        );
+      } else {
+        this.payload = new PagePayloadStore(
+          np.decodedPages ?? 8,
+          np.gunzipSync,
+        );
+      }
     } else {
       this.pool = new CompactPagePool(
         device,
@@ -711,6 +773,9 @@ export class CompactBandStreamer {
         rows,
         section,
         compressed: layout.sections[section].compression === 1,
+        runs:
+          (layout.sections[section] as { encoding?: number }).encoding ===
+          ENCODING_COMPACT_RUNS,
         pageBytes: layout.blocks.map((b) => b.spans[section].stored),
         lodId: -1,
         slotOf: new Map(),
@@ -722,6 +787,9 @@ export class CompactBandStreamer {
 
   /** The WASM trees: one pool tree, one shared tree a piece. */
   async init() {
+    if (this.options.quant) {
+      await this.options.lod("setCompactQuant", { bits: this.options.quant });
+    }
     const { lodId } = (await this.options.lod("newLodTree", {
       capacity: this.options.slots * this.slotNodes,
       slot: this.slotNodes,
@@ -770,7 +838,8 @@ export class CompactBandStreamer {
     const ranges: Record<string, unknown>[] = [];
     const landed = this.landed;
     this.landed = [];
-    for (const { piece, page, raw, stored } of landed) {
+    for (const l of landed) {
+      const { piece, page, raw } = l;
       piece.inFlight.delete(page);
       if (piece.slotOf.has(page)) continue;
       const slot = this.takeSlot();
@@ -783,13 +852,18 @@ export class CompactBandStreamer {
               piece.index,
               page,
               row.count,
-              raw,
+              raw as Uint8Array,
               row.compact,
             )
-          : this.landNodes(piece, page, raw, stored);
+          : this.landNodes(piece, page, l);
       piece.slotOf.set(page, slot);
       this.slotOwner[slot] = { piece: piece.index, page };
-      piece.kids.set(page, compactChildPages(raw, row.count, page));
+      piece.kids.set(
+        page,
+        raw
+          ? compactChildPages(raw, row.count, page)
+          : compactChildPages(input, row.count, page, 6),
+      );
       ranges.push({
         lodId: piece.lodId,
         pageBase: slot * this.slotNodes,
@@ -869,7 +943,10 @@ export class CompactBandStreamer {
         coneFoveate: fov ? fov.coneFoveate : 1,
       };
     }
-    let list = new Uint32Array(0);
+    let list: Uint32Array = new Uint32Array(0);
+    let near:
+      | { parents: Uint32Array; firstKids: Uint32Array; kidCounts: Uint32Array }
+      | undefined;
     if (Object.keys(instances).length) {
       const t0 = performance.now();
       const { keyIndices, culledCount, occludedCount, chunks } = (await lod(
@@ -886,9 +963,20 @@ export class CompactBandStreamer {
           // Negative: any size, pruned with the subtree (spark-rs).
           backCullMin: this.options.backCull === false ? undefined : -1,
           occlusionCull: this.options.occlusion === true,
+          neighbours: !!this.runs,
         },
       )) as {
-        keyIndices: Record<string, { numSplats: number; indices: Uint32Array }>;
+        keyIndices: Record<
+          string,
+          {
+            numSplats: number;
+            indices: Uint32Array;
+            parents?: Uint32Array;
+            firstKids?: Uint32Array;
+            kidCounts?: Uint32Array;
+            culled?: Uint32Array;
+          }
+        >;
         culledCount?: number;
         occludedCount?: number;
         chunks?: [number, number][];
@@ -917,6 +1005,43 @@ export class CompactBandStreamer {
         list.set(part, at);
         at += part.length;
       }
+      if (this.runs) {
+        const cat = (name: "parents" | "firstKids" | "kidCounts") => {
+          const a = new Uint32Array(list.length);
+          let o = 0;
+          for (const k of Object.values(keyIndices)) {
+            a.set((k[name] as Uint32Array).subarray(0, k.numSplats), o);
+            o += k.numSplats;
+          }
+          return a;
+        };
+        near = {
+          parents: cat("parents"),
+          firstKids: cat("firstKids"),
+          kidCounts: cat("kidCounts"),
+        };
+        // The runs the cut may need (its nodes, their parents and
+        // children), then the culled ones; the rest go first over budget.
+        const runs = this.runs;
+        runs.begin();
+        const mark = (i: number, cls: number) => {
+          const key = this.keyOfIndex(i);
+          if (key < 0) return;
+          const g = Math.floor(key / PAGE_PLACES);
+          runs.mark(g, key - g * PAGE_PLACES, cls);
+        };
+        for (let k = 0; k < list.length; k++) {
+          mark(list[k], RUN_CUT);
+          if (near.parents[k] !== 0xffffffff) mark(near.parents[k], RUN_CUT);
+          const f = near.firstKids[k];
+          if (f !== 0xffffffff) {
+            for (let c = 0; c < near.kidCounts[k]; c++) mark(f + c, RUN_CUT);
+          }
+        }
+        for (const k of Object.values(keyIndices)) {
+          for (const i of k.culled ?? []) mark(i, RUN_CULLED);
+        }
+      }
     }
     if (this.options.nodeOrder) {
       // By node (piece, page, place), not by slot: the same order whatever
@@ -930,9 +1055,22 @@ export class CompactBandStreamer {
           (list[k] - slot * this.slotNodes);
       }
       const order = Array.from(list.keys()).sort((x, y) => id[x] - id[y]);
-      list = Uint32Array.from(order, (k) => list[k]);
+      const before = list;
+      list = Uint32Array.from(order, (k) => before[k]);
+      if (near) {
+        const n0 = near;
+        near = {
+          parents: Uint32Array.from(order, (k) => n0.parents[k]),
+          firstKids: Uint32Array.from(order, (k) => n0.firstKids[k]),
+          kidCounts: Uint32Array.from(order, (k) => n0.kidCounts[k]),
+        };
+      }
     }
-    if (this.nodes) list = this.toNodeSlots(list, path);
+    if (this.nodes) list = this.toNodeSlots(list, path, near);
+    if (this.runs) {
+      this.runs.trim();
+      this.fetchRuns();
+    }
     this.drawList = list;
     this.stats.cut = list.length;
     path?.setDrawList(list);
@@ -983,92 +1121,149 @@ export class CompactBandStreamer {
   private landNodes(
     piece: PieceState,
     page: number,
-    raw: Uint8Array,
-    stored: Uint8Array | null,
+    l: {
+      raw: Uint8Array | null;
+      stored: Uint8Array | null;
+      input?: Uint8Array;
+      container?: Uint8Array;
+      fileAt?: number;
+      planes?: Uint8Array[];
+    },
   ) {
     const row = piece.rows[page];
-    (this.payload as PagePayloadStore).put(
-      this.pageBase[piece.index] + page,
-      row.count,
-      stored,
-      raw,
-    );
+    const g = this.pageBase[piece.index] + page;
+    if (this.runs && l.container) {
+      this.runs.put(g, l.container, l.fileAt ?? 0, l.planes);
+    } else {
+      (this.payload as PagePayloadStore).put(
+        g,
+        row.count,
+        l.stored,
+        l.raw as Uint8Array,
+      );
+    }
     return {
-      input: compactTraversalInput(raw, row.count),
+      input: l.input ?? compactTraversalInput(l.raw as Uint8Array, row.count),
       box: new Float32Array(
         Uint32Array.from({ length: 6 }, (_, k) => row.compact[k] >>> 0).buffer,
       ),
     };
   }
 
+  /** The head-table page and place of pool index i (a resident page's node). */
+  private keyOfIndex(i: number) {
+    const N = this.slotNodes;
+    const slot = Math.floor(i / N);
+    const o = this.slotOwner[slot];
+    if (!o) return -1;
+    return (this.pageBase[o.piece] + o.page) * PAGE_PLACES + (i - slot * N);
+  }
+
   /**
    * The traversal's cut (pool slot indices) to node slots: the nodes held
    * are reused, the others get a slot (the pool grown if the cut outgrew
-   * it) and their records packed from their page's payload and written.
-   * The list keeps the cut's order; a node with no payload is left out.
+   * it) and their records packed from their page's payload (a section, or
+   * CMPC v4 runs) and written. The list keeps the cut's order. A node whose
+   * run was dropped (fetched again) is drawn as its parent, else as its
+   * children, when those are held; else left out until it lands.
    */
-  private toNodeSlots(list: Uint32Array, path?: CompactRelitPath) {
+  private toNodeSlots(
+    list: Uint32Array,
+    path?: CompactRelitPath,
+    near?: {
+      parents: Uint32Array;
+      firstKids: Uint32Array;
+      kidCounts: Uint32Array;
+    },
+  ) {
     const alloc = this.nodes as NodeSlotAllocator;
     const pool = this.pool as CompactNodePool;
-    const store = this.payload as PagePayloadStore;
-    const N = this.slotNodes;
+    const runs = this.runs;
+    const store = this.payload;
     const t0 = performance.now();
-    const d0 = store.stats.decodes;
-    const ms0 = store.stats.decodeMs;
+    const d0 = runs ? runs.stats.inflates : (store?.stats.decodes ?? 0);
+    const ms0 = runs ? runs.stats.inflateMs : (store?.stats.decodeMs ?? 0);
     if (list.length > alloc.capacity && pool.grow(list.length)) {
       alloc.grow(pool.capacity);
       path?.setPagedCloud(pool);
     }
     alloc.begin();
     const keys = new Float64Array(list.length);
-    const out = new Uint32Array(list.length);
+    const out = new Int32Array(list.length);
     const miss: number[] = [];
     for (let k = 0; k < list.length; k++) {
-      const i = list[k];
-      const slot = Math.floor(i / N);
-      const o = this.slotOwner[slot] as { piece: number; page: number };
-      const key =
-        (this.pageBase[o.piece] + o.page) * PAGE_PLACES + (i - slot * N);
+      const key = this.keyOfIndex(list[k]);
       keys[k] = key;
       const s = alloc.use(key);
       if (s < 0) miss.push(k);
       else out[k] = s;
     }
-    // The misses page by page (one section each), in place order.
+    // The misses with their payload at hand (runs: not dropped).
+    const groupOf = (key: number) => {
+      const g = Math.floor(key / PAGE_PLACES);
+      if (!runs) return g * 64;
+      const r = runs.runOf(g, key - g * PAGE_PLACES);
+      return g * 64 + (r ? r.r : 0);
+    };
     miss.sort((a, b) => keys[a] - keys[b]);
+    const ready: number[] = [];
+    const absent: number[] = [];
+    for (const k of miss) {
+      const g = Math.floor(keys[k] / PAGE_PLACES);
+      const place = keys[k] - g * PAGE_PLACES;
+      const r = runs?.runOf(g, place);
+      if (runs && (!r || runs.missing(g, r.r))) {
+        if (r) this.wantRun(g, r.r);
+        absent.push(k);
+      } else {
+        ready.push(k);
+      }
+    }
     const got: number[] = [];
     const gotSlot: number[] = [];
-    let missing = 0;
-    for (const k of miss) {
+    let noSlot = 0;
+    for (const k of ready) {
       const s = alloc.allocate(keys[k]);
       if (s < 0) {
-        missing += 1;
+        noSlot += 1;
         continue;
       }
       out[k] = s;
       got.push(k);
       gotSlot.push(s);
     }
-    // Packed page by page (one section each, in key order), then written
-    // in slot order (runs of slots, one write each).
+    // Packed group by group (a page, or a page's run: one inflate each),
+    // then written in slot order (runs of slots, one write each).
     const R = NODE_RECORD_WORDS * 4;
     const packed = new Uint8Array(got.length * R);
     const dropped = new Set<number>();
     let j = 0;
     while (j < got.length) {
-      const g = Math.floor(keys[got[j]] / PAGE_PLACES);
+      const grp = groupOf(keys[got[j]]);
       let e = j + 1;
-      while (e < got.length && Math.floor(keys[got[e]] / PAGE_PLACES) === g) {
-        e++;
+      while (e < got.length && groupOf(keys[got[e]]) === grp) e++;
+      const g = Math.floor(keys[got[j]] / PAGE_PLACES);
+      if (runs) {
+        const r = grp - g * 64;
+        const info = runs.runOf(g, r * 64) as { base: number; m: number };
+        const planes = runs.planes(g, r);
+        const locals = new Uint32Array(e - j);
+        for (let q = j; q < e; q++) {
+          locals[q - j] = keys[got[q]] - g * PAGE_PLACES - info.base;
+        }
+        if (planes)
+          packRunRecords(planes, info.m, locals, g, info.base, packed, j);
+        else for (let q = j; q < e; q++) dropped.add(got[q]);
+      } else {
+        const owner = this.pageOwner[g];
+        const n = this.pieces[owner.piece].rows[owner.page].count;
+        const raw = store?.sectionOf(g) ?? null;
+        const places = new Uint32Array(e - j);
+        for (let q = j; q < e; q++)
+          places[q - j] = keys[got[q]] - g * PAGE_PLACES;
+        if (raw) packPageRecords(raw, n, places, g, packed, j);
+        else for (let q = j; q < e; q++) dropped.add(got[q]);
       }
-      const owner = this.pageOwner[g];
-      const n = this.pieces[owner.piece].rows[owner.page].count;
-      const raw = store.sectionOf(g);
-      const places = new Uint32Array(e - j);
-      for (let q = j; q < e; q++)
-        places[q - j] = keys[got[q]] - g * PAGE_PLACES;
-      if (raw) packPageRecords(raw, n, places, g, packed, j);
-      else for (let q = j; q < e; q++) dropped.add(got[q]);
       j = e;
     }
     const order = got.map((_, q) => q).sort((a, b) => gotSlot[a] - gotSlot[b]);
@@ -1080,23 +1275,123 @@ export class CompactBandStreamer {
     });
     this.stats.writes = order.length ? pool.writeRecords(slots, records) : 0;
     this.stats.uploaded = order.length;
-    this.stats.decodes = store.stats.decodes - d0;
-    this.stats.decodeMs = store.stats.decodeMs - ms0;
-    let result = out;
-    if (missing || dropped.size) {
-      // No slot or no payload: not drawn (the cut outgrew maxCapacity).
-      const failed = new Set(dropped);
-      for (const k of dropped) alloc.release(out[k]);
-      const placed = new Set(got);
-      for (const k of miss) if (!placed.has(k)) failed.add(k);
-      result = out.filter((_, k) => !failed.has(k));
-      this.stats.missing = failed.size;
+    this.stats.decodes =
+      (runs ? runs.stats.inflates : (store?.stats.decodes ?? 0)) - d0;
+    this.stats.decodeMs =
+      (runs ? runs.stats.inflateMs : (store?.stats.decodeMs ?? 0)) - ms0;
+    for (const k of dropped) alloc.release(out[k]);
+    // The rest: drawn as their parent or children when held, else not yet.
+    const failed = new Set<number>(dropped);
+    const placed = new Set(got);
+    for (const k of ready) if (!placed.has(k)) failed.add(k);
+    for (const k of absent) failed.add(k);
+    let result: Uint32Array;
+    let substituted = 0;
+    if (failed.size) {
+      const subs = new Set<number>();
+      const keep: number[] = [];
+      for (let k = 0; k < list.length; k++) {
+        if (!failed.has(k)) {
+          keep.push(out[k]);
+          continue;
+        }
+        if (!near) continue;
+        const parent = near.parents[k];
+        const ps =
+          parent !== 0xffffffff ? alloc.use(this.keyOfIndex(parent)) : -1;
+        if (ps >= 0) {
+          if (!subs.has(ps)) keep.push(ps);
+          subs.add(ps);
+          substituted += 1;
+          continue;
+        }
+        const first = near.firstKids[k];
+        const count = near.kidCounts[k];
+        if (first === 0xffffffff || !count) continue;
+        const kids: number[] = [];
+        for (let c = 0; c < count; c++) {
+          const s = alloc.use(this.keyOfIndex(first + c));
+          if (s < 0) break;
+          kids.push(s);
+        }
+        if (kids.length === count) {
+          for (const s of kids) if (!subs.has(s)) keep.push(s);
+          for (const s of kids) subs.add(s);
+          substituted += 1;
+        }
+      }
+      // A substitute also in the cut itself is drawn once.
+      const seen = new Set<number>();
+      result = Uint32Array.from(
+        keep.filter((s) => {
+          if (seen.has(s)) return false;
+          seen.add(s);
+          return true;
+        }),
+      );
     } else {
-      this.stats.missing = 0;
+      result = Uint32Array.from(out);
     }
+    this.stats.missing = failed.size;
+    this.stats.substituted = substituted;
+    this.stats.noSlot = noSlot;
     alloc.commit(result);
     this.stats.packMs = performance.now() - t0 - this.stats.decodeMs;
     return result;
+  }
+
+  /** Runs to fetch again (dropped runs a cut node needs): page -> runs. */
+  private wantedRuns = new Map<number, Set<number>>();
+  private runFetches = 0;
+
+  private wantRun(page: number, r: number) {
+    const set = this.wantedRuns.get(page) ?? new Set<number>();
+    set.add(r);
+    this.wantedRuns.set(page, set);
+  }
+
+  /** The dropped runs the cut asked for, by Range (adjacent runs of a page in one). */
+  private fetchRuns() {
+    const runs = this.runs;
+    if (!runs) return;
+    const max = this.options.fetchers ?? 4;
+    for (const [g, set] of this.wantedRuns) {
+      if (this.runFetches >= max) break;
+      this.wantedRuns.delete(g);
+      const owner = this.pageOwner[g];
+      const piece = this.pieces[owner.piece].piece;
+      const list = [...set]
+        .filter((r) => runs.missing(g, r))
+        .sort((a, b) => a - b);
+      let k = 0;
+      while (k < list.length) {
+        let e = k + 1;
+        while (e < list.length && list[e] === list[e - 1] + 1) e++;
+        const first = runs.fileSpan(g, list[k]) as [number, number];
+        const last = runs.fileSpan(g, list[e - 1]) as [number, number];
+        const rs = list.slice(k, e);
+        this.runFetches += 1;
+        this.stats.runRanges += 1;
+        piece
+          .read(first[0], last[0] + last[1] - first[0])
+          .then((data) => {
+            for (const r of rs) {
+              const span = runs.fileSpan(g, r);
+              if (!span) continue;
+              runs.putRun(
+                g,
+                r,
+                data.slice(span[0] - first[0], span[0] - first[0] + span[1]),
+              );
+            }
+          })
+          .catch((e) => console.warn(e))
+          .finally(() => {
+            this.runFetches -= 1;
+          });
+        k = e;
+      }
+    }
   }
 
   private evictedRanges: Record<string, unknown>[] = [];
@@ -1114,6 +1409,7 @@ export class CompactBandStreamer {
       key.slotOf.delete(page);
       key.kids.delete(page);
       this.payload?.drop(this.pageBase[key.index] + page);
+      this.runs?.drop(this.pageBase[key.index] + page);
       this.slotOwner[slot] = null;
       this.evictedSlots.add(slot);
       this.evictedRanges.push({
@@ -1224,6 +1520,28 @@ export class CompactBandStreamer {
             span.offset - start,
             span.offset - start + span.stored,
           );
+          if (p.runs) {
+            // CMPC v4: the traversal's member gunzipped, the runs inflated
+            // once (the positions the traversal reads are in them).
+            const c = stored.slice();
+            const h = parseRunsContainer(c);
+            const trav = await this.options.gunzip(
+              c.subarray(h.travAt, h.travAt + h.travBytes),
+            );
+            const nodePool = this.pool instanceof CompactNodePool;
+            const u = unpackRunsContainer(c, h, trav, !nodePool);
+            this.landed.push({
+              piece: p,
+              page,
+              raw: u.raw,
+              stored: null,
+              input: u.input,
+              container: nodePool ? c : undefined,
+              fileAt: span.offset,
+              planes: u.planes,
+            });
+            continue;
+          }
           const raw = p.compressed
             ? await this.options.gunzip(stored)
             : stored.slice();
@@ -1291,8 +1609,8 @@ export class CompactBandStreamer {
         gpuHeads: b.heads,
         gpuRecordsUsed: (this.nodes?.used ?? 0) * NODE_RECORD_WORDS * 4,
         cpuTraversal,
-        cpuCompressed: this.payload?.compressedBytes ?? 0,
-        cpuDecoded: this.payload?.decodedBytes ?? 0,
+        cpuCompressed: this.runs?.bytes ?? this.payload?.compressedBytes ?? 0,
+        cpuDecoded: this.runs?.inflatedBytes ?? this.payload?.decodedBytes ?? 0,
       };
     }
     return {

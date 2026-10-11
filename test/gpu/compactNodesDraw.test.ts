@@ -33,16 +33,24 @@ wasm.initSync({
 
 const FILE = new URL("../fixtures/athc/compact_pages.athc", import.meta.url)
   .pathname;
+/** The same tree as CMPC v4 (athc-convert --compact-runs). */
+const RUNS = new URL(
+  "../fixtures/athc/compact_pages.runs.athc",
+  import.meta.url,
+).pathname;
 const lod: LodCall = makeLodCall(wasm);
 
-function piece(): CompactPiece {
-  const bytes = new Uint8Array(readFileSync(FILE));
+function piece(file = FILE, io?: { ranges: number }): CompactPiece {
+  const bytes = new Uint8Array(readFileSync(file));
   const prefix = bytes.slice(0, wasm.athc_prefix_bytes(bytes.slice(0, 256)));
   return {
     name: "fixture",
     layout: wasm.athc_layout(prefix, bytes.length) as AthcV3Layout,
     prefix,
-    read: async (offset, n) => bytes.slice(offset, offset + n),
+    read: async (offset, n) => {
+      if (io) io.ranges += 1;
+      return bytes.slice(offset, offset + n);
+    },
   };
 }
 
@@ -95,8 +103,15 @@ describe.skipIf(!wideDevice)("the node pool", () => {
     return image;
   }
 
-  async function streamer(slots: number, nodes: boolean, fit: boolean) {
-    const s = new CompactBandStreamer(d, [piece()], {
+  async function streamer(
+    slots: number,
+    nodes: boolean,
+    fit: boolean,
+    file = FILE,
+    runBudget?: number,
+    io?: { ranges: number },
+  ) {
+    const s = new CompactBandStreamer(d, [piece(file, io)], {
       slots,
       slotNodes: 512,
       tau: 0.05,
@@ -104,7 +119,16 @@ describe.skipIf(!wideDevice)("the node pool", () => {
       nodeOrder: true,
       gunzip,
       lod,
-      ...(nodes ? { nodePool: { capacity: 64, decodedPages: 2 } } : {}),
+      ...(nodes
+        ? {
+            nodePool: {
+              capacity: 64,
+              decodedPages: 2,
+              inflatedRuns: 4,
+              ...(runBudget !== undefined ? { runBudget } : {}),
+            },
+          }
+        : {}),
     });
     await s.init();
     const path = new CompactRelitPath(d, { hdri: sky, stableOrder: true });
@@ -160,6 +184,65 @@ describe.skipIf(!wideDevice)("the node pool", () => {
     const bytes = nodes.s.residentBytes();
     process.stderr.write(
       `CT_NODES ${JSON.stringify({ cut: nodes.s.stats.cut, capacity: pool.capacity, bytes, pageBytes: pages.s.residentBytes() })}\n`,
+    );
+    for (const x of [pages, nodes]) {
+      x.path.dispose();
+      x.s.dispose();
+    }
+  });
+
+  it("reads CMPC v4 runs: the same cut and image, in both pools", async () => {
+    const cam = camera(W, H);
+    const pages = await streamer(8, false, false);
+    const pagesRuns = await streamer(8, false, false, RUNS);
+    const nodesRuns = await streamer(8, true, false, RUNS);
+    for (const x of [pages, pagesRuns, nodesRuns]) await settle(x, cam);
+    expect(nodesRuns.s.runs).not.toBeNull();
+    expect(keysOf(pagesRuns.s)).toEqual(keysOf(pages.s));
+    expect(keysOf(nodesRuns.s)).toEqual(keysOf(pages.s));
+    const a = await draw(pages.path, cam);
+    expect(same(a, await draw(pagesRuns.path, cam))).toBe(0);
+    expect(same(a, await draw(nodesRuns.path, cam))).toBe(0);
+    for (const x of [pages, pagesRuns, nodesRuns]) {
+      x.path.dispose();
+      x.s.dispose();
+    }
+  });
+
+  it("drops the runs the cut cannot need and fetches them again", async () => {
+    const cam = camera(W, H);
+    const pages = await streamer(8, false, false);
+    const io = { ranges: 0 };
+    // No budget: only the cut's runs (its nodes, parents, children) kept.
+    const nodes = await streamer(8, true, false, RUNS, 0, io);
+    await settle(pages, cam);
+    await settle(nodes, cam);
+    const runs = nodes.s.runs as NonNullable<typeof nodes.s.runs>;
+    const c = runs.census();
+    expect(c.held).toBeLessThan(c.runs);
+    expect(c.other).toBe(0);
+    expect(keysOf(nodes.s)).toEqual(keysOf(pages.s));
+    expect(same(await draw(pages.path, cam), await draw(nodes.path, cam))).toBe(
+      0,
+    );
+    // A jump: the new cut's dropped runs come again by Range; it settles to
+    // the page pool's image.
+    cam.position.set(30, -4, 1);
+    cam.lookAt(new THREE.Vector3(34, 0, 0));
+    cam.updateMatrixWorld();
+    await settle(pages, cam);
+    // Fetches of runs land between updates: a few more.
+    for (let k = 0; k < 10; k++) {
+      await nodes.s.update(cam, H, nodes.path);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(nodes.s.stats.missing).toBe(0);
+    expect(keysOf(nodes.s)).toEqual(keysOf(pages.s));
+    expect(same(await draw(pages.path, cam), await draw(nodes.path, cam))).toBe(
+      0,
+    );
+    process.stderr.write(
+      `CT_RUNS ${JSON.stringify({ census: runs.census(), stats: runs.stats, runRanges: nodes.s.stats.runRanges })}\n`,
     );
     for (const x of [pages, nodes]) {
       x.path.dispose();

@@ -95,6 +95,8 @@
 //! An asset's compact pieces (thread CQ, `spark_lib::athc_compact`; paged trees
 //! written by `usd-athc --tree ... --pages --compact-basis`, v1 or v2):
 //!   athc-convert --compact-rebase in.athc out.athc   the compact tier in the v3 layout
+//!   athc-convert --compact-runs [--run-nodes 64] in.athc out.athc   CMPC v4 (thread CT):
+//!                         each page's traversal planes gzipped, the GPU's in deflate runs
 //!                         (the traversal's 24 bytes a node: v2's 16, the cone, occlusion), its own tables
 //!   athc-convert --compact-asset car.cmpa --out-dir D a.athc b.athc ...   one asset table
 //!                         for the pieces (D/car.cmpa: the basis once) and each piece written
@@ -134,6 +136,15 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--scene" || a == "--drop-hidden" || a.starts_with("--decimate")) {
         return prune::run(&args);
+    }
+    if args.iter().any(|a| a == "--compact-runs") {
+        let run: usize = args.iter().position(|a| a == "--run-nodes").and_then(|i| args.get(i + 1)).map(|v| v.parse()).transpose()?.unwrap_or(spark_lib::athc_compact::RUN_NODES);
+        let paths: Vec<&String> = args.iter().enumerate().filter(|&(i, a)| !a.starts_with("--") && !(i > 0 && args[i - 1] == "--run-nodes")).map(|(_, a)| a).collect();
+        let [input, output] = paths[..] else { bail!("usage: athc-convert --compact-runs [--run-nodes N] in.athc out.athc") };
+        let (bytes, sizes) = spark_lib::athc_compact::convert_runs(&std::fs::read(input)?, run)?;
+        std::fs::write(output, &bytes)?;
+        eprintln!("{output}: {} bytes, tier 4 {} -> {} bytes", bytes.len(), sizes[0], sizes[1]);
+        return Ok(());
     }
     if args.iter().any(|a| a == "--compact-asset" || a == "--compact-rebase") {
         return compact_asset(&args);

@@ -29,6 +29,11 @@ export function makeLodCall(wasm: Wasm): LodCall {
     if (name === "newSharedLodTree") {
       return wasm.new_shared_lod_tree(a.lodId as number);
     }
+    if (name === "setCompactQuant") {
+      const b = [0, 1, 2, 3, 4].map((k) => (a.bits as number[])[k] ?? 0);
+      wasm.set_compact_quant(b[0], b[1], b[2], b[3], b[4]);
+      return {};
+    }
     if (name === "setLodOcclusionCodebook") {
       wasm.set_lod_occlusion_codebook(
         a.lodId as number,
@@ -100,6 +105,8 @@ export function makeLodCall(wasm: Wasm): LodCall {
       a.errorLimit as number | undefined,
       a.backCullMin as number | undefined,
       a.occlusionCull as boolean | undefined,
+      undefined,
+      a.neighbours as boolean | undefined,
     ) as {
       instanceIndices: { numSplats: number; indices: Uint32Array }[];
       culledCount?: number;

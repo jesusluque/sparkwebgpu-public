@@ -9,6 +9,7 @@ export const atheneaAdapterCompact = {
   kCompactMaterialWords: 4,
   kCompactClusterWords: 504,
   kCompactProjWords: 144,
+  kCompactSunWords: 8,
   kCompactWorkgroup: 256,
   kCompactRounds: 4,
   kCompactDispatchRow: 16776960,
@@ -23,6 +24,10 @@ export const atheneaAdapterCompact = {
   kCompactPlain: 16,
   kCompactCullBacks: 32,
   kCompactDrawList: 64,
+  kCompactBinned: 128,
+  kCompactBins: 256,
+  kCompactStableOrder: 256,
+  kCompactNone: 4294967295,
 } as const;
 
 /** slang/athenea_adapter/cpca.slang */

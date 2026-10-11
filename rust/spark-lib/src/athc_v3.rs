@@ -129,7 +129,7 @@ impl SectionId {
         })
     }
 
-    pub const ALL: [SectionId; 14] = [
+    pub const ALL: [SectionId; 15] = [
         Self::Core,
         Self::Sh,
         Self::LodSize,

@@ -781,7 +781,9 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
                                                       compactParams.footprint, compactParams.footprintClamp);
         }
         // A fold's coat (relight.slang's kRelightCoatFold, after the footprint).
-        if (hasFlag(kCompactCoatFold) && surface.lobes.coatWeight > 0.0) {
+        // Only on a paint-rough lacquer (relight.slang's kRelightCoatFold).
+        if (hasFlag(kCompactCoatFold) && surface.lobes.coatWeight > 0.0 &&
+            compactMaterialRoughness(i) >= kPolishFieldRoughness) {
             const float a = shapeUV.x, b = shapeUV.y, c = shapeUV.z;
             const float kMax = abs(0.5 * (a + c)) + sqrt(0.25 * (a - c) * (a - c) + b * b);
             const float spread = kMax * max(g.scales.x, g.scales.y);

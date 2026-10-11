@@ -222,7 +222,10 @@ export interface AtheneaRelightOptions {
   /**
    * athenea-pieces 35ae3cb: a coat's widening held to 0.3
    * (kCoatFoldRoughness) where the bake's spread is large -- a joint's
-   * lacquer widened to near 1 drew a dark streak. Needs the curvature.
+   * lacquer widened to near 1 drew a dark streak. Needs the curvature, and
+   * only where the material's own roughness (pbr bits 26..31) is at least
+   * 0.3, a paint's: off on chrome, glass and the rough metals, and on any
+   * cloud without the mark. Default true.
    */
   coatFold?: boolean;
   /**
@@ -511,7 +514,7 @@ export function atheneaRelightPlugin(
     cullBacksFacing: CULL_BACKS_FACING,
     sheetFloor: "relight",
     unwiden: true,
-    coatFold: false,
+    coatFold: true,
     polishField: true,
     cpcaBatch: CPCA_BATCH,
     releaseSky: false,

@@ -615,7 +615,8 @@ float sheetFloor(inout SplatShape s, float paid, float g, uint splatIndex) {
 // projectSplat's surfel: the record and the cuts, with s's centre and
 // colour set. rgba is the splat's own (with DRAW_SURFEL_MASS, under
 // minAlpha at its filtered peak, the faint path's floor).
-bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, bool3 zeroScales, uint splatIndex) {
+bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, bool3 zeroScales, uint splatIndex,
+                   bool sheet) {
     const float3 eu = zeroScales.x ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
     const float3 ev = zeroScales.z ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
     const float su = zeroScales.x ? scales.y : scales.x;
@@ -628,7 +629,53 @@ bool projectSurfel(inout SplatShape s, float4 viewQuaternion, float3 scales, boo
     s.rows.x = float3(hu.x - c.x * hu.z, hv.x - c.x * hv.z, c.x);
     s.rows.y = float3(hu.y - c.y * hu.z, hv.y - c.y * hv.z, c.y);
     s.rows.w = float3(hu.z, hv.z, hp.z);
-    if (hasFlag(DRAW_SURFEL_MASS)) {
+    if (sheet) {
+        // A thin sheet's surfel (half of athenea's merged glass): floored
+        // after the anti-alias filter as the 3D path's (sheetFloor), on its
+        // filtered peak alpha x peak share, never faint. The fragment takes
+        // alpha before the filter (splatAlpha x the peak share), so the
+        // floor and the alpha drawn go back over the share; at a share of
+        // 1 the two are the same and athenea's unfaded floor stands.
+        float peak = 1.0;
+        const float2 ju = float2(s.rows.x.x, s.rows.y.x) / s.rows.w.z;
+        const float2 jv = float2(s.rows.x.y, s.rows.y.y) / s.rows.w.z;
+        const float a2 = ju.x * ju.x + jv.x * jv.x;
+        const float b2 = ju.x * ju.y + jv.x * jv.y;
+        const float d2 = ju.y * ju.y + jv.y * jv.y;
+        if (hasFlag(DRAW_SURFEL_MASS)) {
+            peak = sqrt(surfelFiltered(s.rows.x, s.rows.y, s.rows.w).w);
+            if (hasFlag(DRAW_AA_BOX) && peak > 0.0) {
+                float2 e;
+                const float2 sigma = covSigmas(a2, b2, d2, e);
+                float2 rot;
+                peak = min(boxMass(sigma, boxFrame(e, sigma, rot)), 1.0);
+            }
+        }
+        if (!(peak > 0.0)) {
+            return false;
+        }
+        const float spread = sqrt(max(0.0, sqr(0.5 * (a2 - d2)) + b2 * b2));
+        const float major = 0.5 * (a2 + d2) + spread;
+        const float minor = max(0.5 * (a2 + d2) - spread, 0.0);
+        const float own = s.rgba.a;
+        const float drawn = sheetFloor(s, own * peak, sheetFadeOf(major, minor, params.blurAmount), splatIndex);
+        if (drawn == 0.0) {
+            return false;
+        }
+        if (peak < 1.0) {
+            // Before the filter: what markedRgba carries and sheetUnmark
+            // gives the fragment (the faded encodings: the floor is not
+            // SHEET_ALPHA there).
+            s.sheet = own;
+            s.sheetLow = min(s.sheetLow / peak, 1.0);
+            if (s.sheetLow == SHEET_ALPHA) {
+                s.sheetLow = SHEET_ALPHA * 1.000001;
+            }
+            s.rgba.a = s.sheetScale >= 1.0 ? own : s.sheetLow;
+        } else {
+            s.rgba.a = drawn;
+        }
+    } else if (hasFlag(DRAW_SURFEL_MASS)) {
         // The faint path: under FAINT_ALPHA x minAlpha at its peak (alpha x
         // the filtered disc's peak share), alpha raised to that floor, with
         // the probability that keeps its mass; minAlpha added back. Without
@@ -788,7 +835,7 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
         // Exactly one zero scale: a disc (two: a line, drawn as a 3D splat).
         const uint zeros = uint(zeroScales.x) + uint(zeroScales.y) + uint(zeroScales.z);
         if (hasFlag(DRAW_2DGS) && zeros == 1u) {
-            return projectSurfel(s, viewQuaternion, scales, zeroScales, splatIndex);
+            return projectSurfel(s, viewQuaternion, scales, zeroScales, splatIndex, sheet);
         }
         float3x3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);
         cov3D = mul(RS, transpose(RS));

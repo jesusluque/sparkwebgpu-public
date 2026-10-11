@@ -612,6 +612,13 @@ export function decodeCompactSplat(cloud: CompactCloud, i: number) {
   };
 }
 
+/** Whether two word arrays hold the same words. */
+function sameWords(a: Uint32Array, b: Uint32Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export interface CompactPathOptions {
   hdri?: SkyImage | null;
   /** Turns the dome about +Y (radians), as the relight plugin's. */
@@ -643,6 +650,13 @@ export interface CompactPathOptions {
    * are the same: each slot is shaded into its own place.
    */
   binByCluster?: boolean;
+  /**
+   * Check only: the eye (world) the reflected field is read for, in place
+   * of the camera's -- what reusing an earlier frame's field would show.
+   */
+  fieldEye?: THREE.Vector3 | null;
+  /** Check only: with fieldEye, the gaussians of this index parity read the camera (half-rate interleaved); null: none. */
+  fieldFreshParity?: 0 | 1 | null;
   /**
    * Each listed gaussian keeps its own sort slot (culled ones draw as
    * nothing), so equal depths keep the list's order and an image repeats
@@ -689,6 +703,8 @@ export class CompactRelitPath {
   /** The draw list (setDrawList): entries, or -1 for every gaussian. */
   private listCount = -1;
   private listVersion = 0;
+  /** The last draw list, to skip one that did not change. */
+  private listCopy: Uint32Array | null = null;
 
   constructor(
     readonly device: GPUDevice,
@@ -714,7 +730,9 @@ export class CompactRelitPath {
       faint: true,
       releaseSky: true,
       plain: false,
-      binByCluster: true,
+      binByCluster: false,
+      fieldEye: null,
+      fieldFreshParity: null,
       stableOrder: false,
       cullBacks: false,
       cullBacksFacing: -0.2,
@@ -773,6 +791,7 @@ export class CompactRelitPath {
       cloud.layout.clusters * K.kCompactProjWords + K.kCompactSunWords;
     this.projWords = words;
     this.listCount = -1;
+    this.listCopy = null;
     if (this.frame.size < words * 4) {
       this.frame.destroy();
       this.frame = createStorage(this.device, words * 4, "compact projections");
@@ -788,11 +807,17 @@ export class CompactRelitPath {
    * the frame buffer (4 B an entry), which grows to hold it.
    */
   setDrawList(indices: Uint32Array | null) {
-    this.listVersion += 1;
     if (!indices) {
+      if (this.listCount !== -1) this.listVersion += 1;
       this.listCount = -1;
+      this.listCopy = null;
       return;
     }
+    // The same cut again (a LoD traversal of an unmoved eye): nothing to
+    // upload, and a still frame stays still (no shade).
+    if (this.listCopy && sameWords(this.listCopy, indices)) return;
+    this.listCopy = indices.slice();
+    this.listVersion += 1;
     const need = (this.projWords + indices.length) * 4;
     if (this.frame.size < need) {
       this.frame.destroy();
@@ -914,6 +939,12 @@ export class CompactRelitPath {
       row2: row(2),
       eyeObject: [eyeObject.x, eyeObject.y, eyeObject.z, 1],
       eyeWorld: [eye.x, eye.y, eye.z, 1],
+      eyeField: o.fieldEye
+        ? [
+            ...o.fieldEye.clone().applyMatrix4(toStage).toArray(),
+            o.fieldFreshParity == null ? 1 : 2 + o.fieldFreshParity,
+          ]
+        : [eye.x, eye.y, eye.z, 1],
       view0: eyeRow(0, 1),
       view1: eyeRow(1, 1),
       view2: eyeRow(2, -1),

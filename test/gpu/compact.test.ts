@@ -489,3 +489,106 @@ describe.skipIf(!wideDevice)("the compact path's draw list", () => {
     color.destroy();
   });
 });
+
+describe.skipIf(!wideDevice)("the compact path's shading options", () => {
+  const d = wideDevice as GPUDevice;
+  it("bins by cluster and repeats with stableOrder, bit for bit", async () => {
+    const s = syntheticCloud();
+    const cloud = encodeCompact({
+      count: N,
+      ...s,
+      basis: packJointBasis(syntheticJointBasis(256, 5)),
+      clusters: 256,
+    });
+    const W = 160;
+    const H = 120;
+    const { camera, place } = placeCamera(
+      W,
+      H,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(3, -2, 1),
+      40,
+      1,
+    );
+    const color = d.createTexture({
+      size: [W, H],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const view = color.createView();
+    const imageOf = async (binByCluster: boolean, deg: number) => {
+      const path = new CompactRelitPath(d, {
+        hdri: sky(),
+        binByCluster,
+        stableOrder: true,
+      });
+      path.setCloud(cloud);
+      place(deg);
+      const enc = d.createCommandEncoder();
+      path.render(enc, camera, view, "rgba16float", W, H, {
+        clear: { r: 0, g: 0, b: 0, a: 0 },
+      });
+      path.registry.submit(enc.finish());
+      const image = await readImage(d, color);
+      path.dispose();
+      return image;
+    };
+    for (const deg of [0, 37]) {
+      const plain = await imageOf(false, deg);
+      const again = await imageOf(false, deg);
+      const binned = await imageOf(true, deg);
+      expect(again).toEqual(plain);
+      expect(binned).toEqual(plain);
+      expect(plain.some((v) => v > 0)).toBe(true);
+    }
+    color.destroy();
+  });
+
+  it("keeps a still frame still when the same draw list comes again", async () => {
+    const s = syntheticCloud();
+    const cloud = encodeCompact({
+      count: N,
+      ...s,
+      basis: packJointBasis(syntheticJointBasis(256, 5)),
+      clusters: 256,
+    });
+    const W = 64;
+    const H = 48;
+    const { camera } = placeCamera(
+      W,
+      H,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(3, -2, 1),
+      40,
+      1,
+    );
+    const color = d.createTexture({
+      size: [W, H],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const view = color.createView();
+    const path = new CompactRelitPath(d, { hdri: sky() });
+    path.setCloud(cloud);
+    const frame = () => {
+      const enc = d.createCommandEncoder();
+      path.render(enc, camera, view, "rgba16float", W, H);
+      path.registry.submit(enc.finish());
+    };
+    const list = new Uint32Array(N >> 1).map((_, k) => 2 * k);
+    path.setDrawList(list);
+    frame();
+    const shaded = path.stats.frames;
+    path.setDrawList(list.slice());
+    frame();
+    // The same cut: only the draw ran again.
+    expect(path.stats.frames).toBe(shaded);
+    list[0] = 1;
+    path.setDrawList(list);
+    frame();
+    expect(path.stats.frames).toBe(shaded + 1);
+    await d.queue.onSubmittedWorkDone();
+    path.dispose();
+    color.destroy();
+  });
+});

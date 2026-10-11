@@ -129,6 +129,7 @@ public struct CompactParams {
     public float4 row2;
     public float4 eyeObject;   ///< the eye in the cloud's space
     public float4 eyeWorld;    ///< the eye in the stage
+    public float4 eyeField;    ///< the eye the reflected field is read for (eyeWorld; another for staleness checks)
     public float4 view0;       ///< the cloud to the eye's (x right, y up, z depth ahead), rows
     public float4 view1;
     public float4 view2;
@@ -604,6 +605,7 @@ struct CompactSurface {
     SplatSurface surface;
     float lensCurvature;
     uint cluster;
+    uint index;
 };
 
 CompactSurface surfaceOf(uint i, CompactSplat g) {
@@ -668,7 +670,26 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
     }
     o.surface = surface;
     o.cluster = fieldAt(compactParams.cluster, 1u, i);
+    o.index = i;
     return o;
+}
+
+/// The alpha the draw starts from: the stored opacity, or the one the
+/// relight gives a glass (shadeColour's, from the material alone).
+float drawAlphaOf(uint i, CompactSplat g) {
+    if (hasFlag(kCompactPlain)) {
+        return g.rgba.a;
+    }
+    const uint pbr = materialOf(i).x;
+    const float transmission = pbrTransmission(pbr);
+    const bool thin = pbrThinWalled(pbr);
+    if (thin && transmission > 0.5) {
+        return max(max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0), 0.1);
+    }
+    if (!thin && transmission > 0.5 && compactParams.glassCover > 1.0) {
+        return coveredGlass(g.rgba.a, compactParams.glassCover);
+    }
+    return g.rgba.a;
 }
 
 /// The eye's direction from a surface.
@@ -678,7 +699,11 @@ float3 eyeFrom(SplatSurface s) { return normalize(compactParams.eyeWorld.xyz - s
 /// transmitting splat, along the way through: what relitCompact reads.
 void reflectedTerms(CompactSurface c, uint2 wr, out float3 polish, out float3 coat, out float3 through) {
     const SplatSurface s = c.surface;
-    const float3 wo = eyeFrom(s);
+    // eyeField.w (checks): 1 every splat reads eyeField; 2 or 3 the splats
+    // of the other parity than (w - 2) read it, the rest the eye.
+    const float mode = compactParams.eyeField.w;
+    const bool stale = mode < 1.5 || float(c.index & 1u) != mode - 2.0;
+    const float3 wo = normalize((stale ? compactParams.eyeField.xyz : compactParams.eyeWorld.xyz) - s.position);
     const float3 mirror = reflect(-wo, s.normal);
     const bool coated = s.lobes.coatWeight > 0.0;
     reflectedAlong(c.cluster, wr, mirror, s.roughness, coated ? s.lobes.coatRoughness : s.roughness,
@@ -994,8 +1019,10 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         }
         CompactSplat g = readCompact(i);
         const float3 v = toView(g.center);
-        const float4 lit = shadeColour(i, g);
-        float alpha = lit.w >= 0.0 ? lit.w : g.rgba.a;
+        // The footprint first: a splat it drops (under minAlpha, a faint
+        // one's draw) is not relit at all. Its alpha is the relight's
+        // (drawAlphaOf), so the colour and footprint are as before.
+        float alpha = drawAlphaOf(i, g);
         float2 centre, sigma;
         float angle;
         bool lod;
@@ -1007,6 +1034,7 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
             rec3[slot] = 0u;
             continue;
         }
+        const float4 lit = shadeColour(i, g);
         rec0[slot] = packCentre(centre);
         rec1[slot] = (f32tof16(sigma.x) & 0xFFFFu) | (uint(round(angle / 3.14159265358979 * 65535.0)) << 16u);
         rec2[slot] = (f32tof16(sigma.y) & 0xFFFFu) | ((f32tof16(lod ? -alpha : alpha) & 0xFFFFu) << 16u);

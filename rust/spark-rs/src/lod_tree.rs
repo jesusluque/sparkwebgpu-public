@@ -315,6 +315,12 @@ struct LodTree {
 /// octEncode(dir) x 16 - 0.5, the cells clamped, those of weight 0 left out)
 /// all closed in its entry. `dir` from the node toward the eye, in the
 /// asset's own frame (the tree's object space).
+///
+/// A quantized node (`margin` > 0, thread CU): its exact centre is anywhere
+/// within `margin` of the stored one, so it is hidden only if it is hidden
+/// from every such centre: every cell any direction from that box toward the
+/// eye reads is closed (`occluded_box`). It never culls a node the exact
+/// centre keeps.
 fn occluded(s: &LodSplat, eye: Vec3A, occlusion: &(Vec<u32>, [f32; 6])) -> bool {
     let (codebook, b) = occlusion;
     if s.occlusion == 0 {
@@ -328,7 +334,21 @@ fn occluded(s: &LodSplat, eye: Vec3A, occlusion: &(Vec<u32>, [f32; 6])) -> bool 
     if inside {
         return false;
     }
-    let d = eye - s.center();
+    let mask = &codebook[entry..entry + 8];
+    if s.margin > 0.0 {
+        return occluded_box(mask, eye - s.center(), s.margin);
+    }
+    occluded_dir(mask, eye - s.center())
+}
+
+/// Whether cell `bit` of an entry is open.
+fn cell_open(mask: &[u32], cx: i32, cy: i32) -> bool {
+    let bit = cy as usize * 16 + cx as usize;
+    (mask[bit >> 5] >> (bit & 31)) & 1 != 0
+}
+
+/// The exact rule for the direction `d` (node toward eye).
+fn occluded_dir(mask: &[u32], d: Vec3A) -> bool {
     let l1 = d.x.abs() + d.y.abs() + d.z.abs();
     if l1 <= 1.0e-20 {
         return false;
@@ -348,11 +368,80 @@ fn occluded(s: &LodSplat, eye: Vec3A, occlusion: &(Vec<u32>, [f32; 6])) -> bool 
         if w <= 0.0 {
             continue;
         }
-        let cx = ((lo[0] + kx) as i32).clamp(0, 15) as usize;
-        let cy = ((lo[1] + ky) as i32).clamp(0, 15) as usize;
-        let bit = cy * 16 + cx;
-        if (codebook[entry + (bit >> 5)] >> (bit & 31)) & 1 != 0 {
+        let cx = ((lo[0] + kx) as i32).clamp(0, 15);
+        let cy = ((lo[1] + ky) as i32).clamp(0, 15);
+        if cell_open(mask, cx, cy) {
             return false;
+        }
+    }
+    true
+}
+
+/// The conservative rule for a centre known within `margin` of the stored
+/// one: `d` (stored centre toward eye) anywhere in the box d +- margin. The
+/// box is split at the coordinate planes; in each closed orthant both
+/// octahedral coordinates are monotone in every component of d, so their
+/// range over the sub-box is that of its 8 corners, and every cell the exact
+/// rule may read from it lies in floor(min) ..= ceil(max) of the grid's
+/// coordinate (both bilinear cells, clamped). All those cells closed, in
+/// every sub-box: hidden. A box holding the eye's own point: never hidden.
+fn occluded_box(mask: &[u32], d: Vec3A, margin: f32) -> bool {
+    // A hair over the margin (f32 rounding of the exact rule's d).
+    let m = margin * 1.001 + 1.0e-6;
+    let lo = [d.x - m, d.y - m, d.z - m];
+    let hi = [d.x + m, d.y + m, d.z + m];
+    if (0..3).all(|k| lo[k] <= 0.0 && hi[k] >= 0.0) {
+        return false;
+    }
+    // Each axis's sub-intervals by sign: + takes [max(lo, 0), hi] (the exact
+    // rule's sign of 0 is +), - takes [lo, min(hi, 0)].
+    let parts = |k: usize| -> [(f32, f32, f32); 2] {
+        [
+            if hi[k] >= 0.0 { (1.0, lo[k].max(0.0), hi[k]) } else { (0.0, 0.0, 0.0) },
+            if lo[k] < 0.0 { (-1.0, lo[k], hi[k].min(0.0)) } else { (0.0, 0.0, 0.0) },
+        ]
+    };
+    let (px, py, pz) = (parts(0), parts(1), parts(2));
+    for &(sx, x0, x1) in &px {
+        if sx == 0.0 {
+            continue;
+        }
+        for &(sy, y0, y1) in &py {
+            if sy == 0.0 {
+                continue;
+            }
+            for &(sz, z0, z1) in &pz {
+                if sz == 0.0 {
+                    continue;
+                }
+                let (mut u0, mut u1, mut v0, mut v1) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+                for c in 0..8u32 {
+                    let a = if c & 1 == 0 { x0 } else { x1 }.abs();
+                    let b = if c & 2 == 0 { y0 } else { y1 }.abs();
+                    let z = if c & 4 == 0 { z0 } else { z1 }.abs();
+                    let l = a + b + z;
+                    if l <= 1.0e-20 {
+                        return false;
+                    }
+                    let (u, v) = if sz > 0.0 { (sx * a / l, sy * b / l) } else { (sx * (1.0 - b / l), sy * (1.0 - a / l)) };
+                    u0 = u0.min(u);
+                    u1 = u1.max(u);
+                    v0 = v0.min(v);
+                    v1 = v1.max(v);
+                }
+                // Grid coordinates, a hair wider for rounding.
+                let g = |p: f32| (p * 0.5 + 0.5) * 16.0 - 0.5;
+                let (gx0, gx1, gy0, gy1) = (g(u0) - 1.0e-3, g(u1) + 1.0e-3, g(v0) - 1.0e-3, g(v1) + 1.0e-3);
+                let (cx0, cx1) = ((gx0.floor() as i32).clamp(0, 15), (gx1.ceil() as i32).clamp(0, 15));
+                let (cy0, cy1) = ((gy0.floor() as i32).clamp(0, 15), (gy1.ceil() as i32).clamp(0, 15));
+                for cy in cy0..=cy1 {
+                    for cx in cx0..=cx1 {
+                        if cell_open(mask, cx, cy) {
+                            return false;
+                        }
+                    }
+                }
+            }
         }
     }
     true
@@ -1764,5 +1853,118 @@ mod quant_tests {
             }
         }
         assert!(packed * 10 >= total * 9, "{packed} of {total} in records");
+    }
+
+    /// The conservative occlusion against the exact rule on random nodes,
+    /// eyes and masks: the quantized rule never hides what the exact one
+    /// keeps, and with no margin it is the exact rule.
+    #[test]
+    fn quantized_occlusion_is_conservative() {
+        let mut seed = 0x12345678u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let (mut hidden, mut extra) = (0, 0);
+        for _ in 0..200_000 {
+            // Masks mostly closed (a few open cells), so occlusion happens.
+            let mut mask = [0u32; 8];
+            for _ in 0..(rnd() * 6.0) as usize {
+                let bit = (rnd() * 256.0) as usize % 256;
+                mask[bit >> 5] |= 1 << (bit & 31);
+            }
+            let c = Vec3A::new(rnd() * 2.0 - 1.0, rnd() * 2.0 - 1.0, rnd() * 2.0 - 1.0);
+            let eye = Vec3A::new(rnd() * 8.0 - 4.0, rnd() * 8.0 - 4.0, rnd() * 8.0 - 4.0);
+            let margin = rnd() * 0.05;
+            let off = Vec3A::new(rnd() * 2.0 - 1.0, rnd() * 2.0 - 1.0, rnd() * 2.0 - 1.0) * margin / 3f32.sqrt();
+            let exact = occluded_dir(&mask, eye - (c + off));
+            let quant = occluded_box(&mask, eye - c, margin);
+            assert!(!quant || exact, "culled only by the quantized rule: c {c:?} eye {eye:?} margin {margin}");
+            hidden += exact as u32;
+            extra += (exact && !quant) as u32;
+        }
+        assert!(hidden > 1000, "{hidden} hidden");
+        eprintln!("hidden {hidden}, kept by the margin {extra}");
+    }
+
+    /// thread CU: the whole car's nodes (CU_CAR_DIR: car-compact-tx-v5) at
+    /// athenea's Camera, CameraFar, the close-up and random eyes: the nodes
+    /// the quantized rule hides that the exact centre keeps (must be 0), CT's
+    /// rule (the stored centre, no margin) for comparison, and those the
+    /// margin keeps. `cargo test --release -- --ignored car_occlusion --nocapture`
+    #[test]
+    #[ignore]
+    fn car_occlusion() {
+        use spark_lib::athc_compact::{decode_runs, CompactAsset};
+        let Ok(dir) = std::env::var("CU_CAR_DIR") else { return };
+        let asset = CompactAsset::from_bytes(&std::fs::read(format!("{dir}/car.cmpa")).unwrap()).unwrap();
+        let occ = (asset.occlusion.clone(), asset.occlusion_box);
+        // Y-up world (three) to the Z-up stage: (x, -z, y).
+        let st = |p: [f32; 3]| Vec3A::new(p[0], -p[2], p[1]);
+        let (cam, tgt, far) = ([4.378f32, 1.676, 5.854], [0.0f32, 0.553, 0.252], [13.4994f32, 4.0228, 17.5284]);
+        let close = [0, 1, 2].map(|k| cam[k] + 0.55 * (tgt[k] - cam[k]));
+        let mut eyes = vec![("cam".to_string(), st(cam)), ("far".to_string(), st(far)), ("close".to_string(), st(close))];
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        for k in 0..24 {
+            let (az, el, r) = (rnd() * std::f32::consts::TAU, rnd() * 1.2 - 0.1, 2.0 + rnd() * 18.0);
+            eyes.push((format!("rand{k}"), Vec3A::new(r * el.cos() * az.cos(), r * el.cos() * az.sin(), 0.5 + r * el.sin())));
+        }
+        // [exact, ct, cu, ct-only, cu-only, kept by the margin] an eye
+        let mut counts = vec![[0u64; 6]; eyes.len()];
+        let mut nodes = 0u64;
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "athc")).collect();
+        files.sort();
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap();
+            let layout = parse_v3(&bytes).unwrap();
+            let k4 = layout.sections.iter().position(|s| s.id == SectionId::Compact).unwrap();
+            for (p, b) in layout.blocks.iter().enumerate() {
+                let span = b.spans[k4];
+                let (n, raw) = decode_runs(&bytes[span.offset as usize..][..span.stored as usize]).unwrap();
+                let input = traversal_input(&raw, n);
+                let head = layout.pages[p].compact;
+                let exact: Vec<TraversalNode> = (0..n).map(|i| spark_lib::athc_compact::traversal_node_input(&input, n, &head, p as u32, i)).collect();
+                let mut page = exact.clone();
+                let (pq, _) = QUANT_RECORD_BITS.apply(&mut page);
+                for (e, q) in exact.iter().zip(&page) {
+                    nodes += 1;
+                    if e.occlusion == 0 {
+                        continue;
+                    }
+                    let mut se = LodSplat::new_f16(e.centre.map(f16::from_bits), f16::ZERO, 0, 0);
+                    se.occlusion = e.occlusion;
+                    let mut sq = LodSplat::new_f16(q.centre.map(f16::from_bits), f16::ZERO, 0, 0);
+                    sq.occlusion = q.occlusion;
+                    let mut sm = sq.clone();
+                    sm.margin = pq.margin;
+                    for (k, (_, eye)) in eyes.iter().enumerate() {
+                        let a = occluded(&se, *eye, &occ);
+                        let b = occluded(&sq, *eye, &occ);
+                        let c = occluded(&sm, *eye, &occ);
+                        let row = &mut counts[k];
+                        row[0] += a as u64;
+                        row[1] += b as u64;
+                        row[2] += c as u64;
+                        row[3] += (b && !a) as u64;
+                        row[4] += (c && !a) as u64;
+                        row[5] += (a && !c) as u64;
+                    }
+                }
+            }
+        }
+        eprintln!("{nodes} nodes");
+        eprintln!("eye: exact-hidden ct-hidden cu-hidden | ct-only cu-only | kept-by-margin");
+        for ((name, _), r) in eyes.iter().zip(&counts) {
+            eprintln!("{name}: {} {} {} | {} {} | {}", r[0], r[1], r[2], r[3], r[4], r[5]);
+        }
+        assert!(counts.iter().all(|r| r[4] == 0), "nodes culled only by the quantized rule");
     }
 }

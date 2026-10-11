@@ -21,6 +21,7 @@ import {
   GpuSplatSource,
   WgpuSplatRenderer,
 } from "../../src/webgpu/WgpuSplatRenderer";
+import type { WgpuSplatMesh } from "../../src/webgpu/WgpuSplatRenderer";
 import type { AtheneaSky, SkyImage } from "../../src/webgpu/athenea/AtheneaSky";
 import {
   type AtheneaLightRecord,
@@ -375,6 +376,25 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     return readAndDestroy(staging);
   }
 
+  /**
+   * A mesh's relit records laid out five uint4 a splat (relight.slang
+   * kRelightStride) whatever the plugin keeps (relitStrideOf: 2 without
+   * pixelDetail): the records it does not keep read as zeros.
+   */
+  async function readRelit(
+    plugin: ReturnType<typeof atheneaRelightPlugin>,
+    mesh: WgpuSplatMesh,
+    buffer: GPUBuffer,
+  ) {
+    const raw = new Uint32Array(await read(buffer));
+    const s = 4 * plugin.relitStrideOf(mesh);
+    const n = mesh.source.count;
+    const out = new Uint32Array(n * 20);
+    for (let i = 0; i < n; i++)
+      out.set(raw.subarray(i * s, i * s + Math.min(s, 20)), i * 20);
+    return out.buffer;
+  }
+
   /** athenea's colour of every splat (slang/tests/athenea_relight.slang). */
   async function reference(
     sky: AtheneaSky,
@@ -537,7 +557,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     expect(relight.stats.relit).toBe(1);
     const relit = relight.buffers?.("splat", { frame: null, mesh })
       .atheneaRelit as GPUBuffer;
-    const got = new Float32Array(await read(relit));
+    const got = new Float32Array(await readRelit(relight, mesh, relit));
     const want = await reference(
       relight.sky as AtheneaSky,
       src.src,
@@ -573,7 +593,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     relight.set({ sheetFloor: "draw" });
     splats.render(camera, target);
     await d.queue.onSubmittedWorkDone();
-    const marked = new Float32Array(await read(relit));
+    const marked = new Float32Array(await readRelit(relight, mesh, relit));
     MATERIALS.forEach((m, i) => {
       for (let c = 0; c < 3; c++)
         expect(marked[20 * i + c]).toBe(got[20 * i + c]);
@@ -615,7 +635,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     await d.queue.onSubmittedWorkDone();
     const relit = relight.buffers?.("splat", { frame: null, mesh })
       .atheneaRelit as GPUBuffer;
-    const got = new Float32Array(await read(relit));
+    const got = new Float32Array(await readRelit(relight, mesh, relit));
     const sky0 = relight.sky as AtheneaSky;
     const lens = await reference(sky0, src.src, false, true, K);
     const flat = await reference(sky0, src.src, false, true, 0);
@@ -641,7 +661,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     camera.updateMatrixWorld();
     splats.render(camera, target);
     await d.queue.onSubmittedWorkDone();
-    const words = new Uint32Array(await read(relit));
+    const words = new Uint32Array(await readRelit(relight, mesh, relit));
     const half = (w: number) => THREE.DataUtils.fromHalfFloat(w >>> 16);
     const marks = MATERIALS.map((_, i) => half(words[20 * i + 4 * 4 + 3]));
     expect(marks.every((v) => v === 1 || v === 2)).toBe(true);
@@ -687,7 +707,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
       await d.queue.onSubmittedWorkDone();
       const relit = relight.buffers?.("splat", { frame: null, mesh })
         .atheneaRelit as GPUBuffer;
-      const got = new Float32Array(await read(relit));
+      const got = new Float32Array(await readRelit(relight, mesh, relit));
       host.detach();
       splats.dispose();
       return MATERIALS.map((_, i) => got[20 * i + 3]);
@@ -734,7 +754,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     await d.queue.onSubmittedWorkDone();
     const relit = relight.buffers?.("splat", { frame: null, mesh })
       .atheneaRelit as GPUBuffer;
-    const got = new Float32Array(await read(relit));
+    const got = new Float32Array(await readRelit(relight, mesh, relit));
     MATERIALS.forEach((_, i) => {
       expect(got[20 * i + 3]).toBe(-2);
       // Nothing for the draw to shade per pixel.
@@ -815,7 +835,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     ]).toEqual([1, 1, 1]);
     const relit = relight.buffers?.("splat", { frame: null, mesh })
       .atheneaRelit as GPUBuffer;
-    const c = new Float32Array(await read(relit));
+    const c = new Float32Array(await readRelit(relight, mesh, relit));
     const bytesPerRow = 256;
     const buf = d.createBuffer({
       size: bytesPerRow * 32,
@@ -892,11 +912,11 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
       relight.set({ cullBacks: true });
       splats.render(eye, target);
       await d.queue.onSubmittedWorkDone();
-      const on = new Float32Array(await read(relit()));
+      const on = new Float32Array(await readRelit(relight, mesh, relit()));
       relight.set({ cullBacks: false });
       splats.render(eye, target);
       await d.queue.onSubmittedWorkDone();
-      const off = new Float32Array(await read(relit()));
+      const off = new Float32Array(await readRelit(relight, mesh, relit()));
       const eyeObject = eye.position.clone().applyMatrix4(toObject);
       MATERIALS.forEach((m, i) => {
         const centre = new THREE.Vector3(
@@ -995,7 +1015,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
       await d.queue.onSubmittedWorkDone();
       const relit = relight.buffers?.("splat", { frame: null, mesh })
         .atheneaRelit as GPUBuffer;
-      const words = new Uint32Array(await read(relit));
+      const words = new Uint32Array(await readRelit(relight, mesh, relit));
       return { splats, mesh, host, relight, words };
     };
     const all = await run(null);
@@ -1028,7 +1048,9 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
       frame: null,
       mesh: cut.mesh,
     }).atheneaRelit as GPUBuffer;
-    const again = new Uint32Array(await read(relit));
+    const again = new Uint32Array(
+      await readRelit(cut.relight, cut.mesh, relit),
+    );
     for (const i of [0, 2]) {
       expect(Array.from(again.subarray(i * stride, i * stride + 4))).toEqual(
         Array.from(all.words.subarray(i * stride, i * stride + 4)),
@@ -1095,7 +1117,7 @@ describe.skipIf(!wideDevice)("athenea relight plugin", () => {
     await d.queue.onSubmittedWorkDone();
     const relit = relight.buffers?.("splat", { frame: null, mesh })
       .atheneaRelit as GPUBuffer;
-    const got = new Float32Array(await read(relit));
+    const got = new Float32Array(await readRelit(relight, mesh, relit));
     const { sh, sun: disc } = await (relight.sky as AtheneaSky).read();
     // splat_project's catcherOpacity, in JS.
     const octDecode = (u: number, v: number) => {

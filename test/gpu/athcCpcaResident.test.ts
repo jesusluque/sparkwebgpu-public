@@ -41,7 +41,9 @@ const HDR =
   ).pathname;
 const BATCH = Number(process.env.CPCA_BATCH ?? 65536);
 const FRAMES = Number(process.env.CPCA_FRAMES ?? 8);
-const STRIDE = 5; // relight.slang kRelightStride (uint4s a splat)
+// uint4 records a splat in the relit buffer (relight.relitStrideOf: 2 here,
+// the colour and the kept terms; 5 with pixelDetail).
+let STRIDE = 5;
 
 type Decoded = {
   numSplats: number;
@@ -221,6 +223,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
           await d.queue.onSubmittedWorkDone();
           const relit = relight.relitBufferOf(mesh) as GPUBuffer;
           const out = await read(relit);
+          STRIDE = relight.relitStrideOf(mesh);
           // A relight each frame: the eye moves.
           const times: number[] = [];
           for (let k = 0; k < FRAMES; k++) {

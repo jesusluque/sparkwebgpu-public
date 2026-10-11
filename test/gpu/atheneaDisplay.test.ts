@@ -11,7 +11,13 @@ import {
   AtheneaDisplay,
   prepareAces2,
 } from "../../src/webgpu/athenea/AtheneaDisplay";
-import { type FxBuffer, FxGraph, Gpu, rect } from "../../src/webgpu/fx";
+import {
+  type FxBuffer,
+  FxChain,
+  FxGraph,
+  Gpu,
+  rect,
+} from "../../src/webgpu/fx";
 import refModule from "../../src/webgpu/generated/tests/athenea_display";
 import { UniformWriter } from "../../src/webgpu/uniforms";
 import { device, readBack, storage } from "./device";
@@ -187,6 +193,91 @@ describe.skipIf(!device)("athenea display transform", () => {
       expect(worst(got, want)).toBeLessThan(view === 2 ? 5e-6 : 2e-6);
     });
   }
+
+  it("in place (a consumable source) is the same as into a new picture", async () => {
+    for (const view of [0, 1, 2]) {
+      const params = {
+        view,
+        display: 0,
+        exposure: 0.5,
+        background,
+        encoded: 0,
+      };
+      const want = await ours(params);
+      const source = picture(colours);
+      const out = graph.render(
+        {
+          effect: new AtheneaDisplay(),
+          params,
+          inputs: { Source: { picture: source } },
+        },
+        frame,
+        {},
+        [source],
+      );
+      gpu.flush();
+      const p = out.picture as FxBuffer;
+      // Written into the source's own buffer (atheneaDisplayInPlace).
+      expect(p.buffer).toBe(source.buffer);
+      const got = new Float32Array(await readBack(p.buffer)).slice(0, n * 4);
+      expect(Array.from(got)).toEqual(Array.from(want));
+    }
+  });
+
+  it("applied by a chain to a texture, in place, writes the transform back", async () => {
+    const d = device as GPUDevice;
+    // 16 texels a row: 256 bytes, as copyTextureToBuffer wants.
+    const [w, h] = [16, 5];
+    const texture = d.createTexture({
+      size: [w, h],
+      format: "rgba32float",
+      usage:
+        GPUTextureUsage.COPY_SRC |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const texels = hdrColours(w * h, 11);
+    d.queue.writeTexture({ texture }, texels, { bytesPerRow: w * 16 }, [w, h]);
+    const params = { view: 1, display: 0, exposure: 0, background, encoded: 1 };
+    const chain = new FxChain(gpu);
+    const eff = new AtheneaDisplay();
+    chain.add(eff, params);
+    chain.apply(texture, { flipY: false });
+    const out = d.createBuffer({
+      size: w * h * 16,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = d.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture }, { buffer: out, bytesPerRow: w * 16 }, [
+      w,
+      h,
+    ]);
+    d.queue.submit([enc.finish()]);
+    await out.mapAsync(GPUMapMode.READ);
+    const got = new Float32Array(out.getMappedRange().slice(0));
+    out.unmap();
+    const want = graph.render(
+      {
+        effect: new AtheneaDisplay(),
+        params,
+        inputs: { Source: { picture: picture(texels) } },
+      },
+      rect(0, 0, w * h, 1),
+    );
+    gpu.flush();
+    const ref = new Float32Array(
+      await readBack((want.picture as FxBuffer).buffer),
+    ).slice(0, w * h * 4);
+    let worstDiff = 0;
+    for (let i = 0; i < w * h * 4; i++)
+      if (i % 4 !== 3)
+        worstDiff = Math.max(worstDiff, Math.abs(got[i] - ref[i]));
+    // AgX moves every colour: the texture holds the transform, not its input.
+    expect(worstDiff).toBeLessThan(1e-6);
+    expect(Array.from(got.slice(0, 3))).not.toEqual(
+      Array.from(texels.slice(0, 3)),
+    );
+  });
 
   it("is the formulas: Standard and AgX onto sRGB (JS)", async () => {
     for (const view of [0, 1]) {

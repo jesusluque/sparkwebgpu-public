@@ -237,6 +237,24 @@ export class Gpu {
   }
 
   /**
+   * Hands a lent buffer (lend, scratch) back before the frame ends, once
+   * nothing recorded after this point reads it: the next lend of its size
+   * this frame gets it again. Safe within one frame because every use is
+   * recorded in order into one encoder (WebGPU orders the later writes
+   * after the earlier reads). A buffer not lent this frame is ignored.
+   */
+  release(buffer: GPUBuffer | FxBuffer | null | undefined) {
+    const b = buffer && "buffer" in buffer ? buffer.buffer : buffer;
+    if (!b) return;
+    const k = this.lent.indexOf(b as GPUBuffer);
+    if (k < 0) return;
+    this.lent.splice(k, 1);
+    const list = this.free.get(b.size) ?? [];
+    list.push(b as GPUBuffer);
+    this.free.set(b.size, list);
+  }
+
+  /**
    * aofx `keep`: a buffer that outlives the frame, by a key that identifies
    * its contents. Asking again with the same key costs nothing and `data` may
    * be left out once it is there. There is no eviction: `drop` what you

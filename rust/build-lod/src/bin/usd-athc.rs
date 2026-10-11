@@ -1300,16 +1300,45 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
     // are (the mass-ratio `coverage` left aside).
     // `--mass-coverage`: the mass ratio instead, as before her composited
     // coverage (for comparisons).
-    let mass = flag("--mass-coverage");
+    // `--mass-capped`: each merge drawn at its mass ratio W / A held at
+    // athenea's 0.99 (her mass trees' own opacity), and kept as it is
+    // (FLAG_NODE_COVERAGE: not uncapped, not widened). Spark's draw keeps a
+    // splat's mass (the AA blur and the surfel filter), so a merge drawn at
+    // W / A puts back its leaves' mass; her composited coverage, fitted to
+    // a G over the merge's core, does not (thread CJ: a far fender's
+    // coverage 0.63 against the leaves' 0.85, with the mass ratio 0.86).
+    let capped = flag("--mass-capped");
+    if capped {
+        let mass_ratio = if prim.get("athenea:splat:coverageMass").is_some() {
+            prim.floats(&["athenea:splat:coverageMass"])?
+        } else {
+            std::mem::take(&mut streams.coverage)
+        };
+        if mass_ratio.len() == streams.count {
+            for (k, m) in mass_ratio.iter().enumerate() {
+                if has_kids[k] && m.is_finite() {
+                    if let Some(o) = streams.opacities.get_mut(k) {
+                        *o = m.min(0.99);
+                    }
+                }
+            }
+        }
+        streams.coverage.clear();
+    }
+    let mass = !capped && flag("--mass-coverage");
     if mass && prim.get("athenea:splat:coverageMass").is_some() {
         streams.coverage = prim.floats(&["athenea:splat:coverageMass"])?;
     }
-    let marked = !mass && prim.get("athenea:splat:coverageMass").is_some();
-    let node_coverage = !mass && (marked || flag("--node-coverage") || prim.bool("athenea:splat:treeCoverage"));
+    let marked = !mass && !capped && prim.get("athenea:splat:coverageMass").is_some();
+    let node_coverage =
+        capped || (!mass && (marked || flag("--node-coverage") || prim.bool("athenea:splat:treeCoverage")));
     if node_coverage && !marked {
         streams.coverage.clear();
     }
-    if node_coverage {
+    if capped {
+        eprintln!("node coverage: the merges' mass ratio held at 0.99 as their opacity (--mass-capped)");
+    }
+    if node_coverage && !capped {
         eprintln!("node coverage: the merges' composited coverage kept as their opacity{}", if marked { " (coverage; coverageMass left aside)" } else { "" });
     }
     if streams.count != total {
@@ -1573,6 +1602,45 @@ fn main() -> Result<()> {
     let prim = Prim::read(data.as_ref(), prim_path)?;
     let closed = prim.closed();
     let up_axis = up_axis(data.as_ref());
+    if flag("--opacity-stats") {
+        // Quantiles of the opacity-like streams (opacities, coverage,
+        // coverageMass): what a flat cut of athenea's draws (thread CJ).
+        for name in ["opacities", "athenea:splat:coverage", "athenea:splat:coverageMass"] {
+            let mut v = prim.floats(&[name])?;
+            if v.is_empty() {
+                println!("{name}: none");
+                continue;
+            }
+            v.sort_by(|a, b| a.total_cmp(b));
+            let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+            let over = v.iter().filter(|&&x| x > 1.0).count();
+            let capped = v.iter().filter(|&&x| (x - 0.99).abs() < 1e-4).count();
+            println!(
+                "{name}: n {} min {:.4} p10 {:.4} p50 {:.4} p90 {:.4} max {:.4} >1 {over} =0.99 {capped}",
+                v.len(), v[0], q(0.1), q(0.5), q(0.9), v[v.len() - 1]
+            );
+        }
+        // Scales: how many have an axis exactly 0 (surfels), and the median
+        // thinnest / middle axis.
+        let sc = prim.floats(&["scales", "scalesh"])?;
+        let mut zero = 0usize;
+        let mut ratio: Vec<f32> = sc
+            .chunks(3)
+            .map(|s| {
+                let mut v = [s[0].abs(), s[1].abs(), s[2].abs()];
+                v.sort_by(|a, b| a.total_cmp(b));
+                if v[0] == 0.0 {
+                    zero += 1;
+                }
+                v[0] / v[1].max(1e-30)
+            })
+            .collect();
+        ratio.sort_by(|a, b| a.total_cmp(b));
+        if !ratio.is_empty() {
+            println!("scales: n {} zero-axis {zero} thinnest/middle p50 {:.4}", ratio.len(), ratio[ratio.len() / 2]);
+        }
+        return Ok(());
+    }
     if flag("--list") {
         if let Some(up) = &up_axis {
             println!("upAxis: {up}");
@@ -1622,6 +1690,12 @@ fn main() -> Result<()> {
         prim.skeleton(arg(&args, "--clip").unwrap_or("default"), fps, k, if has_gradients { k - 1 } else { 0 })?
     };
     let (mut streams, mask) = filtered(prim, &[])?;
+    // `--opacities-as-drawn`: the file's own opacities, the `coverage`
+    // primvar left aside (a flat cut of athenea's mass tree draws its 0.99
+    // capped opacities where `coverage` is the uncapped mass ratio).
+    if flag("--opacities-as-drawn") {
+        streams.coverage.clear();
+    }
     let mut sources = vec![json!({ "source": input, "splats": streams.count })];
     // Each source cloud's prim mask and where its splats start in the streams.
     let mut masks: Vec<(Option<Vec<bool>>, usize)> = vec![(mask, 0)];

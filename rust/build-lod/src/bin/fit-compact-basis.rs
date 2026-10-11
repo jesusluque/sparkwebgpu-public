@@ -3,7 +3,7 @@
 //!
 //!   fit-compact-basis <piece.athc>... --out <dir/basis> [--clusters 256]
 //!     [--iters 16] [--seed 1] [--seed-sample 200000] [--compare other.json]
-//!     [--report report.json]
+//!     [--report report.json] [--held-out piece.athc]...
 //!
 //! The pieces: .athc files carrying the full 112-value transfer in their
 //! streams (usd-athc --transfer full). Every node is used (leaves and merged
@@ -11,6 +11,7 @@
 //! --compact-basis reads) and prints, per piece and block (direct, indirect,
 //! reflected), the transfer's relMSE through the fitted basis at int4 -- and
 //! through `--compare` (e.g. athenea's q97, a LOCAL comparison only).
+//! `--held-out <piece.athc>` (repeatable): measured, not fitted on.
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -21,7 +22,9 @@ use spark_lib::athc_compact::JointBasis;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let valued = ["--out", "--clusters", "--iters", "--seed", "--seed-sample", "--compare", "--report"];
+    let valued = ["--out", "--clusters", "--iters", "--seed", "--seed-sample", "--compare", "--report", "--held-out"];
+    let held: Vec<String> =
+        args.iter().enumerate().filter(|(_, a)| *a == "--held-out").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
     let mut files = Vec::new();
     let mut k = 0;
     while k < args.len() {
@@ -56,7 +59,7 @@ fn main() -> Result<()> {
     // The transfer of every node, by piece.
     let mut pieces: Vec<(String, std::ops::Range<usize>)> = Vec::new();
     let mut x: Vec<f32> = Vec::new();
-    for f in &files {
+    for f in files.iter().chain(&held) {
         let bytes = std::fs::read(f).with_context(|| f.clone())?;
         let file = spark_lib::athc_v3::read_v3(&bytes).with_context(|| f.clone())?;
         let first = x.len() / 112;
@@ -78,7 +81,8 @@ fn main() -> Result<()> {
         pieces.push((name, first..x.len() / 112));
     }
 
-    let (basis, fit) = fit_joint_basis(&x, &o)?;
+    let fitted = pieces.iter().take(files.len()).map(|(_, r)| r.end).max().unwrap_or(0);
+    let (basis, fit) = fit_joint_basis(&x[..fitted * 112], &o)?;
     eprintln!("fit: {}", serde_json::to_string(&fit)?);
 
     let compare = match arg("--compare") {
@@ -94,9 +98,11 @@ fn main() -> Result<()> {
         json!({ "all": all, "direct": e[0] / f[0].max(1e-30), "indirect": e[1] / f[1].max(1e-30), "reflected": e[2] / f[2].max(1e-30) })
     };
     let mut rows = Vec::new();
-    for (name, r) in pieces.iter().chain(std::iter::once(&("ALL".to_string(), 0..x.len() / 112))) {
+    let all = ("ALL fitted".to_string(), 0..fitted);
+    for (k, (name, r)) in pieces.iter().chain(std::iter::once(&all)).enumerate() {
         let row = json!({
             "piece": name,
+            "heldOut": k >= files.len() && k < pieces.len(),
             "nodes": r.len(),
             "ours": rel(&basis, r),
             "compare": compare.as_ref().map(|c| rel(c, r)),
@@ -105,7 +111,7 @@ fn main() -> Result<()> {
         rows.push(row);
     }
 
-    let names: Vec<&str> = pieces.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<&str> = pieces.iter().take(files.len()).map(|(n, _)| n.as_str()).collect();
     let (j, bin) = basis_json_bin(
         &basis,
         json!({

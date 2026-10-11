@@ -634,6 +634,25 @@ lodError        the 2 LODE words                            -- the traversal's 2
   in f16 (504 words a cluster). The basis is the one `--compact-basis`
   names; athenea's q97 basis is local only, so a file made with it is never
   published.
+- **the asset's basis, once** (thread CR; provisional until thread CQ's
+  asset table lands): `usd-athc ... --compact-asset asset.cmpa` writes the
+  basis into a sidecar shared by the asset's pieces and leaves the piece's
+  `CMPT` with flag 4 (`TABLE_ASSET_BASIS`) and, where the basis would be,
+  two words: the asset table's id. The sidecar is CQ's `CMPA` v1 layout
+  with the basis alone: 16 words (magic `CMPA`, version 1, words, flags 1,
+  clusters, 0, 0, basis at 16, basis words, end, end, id lo, id hi, 0 0 0)
+  then the f16 table; the id is FNV-1a 64 of the blob with its id words 0.
+  A reader loads the sidecar first (`loadCompactAsset`) and passes it to
+  `openCompactPiece`; a piece naming another id is refused. A set's
+  `corvette.json` names it as `compactAsset`.
+- **our own basis**: `fit-compact-basis <piece.athc>... --out basis`
+  (`athc_basis_fit.rs`) fits a joint CPCA in athenea's layout (C 256, K 8,
+  int4 weights) to the full transfer of the pieces' nodes: per-block energy
+  norms, k-means of the joint vectors (k-means++ seeds, Lloyd over every
+  node), per-cluster PCA of each block, and the scale per direction with
+  the least error through the int4 code and the GPU's int8 grid.
+  `--compare other.json` prints the same per-piece, per-block relMSE for
+  another basis.
 
 A compact reader (`CompactBandStreamer`, `src/webgpu/athenea/compactPages.ts`)
 reads the tables with the page table, then only `CMPC` runs: each page goes

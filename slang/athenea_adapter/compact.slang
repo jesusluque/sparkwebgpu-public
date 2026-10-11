@@ -135,6 +135,7 @@ public struct CompactParams {
     public float falloff;
     public float keyScale;     ///< (2^24 - 1) / the farthest distance sorted
     public float cullFacing;   ///< kCompactCullBacks: the cosine below which a back is culled
+    public float sheetFade;    ///< a thin sheet's floor after the AA blur, faded under A0 px^2 (0: unfaded); < 0: floored before the blur (CN's)
     public uint  drawList;     ///< kCompactDrawList: the list's start in compactFrame, words (count entries)
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
     public float4 row1;
@@ -722,6 +723,30 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
     return o;
 }
 
+/// athenea's kSheetAlpha (splat_project): a thin sheet's floor.
+static const float kCompactSheetAlpha = 0.1;
+
+/// A thin sheet floored AFTER the AA blur, as the normal path's draw
+/// (splat_shape.slang sheetFloor, pieces.html's sheet=draw): CN's compact
+/// path floored it before the blur, so a sheet under a pixel or two (the
+/// headlight cover from a few metres) lost the blur's share of its floor,
+/// down to minAlpha and gone (thread CS).
+bool sheetAfterBlur() { return compactParams.sheetFade >= 0.0; }
+
+/// splat_shape.slang sheetFadeOf, the gaussian AA blur only.
+float compactSheetFade(float major2, float minor2, float blur) {
+    const float a0 = compactParams.sheetFade;
+    if (!(a0 > 0.0) || !(blur > 0.0)) {
+        return 1.0;
+    }
+    const float ref2 = a0 / (2.0 * 3.14159265358979);
+    const float e2 = sqrt(max(major2 * minor2, 0.0));
+    if (!(e2 < ref2)) {
+        return 1.0;
+    }
+    return min(1.0, e2 * (ref2 + blur) / (ref2 * (e2 + blur)));
+}
+
 /// The alpha the draw starts from: the stored opacity, or the one the
 /// relight gives a glass (shadeColour's, from the material alone).
 float drawAlphaOf(uint i, CompactSplat g) {
@@ -732,12 +757,24 @@ float drawAlphaOf(uint i, CompactSplat g) {
     const float transmission = pbrTransmission(pbr);
     const bool thin = pbrThinWalled(pbr);
     if (thin && transmission > 0.5) {
-        return max(max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0), 0.1);
+        const float own = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
+        // After the blur (sheetAfterBlur): its own alpha, floored by
+        // projectCompact; CN's: floored here, before the blur took its share.
+        return sheetAfterBlur() ? own : max(own, kCompactSheetAlpha);
     }
     if (!thin && transmission > 0.5 && compactParams.glassCover > 1.0) {
         return coveredGlass(g.rgba.a, compactParams.glassCover);
     }
     return g.rgba.a;
+}
+
+/// Whether splat i is a thin sheet of glass (athenea's splat_project floor).
+bool isSheet(uint i) {
+    if (hasFlag(kCompactPlain)) {
+        return false;
+    }
+    const uint pbr = materialOf(i).x;
+    return pbrThinWalled(pbr) && pbrTransmission(pbr) > 0.5;
 }
 
 /// The eye's direction from a surface.
@@ -787,8 +824,13 @@ public float4 shadeColour(uint i, CompactSplat g) {
     float alpha = -1.0;
     if (surface.thinWalled && surface.transmission > 0.5) {
         const float alphaOwn = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
-        alpha = max(alphaOwn, 0.1);
-        light *= alphaOwn / alpha;
+        if (sheetAfterBlur()) {
+            // Floored after the blur (projectCompact gives the colour's scale).
+            alpha = alphaOwn;
+        } else {
+            alpha = max(alphaOwn, kCompactSheetAlpha);
+            light *= alphaOwn / alpha;
+        }
     } else if (!surface.thinWalled && surface.transmission > 0.5 && compactParams.glassCover > 1.0) {
         alpha = coveredGlass(g.rgba.a, compactParams.glassCover);
     }
@@ -946,8 +988,9 @@ void atheneaCompactClamp(uint3 tid: SV_DispatchThreadID) {
 /// default path: the anti-aliasing blur with its alpha kept, LoD opacity,
 /// the faint path), from the view-space centre: false where not drawn.
 /// sigma: the blurred covariance's two deviations, angle: the major axis'.
-bool projectCompact(CompactSplat g, float3 v, uint index, inout float alpha, out float2 centre, out float2 sigma,
-                    out float angle, out bool lod) {
+bool projectCompact(CompactSplat g, float3 v, uint index, bool sheet, inout float alpha, out float2 centre,
+                    out float2 sigma, out float angle, out bool lod, out float sheetScale) {
+    sheetScale = 1.0;
     centre = float2(0.0);
     sigma = float2(0.0);
     angle = 0.0;
@@ -983,7 +1026,35 @@ bool projectCompact(CompactSplat g, float3 v, uint index, inout float alpha, out
     const float blurred = a0 * sqrt(max(0.0, detOrig / det));
     const float minAlpha = compactParams.minAlpha;
     const float faintTarget = 4.0 * minAlpha;
-    if (hasFlag(kCompactFaint) && a0 <= 1.0 && compactParams.falloff == 1.0 && detOrig > 0.0 &&
+    if (sheet && sheetAfterBlur()) {
+        // sheetFloor: the floor on the alpha the blur left (paid), faded by
+        // the splat's area on screen; the colour scaled by paid / floor.
+        const float spread = sqrt(max(0.0, 0.25 * (a00 - d00) * (a00 - d00) + b * b));
+        const float major = 0.5 * (a00 + d00) + spread;
+        const float minor = max(0.5 * (a00 + d00) - spread, 0.0);
+        const float gFade = compactSheetFade(major, minor, blur);
+        const float low = kCompactSheetAlpha * gFade;
+        if (blurred >= low) {
+            alpha = blurred;
+        } else {
+            float target = low;
+            if (target < faintTarget) {
+                uint x = (stableIndexOf(index) * 0x9e3779b9u) ^ 0x85ebca6bu;
+                x ^= x >> 16u;
+                x *= 0x7feb352du;
+                x ^= x >> 15u;
+                x *= 0x846ca68bu;
+                x ^= x >> 16u;
+                if (float(x >> 8u) / 16777216.0 >= target / faintTarget) {
+                    return false;
+                }
+                target = faintTarget;
+            }
+            sheetScale = blurred / low;
+            alpha = target;
+        }
+        lod = false;
+    } else if (hasFlag(kCompactFaint) && a0 <= 1.0 && compactParams.falloff == 1.0 && detOrig > 0.0 &&
         blurred < faintTarget) {
         const float mass = a0 * sqrt(detOrig);
         const float tr = a00 + d00;
@@ -1080,7 +1151,9 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         float2 centre, sigma;
         float angle;
         bool lod;
-        const bool drawn = alpha > 0.0 && projectCompact(g, v, i, alpha, centre, sigma, angle, lod);
+        float sheetScale;
+        const bool sheet = sheetAfterBlur() && isSheet(i);
+        const bool drawn = (alpha > 0.0 || sheet) && projectCompact(g, v, i, sheet, alpha, centre, sigma, angle, lod, sheetScale);
         if (!drawn || max(sigma.x, sigma.y) * compactParams.maxStdDev < compactParams.minPixelRadius) {
             rec0[slot] = 0u;
             rec1[slot] = 0u;
@@ -1088,7 +1161,7 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
             rec3[slot] = 0u;
             continue;
         }
-        const float4 lit = shadeColour(i, g);
+        const float4 lit = shadeColour(i, g) * float4(float3(sheetScale), 1.0);
         rec0[slot] = packCentre(centre);
         rec1[slot] = (f32tof16(sigma.x) & 0xFFFFu) | (uint(round(angle / 3.14159265358979 * 65535.0)) << 16u);
         rec2[slot] = (f32tof16(sigma.y) & 0xFFFFu) | ((f32tof16(lod ? -alpha : alpha) & 0xFFFFu) << 16u);
@@ -1169,16 +1242,18 @@ void atheneaCompactColours(uint3 tid: SV_DispatchThreadID) {
     debugOut[3u * i] = lit;
     // The footprint as the draw takes it: its two axes' lengths in pixels,
     // the alpha, the adjusted deviations (0s: not drawn).
-    float alpha = lit.w >= 0.0 ? lit.w : g.rgba.a;
+    float alpha = drawAlphaOf(i, g);
+    const bool sheet = sheetAfterBlur() && isSheet(i);
+    float sheetScale;
     const float3 v = toView(g.center);
     float2 centre, sigma;
     float angle;
     bool lod;
     float4 shape = float4(0.0);
     float4 place = float4(0.0);
-    if (inFrustum(v) && alpha > 0.0) {
+    if (inFrustum(v) && (alpha > 0.0 || sheet)) {
         float pre = alpha > 1.0 ? min(alpha * 4.0 - 3.0, 5.0) : alpha;
-        if (projectCompact(g, v, i, alpha, centre, sigma, angle, lod)) {
+        if (projectCompact(g, v, i, sheet, alpha, centre, sigma, angle, lod, sheetScale)) {
             const float adjusted = adjustedStdDevOf(alpha, lod, sigma, pre);
             shape = float4(min(compactParams.maxPixelRadius, adjusted * sigma.x),
                            min(compactParams.maxPixelRadius, adjusted * sigma.y), alpha, adjusted);

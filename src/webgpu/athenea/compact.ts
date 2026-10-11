@@ -636,6 +636,13 @@ export interface CompactPathOptions {
   footprint?: number;
   footprintClamp?: number;
   glassCover?: number;
+  /**
+   * A thin sheet of glass (thinWalled, transmission) floored at athenea's 0.1
+   * AFTER the AA blur, as the normal path's draw (`sheetFloor: "draw"`),
+   * faded under this many px² (`sheetFade`, 3 as pieces.html); 0 unfaded.
+   * Negative: CN's floor before the blur (a small sheet drawn paler).
+   */
+  sheetFade?: number;
   /** Spark's draw defaults. */
   blurAmount?: number;
   minAlpha?: number;
@@ -726,6 +733,7 @@ export class CompactRelitPath {
       footprint: 0.5,
       footprintClamp: 1,
       glassCover: 1,
+      sheetFade: 3,
       blurAmount: 0.3,
       minAlpha: 0.5 / 255,
       maxStdDev: Math.sqrt(8),
@@ -963,6 +971,7 @@ export class CompactRelitPath {
       falloff: 1,
       keyScale: ((1 << K.kCompactKeyBits) - 1) / (far * 1.8),
       cullFacing: o.cullBacksFacing,
+      sheetFade: o.sheetFade,
       row0: row(0),
       row1: row(1),
       row2: row(2),

@@ -694,6 +694,10 @@ export interface CompactPathOptions {
    */
   cullBacks?: boolean;
   cullBacksFacing?: number;
+  /** Check only (thread CW): the coat's and polish's roughness at least this. */
+  coatFloor?: number;
+  /** Check only (thread CW): 1 merged nodes' LoD opacity held to 1. */
+  debugBits?: number;
   /** The relight plugin's coatFold (athenea 35ae3cb): needs the curvature. */
   coatFold?: boolean;
   /** The relight plugin's polishField (athenea 35ae3cb): pbr bits 26..31; default true. */
@@ -764,6 +768,8 @@ export class CompactRelitPath {
       stableOrder: false,
       cullBacks: false,
       cullBacksFacing: -0.2,
+      coatFloor: 0,
+      debugBits: 0,
       coatFold: false,
       polishField: true,
       ...options,
@@ -1022,7 +1028,7 @@ export class CompactRelitPath {
         (width / 2) * (1 - p[8]),
         (height / 2) * (1 + p[9]),
       ],
-      viewport: [width, height, 0, 0],
+      viewport: [width, height, o.coatFloor, o.debugBits],
     });
   }
 

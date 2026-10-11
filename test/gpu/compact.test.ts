@@ -231,7 +231,11 @@ describe.skipIf(!wideDevice).each([8, 4])(
       });
       const got = await compactRun(d, cloud, {
         ...run,
-        path: { faint: !noFaint },
+        // The same sheet floor on both sides: the reference relight's
+        // default floors a thin sheet at 0.1 BEFORE the draw's blur, the
+        // compact path now floors it after (sheetFade, thread CS) unless
+        // told CN's way (sheetFade < 0). Material 2 is a thin sheet.
+        path: { faint: !noFaint, sheetFade: -1 },
       });
       const colours = compare(
         got.colours as Float32Array,
@@ -326,6 +330,51 @@ describe.skipIf(!wideDevice).each([8, 4])(
       );
       expect(colours.relMSE).toBeLessThan(1e-5);
       expect(alphaDiff).toBeLessThan(1e-3);
+      expect(image.relMSE).toBeLessThan(1e-3);
+    }, 120_000);
+
+    it("floors thin sheets after the blur as the draw does (sheetFade)", async () => {
+      // The compact path's default (thread CS) against today's path with
+      // the floor in the draw (sheetFloor "draw", the renderer's sheetFade
+      // 3, pieces.html's): the image (the per-splat colours differ by
+      // design: the draw takes the sheet's scale, the compact shade too).
+      const W = 320;
+      const H = 240;
+      const { camera, place } = placeCamera(
+        W,
+        H,
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(1.2, -1.0, 0.6),
+        50,
+        1,
+      );
+      const run = { W, H, sky: sky(), camera, place, image: true };
+      const ref = await referenceRun(
+        d,
+        { ...compactToSource(cloud, s.q8) },
+        N,
+        basis,
+        { ...run, relight: { sheetFloor: "draw" }, renderer: { sheetFade: 3 } },
+      );
+      const got = await compactRun(d, cloud, {
+        ...run,
+        path: { sheetFade: 3 },
+      });
+      const before = await compactRun(d, cloud, {
+        ...run,
+        path: { sheetFade: -1 },
+      });
+      const image = compare(
+        got.image as Float32Array,
+        ref.image as Float32Array,
+      );
+      const old = compare(
+        before.image as Float32Array,
+        ref.image as Float32Array,
+      );
+      process.stderr.write(
+        `COMPACT_SHEET_AFTER_BLUR ${JSON.stringify({ image, before: old })}\n`,
+      );
       expect(image.relMSE).toBeLessThan(1e-3);
     }, 120_000);
   },

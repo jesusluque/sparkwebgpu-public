@@ -276,6 +276,8 @@ export interface RunOptions {
   lodOpacity?: boolean;
   /** Reference only: the relight plugin's transferResident (default "cpca8"). */
   transferResident?: "cpca8" | "words";
+  /** Reference only: more atheneaRelightPlugin options (sheetFloor). */
+  relight?: Record<string, unknown>;
 }
 
 function median(v: number[]) {
@@ -361,6 +363,7 @@ export async function referenceRun(
   const relight = atheneaRelightPlugin({
     hdri: o.sky,
     transferResident: o.transferResident ?? "cpca8",
+    ...o.relight,
   });
   host.register(relight).attach(splats);
   const mesh = splats.add(source);

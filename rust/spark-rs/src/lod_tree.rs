@@ -942,7 +942,7 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
 struct TraverseOut {
     lod_ids: Vec<u32>,
     outputs: Vec<Vec<u32>>,
-    extra: Vec<[Vec<u32>; 4]>,
+    extra: Vec<[Vec<u32>; 5]>,
     touched: Vec<(u32, u32)>,
     min_pixel_scale: f32,
     output_size: usize,
@@ -1239,7 +1239,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
         }
         // Each cut node's parent, its first child and their count (resident
         // children only; u32::MAX none), and the culled nodes, by instance.
-        let mut extra: Vec<[Vec<u32>; 4]> = (0..num_instances).map(|_| Default::default()).collect();
+        let mut extra: Vec<[Vec<u32>; 5]> = (0..num_instances).map(|_| Default::default()).collect();
         if neighbours {
             for &(inst_index, paged_index, parent) in output.iter() {
                 let e = &mut extra[inst_index as usize];
@@ -1257,6 +1257,17 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
                 };
                 e[1].push(first);
                 e[2].push(count);
+                // Its size on screen (thread CU: the order its payload is
+                // decoded in): its sphere's angle (a leaf: half its parent's),
+                // foveated as the cut is; f32 bits.
+                let r = if node.child_count > 0 || parent == u32::MAX {
+                    node.rho.to_f32()
+                } else {
+                    0.5 * instance.1.get(parent as usize).rho.to_f32()
+                };
+                let delta = node.center() - instance.4;
+                let d = delta.length().max(1.0e-6);
+                e[4].push((r / d * foveate_of(delta, 1.0 / d, instance)).to_bits());
             }
             for &(inst_index, paged_index) in culled_out.iter() {
                 extra[inst_index as usize][3].push(paged_index);
@@ -1314,7 +1325,7 @@ pub fn traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
         if neighbours {
             let e = &extra[inst_index];
-            for (k, name) in ["parents", "firstKids", "kidCounts", "culled"].into_iter().enumerate() {
+            for (k, name) in ["parents", "firstKids", "kidCounts", "culled", "screens"].into_iter().enumerate() {
                 let a = Uint32Array::new_with_length(e[k].len() as u32);
                 a.copy_from(&e[k]);
                 Reflect::set(&result, &JsValue::from_str(name), &JsValue::from(a)).unwrap();
@@ -1347,7 +1358,7 @@ pub fn traverse_lod_trees(
 type Inst<'a> = (u32, Ref<'a, LodNodes>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32, f32);
 
 fn compute_pixel_scale<'a>(splat: &LodSplat, instance: &Inst<'a>) -> f32 {
-    let &(_, _, _, _, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard) = instance;
+    let &(_, _, _, _, origin, _, lod_scale, _, _, _, _, err_ratio, size_guard) = instance;
     let center = splat.center();
     let delta = center - origin;
     // A quantized node's distance less its page's centre error (thread CT).
@@ -1361,7 +1372,12 @@ fn compute_pixel_scale<'a>(splat: &LodSplat, instance: &Inst<'a>) -> f32 {
         splat.size() * inv_distance
     };
     let pixel_scale = pixel_scale * lod_scale;
+    foveate_of(delta, inv_distance, instance) * pixel_scale
+}
 
+/// The foveation weight of a node at `delta` from the eye (1 in the view's cone).
+fn foveate_of(delta: Vec3A, inv_distance: f32, instance: &Inst<'_>) -> f32 {
+    let &(_, _, _, _, _, forward, _, behind_foveate, cone_foveate, cone_dot0, cone_dot, _, _) = instance;
     let forward_dot = delta.dot(forward);
     let foveate = if forward_dot <= 0.0 {
         behind_foveate
@@ -1377,7 +1393,7 @@ fn compute_pixel_scale<'a>(splat: &LodSplat, instance: &Inst<'a>) -> f32 {
             behind_foveate + (cone_foveate - behind_foveate) * t
         }
     };
-    foveate * pixel_scale
+    foveate
 }
 
 #[wasm_bindgen]

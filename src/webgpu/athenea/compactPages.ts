@@ -54,16 +54,12 @@ import {
   parseRunsContainer,
   unpackRunsContainer,
 } from "./compactNodes";
+import type { RunBatch, RunJob, RunReply } from "./runWorker";
+import RunWorker from "./runWorker?worker&inline";
 
-/**
- * Bytes a node in a CMPC section, by plane (rust athc_compact PLANE_WIDTHS):
- * v3 (thread CS) appends the cone word (4), the occlusion index (2) and 2
- * spare to v2's 31 planes, at the same offsets.
- */
-export const COMPACT_PLANE_WIDTHS = [
-  2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-] as const;
+import { COMPACT_PLANE_WIDTHS } from "./compactRecords";
+
+export { COMPACT_PLANE_WIDTHS };
 export const COMPACT_NODE_BYTES = 64;
 export const COMPACT_NODE_BYTES_V2 = 56;
 const COMPACT_PLANES_V2 = 31;
@@ -601,14 +597,41 @@ export interface CompactBandOptions {
     protect?: "neighbours" | "none";
     /** New records a update at most (the rest drawn as parent or children meanwhile). */
     uploadsPerUpdate?: number;
-    /** Range requests for dropped runs in flight at most; default 8. */
+    /** Range requests for dropped runs in flight at most; default 12. */
     runFetchers?: number;
+    /**
+     * Decode the misses largest on screen first (thread CU), default true;
+     * false: in node order (CT's).
+     */
+    priority?: boolean;
+    /**
+     * How far ahead the view is extrapolated for the prefetch of dropped
+     * runs (thread CU), ms; default 2.5 updates (at most 600); 0 off.
+     */
+    aheadMs?: number;
+    /**
+     * CMPC v4: inflate and pack the runs in a worker (thread CU), default
+     * true: the main thread only writes the records, as they come back.
+     */
+    decoder?: boolean;
+    /** The decoder: runs sent and not back at most (default 2048), and runs a message (32). */
+    decodeAhead?: number;
+    decodeBatch?: number;
     /** Runs inflated an update at most (the frame's decode budget); default 256. */
     inflatesPerUpdate?: number;
   };
 }
 
 type Row = AthcPageRow & { tier4Bytes: number; compact: number[] };
+
+/** The traversal's neighbours of each cut node (the node pool). */
+interface CutNeighbours {
+  parents: Uint32Array;
+  firstKids: Uint32Array;
+  kidCounts: Uint32Array;
+  /** Its angle on screen, foveated (thread CU): the decode order. */
+  screens?: Float32Array;
+}
 
 interface PieceState {
   piece: CompactPiece;
@@ -704,6 +727,18 @@ export class CompactBandStreamer {
     /** Node pool: of those, whose run was dropped (fetched again), and left by the decode budget. */
     missDropped: 0,
     missDeferred: 0,
+    /** Node pool: the missing nodes' share of the cut's screen area, and of the holes (not substituted). */
+    missingArea: 0,
+    holeArea: 0,
+    holes: 0,
+    /** Node pool: the view ahead's traversal ms, and the dropped runs it asked for. */
+    aheadMs: 0,
+    prefetchRuns: 0,
+    /** Node pool, the run decoder: cut nodes whose records are on their way; the decoder's ms, inflates and records written, in all. */
+    inFlight: 0,
+    decoderMs: 0,
+    decoderInflates: 0,
+    uploadedAsync: 0,
     /** Node pool: of those, drawn as their parent or children. */
     substituted: 0,
     /** Node pool: cut nodes with no slot (past maxCapacity). */
@@ -760,6 +795,11 @@ export class CompactBandStreamer {
           np.runBudget ?? Number.POSITIVE_INFINITY,
           np.inflatedRuns ?? 256,
         );
+        if (np.decoder !== false && typeof Worker !== "undefined") {
+          const w: Worker = new RunWorker();
+          w.onmessage = (e: MessageEvent<RunReply>) => this.onRuns(e.data);
+          this.decoder = w;
+        }
       } else {
         this.payload = new PagePayloadStore(
           np.decodedPages ?? 8,
@@ -970,9 +1010,7 @@ export class CompactBandStreamer {
       };
     }
     let list: Uint32Array = new Uint32Array(0);
-    let near:
-      | { parents: Uint32Array; firstKids: Uint32Array; kidCounts: Uint32Array }
-      | undefined;
+    let near: CutNeighbours | undefined;
     if (Object.keys(instances).length) {
       const t0 = performance.now();
       const { keyIndices, culledCount, occludedCount, chunks, wasmMs } =
@@ -1001,6 +1039,7 @@ export class CompactBandStreamer {
               firstKids?: Uint32Array;
               kidCounts?: Uint32Array;
               culled?: Uint32Array;
+              screens?: Uint32Array;
             }
           >;
           culledCount?: number;
@@ -1034,7 +1073,9 @@ export class CompactBandStreamer {
         at += part.length;
       }
       if (this.runs) {
-        const cat = (name: "parents" | "firstKids" | "kidCounts") => {
+        const cat = (
+          name: "parents" | "firstKids" | "kidCounts" | "screens",
+        ) => {
           const a = new Uint32Array(list.length);
           let o = 0;
           for (const k of Object.values(keyIndices)) {
@@ -1043,10 +1084,15 @@ export class CompactBandStreamer {
           }
           return a;
         };
+        const hasScreens = Object.values(keyIndices).every((k) => k.screens);
         near = {
           parents: cat("parents"),
           firstKids: cat("firstKids"),
           kidCounts: cat("kidCounts"),
+          // Each cut node's angle on screen (f32 bits; older WASM: none).
+          screens: hasScreens
+            ? new Float32Array(cat("screens").buffer)
+            : undefined,
         };
         // The runs the cut may need (its nodes, their parents and
         // children), then the culled ones; the rest go first over budget.
@@ -1092,10 +1138,20 @@ export class CompactBandStreamer {
           parents: Uint32Array.from(order, (k) => n0.parents[k]),
           firstKids: Uint32Array.from(order, (k) => n0.firstKids[k]),
           kidCounts: Uint32Array.from(order, (k) => n0.kidCounts[k]),
+          screens: n0.screens
+            ? Float32Array.from(order, (k) => (n0.screens as Float32Array)[k])
+            : undefined,
         };
       }
     }
+    if (path) this.lastPath = path;
     if (this.nodes) list = this.toNodeSlots(list, path, near);
+    // The view a moment ahead (thread CU): its cut's dropped runs asked
+    // for now, so they are here when the camera is.
+    const ahead = this.runs ? this.predictView(view) : null;
+    if (ahead && Object.keys(instances).length) {
+      await this.prefetchAhead(ahead, instances, pixel, errorLimit);
+    } else this.stats.prefetchRuns = 0;
     if (this.runs) {
       this.runs.trim();
       this.fetchRuns();
@@ -1199,11 +1255,7 @@ export class CompactBandStreamer {
   private toNodeSlots(
     list: Uint32Array,
     path?: CompactRelitPath,
-    near?: {
-      parents: Uint32Array;
-      firstKids: Uint32Array;
-      kidCounts: Uint32Array;
-    },
+    near?: CutNeighbours,
   ) {
     // Typed arrays throughout (thread CU): no per-node objects, Sets or
     // comparator sorts; the misses are sorted as packed float keys.
@@ -1224,7 +1276,14 @@ export class CompactBandStreamer {
     // Pool index -> node key: i + kb[slot] (the slot's page's first key less its first index).
     const kb = this.slotKeyBases();
     const keys = new Int32Array(n);
-    const out = new Int32Array(n);
+    const out = new Int32Array(n).fill(-1);
+    // The run decoder (worker): a slot whose record is on its way is held
+    // but not drawn yet (as a miss, not asked for again).
+    const decoder = this.decoder;
+    const pending = this.pendingFlags(alloc.capacity);
+    const failed = new Uint8Array(n);
+    let failedN = 0;
+    let inFlight = 0;
     // Misses as key * 2^23 + k (exact in a double; a cut under 2^23).
     const SH = 8388608;
     const missKeys = new Float64Array(n);
@@ -1235,37 +1294,85 @@ export class CompactBandStreamer {
       keys[k] = key;
       const s = alloc.use(key);
       if (s < 0) missKeys[missN++] = key * SH + k;
-      else out[k] = s;
+      else {
+        out[k] = s;
+        if (pending[s]) {
+          failed[k] = 1;
+          failedN += 1;
+          inFlight += 1;
+        }
+      }
     }
     const miss = missKeys.subarray(0, missN).sort();
+    // The groups (a run's misses, v4, or a page's), in key order.
+    const gStart: number[] = [];
+    const gRun: number[] = [];
+    {
+      let q = 0;
+      while (q < missN) {
+        const key0 = keys[miss[q] % SH];
+        const g = key0 >>> 12;
+        const info = runs?.runInfo(g);
+        const r = info ? ((key0 & 4095) / info.run) | 0 : -1;
+        gStart.push(q);
+        gRun.push(r);
+        q += 1;
+        while (q < missN) {
+          const key = keys[miss[q] % SH];
+          if (key >>> 12 !== g) break;
+          if (info && (((key & 4095) / info.run) | 0) !== r) break;
+          q++;
+        }
+      }
+      gStart.push(missN);
+    }
+    const groups = gRun.length;
+    // Decoded largest first (thread CU): a group's weight is its misses'
+    // area on screen, so what the budget leaves out is the least visible.
+    const screens = near?.screens;
+    let order: Uint32Array;
+    if (screens && groups > 1 && this.options.nodePool?.priority !== false) {
+      const w = new Float64Array(groups);
+      for (let x = 0; x < groups; x++) {
+        let a = 0;
+        for (let y = gStart[x]; y < gStart[x + 1]; y++) {
+          const sc = screens[miss[y] % SH];
+          a += sc * sc;
+        }
+        w[x] = a;
+      }
+      order = new Uint32Array(groups);
+      for (let x = 0; x < groups; x++) order[x] = x;
+      order.sort((a, b) => w[b] - w[a]);
+    } else {
+      order = new Uint32Array(groups);
+      for (let x = 0; x < groups; x++) order[x] = x;
+    }
     // Each miss: ready (payload at hand, under the budgets) or absent.
-    // CMPC v4: one decision a run (the misses of a run are consecutive).
     const ready = new Int32Array(missN);
     let readyN = 0;
-    const failed = new Uint8Array(n);
-    let failedN = 0;
     this.deferred = false;
+    // The decoder's budget: runs sent and not back, at most decodeAhead.
+    let sendable = decoder
+      ? Math.max(
+          0,
+          (this.options.nodePool?.decodeAhead ?? 2048) - this.runsInFlight,
+        )
+      : 0;
     const cap =
       this.options.nodePool?.uploadsPerUpdate ?? Number.POSITIVE_INFINITY;
     const inflateCap = this.options.nodePool?.inflatesPerUpdate ?? 256;
     let inflating = 0;
     let missDropped = 0;
     let missDeferred = 0;
-    let q = 0;
-    while (q < missN) {
-      const k0 = miss[q] % SH;
-      const key0 = keys[k0];
+    for (let o = 0; o < groups; o++) {
+      const x = order[o];
+      const q = gStart[x];
+      const e = gStart[x + 1];
+      const key0 = keys[miss[q] % SH];
       const g = key0 >>> 12;
+      const r = gRun[x];
       const info = runs?.runInfo(g);
-      // The group: a run's misses (v4), or a page's (a section).
-      const r = info ? ((key0 & 4095) / info.run) | 0 : -1;
-      let e = q + 1;
-      while (e < missN) {
-        const key = keys[miss[e] % SH];
-        if (key >>> 12 !== g) break;
-        if (info && (((key & 4095) / info.run) | 0) !== r) break;
-        e++;
-      }
       let ok = true;
       if (runs) {
         if (!info) ok = false;
@@ -1276,6 +1383,12 @@ export class CompactBandStreamer {
             this.wantRun(g, r);
             ok = false;
             missDropped += e - q;
+          } else if (decoder) {
+            if (sendable <= 0) {
+              this.deferred = true;
+              ok = false;
+              missDeferred += e - q;
+            } else sendable -= 1;
           } else if (!runs.isInflated(g, r)) {
             // The decode budget: runs not inflated yet, at most inflateCap.
             if (inflating >= inflateCap) {
@@ -1286,15 +1399,14 @@ export class CompactBandStreamer {
           }
         }
       }
-      for (let x = q; x < e; x++) {
-        const k = miss[x] % SH;
+      for (let y = q; y < e; y++) {
+        const k = miss[y] % SH;
         if (ok && readyN < cap) ready[readyN++] = k;
         else {
           failed[k] = 1;
           failedN += 1;
         }
       }
-      q = e;
     }
     // Slots for the ready (in key order: a run's nodes together).
     const got = new Int32Array(readyN);
@@ -1313,6 +1425,17 @@ export class CompactBandStreamer {
       out[k] = s;
       gotSlot[gotN] = s * SH + gotN;
       got[gotN++] = k;
+    }
+    if (decoder && runs) {
+      // To the decoder, largest first, in batches (the first back first);
+      // drawn when their records are written (`refresh`).
+      this.sendRuns(got.subarray(0, gotN), keys, out, pending);
+      for (let x = 0; x < gotN; x++) {
+        failed[got[x]] = 1;
+        failedN += 1;
+        inFlight += 1;
+      }
+      gotN = 0;
     }
     // Each record's place in slot order (one write a run of slots).
     const bySlot = gotSlot.subarray(0, gotN).sort();
@@ -1398,78 +1521,336 @@ export class CompactBandStreamer {
     this.stats.decodeMs =
       (runs ? runs.stats.inflateMs : (store?.stats.decodeMs ?? 0)) - ms0;
     // The rest: drawn as their parent or children when held, else not yet.
-    let result: Uint32Array;
-    let substituted = 0;
-    if (failedN) {
-      // Each slot drawn once: the cut's own slots marked first, then a
-      // substitute only if not marked (an epoch stamp a slot).
-      const seen = this.seenStamps(alloc.capacity);
-      const epoch = ++this.seenEpoch;
-      for (let k = 0; k < n; k++) if (!failed[k]) seen[out[k]] = epoch;
-      let res = new Uint32Array(n + 64);
-      let rn = 0;
-      const push = (s: number) => {
-        if (rn === res.length) {
-          const g2 = new Uint32Array(res.length * 2);
-          g2.set(res);
-          res = g2;
-        }
-        res[rn++] = s;
-      };
+    // The cut's drawn part (its own slots, in its order) once; a refresh
+    // then only walks the misses (thread CU).
+    const base = new Uint32Array(n - failedN);
+    const failedList = new Int32Array(failedN);
+    let allArea = 0;
+    {
+      let b0 = 0;
+      let f0 = 0;
+      const scr = near?.screens;
       for (let k = 0; k < n; k++) {
-        if (!failed[k]) {
-          push(out[k]);
-          continue;
-        }
-        if (!near) continue;
-        const parent = near.parents[k];
-        const ps =
-          parent !== 0xffffffff ? alloc.use(parent + kb[(parent / N) | 0]) : -1;
-        if (ps >= 0) {
-          if (seen[ps] !== epoch) {
-            seen[ps] = epoch;
-            push(ps);
-          }
-          substituted += 1;
-          continue;
-        }
-        const first = near.firstKids[k];
-        const count = near.kidCounts[k];
-        if (first === 0xffffffff || !count) continue;
-        if (this.kidScratch.length < count)
-          this.kidScratch = new Int32Array(count * 2);
-        const ks = this.kidScratch;
-        let c = 0;
-        for (; c < count; c++) {
-          const i = first + c;
-          const s = alloc.use(i + kb[(i / N) | 0]);
-          if (s < 0) break;
-          ks[c] = s;
-        }
-        if (c === count) {
-          for (let x = 0; x < count; x++) {
-            const s = ks[x];
-            if (seen[s] !== epoch) {
-              seen[s] = epoch;
-              push(s);
-            }
-          }
-          substituted += 1;
-        }
+        if (failed[k]) failedList[f0++] = k;
+        else base[b0++] = out[k];
+        if (scr) allArea += scr[k] * scr[k];
       }
-      result = res.slice(0, rn);
-    } else {
-      result = Uint32Array.from(out);
     }
-    this.stats.missing = failedN;
+    this.cutState = { keys, out, near, kb, n, base, failedList, allArea };
+    const result = this.buildDrawList();
     this.stats.missDropped = missDropped;
     this.stats.missDeferred = missDeferred;
-    this.stats.substituted = substituted;
+    this.stats.inFlight = inFlight;
     this.stats.noSlot = noSlot;
     alloc.commit(result);
     this.stats.packMs = performance.now() - t0 - this.stats.decodeMs;
     return result;
   }
+
+  /** The last cut (node keys, slots, misses, neighbours), for `refresh`. */
+  private cutState: {
+    keys: Int32Array;
+    out: Int32Array;
+    near?: CutNeighbours;
+    kb: Int32Array;
+    n: number;
+    /** Its nodes drawn (slots, the cut's order), then those whose records came since. */
+    base: Uint32Array;
+    /** Its misses (cut indices) still waiting. */
+    failedList: Int32Array;
+    /** The cut's screen area (sum of its nodes' angle squared). */
+    allArea: number;
+  } | null = null;
+
+  /**
+   * The draw list of the last cut: its nodes held and written (`base`),
+   * those of its misses whose records came since (they join `base`), the
+   * other misses as their parent or children when those are held, else
+   * left out; the stats of what is missing (count, screen area, holes).
+   * Substitutes are never cut nodes (a cut is an antichain): only they are
+   * deduplicated.
+   */
+  private buildDrawList() {
+    const st = this.cutState as NonNullable<typeof this.cutState>;
+    const { keys, out, near, kb } = st;
+    const alloc = this.nodes as NodeSlotAllocator;
+    const pending = this.pendingFlags(alloc.capacity);
+    const N = this.slotNodes;
+    const screens = near?.screens;
+    // Misses whose records are now written: drawn from now on.
+    const fl = st.failedList;
+    let resolved = 0;
+    for (let x = 0; x < fl.length; x++) {
+      const s = out[fl[x]];
+      if (s >= 0 && !pending[s] && alloc.keyIn(s) === keys[fl[x]]) resolved++;
+    }
+    if (resolved) {
+      const base = new Uint32Array(st.base.length + resolved);
+      base.set(st.base);
+      let b0 = st.base.length;
+      let f0 = 0;
+      for (let x = 0; x < fl.length; x++) {
+        const k = fl[x];
+        const s = out[k];
+        if (s >= 0 && !pending[s] && alloc.keyIn(s) === keys[k]) {
+          base[b0++] = s;
+          alloc.use(keys[k]);
+        } else fl[f0++] = k;
+      }
+      st.base = base;
+      st.failedList = fl.subarray(0, f0);
+    }
+    const misses = st.failedList;
+    let substituted = 0;
+    let holes = 0;
+    let holeArea = 0;
+    let missedArea = 0;
+    let result: Uint32Array;
+    if (misses.length) {
+      const seen = this.seenStamps(alloc.capacity);
+      const epoch = ++this.seenEpoch;
+      let subs = new Uint32Array(Math.max(64, misses.length * 2));
+      let sn = 0;
+      const push = (s: number) => {
+        if (seen[s] === epoch) return;
+        seen[s] = epoch;
+        if (sn === subs.length) {
+          const g2 = new Uint32Array(subs.length * 2);
+          g2.set(subs);
+          subs = g2;
+        }
+        subs[sn++] = s;
+      };
+      const held = (i: number) => {
+        const s = alloc.use(i + kb[(i / N) | 0]);
+        return s >= 0 && !pending[s] ? s : -1;
+      };
+      for (let x = 0; x < misses.length; x++) {
+        const k = misses[x];
+        const a = screens ? screens[k] * screens[k] : 0;
+        missedArea += a;
+        if (!near) {
+          holes += 1;
+          continue;
+        }
+        // Its own slot stays stamped (a record on its way stays held).
+        if (out[k] >= 0) alloc.use(keys[k]);
+        const parent = near.parents[k];
+        const ps = parent !== 0xffffffff ? held(parent) : -1;
+        if (ps >= 0) {
+          push(ps);
+          substituted += 1;
+          continue;
+        }
+        const first = near.firstKids[k];
+        const count = near.kidCounts[k];
+        let c = 0;
+        if (first !== 0xffffffff && count) {
+          if (this.kidScratch.length < count)
+            this.kidScratch = new Int32Array(count * 2);
+          const ks = this.kidScratch;
+          for (; c < count; c++) {
+            const s = held(first + c);
+            if (s < 0) break;
+            ks[c] = s;
+          }
+          if (c === count) {
+            for (let y = 0; y < count; y++) push(ks[y]);
+            substituted += 1;
+            continue;
+          }
+        }
+        holes += 1;
+        holeArea += a;
+      }
+      result = new Uint32Array(st.base.length + sn);
+      result.set(st.base);
+      result.set(subs.subarray(0, sn), st.base.length);
+    } else {
+      result = st.base;
+    }
+    if (screens) {
+      this.stats.missingArea = st.allArea > 0 ? missedArea / st.allArea : 0;
+      this.stats.holeArea = st.allArea > 0 ? holeArea / st.allArea : 0;
+    }
+    this.stats.holes = holes;
+    this.stats.missing = misses.length;
+    this.stats.substituted = substituted;
+    return result;
+  }
+
+  // ---------------------------------------------- the run decoder (worker)
+
+  /** The run decoder (nodePool.decoder): CMPC v4 runs inflated and packed off the main thread. */
+  private decoder: Worker | null = null;
+  /** Runs sent to the decoder and not back. */
+  private runsInFlight = 0;
+  private batchId = 0;
+  private batches = new Map<
+    number,
+    { runs: number; slots: Int32Array; keys: Int32Array; counts: number[] }
+  >();
+  private pending = new Uint8Array(0);
+  /** Records written since the draw list was last built. */
+  private fresh = 0;
+  private lastPath: CompactRelitPath | undefined;
+
+  /** A flag a node slot: its record is on its way (grown with the pool). */
+  private pendingFlags(capacity: number) {
+    if (this.pending.length < capacity) {
+      const p = new Uint8Array(capacity);
+      p.set(this.pending);
+      this.pending = p;
+    }
+    return this.pending;
+  }
+
+  /**
+   * The cut's ready misses (`got`: cut indices, in groups of a run, the
+   * groups largest first) to the decoder in batches of `decodeBatch` (32)
+   * runs: their slots wait (pending) for the records.
+   */
+  private sendRuns(
+    got: Int32Array,
+    keys: Int32Array,
+    out: Int32Array,
+    pending: Uint8Array,
+  ) {
+    const runs = this.runs as RunPayloadStore;
+    const worker = this.decoder as Worker;
+    const per = this.options.nodePool?.decodeBatch ?? 32;
+    let jobs: RunJob[] = [];
+    let slots: number[] = [];
+    let ks: number[] = [];
+    let counts: number[] = [];
+    const flush = () => {
+      if (!jobs.length) return;
+      const id = ++this.batchId;
+      this.batches.set(id, {
+        runs: jobs.length,
+        slots: Int32Array.from(slots),
+        keys: Int32Array.from(ks),
+        counts,
+      });
+      this.runsInFlight += jobs.length;
+      worker.postMessage({ id, jobs } satisfies RunBatch);
+      jobs = [];
+      slots = [];
+      ks = [];
+      counts = [];
+    };
+    let j = 0;
+    while (j < got.length) {
+      const key0 = keys[got[j]];
+      const g = key0 >>> 12;
+      const info = runs.runInfo(g) as { n: number; run: number };
+      const r = ((key0 & 4095) / info.run) | 0;
+      let e = j + 1;
+      while (e < got.length) {
+        const key = keys[got[e]];
+        if (key >>> 12 !== g || (((key & 4095) / info.run) | 0) !== r) break;
+        e++;
+      }
+      const base = r * info.run;
+      const bytes = runs.runBytes(g, r);
+      const locals = new Uint16Array(e - j);
+      for (let x = j; x < e; x++) {
+        const k = got[x];
+        locals[x - j] = (keys[k] & 4095) - base;
+        slots.push(out[k]);
+        ks.push(keys[k]);
+        pending[out[k]] = 1;
+      }
+      jobs.push({
+        key: g * 64 + r,
+        page: g,
+        base,
+        m: Math.min(info.run, info.n - base),
+        bytes: bytes ?? undefined,
+        // Dropped but still inflated here (a page's runs as it landed).
+        planes: bytes ? undefined : (runs.inflatedPlanes(g, r) ?? undefined),
+        locals,
+      });
+      counts.push(e - j);
+      if (jobs.length >= per) flush();
+      j = e;
+    }
+    flush();
+  }
+
+  /** A batch back from the decoder: the records of the slots still waiting for them written. */
+  private onRuns(reply: RunReply) {
+    const b = this.batches.get(reply.id);
+    if (!b) return;
+    this.batches.delete(reply.id);
+    this.runsInFlight -= b.runs;
+    const alloc = this.nodes as NodeSlotAllocator;
+    const pool = this.pool as CompactNodePool;
+    const pending = this.pendingFlags(alloc.capacity);
+    const R = NODE_RECORD_WORDS * 4;
+    const lost = new Uint8Array(b.slots.length);
+    if (reply.lost.length) {
+      let at = 0;
+      const starts = b.counts.map((c) => {
+        const s0 = at;
+        at += c;
+        return s0;
+      });
+      for (const x of reply.lost) {
+        for (let y = 0; y < b.counts[x]; y++) lost[starts[x] + y] = 1;
+      }
+    }
+    // The live ones, in slot order (one write a run of slots).
+    const SH = 8388608;
+    const live = new Float64Array(b.slots.length);
+    let ln = 0;
+    for (let y = 0; y < b.slots.length; y++) {
+      const s = b.slots[y];
+      if (!pending[s] || alloc.keyIn(s) !== b.keys[y]) continue;
+      if (lost[y]) {
+        pending[s] = 0;
+        alloc.release(s);
+        continue;
+      }
+      live[ln++] = s * SH + y;
+    }
+    const order = live.subarray(0, ln).sort();
+    const slots = new Uint32Array(ln);
+    const records = new Uint8Array(ln * R);
+    for (let x = 0; x < ln; x++) {
+      const v = order[x];
+      const y = v % SH;
+      slots[x] = (v - y) / SH;
+      records.set(reply.records.subarray(y * R, y * R + R), x * R);
+      pending[slots[x]] = 0;
+    }
+    if (ln) pool.writeRecords(slots, records);
+    this.fresh += ln;
+    this.stats.decoderMs += reply.ms;
+    this.stats.decoderInflates += reply.inflates;
+    this.stats.uploadedAsync += ln;
+  }
+
+  /**
+   * Each frame (the node pool with the run decoder): the records written
+   * since the last draw list join it, their parents and children out.
+   */
+  refresh(path?: CompactRelitPath) {
+    if (!this.fresh || !this.cutState) return false;
+    // At most every other frame unless much came (the list is rebuilt).
+    const now = performance.now();
+    const much = this.fresh * 50 > this.cutState.n;
+    if (!much && now - this.lastRefresh < 30) return false;
+    this.lastRefresh = now;
+    this.fresh = 0;
+    const result = this.buildDrawList();
+    this.drawList = result;
+    this.stats.cut = result.length;
+    (path ?? this.lastPath)?.setDrawList(result);
+    return true;
+  }
+
+  private lastRefresh = 0;
 
   private seenEpoch = 0;
   private seen = new Uint32Array(0);
@@ -1499,6 +1880,113 @@ export class CompactBandStreamer {
     return kb;
   }
 
+  /** The views of the last updates (trees' space), for the view ahead. */
+  private views: { t: number; m: THREE.Matrix4 }[] = [];
+
+  /**
+   * The view `nodePool.aheadMs` (default 2.5 updates, at most 600 ms)
+   * ahead, extrapolated from the last two updates' (position linearly, the
+   * rotation by the same turn); null when still or no history.
+   */
+  private predictView(view: THREE.Matrix4): THREE.Matrix4 | null {
+    const now = performance.now();
+    const h = this.views;
+    h.push({ t: now, m: view.clone() });
+    if (h.length > 2) h.shift();
+    if (h.length < 2 || this.options.nodePool?.aheadMs === 0) return null;
+    const [a, b] = h;
+    const dt = b.t - a.t;
+    if (!(dt > 0) || dt > 1000) return null;
+    const pa = new THREE.Vector3();
+    const pb = new THREE.Vector3();
+    const qa = new THREE.Quaternion();
+    const qb = new THREE.Quaternion();
+    const sc = new THREE.Vector3();
+    a.m.decompose(pa, qa, sc);
+    b.m.decompose(pb, qb, sc);
+    const turn = qb.clone().multiply(qa.clone().invert());
+    const angle = 2 * Math.acos(Math.min(1, Math.abs(turn.w)));
+    if (pa.distanceTo(pb) < 1.0e-4 && angle < 1.0e-4) return null;
+    const lead = Math.min(this.options.nodePool?.aheadMs ?? 2.5 * dt, 600) / dt;
+    const p = pb.clone().addScaledVector(pb.clone().sub(pa), lead);
+    // The turn raised to `lead` (about the same axis).
+    const axis = new THREE.Vector3(turn.x, turn.y, turn.z);
+    const q = qb.clone();
+    if (axis.lengthSq() > 1.0e-12 && angle >= 1.0e-4) {
+      const sign = turn.w < 0 ? -1 : 1;
+      axis.multiplyScalar(sign).normalize();
+      q.premultiply(
+        new THREE.Quaternion().setFromAxisAngle(axis, angle * lead),
+      );
+    }
+    return new THREE.Matrix4().compose(p, q, sc.set(1, 1, 1));
+  }
+
+  /**
+   * The cut of the view ahead (one more traversal, no neighbours): the runs
+   * of its nodes not held are kept this update, and those dropped asked
+   * for again (after the cut's own, which went first).
+   */
+  private async prefetchAhead(
+    ahead: THREE.Matrix4,
+    instances: Record<string, unknown>,
+    pixel: number,
+    errorLimit: number,
+  ) {
+    const runs = this.runs as RunPayloadStore;
+    const alloc = this.nodes as NodeSlotAllocator;
+    const inst: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(instances)) {
+      inst[k] = {
+        ...(v as Record<string, unknown>),
+        viewToObjectCols: ahead.elements.slice(),
+      };
+    }
+    const t0 = performance.now();
+    const { keyIndices } = (await this.options.lod("traverseLodTrees", {
+      maxSplats:
+        this.pool instanceof CompactNodePool
+          ? this.pool.maxCapacity
+          : this.options.slots * this.slotNodes,
+      pixelScaleLimit: pixel,
+      instances: inst,
+      traverseMode: "standard",
+      errorLimit,
+      backCullMin: this.options.backCull === false ? undefined : -1,
+      occlusionCull: this.options.occlusion === true,
+      neighbours: false,
+      unordered: true,
+    })) as {
+      keyIndices: Record<string, { numSplats: number; indices: Uint32Array }>;
+    };
+    this.stats.aheadMs = performance.now() - t0;
+    const N = this.slotNodes;
+    const kb = this.slotKeyBases();
+    let wanted = 0;
+    let lastRun = -1;
+    for (const k of Object.values(keyIndices)) {
+      const idx = k.indices;
+      for (let j = 0; j < k.numSplats; j++) {
+        const i = idx[j];
+        const key = i + kb[(i / N) | 0];
+        if (key < 0 || alloc.slotOf.slot(key) >= 0) continue;
+        const g = key >>> 12;
+        const info = runs.runInfo(g);
+        if (!info) continue;
+        const r = ((key & 4095) / info.run) | 0;
+        const rk = g * 64 + r;
+        if (rk === lastRun) continue;
+        lastRun = rk;
+        runs.mark(g, key & 4095, RUN_CUT);
+        if (runs.missing(g, r) && !this.wantedRuns.get(g)?.has(r)) {
+          this.wantRun(g, r);
+          wanted += 1;
+        }
+      }
+    }
+    this.stats.prefetchRuns = wanted;
+  }
+
   /** Nodes left for the next update by the decode budget. */
   private deferred = false;
 
@@ -1520,7 +2008,7 @@ export class CompactBandStreamer {
   private fetchRuns() {
     const runs = this.runs;
     if (!runs) return;
-    const max = this.options.nodePool?.runFetchers ?? 8;
+    const max = this.options.nodePool?.runFetchers ?? 12;
     for (const [g, set] of this.wantedRuns) {
       if (this.runFetches >= max) break;
       this.wantedRuns.delete(g);
@@ -1571,6 +2059,8 @@ export class CompactBandStreamer {
           .catch((e) => console.warn(e))
           .finally(() => {
             this.runFetches -= 1;
+            // The next ones at once, not at the next update (thread CU).
+            if (this.wantedRuns.size) this.fetchRuns();
           });
       }
     }
@@ -1820,6 +2310,8 @@ export class CompactBandStreamer {
 
   dispose() {
     this.pool.dispose();
+    this.decoder?.terminate();
+    this.decoder = null;
   }
 }
 

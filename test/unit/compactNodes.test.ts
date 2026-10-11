@@ -6,6 +6,7 @@ import { deflateRawSync, gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import {
   NODE_RECORD_WORDS,
+  NodeIndex,
   NodeSlotAllocator,
   PagePayloadStore,
   RUN_CULLED,
@@ -94,6 +95,31 @@ describe("NodeSlotAllocator", () => {
     expect(a.stats.failed).toBe(0);
   });
 
+  it("idles every slot a frame used, not only its cut (thread CU)", () => {
+    // A substitute (a parent drawn for a missing child) or a record on its
+    // way is used by a frame but not in the list it commits: it must go
+    // idle once a frame no longer uses it, never stay held for good.
+    const a = new NodeSlotAllocator(4);
+    a.begin();
+    const p = a.allocate(1); // the parent, drawn as a substitute
+    const c = a.allocate(2); // the child, its record on its way
+    // The list committed is the one drawn last: the child had come by then.
+    a.commit(Uint32Array.of(c));
+    a.begin();
+    a.use(2);
+    a.commit(Uint32Array.of(c));
+    a.begin();
+    a.use(2);
+    a.commit(Uint32Array.of(c));
+    // The full pool takes the parent's slot (idle), not a failure.
+    a.begin();
+    a.use(2);
+    const got = [3, 4, 5].map((k) => a.allocate(k));
+    expect(got.every((s) => s >= 0)).toBe(true);
+    expect(got).toContain(p);
+    expect(a.use(1)).toBe(-1);
+  });
+
   it("releases a slot", () => {
     const a = new NodeSlotAllocator(2);
     a.begin();
@@ -102,6 +128,24 @@ describe("NodeSlotAllocator", () => {
     expect(a.keyIn(s)).toBe(-1);
     expect(a.use(9)).toBe(-1);
     expect(a.allocate(10)).toBe(s);
+  });
+});
+
+describe("NodeIndex", () => {
+  it("maps keys by page and place, freeing a page with its last node", () => {
+    const x = new NodeIndex(3072);
+    x.set(5 * 4096 + 7, 11);
+    x.set(5 * 4096 + 3000, 12);
+    x.set(9000 * 4096 + 1, 13);
+    expect(x.get(5 * 4096 + 7)).toBe(11);
+    expect(x.slot(5 * 4096 + 8)).toBe(-1);
+    expect(x.get(9000 * 4096 + 1)).toBe(13);
+    expect(x.bytes).toBe(2 * 3072 * 4);
+    x.delete(5 * 4096 + 7);
+    x.delete(5 * 4096 + 3000);
+    expect(x.size).toBe(1);
+    expect(x.bytes).toBe(3072 * 4);
+    expect(x.slot(-5)).toBe(-1);
   });
 });
 

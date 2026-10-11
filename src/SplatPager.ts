@@ -92,6 +92,8 @@ export class SplatPager {
   protected readonly pageFreelist: number[];
   protected readonly pageLru: Set<{ page: number; lru: number }>;
   protected freeablePages: number[];
+  /** Whether a fetched chunk with no page free waits rather than drops. */
+  protected keepUnplaced = false;
   private newUploads: PageUpload[];
   private readonly readyUploads: PageUpload[];
   lodTreeUpdates: {
@@ -751,7 +753,9 @@ export class SplatPager {
       if (page === undefined) {
         page = this.allocateFreeable();
         if (page === undefined) {
-          // No pages available, stop for now
+          // No pages available, stop for now (a band pager keeps the page
+          // for when one is: dropped, it would be fetched again).
+          if (this.keepUnplaced) this.fetched.unshift(fetched);
           return;
         }
       }

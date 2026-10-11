@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { AthcPageRow } from "../../src/athc";
 import {
+  BAND_KEEP,
   type BandMesh,
   bandTauToFit,
   pageNeeded,
   planBand,
+  planBandFitted,
 } from "../../src/webgpu/WgpuBandPager";
 
 // A row of a page table: a box on the x axis from x0 to x1, parent errors.
@@ -145,5 +147,81 @@ describe("band pages (athenea's error-band paging)", () => {
       const finer = planBand([mesh(eye, unit * tau * 0.999)], 100);
       expect(finer.neededPages).toBeGreaterThan(capacity);
     }
+  });
+
+  // athenea's Nanite rules (thread CM: the phone's paged set at 0.6 m read
+  // 203 MB in 1372 page requests and never settled).
+  it("never evicts a needed page for another one: a full pool takes no new page", () => {
+    // A full pool of 4 slots holding needed pages 0..3; 4..7 needed too.
+    const resident = new Set([0, 1, 2, 3]);
+    const plan = planBand([mesh([2, 0.15, 0], 0.001, resident)], 4, 8 << 20, {
+      free: 0,
+      pending: 0,
+    });
+    expect(plan.neededPages).toBe(8);
+    expect(plan.evictable).toEqual([]);
+    expect(plan.requests).toEqual([]);
+    // Two free slots and one page on its way: one request, no more.
+    const one = planBand([mesh([2, 0.15, 0], 0.001, resident)], 6, 8 << 20, {
+      free: 2,
+      pending: 1,
+    });
+    expect(one.requests.flatMap((r) => r.pages)).toHaveLength(1);
+  });
+
+  it("requests only what the evictable pages and free slots make room for", () => {
+    // From far away 0 and 1 are needed; 2..7 resident and evictable.
+    const all = new Set(rows.map((_, p) => p));
+    const plan = planBand([mesh([40, 0, 0], 0.001, all)], 8, 8 << 20, {
+      free: 0,
+      pending: 0,
+    });
+    expect(plan.evictable.map((e) => e.page)).toEqual([7, 6, 5, 4, 3, 2]);
+    expect(plan.requests).toEqual([]);
+  });
+
+  it("protects the cut's pages, and (through the dependency rule) their ancestors' pages", () => {
+    const all = new Set(rows.map((_, p) => p));
+    const children = { 1: [2, 3], 2: [4, 5], 3: [6, 7] };
+    const m = mesh([40, 0, 0], 0.001, all, children);
+    // The cut still draws nodes of page 5 (its tau has just risen).
+    const plan = planBand([{ ...m, inCut: (p) => p === 5 }], 100);
+    const going = plan.evictable.map((e) => e.page);
+    expect(going).not.toContain(5);
+    // Page 2 holds page 5's parents: it stays; 3 and its children may go.
+    expect(going).not.toContain(2);
+    expect(going).toEqual([7, 6, 4, 3]);
+  });
+
+  it("keeps a page needed within BAND_KEEP of the limit (hysteresis)", () => {
+    const all = new Set(rows.map((_, p) => p));
+    // Page 3 (x 2-4, error 0.02) from x = -1: 0.02 / 3 = 0.0067.
+    const eye = [-1, 0, 0];
+    expect(pageNeeded(rows[3], eye, 0.0067 / BAND_KEEP / 1.01)).toBe(false);
+    const plan = planBand([mesh(eye, 0.0067 / BAND_KEEP / 1.01, all)], 100);
+    expect((plan.needed.get("m") as Set<number>).has(3)).toBe(false);
+    expect(plan.evictable.map((e) => e.page)).not.toContain(3);
+  });
+
+  it("fits tau before it requests: the needed set at the fitted limit fits the pool", () => {
+    const eye = [2, 0.15, 0];
+    const unit = 0.001;
+    for (const capacity of [3, 5, 7]) {
+      const { plan, fit } = planBandFitted(
+        [{ ...mesh(eye, unit), unit }],
+        capacity,
+        8 << 20,
+        { free: capacity, pending: 0 },
+      );
+      expect(fit).toBeGreaterThan(1);
+      expect(plan.neededPages).toBeLessThanOrEqual(capacity);
+      expect(plan.requests.flatMap((r) => r.pages).length).toBeLessThanOrEqual(
+        capacity,
+      );
+    }
+    // Everything fits: the limit is left as it is.
+    const loose = planBandFitted([{ ...mesh(eye, unit), unit }], 100);
+    expect(loose.fit).toBe(0);
+    expect(loose.plan.neededPages).toBe(8);
   });
 });

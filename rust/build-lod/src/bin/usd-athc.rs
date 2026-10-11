@@ -1617,6 +1617,24 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
                 if let Some(l) = arg(args, "--compact-levels") {
                     co.levels = l.parse().context("--compact-levels")?;
                 }
+                // `--compact-asset car.cmpa` (thread CQ): the pieces of one asset
+                // share one table, the basis once (created here when missing,
+                // else its basis must be this one; a table that
+                // `athc-convert --compact-asset` gave a shadow dictionary and
+                // materials gives them to this piece too).
+                if let Some(asset_path) = arg(args, "--compact-asset") {
+                    let path = std::path::Path::new(asset_path);
+                    let asset = if path.exists() {
+                        spark_lib::athc_compact::CompactAsset::from_bytes(&std::fs::read(path)?)?
+                    } else {
+                        let a = spark_lib::athc_compact::CompactAsset { basis: basis.table_f16(), clusters: basis.clusters as u32, ..Default::default() };
+                        std::fs::write(path, a.to_bytes())?;
+                        eprintln!("compact asset table {asset_path}: the basis, id {:016x}", a.id());
+                        a
+                    };
+                    co.asset_name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    co.asset = Some(asset);
+                }
                 let c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
                 eprintln!("compact tier: {}", serde_json::to_string(&c.stats)?);
                 Some(c)
@@ -1757,6 +1775,7 @@ fn main() -> Result<()> {
         "--compact-basis",
         "--compact-centroids",
         "--compact-levels",
+        "--compact-asset",
     ];
     let mut paths = Vec::new();
     let mut skip = false;

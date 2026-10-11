@@ -91,6 +91,17 @@
 //!                         float (1920); D: the views as PPM, for looking only
 //!   --report R.json       what was done, a file at a time
 //!   PART: a file's name up to its first '-' or '.' (paint-t16-gz.athc: paint)
+//!
+//! An asset's compact pieces (thread CQ, `spark_lib::athc_compact`; paged trees
+//! written by `usd-athc --tree ... --pages --compact-basis`, v1 or v2):
+//!   athc-convert --compact-rebase in.athc out.athc   the compact tier in the v2 layout
+//!                         (the traversal's 16 bytes a node), its own tables
+//!   athc-convert --compact-asset car.cmpa --out-dir D a.athc b.athc ...   one asset table
+//!                         for the pieces (D/car.cmpa: the basis once) and each piece written
+//!                         to D under its name, sharing it; tiers 1-3 byte for byte
+//!   --asset-entries N     one shadow dictionary of N entries for every piece (4096; 0: each
+//!                         piece keeps its own), k-means over every node (--asset-rounds 12)
+//!   --piece-materials     each piece keeps its material table (default: one for the asset)
 
 
 use anyhow::{bail, Context, Result};
@@ -119,6 +130,9 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--scene" || a == "--drop-hidden" || a.starts_with("--decimate")) {
         return prune::run(&args);
+    }
+    if args.iter().any(|a| a == "--compact-asset" || a == "--compact-rebase") {
+        return compact_asset(&args);
     }
     let flag = |f: &str| args.iter().any(|a| a == f);
     // Paths: what is neither a flag nor a --keep-* flag's value.
@@ -463,4 +477,56 @@ fn cut_values_of(w: &[f32], lists: &[Vec<u32>], per_splat: &[f32], c: usize) -> 
         }
     }
     (values, sums)
+}
+
+/// `--compact-rebase` and `--compact-asset` (thread CQ).
+fn compact_asset(args: &[String]) -> Result<()> {
+    use spark_lib::athc_compact::{build_asset, rebase_compact};
+    let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    let takes = ["--compact-asset", "--out-dir", "--asset-entries", "--asset-rounds"];
+    let paths: Vec<&String> =
+        args.iter().enumerate().filter(|&(i, a)| !a.starts_with("--") && !(i > 0 && takes.contains(&args[i - 1].as_str()))).map(|(_, a)| a).collect();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    if args.iter().any(|a| a == "--compact-rebase") {
+        let [input, output] = paths[..] else { bail!("usage: athc-convert --compact-rebase in.athc out.athc") };
+        let (bytes, stats) = rebase_compact(&std::fs::read(input)?, None, "", threads)?;
+        std::fs::write(output, &bytes)?;
+        eprintln!("{output}: {} bytes, {}", bytes.len(), serde_json::to_string(&stats)?);
+        return Ok(());
+    }
+    let asset_path = value("--compact-asset").context("--compact-asset car.cmpa")?;
+    let out_dir = std::path::PathBuf::from(value("--out-dir").context("--out-dir D")?);
+    let entries: usize = value("--asset-entries").map(|v| v.parse()).transpose().context("--asset-entries")?.unwrap_or(4096);
+    let rounds: usize = value("--asset-rounds").map(|v| v.parse()).transpose().context("--asset-rounds")?.unwrap_or(12);
+    let shared_materials = !args.iter().any(|a| a == "--piece-materials");
+    if paths.is_empty() {
+        bail!("--compact-asset: no pieces");
+    }
+    let inputs: Vec<Vec<u8>> = paths.iter().map(std::fs::read).collect::<std::io::Result<_>>()?;
+    let refs: Vec<&[u8]> = inputs.iter().map(|b| b.as_slice()).collect();
+    let t = std::time::Instant::now();
+    let asset = build_asset(&refs, entries, rounds, shared_materials, threads)?;
+    std::fs::create_dir_all(&out_dir)?;
+    let name = std::path::Path::new(&asset_path).file_name().context("--compact-asset: a file name")?.to_string_lossy().into_owned();
+    let blob = asset.to_bytes();
+    std::fs::write(out_dir.join(&name), &blob)?;
+    eprintln!(
+        "{name}: {} bytes (basis {} clusters, {} entries, {} materials), id {:016x}, {:.1}s",
+        blob.len(),
+        asset.clusters,
+        asset.codebook.len() / 8,
+        asset.materials.len() / 4,
+        asset.id(),
+        t.elapsed().as_secs_f32()
+    );
+    let mut report = Vec::new();
+    for (path, bytes) in paths.iter().zip(&inputs) {
+        let (out, stats) = rebase_compact(bytes, Some(&asset), &name, threads)?;
+        let file = std::path::Path::new(path.as_str()).file_name().context("a piece's name")?;
+        std::fs::write(out_dir.join(file), &out)?;
+        eprintln!("{}: {} -> {} bytes", file.to_string_lossy(), bytes.len(), out.len());
+        report.push(serde_json::json!({ "piece": file.to_string_lossy(), "bytes": out.len(), "before": bytes.len(), "compact": stats }));
+    }
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "asset": name, "assetBytes": blob.len(), "pieces": report }))?);
+    Ok(())
 }

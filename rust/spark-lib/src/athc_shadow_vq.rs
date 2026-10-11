@@ -108,7 +108,7 @@ fn hamming(a: &Mask, b: &Mask) -> u32 {
 }
 
 /// The nearest centroid of each mask (ties: the lowest index).
-fn assign(masks: &[Mask], centroids: &[Mask], threads: usize, out: &mut [u32]) {
+pub fn assign(masks: &[Mask], centroids: &[Mask], threads: usize, out: &mut [u32]) {
     let per = masks.len().div_ceil(threads.max(1)).max(1);
     std::thread::scope(|s| {
         for (ms, os) in masks.chunks(per).zip(out.chunks_mut(per)) {

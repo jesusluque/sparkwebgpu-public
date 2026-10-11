@@ -95,8 +95,26 @@ pub const FLAG_LOD_SIZE: u32 = 64;
 /// (each merged node's monotone error and bounding radius, two f16), or a
 /// merged ATHV page's. Never in a v2 file.
 pub const FLAG_LOD_ERROR: u32 = 128;
-pub const KNOWN_FLAGS: u32 =
-    FLAG_NORMALS | FLAG_LINEAR | FLAG_EMISSION | FLAG_MATERIAL | FLAG_TRANSFER | FLAG_LOD_SIZE | FLAG_LOD_ERROR;
+/// The merged levels' opacities are their producer's own coverage (athenea's
+/// `decimate --tree-coverage`: each merge's leaves composited on its plane,
+/// 1 - prod(1 - alpha G) over an 8 x 8 grid, as its opacity): kept as stored,
+/// never replaced by the mass ratio (`uncap_levels`) nor divided by the area
+/// the decoder's widening adds (`widen_merged` only orients them). v3 only.
+pub const FLAG_NODE_COVERAGE: u32 = 256;
+/// Each element carries an index into the file's occlusion codebook (v3
+/// section OCCL, the codebook after the starts; athenea's occlusion masks).
+pub const FLAG_OCCLUSION: u32 = 512;
+/// Words an occlusion codebook entry holds (256 bits).
+pub const OCCLUSION_WORDS: usize = 8;
+pub const KNOWN_FLAGS: u32 = FLAG_OCCLUSION
+    | FLAG_NORMALS
+    | FLAG_LINEAR
+    | FLAG_EMISSION
+    | FLAG_MATERIAL
+    | FLAG_TRANSFER
+    | FLAG_LOD_SIZE
+    | FLAG_LOD_ERROR
+    | FLAG_NODE_COVERAGE;
 
 /// Spark's LoD pages (and athenea's default chunk): 65 536 splats.
 pub const PAGE_SPLATS: u32 = 65536;
@@ -487,6 +505,9 @@ pub struct AthcBlock {
     /// words a merged node, f16 epsilon | f16 rho (metres), then f16 theta |
     /// the cone's octahedral 8+8-bit axis; 0 for a splat, or empty.
     pub lod_error: Vec<u32>,
+    /// athenea's occlusion mask (v3 section OCCL): an element's codebook
+    /// entry + 1, 0 none (never culled); one word, its low byte(s) used.
+    pub occlusion: Vec<u32>,
 }
 
 fn words_of(b: &[u8], at: &mut usize, n: usize) -> Vec<u32> {
@@ -517,7 +538,7 @@ impl AthcBlock {
         let shadow_bits = opt(x.shadow_words > 0, &mut at, x.shadow_words);
         let curvature = opt(x.curvature_words > 0, &mut at, x.curvature_words);
         let skin = opt(x.skin_words() > 0, &mut at, x.skin_words());
-        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new(), lod_error: Vec::new() })
+        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new(), lod_error: Vec::new(), occlusion: Vec::new() })
     }
 
     /// Every array after positions, in file order.
@@ -573,6 +594,7 @@ impl AthcBlock {
             skin: cut(&self.skin),
             lod_size: if self.lod_size.is_empty() { Vec::new() } else { self.lod_size[start..start + n].to_vec() },
             lod_error: if self.lod_error.is_empty() { Vec::new() } else { cut(&self.lod_error) },
+            occlusion: if self.occlusion.is_empty() { Vec::new() } else { cut(&self.occlusion) },
         }
     }
 
@@ -597,6 +619,15 @@ impl AthcBlock {
                 self.lod_size.resize(self.n, 0.0);
             } else {
                 self.lod_size.extend_from_slice(&other.lod_size);
+            }
+        }
+        // And the occlusion indices (0: none).
+        if !self.occlusion.is_empty() || !other.occlusion.is_empty() {
+            self.occlusion.resize(self.n - other.n, 0);
+            if other.occlusion.is_empty() {
+                self.occlusion.resize(self.n, 0);
+            } else {
+                self.occlusion.extend_from_slice(&other.occlusion);
             }
         }
         // The same for the LoD errors (0: none).
@@ -626,6 +657,11 @@ pub struct AthcFile {
     pub levels: Vec<(u32, AthcBlock)>,
     pub starts: Vec<u32>,
     pub chunks: Vec<AthcBlock>,
+    /// athenea's occlusion codebook (`decimate --occlusion-mask`): entries of
+    /// 8 words, 256 bits each, a 16 x 16 octahedral grid of directions in the
+    /// asset's frame (bit y * 16 + x, 1 open); empty without
+    /// (`FLAG_OCCLUSION`, the v3 header's codebook, `athc_lod_cut`).
+    pub occlusion_codebook: Vec<u32>,
 }
 
 impl AthcFile {
@@ -645,7 +681,7 @@ impl AthcFile {
             .iter()
             .map(|e| AthcBlock::read(&bytes[e.offset as usize..], e.count as usize, &h, &x))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { header: h, extra: x, levels, starts, chunks })
+        Ok(Self { header: h, extra: x, levels, starts, chunks, occlusion_codebook: Vec::new() })
     }
 
     /// The file `writeAthc` writes for this cloud: version, flags, counts and
@@ -1138,14 +1174,14 @@ pub fn merged_block(file: &AthcFile, tree: &VirtualTree) -> AthcBlock {
     let extent = file.header.extent;
     let mut all = if tree.synth_root {
         let mut root = merge_root(&file.levels[0].1, file.header.sh_words as usize);
-        widen_merged(&mut root, extent);
+        widen_levels(file, &mut root, extent);
         root
     } else {
         AthcBlock::default()
     };
     for (level, block) in &file.levels {
         let mut block = block.clone();
-        widen_merged(&mut block, extent / (1u64 << *level) as f32);
+        widen_levels(file, &mut block, extent / (1u64 << *level) as f32);
         all.append(&block);
     }
     all
@@ -1268,6 +1304,10 @@ pub fn coverage_ratios(file: &AthcFile) -> Vec<Vec<f32>> {
 /// Every level's opacities replaced by their uncapped ratio, and every
 /// merged glass spread to its splats' area (`spread_translucent`).
 pub fn uncap_levels(file: &mut AthcFile) {
+    // A producer's own coverage stays as it is (FLAG_NODE_COVERAGE).
+    if file.header.has(FLAG_NODE_COVERAGE) {
+        return;
+    }
     let ratios = coverage_ratios(file);
     let areas = translucent_areas(file);
     for (((_, block), r), a) in file.levels.iter_mut().zip(ratios).zip(areas) {
@@ -1414,6 +1454,16 @@ pub const MERGED_FILL: f32 = 0.35;
 /// file whose coverage is not known) stays at least 0.99. Measured on the
 /// Corvette (paint and body, CPU raster of Spark's draw): the light let
 /// through at 58 m goes from 5.2% to 0.6%.
+/// `widen_merged` for a file's merged nodes, or only `orient_merged` when
+/// their opacities are their producer's coverage (FLAG_NODE_COVERAGE).
+pub fn widen_levels(file: &AthcFile, block: &mut AthcBlock, edge: f32) {
+    if file.header.has(FLAG_NODE_COVERAGE) {
+        orient_merged(block);
+    } else {
+        widen_merged(block, edge);
+    }
+}
+
 pub fn widen_merged(block: &mut AthcBlock, edge: f32) {
     orient_merged(block);
     let grow = (MERGED_FILL * edge).powi(2);
@@ -1519,7 +1569,7 @@ pub fn truncate_levels(file: &AthcFile, keep: usize) -> Result<AthcFile> {
     let mut splats = full.levels[keep].1.clone();
     // The kept groups are drawn as splats, never through `merged_block`:
     // widened here, once.
-    widen_merged(&mut splats, full.header.extent / (1u64 << full.levels[keep].0) as f32);
+    widen_levels(&full, &mut splats, full.header.extent / (1u64 << full.levels[keep].0) as f32);
     let parents = &full.levels[keep - 1].1.tail;
     let mut starts = Vec::with_capacity(parents.len());
     let mut j = 0;
@@ -1541,6 +1591,7 @@ pub fn truncate_levels(file: &AthcFile, keep: usize) -> Result<AthcFile> {
         levels: full.levels[..keep].to_vec(),
         starts,
         chunks,
+        occlusion_codebook: full.occlusion_codebook.clone(),
     };
     out.header.count = splats.n as u32;
     out.header.chunks = out.chunks.len() as u32;
@@ -1720,7 +1771,7 @@ pub fn truncate_creases(file: &AthcFile, keep: usize, max_spread: f32, max_depth
     let widened: Vec<AthcBlock> = (keep..levels)
         .map(|l| {
             let mut b = full.levels[l].1.clone();
-            widen_merged(&mut b, full.header.extent / (1u64 << full.levels[l].0) as f32);
+            widen_levels(&full, &mut b, full.header.extent / (1u64 << full.levels[l].0) as f32);
             b
         })
         .collect();
@@ -1780,7 +1831,14 @@ pub fn truncate_creases(file: &AthcFile, keep: usize, max_spread: f32, max_depth
     }
     let per = file.header.chunk_splats.max(1) as usize;
     let chunks: Vec<AthcBlock> = (0..splats.n).step_by(per).map(|s| splats.slice(s, per.min(splats.n - s))).collect();
-    let mut out = AthcFile { header: full.header, extra: full.extra, levels: full.levels[..keep].to_vec(), starts, chunks };
+    let mut out = AthcFile {
+        header: full.header,
+        extra: full.extra,
+        levels: full.levels[..keep].to_vec(),
+        starts,
+        chunks,
+        occlusion_codebook: full.occlusion_codebook.clone(),
+    };
     out.header.count = splats.n as u32;
     out.header.chunks = out.chunks.len() as u32;
     out.header.levels = keep as u32;
@@ -1835,7 +1893,7 @@ pub fn athv_merged_pages(prefix: &[u8], file_bytes: u64) -> Result<(VirtualTree,
         .collect::<Result<Vec<_>>>()?;
     let mut at = h.starts as usize;
     let starts = words_of(prefix, &mut at, h.finest_groups as usize);
-    let file = AthcFile { header: h, extra: x, levels, starts, chunks: Vec::new() };
+    let file = AthcFile { header: h, extra: x, levels, starts, chunks: Vec::new(), occlusion_codebook: Vec::new() };
     merged_pages_of(&file, prefix)
 }
 
@@ -1871,6 +1929,13 @@ pub fn merged_pages_of(file: &AthcFile, header_page: &[u8]) -> Result<(VirtualTr
             out[152..156].copy_from_slice(&flags.to_le_bytes());
             let w = crate::athc_lod_cut::LOD_ERROR_WORDS;
             for v in &merged.lod_error[base as usize * w..(base + n) as usize * w] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        if !merged.occlusion.is_empty() {
+            let flags = u32::from_le_bytes(out[152..156].try_into().unwrap()) | ATHV_OCCLUSION;
+            out[152..156].copy_from_slice(&flags.to_le_bytes());
+            for v in &merged.occlusion[base as usize..(base + n) as usize] {
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -1953,6 +2018,9 @@ pub const ATHV_LOD_SIZES: u32 = 2;
 /// An ATHV merged page's decode flags, bit 2: its nodes' LoD errors
 /// (`AthcBlock::lod_error`, a word each) follow the sizes (or the ranges).
 pub const ATHV_LOD_ERRORS: u32 = 4;
+/// An ATHV merged page's decode flags, bit 3: its nodes' occlusion indices
+/// (`AthcBlock::occlusion`, a word each) follow the errors.
+pub const ATHV_OCCLUSION: u32 = 8;
 
 /// Feeds `block`'s elements to `receiver` as splats base .. base + n, with
 /// `children` (counts, virtual starts) when they are tree nodes.
@@ -2084,6 +2152,10 @@ pub fn emit_block<T: SplatReceiver>(
     if lod_tree && block.lod_size.len() == block.n && block.lod_size.iter().any(|&v| v > 0.0) {
         receiver.set_lod_size(base, block.n, &block.lod_size);
     }
+    // athenea's occlusion indices (entry + 1, 0 none), nodes and splats alike.
+    if lod_tree && block.occlusion.len() == block.n && block.occlusion.iter().any(|&v| v != 0) {
+        receiver.set_lod_occlusion(base, block.n, &block.occlusion);
+    }
     // LoD errors for the error cut (athc_lod_cut), for the nodes that have them.
     if lod_tree && block.lod_error.len() == block.n * crate::athc_lod_cut::LOD_ERROR_WORDS && block.lod_error.iter().any(|&v| v != 0) {
         receiver.set_lod_error(base, block.n, &block.lod_error);
@@ -2149,6 +2221,9 @@ impl<T: SplatReceiver> AthcDecoder<T> {
         let tree = VirtualTree::of_file(&file, false)?;
         let merged = merged_block(&file, &tree);
         begin(&mut self.splats, (tree.merged + h.count) as usize, &h, &x)?;
+        if !file.occlusion_codebook.is_empty() {
+            self.splats.set_lod_occlusion_codebook(&file.occlusion_codebook, h.bounds_min, h.bounds_max);
+        }
         emit_block(
             &mut self.splats,
             0,
@@ -2227,6 +2302,12 @@ impl<T: SplatReceiver> AthcDecoder<T> {
                     bail!("ATHV page shorter than its LoD errors");
                 }
                 block.lod_error = words_of(b, &mut after, w * n);
+            }
+            if u32_at(b, 152) & ATHV_OCCLUSION != 0 {
+                if b.len() < after + 4 * n {
+                    bail!("ATHV page shorter than its occlusion indices");
+                }
+                block.occlusion = words_of(b, &mut after, n);
             }
             Some(ranges)
         } else {
@@ -2783,6 +2864,7 @@ mod tests {
                 .step_by(65536)
                 .map(|at| all.slice(at, (count as usize - at).min(65536)))
                 .collect(),
+            occlusion_codebook: Vec::new(),
         }
     }
 

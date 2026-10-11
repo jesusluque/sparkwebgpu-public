@@ -8,6 +8,7 @@ import init_wasm, {
   new_shared_lod_tree,
   init_lod_tree,
   dispose_lod_tree,
+  set_lod_occlusion_codebook,
   traverse_lod_trees,
   dynamic_traverse_lod_trees,
   type ChunkDecoder,
@@ -43,6 +44,7 @@ const rpcHandlers = {
   newSharedLodTree,
   initLodTree,
   disposeLodTree,
+  setLodOcclusionCodebook,
   updateLodTrees,
   traverseLodTrees,
   getLodTreeLevel,
@@ -212,6 +214,9 @@ type DecodedPackedResult = {
   readonly sh3Codes?: Uint32Array;
   readonly lodTree?: Uint32Array;
   readonly lodError?: Uint32Array;
+  readonly lodOcclusion?: Uint32Array;
+  readonly lodOcclusionCodebook?: Uint32Array;
+  readonly lodOcclusionBounds?: Float32Array;
   readonly splatEncoding: SplatEncoding;
   readonly attribSpecs?: AttribValues["specs"];
   readonly attribColumns?: AttribValues["values"];
@@ -230,6 +235,9 @@ function toPackedResult(packed: DecodedPackedResult): PackedResult {
       sh3Codes: packed.sh3Codes,
       lodTree: packed.lodTree,
       lodError: packed.lodError,
+      lodOcclusion: packed.lodOcclusion,
+      lodOcclusionCodebook: packed.lodOcclusionCodebook,
+      lodOcclusionBounds: packed.lodOcclusionBounds,
       attribs: attribValues(packed),
     },
     splatEncoding: packed.splatEncoding,
@@ -391,6 +399,9 @@ type DecodedExtResult = {
   sh3Codes?: [Uint32Array, Uint32Array];
   lodTree?: Uint32Array;
   lodError?: Uint32Array;
+  lodOcclusion?: Uint32Array;
+  lodOcclusionCodebook?: Uint32Array;
+  lodOcclusionBounds?: Float32Array;
   attribSpecs?: AttribValues["specs"];
   attribColumns?: AttribValues["values"];
 };
@@ -409,6 +420,9 @@ function toExtResult(packed: DecodedExtResult): ExtResult {
       sh3Codes: packed.sh3Codes,
       lodTree: packed.lodTree,
       lodError: packed.lodError,
+      lodOcclusion: packed.lodOcclusion,
+      lodOcclusionCodebook: packed.lodOcclusionCodebook,
+      lodOcclusionBounds: packed.lodOcclusionBounds,
       attribs: attribValues(packed),
     },
   };
@@ -698,20 +712,36 @@ function initLodTree({
   numSplats,
   lodTree,
   lodError,
+  lodOcclusion,
 }: {
   numSplats: number;
   lodTree: Uint32Array;
   lodError?: Uint32Array;
+  lodOcclusion?: Uint32Array;
 }) {
   const { lodId, chunkToPage } = init_lod_tree(
     numSplats,
     lodTree,
     lodError,
+    lodOcclusion,
   ) as {
     lodId: number;
     chunkToPage: Uint32Array;
   };
   return { lodId, chunkToPage };
+}
+
+/** A tree's occlusion codebook (athenea's masks) and the asset's box. */
+function setLodOcclusionCodebook({
+  lodId,
+  codebook,
+  bounds,
+}: {
+  lodId: number;
+  codebook: Uint32Array;
+  bounds: Float32Array;
+}) {
+  set_lod_occlusion_codebook(lodId, codebook, bounds);
 }
 
 function disposeLodTree({ lodId }: { lodId: number }) {
@@ -728,6 +758,7 @@ function updateLodTrees({
     count: number;
     lodTreeData?: Uint32Array;
     lodErrorData?: Uint32Array;
+    lodOcclusionData?: Uint32Array;
   }[];
 }) {
   const lodIds = new Uint32Array(ranges.map(({ lodId }) => lodId));
@@ -738,6 +769,11 @@ function updateLodTrees({
   const lodErrorData = ranges.some(({ lodErrorData }) => lodErrorData)
     ? ranges.map(({ lodErrorData }) => lodErrorData)
     : undefined;
+  const lodOcclusionData = ranges.some(
+    ({ lodOcclusionData }) => lodOcclusionData,
+  )
+    ? ranges.map(({ lodOcclusionData }) => lodOcclusionData)
+    : undefined;
 
   const result = update_lod_trees(
     lodIds,
@@ -746,6 +782,7 @@ function updateLodTrees({
     counts,
     lodTreeData,
     lodErrorData,
+    lodOcclusionData,
   );
 }
 
@@ -756,15 +793,21 @@ function traverseLodTrees({
   instances,
   traverseMode,
   errorLimit,
-  backCull,
+  backCullMin,
+  occlusionCull,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
   lastPixelLimit?: number;
   /** The error cut: tau x the size of a pixel (athc_lod_cut.rs). */
   errorLimit?: number;
-  /** Drop wholly back-facing nodes with their subtrees. */
-  backCull?: boolean;
+  /**
+   * Leave out the cut's back-facing nodes wider than this (a pixel's angle
+   * x lodBackCullMinPx); undefined: no culling.
+   */
+  backCullMin?: number;
+  /** Leave out what athenea's occlusion masks hide from the eye. */
+  occlusionCull?: boolean;
   instances: Record<
     string,
     {
@@ -829,9 +872,11 @@ function traverseLodTrees({
     coneFov0s,
     coneFovs,
     errorLimit,
-    backCull,
+    backCullMin,
+    occlusionCull,
   ) as {
     culledCount?: number;
+    occludedCount?: number;
     instanceIndices: {
       lodId: number;
       numSplats: number;
@@ -840,7 +885,8 @@ function traverseLodTrees({
     chunks: [number, number][];
     pixelLimit?: number;
   };
-  const { instanceIndices, chunks, pixelLimit, culledCount } = result;
+  const { instanceIndices, chunks, pixelLimit, culledCount, occludedCount } =
+    result;
 
   const indices = keyInstances.reduce(
     (indices, [key, _instance], index) => {
@@ -859,6 +905,7 @@ function traverseLodTrees({
     chunks,
     pixelLimit,
     culledCount,
+    occludedCount,
   };
 }
 

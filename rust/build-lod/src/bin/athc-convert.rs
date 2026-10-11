@@ -53,7 +53,7 @@
 //!                         athc_merge::group_cost of its children (BC's merge cost without the
 //!                         on-screen weight, any number of children); rho the sphere round its
 //!                         leaves; theta the back-face cone of its leaves' normals (none for glass,
-//!                         thin walls, no normals, --double-sided). A file that has them keeps them
+//!                         thin walls, no normals; only with --closed, never with --double-sided). A file that has them keeps them
 //!                         (athenea's, from usd-athc --tree) unless the tree changes (then ours);
 //!                         --no-lod-errors drops them; --lod-error-weights colour=,normal=,guard=,floor=
 //!
@@ -277,7 +277,8 @@ fn main() -> Result<()> {
         }
     } else if flag("--lod-errors") || had_lod_errors && tree_changed {
         let w = spark_lib::athc_lod_cut::ErrorWeights::parse(&text("--lod-error-weights").unwrap_or_default())?;
-        file = spark_lib::athc_lod_cut::with_lod_errors(&file, None, &w, flag("--double-sided"))?;
+        // A cone only for a piece said to be closed (`--closed`; `--double-sided` wins).
+        file = spark_lib::athc_lod_cut::with_lod_errors(&file, None, &w, !flag("--closed") || flag("--double-sided"))?;
         println!("LoD errors (ours) for {} merged nodes", file.levels.iter().map(|(_, b)| b.n).sum::<usize>());
     }
     if let Some(spec) = text("--shadow-vq") {

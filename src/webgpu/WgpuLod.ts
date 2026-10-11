@@ -51,12 +51,22 @@ export interface WgpuLodOptions {
    */
   lodErrorTau?: number;
   /**
-   * With the bounds' back-face cones (LODE): a merged node whose leaves all
-   * face away from the eye is dropped with its subtree. Glass, thin walls,
-   * double-sided pieces and clouds without normals carry no cone.
-   * @default false
+   * With the bounds' back-face cones (LODE): a node the cut draws whose
+   * leaves all face away from the eye is left out, when it is coarse
+   * (wider than lodBackCullMinPx on screen; a node the cut refines is never
+   * culled, so full detail never is). Only closed, non-glass pieces carry a
+   * cone (usd-athc: `athenea:splat:closed`). @default false
    */
   lodBackCull?: boolean;
+  /** The narrowest node lodBackCull culls, in pixels. @default 1 */
+  lodBackCullMinPx?: number;
+  /**
+   * athenea's occlusion masks (`.athc` section OCCL and codebook, `decimate
+   * --occlusion-mask`): a node is left out with its subtree when the eye is
+   * outside the asset's box and the four cells toward the eye on the 16 x
+   * 16 octahedral grid are all closed in its entry. @default false
+   */
+  lodOcclusionCull?: boolean;
   /**
    * tau that breathes with a budget (thread CG, Nanite-style), with
    * lodErrorTau > 0: a detail scale s in [min, 1] divides tau (the cut
@@ -236,6 +246,8 @@ export class WgpuLod {
     lodSplats: 0,
     traversals: 0,
     culled: 0,
+    /** Nodes the occlusion masks hid in the last traversal (with subtrees). */
+    occluded: 0,
     /** The tau the last update used (lodErrorTau over the auto scale). */
     tau: 0,
   };
@@ -255,6 +267,7 @@ export class WgpuLod {
     count: number;
     lodTreeData?: Uint32Array;
     lodErrorData?: Uint32Array;
+    lodOcclusionData?: Uint32Array;
   }[] = [];
   private dirty = true;
   private version = 0;
@@ -264,11 +277,14 @@ export class WgpuLod {
     quat: THREE.Quaternion;
     pixelScaleLimit: number;
     errorLimit: number;
-    backCull: boolean;
+    backCull: number;
+    occlusion: boolean;
     maxSplats: number;
   };
   private lastPixelLimit?: number;
   private lastRaycastTime = Number.NEGATIVE_INFINITY;
+  /** lodBackCull's narrowest node, in the limit's angle units (-1: off). */
+  private backCullMin = -1;
 
   constructor(
     readonly renderer: WgpuSplatRenderer,
@@ -281,6 +297,8 @@ export class WgpuLod {
       lodTraverseMode: "standard",
       lodErrorTau: 0,
       lodBackCull: false,
+      lodBackCullMinPx: 1,
+      lodOcclusionCull: false,
       lodErrorTauAuto: false,
       behindFoveate: 0.2,
       coneFov0: 90,
@@ -545,6 +563,10 @@ export class WgpuLod {
     }
     this.stats.tau = tau;
     const errorLimit = tau > 0 ? pixelScaleLimit * tau : 0;
+    // The narrowest node the back-face cull may drop (-1: off).
+    this.backCullMin = o.lodBackCull
+      ? pixelScaleLimit * Math.max(0, o.lodBackCullMinPx)
+      : -1;
     pixelScaleLimit *= o.lodRenderScale;
 
     camera.updateMatrixWorld();
@@ -556,7 +578,8 @@ export class WgpuLod {
       if (
         this.lastLod.pixelScaleLimit !== pixelScaleLimit ||
         this.lastLod.errorLimit !== errorLimit ||
-        this.lastLod.backCull !== o.lodBackCull ||
+        this.lastLod.backCull !== this.backCullMin ||
+        this.lastLod.occlusion !== o.lodOcclusionCull ||
         this.lastLod.maxSplats !== maxSplats
       ) {
         this.dirty = true;
@@ -724,7 +747,41 @@ export class WgpuLod {
           numSplats: splats.numSplats ?? 0,
           lodTree: (splats.extra.lodTree as Uint32Array).slice(),
           lodError: (splats.extra.lodError as Uint32Array | undefined)?.slice(),
+          lodOcclusion: (
+            splats.extra.lodOcclusion as Uint32Array | undefined
+          )?.slice(),
         }));
+        const codebook = splats.extra.lodOcclusionCodebook as
+          | Uint32Array
+          | undefined;
+        const bounds = splats.extra.lodOcclusionBounds as
+          | Float32Array
+          | undefined;
+        if (codebook && bounds) {
+          await worker.call("setLodOcclusionCodebook", {
+            lodId,
+            codebook: codebook.slice(),
+            bounds: bounds.slice(),
+          });
+        }
+      }
+      if (splats instanceof PagedSplats && splats.athcLayoutPromise) {
+        // A paged .athc v3's codebook is in its tables.
+        const { layout } = await splats.athcLayoutPromise;
+        const v3 = layout as {
+          occlusionCodebook?: number[];
+          header: { boundsMin: number[]; boundsMax: number[] };
+        };
+        if (v3.occlusionCodebook?.length) {
+          await worker.call("setLodOcclusionCodebook", {
+            lodId,
+            codebook: new Uint32Array(v3.occlusionCodebook),
+            bounds: new Float32Array([
+              ...v3.header.boundsMin,
+              ...v3.header.boundsMax,
+            ]),
+          });
+        }
       }
       this.trees.set(splats, { lodId, lastTouched: performance.now() });
       this.lodIdToSplats.set(lodId, splats);
@@ -733,7 +790,15 @@ export class WgpuLod {
 
     if (this.pager) {
       for (const update of this.pager.consumeLodTreeUpdates()) {
-        const { splats, page, chunk, numSplats, lodTree, lodError } = update;
+        const {
+          splats,
+          page,
+          chunk,
+          numSplats,
+          lodTree,
+          lodError,
+          lodOcclusion,
+        } = update;
         const record = this.trees.get(splats);
         if (!record) continue;
         if (lodTree && chunk === 0) {
@@ -757,6 +822,7 @@ export class WgpuLod {
           count: numSplats,
           lodTreeData: lodTree,
           lodErrorData: lodError,
+          lodOcclusionData: lodOcclusion,
         });
       }
     }
@@ -774,7 +840,8 @@ export class WgpuLod {
       quat: viewQuat,
       pixelScaleLimit,
       errorLimit,
-      backCull: this.options.lodBackCull,
+      backCull: this.backCullMin,
+      occlusion: this.options.lodOcclusionCull,
       maxSplats,
     };
     await this.traverse(
@@ -853,19 +920,19 @@ export class WgpuLod {
     }
 
     const t0 = performance.now();
-    const { keyIndices, chunks, pixelLimit, culledCount } = await worker.call(
-      "traverseLodTrees",
-      {
+    const { keyIndices, chunks, pixelLimit, culledCount, occludedCount } =
+      await worker.call("traverseLodTrees", {
         maxSplats,
         pixelScaleLimit,
         lastPixelLimit: this.lastPixelLimit,
         instances,
         traverseMode: o.lodTraverseMode,
         errorLimit: errorLimit > 0 ? errorLimit : undefined,
-        backCull: o.lodBackCull,
-      },
-    );
+        backCullMin: this.backCullMin >= 0 ? this.backCullMin : undefined,
+        occlusionCull: o.lodOcclusionCull,
+      });
     this.stats.culled = culledCount ?? 0;
+    this.stats.occluded = occludedCount ?? 0;
     this.stats.traverseMs = performance.now() - t0;
     this.stats.traversals += 1;
     this.lastPixelLimit = pixelLimit;
@@ -959,7 +1026,8 @@ export class WgpuLod {
       instances,
       traverseMode: o.lodTraverseMode,
       errorLimit: errorLimit > 0 ? errorLimit : undefined,
-      backCull: o.lodBackCull,
+      backCullMin: this.backCullMin >= 0 ? this.backCullMin : undefined,
+      occlusionCull: o.lodOcclusionCull,
     });
     for (const [id, { numSplats, indices }] of Object.entries(keyIndices)) {
       const m = byId.get(id);

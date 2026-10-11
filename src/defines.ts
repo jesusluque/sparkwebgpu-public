@@ -93,6 +93,10 @@ export type PackedExtra = {
   readonly lodTree?: Uint32Array;
   /** The LoD error cut's bounds, two words a node (rust athc_lod_cut.rs). */
   readonly lodError?: Uint32Array;
+  /** athenea's occlusion indices (entry + 1, 0 none), its codebook and box. */
+  readonly lodOcclusion?: Uint32Array;
+  readonly lodOcclusionCodebook?: Uint32Array;
+  readonly lodOcclusionBounds?: Float32Array;
   readonly radMeta?: RadMeta;
   /**
    * Per-Gaussian attributes: AttribValues from the loader, or an AttribPool
@@ -138,6 +142,10 @@ export type ExtExtra = {
   readonly lodTree?: Uint32Array;
   /** The LoD error cut's bounds, two words a node (rust athc_lod_cut.rs). */
   readonly lodError?: Uint32Array;
+  /** athenea's occlusion indices (entry + 1, 0 none), its codebook and box. */
+  readonly lodOcclusion?: Uint32Array;
+  readonly lodOcclusionCodebook?: Uint32Array;
+  readonly lodOcclusionBounds?: Float32Array;
   readonly radMeta?: RadMeta;
   /** Per-Gaussian attributes, as PackedExtra.attribs. */
   readonly attribs?: object;

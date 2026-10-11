@@ -67,6 +67,10 @@ pub enum SectionId {
     /// f16 eps | f16 rho, f16 theta | 8+8-bit octahedral cone axis (0 in a
     /// chunk). Read by the traversal, so tier 1.
     LodError,
+    /// athenea's occlusion masks (`decimate --occlusion-mask`): an
+    /// element's codebook entry + 1 (0: none), one word (a byte of it used
+    /// with 256 entries). Read by the traversal, so tier 1.
+    Occlusion,
     /// sparkwebGPU's skin (`athc_skin`): influences then weight gradients,
     /// what a skeleton needs to carry the splats -- geometry, so tier 1.
     Skin,
@@ -93,6 +97,7 @@ impl SectionId {
             Self::Sh => b"SHRS",
             Self::LodSize => b"LODS",
             Self::LodError => b"LODE",
+            Self::Occlusion => b"OCCL",
             Self::Skin => b"SKIN",
             Self::TransferDirect => b"TXDI",
             Self::TransferIndirect => b"TXIN",
@@ -103,11 +108,12 @@ impl SectionId {
         })
     }
 
-    pub const ALL: [SectionId; 11] = [
+    pub const ALL: [SectionId; 12] = [
         Self::Core,
         Self::Sh,
         Self::LodSize,
         Self::LodError,
+        Self::Occlusion,
         Self::Skin,
         Self::Material,
         Self::Shadow,
@@ -127,6 +133,7 @@ impl SectionId {
             Self::Sh => "SHRS",
             Self::LodSize => "LODS",
             Self::LodError => "LODE",
+            Self::Occlusion => "OCCL",
             Self::Skin => "SKIN",
             Self::Material => "MATL",
             Self::Shadow => "SHAD",
@@ -141,7 +148,7 @@ impl SectionId {
     /// materials, 3 relit (shadow bits and transfer).
     pub fn tier(self) -> u32 {
         match self {
-            Self::Core | Self::Sh | Self::LodSize | Self::LodError | Self::Skin => 1,
+            Self::Core | Self::Sh | Self::LodSize | Self::LodError | Self::Occlusion | Self::Skin => 1,
             Self::Material => 2,
             _ => 3,
         }
@@ -216,7 +223,7 @@ impl Want {
         let [direct, indirect, _] = transfer_split_words(x.transfer_count);
         let words = self.transfer_values.div_ceil(2);
         match id {
-            SectionId::Core | SectionId::Sh | SectionId::LodSize | SectionId::LodError | SectionId::Skin => true,
+            SectionId::Core | SectionId::Sh | SectionId::LodSize | SectionId::LodError | SectionId::Occlusion | SectionId::Skin => true,
             SectionId::Material => self.material,
             SectionId::Shadow | SectionId::Curvature => self.transfer_values > 0,
             SectionId::TransferDirect => words > 0,
@@ -312,6 +319,7 @@ pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Sec
             SectionId::LodError,
             if h.has(crate::athc::FLAG_LOD_ERROR) { crate::athc_lod_cut::LOD_ERROR_WORDS as u32 } else { 0 },
         ),
+        (SectionId::Occlusion, if h.has(crate::athc::FLAG_OCCLUSION) { 1 } else { 0 }),
         (SectionId::Skin, x.skin_words()),
         (SectionId::Material, material),
         (SectionId::Shadow, x.shadow_words),
@@ -360,6 +368,13 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
                 for v in &block.lod_size {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
+            } else {
+                out.resize(4 * block.n, 0);
+            }
+        }
+        SectionId::Occlusion => {
+            if block.occlusion.len() == block.n {
+                put_words(&mut out, &block.occlusion);
             } else {
                 out.resize(4 * block.n, 0);
             }
@@ -633,6 +648,9 @@ pub struct V3Layout {
     pub starts_offset: u64,
     /// Where the skeleton (`athc_skin::AthcSkeleton`, an ATSK blob) sits; 0: none.
     pub skeleton_offset: u64,
+    /// athenea's occlusion codebook (8 words an entry; empty: none), read
+    /// from the tables (it sits before the data).
+    pub occlusion_codebook: Vec<u32>,
 }
 
 /// v2 (in memory) to v3 bytes.
@@ -812,6 +830,24 @@ fn write_v3_impl(
             to.lod_error = if from.lod_error.is_empty() { vec![0; from.n * w] } else { from.lod_error.clone() };
         }
     }
+    // So do athenea's occlusion masks (every block: levels and chunks).
+    if file.levels.iter().map(|(_, b)| b).chain(&file.chunks).any(|b| !b.occlusion.is_empty()) {
+        v2.header.flags |= crate::athc::FLAG_OCCLUSION;
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.occlusion = if from.occlusion.is_empty() { vec![0; from.n] } else { from.occlusion.clone() };
+        }
+        for (to, from) in v2.chunks.iter_mut().zip(&file.chunks) {
+            to.occlusion = if from.occlusion.is_empty() { vec![0; from.n] } else { from.occlusion.clone() };
+        }
+    }
+    // So does a producer's own coverage (FLAG_NODE_COVERAGE): the levels'
+    // opacities as they are, never capped.
+    if file.header.has(crate::athc::FLAG_NODE_COVERAGE) {
+        v2.header.flags |= crate::athc::FLAG_NODE_COVERAGE;
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.positions = from.positions.clone();
+        }
+    }
     // So do merged opacities past 0.99 (athc::coverage_ratios), which the
     // v2 writer caps as athenea's files hold them.
     if file.over_capped() {
@@ -841,17 +877,20 @@ fn write_v3_impl(
         .map(|(level, b)| (0, *level, 0, b))
         .chain(v2.chunks.iter().enumerate().map(|(c, b)| (1, 0, c as u32 * h.chunk_splats, b)))
         .collect();
-    let section_table = V3_HEADER_BYTES as u64;
+    // The occlusion codebook (athenea's masks) widens the header by 16 bytes:
+    // its offset and entries at 160 (a reader finds the section table where
+    // the header says, so an older one skips them).
+    let codebook = &file.occlusion_codebook;
+    let header_bytes = if codebook.is_empty() { V3_HEADER_BYTES } else { V3_HEADER_BYTES + 16 };
+    let section_table = header_bytes as u64;
     let block_index = section_table + (SECTION_ENTRY_BYTES * sections.len()) as u64;
     let entry = BLOCK_ENTRY_HEAD + BLOCK_ENTRY_PER_SECTION * sections.len();
     let starts = aligned(block_index + (entry * blocks.len()) as u64);
     let blob = skeleton.map(|s| s.to_bytes()).unwrap_or_default();
     let skeleton_offset = if blob.is_empty() { 0 } else { (starts + 4 * v2.starts.len() as u64).div_ceil(16) * 16 };
-    let data_start = aligned(if blob.is_empty() {
-        starts + 4 * v2.starts.len() as u64
-    } else {
-        skeleton_offset + blob.len() as u64
-    });
+    let after_skeleton = if blob.is_empty() { starts + 4 * v2.starts.len() as u64 } else { skeleton_offset + blob.len() as u64 };
+    let codebook_offset = if codebook.is_empty() { 0 } else { after_skeleton.div_ceil(16) * 16 };
+    let data_start = aligned(if codebook.is_empty() { after_skeleton } else { codebook_offset + 4 * codebook.len() as u64 });
 
     let mut data = Vec::new();
     let mut entries = Vec::new();
@@ -932,9 +971,21 @@ fn write_v3_impl(
     }
     put_words(&mut out, &[x.skin_influences, x.skin_gradient_words]);
     out.extend_from_slice(&skeleton_offset.to_le_bytes());
-    out.resize(V3_HEADER_BYTES, 0);
+    if !codebook.is_empty() {
+        out.extend_from_slice(&codebook_offset.to_le_bytes());
+        put_words(&mut out, &[(codebook.len() / crate::athc::OCCLUSION_WORDS) as u32, 0]);
+    }
+    out.resize(header_bytes, 0);
     for s in &sections {
-        put_words(&mut out, &[s.id.code(), s.tier, s.encoding, s.compression, s.words, 0, 0, 0]);
+        // OCCL: the bytes an index needs (entry + 1, 0 none: two with 256
+        // entries), in the entry's sixth word; the stored word keeps any.
+        let width = if s.id == SectionId::Occlusion {
+            let top = (codebook.len() / crate::athc::OCCLUSION_WORDS) as u32;
+            if top < 0x100 { 1 } else if top < 0x10000 { 2 } else { 4 }
+        } else {
+            0
+        };
+        put_words(&mut out, &[s.id.code(), s.tier, s.encoding, s.compression, s.words, width, 0, 0]);
     }
     for e in &entries {
         put_words(&mut out, &[e.kind, e.level, e.first, e.n]);
@@ -951,6 +1002,10 @@ fn write_v3_impl(
     if !blob.is_empty() {
         out.resize(skeleton_offset as usize, 0);
         out.extend_from_slice(&blob);
+    }
+    if !codebook.is_empty() {
+        out.resize(codebook_offset as usize, 0);
+        put_words(&mut out, codebook);
     }
     out.resize(data_start as usize, 0);
     out.extend_from_slice(&data);
@@ -1068,7 +1123,18 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
             spans,
         });
     }
-    Ok(V3Layout { header, extra, sections, blocks, starts_offset, skeleton_offset })
+    // A header of 176 bytes or more carries the occlusion codebook's offset
+    // and entries at 160.
+    let mut occlusion_codebook = Vec::new();
+    if section_table >= V3_HEADER_BYTES + 16 {
+        let (at, entries) = (u64_at(bytes, 160)? as usize, u32_at(bytes, 168)? as usize);
+        if at != 0 {
+            occlusion_codebook = (0..entries * crate::athc::OCCLUSION_WORDS)
+                .map(|k| u32_at(bytes, at + 4 * k))
+                .collect::<Result<Vec<_>>>()?;
+        }
+    }
+    Ok(V3Layout { header, extra, sections, blocks, starts_offset, skeleton_offset, occlusion_codebook })
 }
 
 /// One block's elements from its sections' bytes (`raw[k]`: section k,
@@ -1102,6 +1168,11 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
             SectionId::LodError => {
                 if v.iter().any(|&w| w != 0) {
                     block.lod_error = v;
+                }
+            }
+            SectionId::Occlusion => {
+                if v.iter().any(|&w| w != 0) {
+                    block.occlusion = v;
                 }
             }
             SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {
@@ -1322,7 +1393,7 @@ pub fn athv_merged_pages_v3(
     let starts = (0..layout.header.finest_groups as usize)
         .map(|g| u32_at(tables, at + 4 * g))
         .collect::<Result<Vec<_>>>()?;
-    let file = AthcFile { header: h, extra: x, levels: blocks, starts, chunks: Vec::new() };
+    let file = AthcFile { header: h, extra: x, levels: blocks, starts, chunks: Vec::new(), occlusion_codebook: Vec::new() };
     let mut headers = h.to_bytes().to_vec();
     headers.extend_from_slice(&x.to_bytes());
     let (tree, pages) = crate::athc::merged_pages_of(&file, &headers)?;
@@ -1408,7 +1479,7 @@ pub fn read_v3(bytes: &[u8]) -> Result<AthcFile> {
     let starts = (0..layout.header.finest_groups as usize)
         .map(|g| u32_at(bytes, at + 4 * g))
         .collect::<Result<Vec<_>>>()?;
-    Ok(AthcFile { header: layout.header, extra: layout.extra, levels, starts, chunks })
+    Ok(AthcFile { header: layout.header, extra: layout.extra, levels, starts, chunks, occlusion_codebook: layout.occlusion_codebook })
 }
 
 #[cfg(test)]

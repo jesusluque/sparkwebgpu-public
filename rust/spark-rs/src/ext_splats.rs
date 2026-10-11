@@ -37,6 +37,10 @@ pub struct ExtSplatsData {
     lod_sizes: Option<Vec<f32>>,
     /// LoD error cut bounds (spark-lib athc_lod_cut), LOD_ERROR_WORDS a splat.
     lod_errors: Option<Vec<u32>>,
+    /// athenea's occlusion indices (entry + 1, 0 none), one a splat.
+    lod_occlusion: Option<Vec<u32>>,
+    /// The file's occlusion codebook and box (min xyz, max xyz).
+    lod_occlusion_codebook: Option<(Vec<u32>, [f32; 6])>,
     buffer_a: Vec<u32>,
     buffer_b: Vec<u32>,
     buffer_base: usize,
@@ -68,6 +72,8 @@ impl ExtSplatsData {
             child_starts: None,
             lod_sizes: None,
             lod_errors: None,
+            lod_occlusion: None,
+            lod_occlusion_codebook: None,
             buffer_a: Vec::new(),
             buffer_b: Vec::new(),
             buffer_base: 0,
@@ -116,6 +122,19 @@ impl ExtSplatsData {
             let array = Uint32Array::new_with_length(errors.len() as u32);
             array.copy_from(errors);
             Reflect::set(&object, &JsValue::from_str("lodError"), &JsValue::from(array)).unwrap();
+        }
+        if let Some(index) = self.lod_occlusion.as_ref() {
+            let array = Uint32Array::new_with_length(index.len() as u32);
+            array.copy_from(index);
+            Reflect::set(&object, &JsValue::from_str("lodOcclusion"), &JsValue::from(array)).unwrap();
+        }
+        if let Some((codebook, bounds)) = self.lod_occlusion_codebook.as_ref() {
+            let array = Uint32Array::new_with_length(codebook.len() as u32);
+            array.copy_from(codebook);
+            Reflect::set(&object, &JsValue::from_str("lodOcclusionCodebook"), &JsValue::from(array)).unwrap();
+            let b = js_sys::Float32Array::new_with_length(6);
+            b.copy_from(bounds);
+            Reflect::set(&object, &JsValue::from_str("lodOcclusionBounds"), &JsValue::from(b)).unwrap();
         }
         object
     }
@@ -394,6 +413,8 @@ impl SplatReceiver for ExtSplatsData {
 
     fn init_splats(&mut self, init: &SplatInit) -> anyhow::Result<()> {
         self.lod_errors = None;
+        self.lod_occlusion = None;
+        self.lod_occlusion_codebook = None;
         let (_, _, _, max_splats) = get_splat_tex_size(init.num_splats);
         self.max_splats = max_splats;
         self.num_splats = init.num_splats;
@@ -855,6 +876,15 @@ impl SplatReceiver for ExtSplatsData {
         let w = crate::lod_tree::LOD_ERROR_WORDS;
         let errors = self.lod_errors.get_or_insert_with(|| vec![0; self.num_splats * w]);
         errors[base * w..(base + count) * w].copy_from_slice(&error[..count * w]);
+    }
+
+    fn set_lod_occlusion(&mut self, base: usize, count: usize, index: &[u32]) {
+        let occlusion = self.lod_occlusion.get_or_insert_with(|| vec![0; self.num_splats]);
+        occlusion[base..base + count].copy_from_slice(&index[..count]);
+    }
+
+    fn set_lod_occlusion_codebook(&mut self, codebook: &[u32], lo: [f32; 3], hi: [f32; 3]) {
+        self.lod_occlusion_codebook = Some((codebook.to_vec(), [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]));
     }
 
     fn set_lod_size(&mut self, base: usize, count: usize, size: &[f32]) {

@@ -132,6 +132,11 @@ pub trait SplatReceiver: 'static {
     /// f16 rho high, a word a node (0: none).
     #[allow(unused_variables)]
     fn set_lod_error(&mut self, base: usize, count: usize, error: &[u32]) {}
+    /// athenea's occlusion indices (an entry of the file's codebook + 1, 0
+    /// none), a word a node.
+    fn set_lod_occlusion(&mut self, base: usize, count: usize, index: &[u32]) {}
+    /// The file's occlusion codebook (8 words an entry) and the asset's box.
+    fn set_lod_occlusion_codebook(&mut self, codebook: &[u32], bounds_min: [f32; 3], bounds_max: [f32; 3]) {}
     fn finish(&mut self) -> anyhow::Result<()> { Ok(()) }
     fn debug(&self, value: usize) { println!("debug: {}", value); }
     fn set_encoding(&mut self, encoding: &SetSplatEncoding) -> anyhow::Result<()> { Ok(()) }

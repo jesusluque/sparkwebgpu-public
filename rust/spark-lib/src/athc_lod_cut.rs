@@ -160,11 +160,13 @@ pub fn one_sided(b: &AthcBlock, i: usize) -> bool {
     (w >> 24) & 1 == 0 && ((w >> 16) & 255) <= 127
 }
 
-/// Element i's base colour (as stored) and roughness (pbr byte 1; 1 without).
+/// Element i's base colour as stored, at least 0 (lod_blob's `blobOf`:
+/// 0.5 + SH0 dc), and roughness (pbr byte 1; 0.5 without, as athenea's
+/// Decimate.cpp fills `roughness` when the cloud has none).
 pub fn look_of(b: &AthcBlock, i: usize) -> ([f32; 3], f32) {
     let w = &b.shape[i * 4..i * 4 + 4];
-    let rough = if b.pbr.is_empty() { 1.0 } else { ((b.pbr[i * (b.pbr.len() / b.n)] >> 8) & 255) as f32 / 255.0 };
-    ([high_half(w[2]), low_half(w[3]), high_half(w[3])], rough)
+    let rough = if b.pbr.is_empty() { 0.5 } else { ((b.pbr[i * (b.pbr.len() / b.n)] >> 8) & 255) as f32 / 255.0 };
+    ([high_half(w[2]).max(0.0), low_half(w[3]).max(0.0), high_half(w[3]).max(0.0)], rough)
 }
 
 /// athenea's node size `r`: `sqrt(dot(scale, scale))`, `sqrt(tr Sigma)`.
@@ -199,6 +201,34 @@ impl Default for ErrorWeights {
 }
 
 impl ErrorWeights {
+    /// athenea's research prototype on the GPU (Decimate.cpp, the cut by
+    /// error with `--cut-bounds`): colour 10, normal 1, guard 4, floor 2.
+    /// The default for her trees (`usd-athc --tree --lod-errors`).
+    pub fn athenea() -> Self {
+        Self { colour: 10.0, normal: 1.0, guard: 4.0, floor_size: 2.0 }
+    }
+
+    /// `k=v,...` over `self` ("own": treeErrorOwn's weights, 0 0 1 0).
+    pub fn parse_over(self, spec: &str) -> anyhow::Result<Self> {
+        let mut w = self;
+        for kv in spec.split(',').filter(|s| !s.is_empty()) {
+            if kv == "own" {
+                w = Self::default();
+                continue;
+            }
+            let (k, v) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("--lod-error-weights k=v,..."))?;
+            let v: f32 = v.parse()?;
+            match k {
+                "colour" | "color" => w.colour = v,
+                "normal" => w.normal = v,
+                "guard" => w.guard = v,
+                "floor" => w.floor_size = v,
+                _ => anyhow::bail!("--lod-error-weights: unknown {k}"),
+            }
+        }
+        Ok(w)
+    }
+
     pub fn parse(spec: &str) -> anyhow::Result<Self> {
         let mut w = Self::default();
         for kv in spec.split(',').filter(|s| !s.is_empty()) {
@@ -296,9 +326,18 @@ pub fn athenea_tree_errors(
     cost: &[f32],
     weights: &ErrorWeights,
     double_sided: bool,
+    closed: Option<&[bool]>,
 ) -> Vec<NodeBounds> {
     let n = parent.len();
-    let mut nb: Vec<NodeBounds> = (0..n).map(|k| NodeBounds::own(block, k, double_sided)).collect();
+    // `closed`: each node's own mark (athenea:splat:closed); a node is
+    // culled only when all its leaves are (the climb ANDs it).
+    let mut nb: Vec<NodeBounds> = (0..n)
+        .map(|k| {
+            let mut b = NodeBounds::own(block, k, double_sided);
+            b.cull &= closed.is_none_or(|c| c[k]);
+            b
+        })
+        .collect();
     // The spread, cone and sphere first (treeBoundsUp, with the sphere).
     for k in 0..n {
         let p = parent[k] as usize;
@@ -325,6 +364,52 @@ pub fn athenea_tree_errors(
         }
     }
     nb
+}
+
+/// athenea's occlusion rule (`decimate --occlusion-mask`, the player's): a
+/// node with codebook entry `stored - 1` (0: none) is hidden from `eye` when
+/// the eye is outside the asset's box (min xyz, max xyz) and the four cells
+/// toward it on the 16 x 16 octahedral grid -- splatCellsOpen's:
+/// `octEncode(dir) * 16 - 0.5`, the cells clamped to [0, 15], those of
+/// bilinear weight 0 left out -- are all closed in the entry (bit y * 16 + x,
+/// 1 open). `dir` from the node's centre toward the eye, in the asset's frame.
+/// The traversal (spark-rs lod_tree.rs `occluded`) is the same code.
+pub fn occlusion_hides(codebook: &[u32], stored: u32, bounds: [f32; 6], centre: [f32; 3], eye: [f32; 3]) -> bool {
+    if stored == 0 {
+        return false;
+    }
+    let entry = (stored - 1) as usize * crate::athc::OCCLUSION_WORDS;
+    if entry + crate::athc::OCCLUSION_WORDS > codebook.len() {
+        return false;
+    }
+    if (0..3).all(|k| eye[k] >= bounds[k] && eye[k] <= bounds[3 + k]) {
+        return false;
+    }
+    let d = [eye[0] - centre[0], eye[1] - centre[1], eye[2] - centre[2]];
+    let l1 = d[0].abs() + d[1].abs() + d[2].abs();
+    if l1 <= 1.0e-20 {
+        return false;
+    }
+    let n = d.map(|v| v / l1);
+    let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+    let p = if n[2] >= 0.0 { [n[0], n[1]] } else { [(1.0 - n[1].abs()) * sign(n[0]), (1.0 - n[0].abs()) * sign(n[1])] };
+    let at = [(p[0] * 0.5 + 0.5) * 16.0 - 0.5, (p[1] * 0.5 + 0.5) * 16.0 - 0.5];
+    let lo = [at[0].floor(), at[1].floor()];
+    let f = [at[0] - lo[0], at[1] - lo[1]];
+    for k in 0..4u32 {
+        let (kx, ky) = ((k & 1) as f32, (k >> 1) as f32);
+        let w = (if kx > 0.0 { f[0] } else { 1.0 - f[0] }) * (if ky > 0.0 { f[1] } else { 1.0 - f[1] });
+        if w <= 0.0 {
+            continue;
+        }
+        let cx = ((lo[0] + kx) as i32).clamp(0, 15) as usize;
+        let cy = ((lo[1] + ky) as i32).clamp(0, 15) as usize;
+        let bit = cy * 16 + cx;
+        if (codebook[entry + (bit >> 5)] >> (bit & 31)) & 1 != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(feature = "athc")]
@@ -679,6 +764,108 @@ mod tests {
         }
     }
 
+    /// athenea's bounded error (Decimate.cpp's weights): r (|cost| + 10 s_c
+    /// + theta^2 / alpha), a guarded merge (cost < 0) x 4, at least 2 r.
+    #[test]
+    fn athenea_bounded_weights() {
+        let f = fixture("hood_t16.athc");
+        let b = &f.chunks[0];
+        // A small chain over the first splats: 0 1 -> 4, 2 3 -> 5, 4 5 -> 6.
+        let mut block = AthcBlock::default();
+        for k in [0, 700, 1400, 2100, 300, 1000, 1700] {
+            block.append(&b.slice(k, 1));
+        }
+        let parent = [4, 4, 5, 5, 6, 6, 6];
+        let cost = [0.0, 0.0, 0.0, 0.0, 0.2, -0.3, 0.05];
+        let w = ErrorWeights::athenea();
+        let nb = athenea_tree_errors(&block, &parent, 4, &cost, &w, false, None);
+        let own = |k: usize| {
+            let r = size_of(scales_of(&block, k));
+            let alpha = look_of(&block, k).1.max(0.02).powi(2);
+            r * (cost[k].abs() + 10.0 * nb[k].spread + nb[k].theta * nb[k].theta / alpha)
+        };
+        assert!(nb[6].theta > 0.0);
+        assert!((nb[4].eps - own(4)).abs() <= 1e-6 * own(4).max(1e-6));
+        let r5 = size_of(scales_of(&block, 5));
+        assert!((nb[5].eps - (4.0 * own(5)).max(2.0 * r5)).abs() <= 1e-6 * nb[5].eps);
+        assert_eq!(nb[6].eps, own(6).max(nb[4].eps).max(nb[5].eps));
+        assert_eq!(ErrorWeights::athenea().parse_over("own").unwrap().colour, 0.0);
+        assert_eq!(ErrorWeights::athenea().parse_over("colour=3").unwrap().guard, 4.0);
+    }
+
+    /// A producer's own coverage (FLAG_NODE_COVERAGE) is kept: not uncapped,
+    /// not divided by the widening's area, through v3.
+    #[test]
+    fn node_coverage_is_kept_as_stored() {
+        use crate::athc::{merged_block, uncap_levels, VirtualTree, FLAG_NODE_COVERAGE};
+        let mut f = fixture("two_cards.athc");
+        f.header.flags |= FLAG_NODE_COVERAGE;
+        for (_, b) in f.levels.iter_mut() {
+            for i in 0..b.n {
+                b.positions[i * 4 + 3] = 0.37;
+            }
+        }
+        let mut g = f.clone();
+        uncap_levels(&mut g);
+        assert!(g.levels.iter().all(|(_, b)| (0..b.n).all(|i| b.positions[i * 4 + 3] == 0.37)));
+        let back = crate::athc_v3::read_v3(&crate::athc_v3::write_v3(&g, crate::athc_v3::COMPRESSION_GZIP).unwrap()).unwrap();
+        assert!(back.header.has(FLAG_NODE_COVERAGE));
+        assert!(back.levels.iter().all(|(_, b)| (0..b.n).all(|i| b.positions[i * 4 + 3] == 0.37)));
+        let tree = VirtualTree::of_file(&back, false).unwrap();
+        let m = merged_block(&back, &tree);
+        let first = if tree.synth_root { 1 } else { 0 };
+        assert!((first..m.n).all(|i| m.positions[i * 4 + 3] == 0.37));
+        // Without the flag the decoder widens (and uncaps) them.
+        let mut plain = back.clone();
+        plain.header.flags &= !FLAG_NODE_COVERAGE;
+        let m = merged_block(&plain, &tree);
+        assert!((first..m.n).any(|i| m.positions[i * 4 + 3] != 0.37));
+    }
+
+    /// athenea's occlusion rule: the four cells toward the eye, all closed.
+    #[test]
+    fn occlusion_reads_the_cells_toward_the_eye() {
+        // Entry 0 all closed, entry 1 open only round +z (octEncode(+z) is the
+        // square's centre: cells 7..8 x 7..8).
+        let mut codebook = vec![0u32; 16];
+        for (x, y) in [(7, 7), (8, 7), (7, 8), (8, 8)] {
+            let bit = y * 16 + x;
+            codebook[8 + (bit >> 5)] |= 1 << (bit & 31);
+        }
+        let b = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let c = [0.0, 0.0, 0.0];
+        assert!(occlusion_hides(&codebook, 1, b, c, [0.0, 0.0, 5.0]), "all closed");
+        assert!(!occlusion_hides(&codebook, 2, b, c, [0.0, 0.0, 5.0]), "open toward +z");
+        assert!(occlusion_hides(&codebook, 2, b, c, [5.0, 0.0, 0.0]), "closed toward +x");
+        assert!(!occlusion_hides(&codebook, 1, b, c, [0.0, 0.0, 0.5]), "the eye inside the box");
+        assert!(!occlusion_hides(&codebook, 0, b, c, [0.0, 0.0, 5.0]), "no index");
+    }
+
+    /// The occlusion section and the codebook through v3, the merged pages
+    /// and the whole-file decoder.
+    #[test]
+    fn occlusion_goes_through_v3_and_the_merged_pages() {
+        let f = fixture("door_occlusion.athc");
+        assert_eq!(f.occlusion_codebook.len(), 256 * 8);
+        assert!(f.levels.iter().map(|(_, b)| b).chain(&f.chunks).all(|b| b.occlusion.len() == b.n));
+        let bytes = crate::athc_v3::write_v3(&f, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let back = crate::athc_v3::read_v3(&bytes).unwrap();
+        assert_eq!(back.occlusion_codebook, f.occlusion_codebook);
+        for ((_, a), (_, b)) in back.levels.iter().zip(&f.levels) {
+            assert_eq!(a.occlusion, b.occlusion);
+        }
+        assert_eq!(back.chunks[0].occlusion, f.chunks[0].occlusion);
+        let layout = crate::athc_v3::parse_v3(&bytes).unwrap();
+        assert_eq!(layout.occlusion_codebook, f.occlusion_codebook);
+        let mut head = f.header.to_bytes().to_vec();
+        head.extend_from_slice(&f.extra.to_bytes());
+        let (tree, pages) = crate::athc::merged_pages_of(&f, &head).unwrap();
+        assert_eq!(pages.len(), 1);
+        let flags = u32::from_le_bytes(pages[0][152..156].try_into().unwrap());
+        assert_ne!(flags & crate::athc::ATHV_OCCLUSION, 0);
+        assert!(tree.merged as usize > f.levels.iter().map(|(_, b)| b.n).sum::<usize>() - 1);
+    }
+
     /// athenea's definitions on a hand tree: leaves 0, a merge r |cost|
     /// raised by its children, the sphere grown by the child's offset.
     #[test]
@@ -694,7 +881,11 @@ mod tests {
         }
         let parent = [4, 4, 5, 5, 6, 6, 6];
         let cost = [0.0, 0.0, 0.0, 0.0, 0.5, -3.0, 0.1];
-        let nb = athenea_tree_errors(&b, &parent, 4, &cost, &ErrorWeights::default(), false);
+        let nb = athenea_tree_errors(&b, &parent, 4, &cost, &ErrorWeights::default(), false, None);
+        // A leaf left open takes the cone from every node over it.
+        let open = [true, false, true, true, true, true, true];
+        let nb2 = athenea_tree_errors(&b, &parent, 4, &cost, &ErrorWeights::default(), false, Some(&open));
+        assert!(!nb2[1].cull && !nb2[4].cull && !nb2[6].cull);
         let size = |k: usize| size_of(scales_of(&b, k));
         for k in 0..4 {
             assert_eq!(nb[k].eps, 0.0);

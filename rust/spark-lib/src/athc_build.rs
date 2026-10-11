@@ -972,6 +972,7 @@ pub fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         skin: pick(&b.skin),
         lod_size: Vec::new(),
         lod_error: Vec::new(),
+        occlusion: pick(&b.occlusion),
     }
 }
 
@@ -1800,6 +1801,7 @@ pub fn build_lod_from_codes(cloud: &PackedCloud, o: &BuildOptions, codes: &[u32]
         levels: stored,
         starts: finest_level.starts.clone(),
         chunks,
+        occlusion_codebook: Vec::new(),
     })
 }
 

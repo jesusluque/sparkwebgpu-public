@@ -28,6 +28,12 @@ export interface SplatPagerOptions {
    */
   maxSplats?: number;
   /**
+   * Splats a pool page holds. @default 65536. A pager of athenea's
+   * error-band pages (WgpuBandPager) uses fewer; WebGPU only (the WebGL
+   * texture layers are 256 x 256).
+   */
+  pageSplats?: number;
+  /**
    * Maximum number of spherical harmonics to keep
    * @default 3
    */
@@ -83,9 +89,9 @@ export class SplatPager {
     | { splats: PagedSplats; chunk: number; time: number }
     | undefined
   )[] = [];
-  private readonly pageFreelist: number[];
-  private readonly pageLru: Set<{ page: number; lru: number }>;
-  private freeablePages: number[];
+  protected readonly pageFreelist: number[];
+  protected readonly pageLru: Set<{ page: number; lru: number }>;
+  protected freeablePages: number[];
   private newUploads: PageUpload[];
   private readonly readyUploads: PageUpload[];
   lodTreeUpdates: {
@@ -100,8 +106,8 @@ export class SplatPager {
     lodOcclusion?: Uint32Array;
   }[];
 
-  private readonly fetchers: { splats: PagedSplats; chunk: number }[];
-  private readonly fetched: {
+  protected readonly fetchers: { splats: PagedSplats; chunk: number }[];
+  protected readonly fetched: {
     splats: PagedSplats;
     chunk: number;
     data: PackedResult | ExtResult;
@@ -152,10 +158,10 @@ export class SplatPager {
     this.renderer = options.renderer;
     this.extSplats = options.extSplats ?? false;
 
-    this.pageSplats = PAGE_SPLATS;
+    this.pageSplats = options.pageSplats ?? PAGE_SPLATS;
     this.maxSplats = options.maxSplats ?? 16777216;
-    this.maxPages = Math.ceil(this.maxSplats / PAGE_SPLATS);
-    this.maxSplats = this.maxPages * PAGE_SPLATS;
+    this.maxPages = Math.ceil(this.maxSplats / this.pageSplats);
+    this.maxSplats = this.maxPages * this.pageSplats;
 
     this.maxSh = options.maxSh ?? 3;
     this.curSh = 0;
@@ -709,7 +715,7 @@ export class SplatPager {
     return this.maxPages - this.pageFreelist.length;
   }
 
-  private allocateFreeable(): number | undefined {
+  protected allocateFreeable(): number | undefined {
     const page = this.freeablePages.shift();
     if (page === undefined) {
       // No freeable pages available
@@ -727,12 +733,12 @@ export class SplatPager {
       splats,
       page,
       chunk,
-      numSplats: PAGE_SPLATS,
+      numSplats: this.pageSplats,
     });
     return page;
   }
 
-  private processFetched() {
+  protected processFetched() {
     const now = performance.now();
     while (true) {
       const fetched = this.fetched.shift();

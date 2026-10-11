@@ -156,6 +156,7 @@ export function planAttribPaging(
     pages = {},
     transferForm = "full",
     cloudPages,
+    pageSplats = PAGE_SPLATS,
   }: {
     budget: number;
     tier: Tier;
@@ -163,6 +164,11 @@ export function planAttribPaging(
     pages?: Record<string, number>;
     transferForm?: TransferForm;
     cloudPages?: number;
+    /**
+     * Splats a page holds. Groups are paged in slots of 65 536 only: with
+     * smaller pages (athenea's band pages) every group is kept whole.
+     */
+    pageSplats?: number;
   },
 ): AttribPagingPlan {
   const dropped: AttribPagingPlan["dropped"] = [];
@@ -208,7 +214,6 @@ export function planAttribPaging(
   ].filter((n) => byGroup.has(n));
   const total = [...byGroup.values()].reduce((n, g) => n + g.length, 0);
   let left = budget - headerBytes(total);
-  const pageSplats = PAGE_SPLATS;
   const groups: PlannedGroup[] = [];
   for (const name of order) {
     const groupSpecs = byGroup.get(name) as AttributeSpec[];
@@ -217,7 +222,9 @@ export function planAttribPaging(
     const tables = 4 * maxPages * groupSpecs.length;
     const asked = pages[name];
     let slots: number;
-    if (asked !== undefined) {
+    if (pageSplats !== PAGE_SPLATS) {
+      slots = maxPages;
+    } else if (asked !== undefined) {
       slots = Math.max(0, Math.min(Math.floor(asked), maxPages));
     } else if (full <= left) {
       slots = maxPages;

@@ -104,9 +104,15 @@ pub const FLAG_NODE_COVERAGE: u32 = 256;
 /// Each element carries an index into the file's occlusion codebook (v3
 /// section OCCL, the codebook after the starts; athenea's occlusion masks).
 pub const FLAG_OCCLUSION: u32 = 512;
+/// The file's blocks are athenea's error-band pages (`athc_pages`, v3 only):
+/// every node of her merge tree, leaves and merges, page by page, each
+/// node's children named in the `TREE` section, the page table (`PAGE`)
+/// among the tables. No levels, no starts.
+pub const FLAG_PAGED: u32 = 1024;
 /// Words an occlusion codebook entry holds (256 bits).
 pub const OCCLUSION_WORDS: usize = 8;
 pub const KNOWN_FLAGS: u32 = FLAG_OCCLUSION
+    | FLAG_PAGED
     | FLAG_NORMALS
     | FLAG_LINEAR
     | FLAG_EMISSION
@@ -383,12 +389,15 @@ pub fn parse_headers(bytes: &[u8]) -> Result<(AthcHeader, ExtraHeader)> {
             bits.join(", ")
         );
     }
+    // A paged tree (FLAG_PAGED) has no levels and pages of their own sizes.
+    let paged = h.flags & FLAG_PAGED != 0;
     if h.count == 0
-        || h.levels == 0
+        || (h.levels == 0) != paged
         || h.chunk_splats == 0
         || h.sh_words == 0
         || h.sh_words > 64
-        || h.chunks as u64 != (h.count as u64).div_ceil(h.chunk_splats as u64)
+        || (!paged && h.chunks as u64 != (h.count as u64).div_ceil(h.chunk_splats as u64))
+        || (paged && (h.chunks == 0 || h.chunks as u64 > h.count as u64))
     {
         bail!("not a readable .athc (inconsistent counts)");
     }
@@ -508,6 +517,10 @@ pub struct AthcBlock {
     /// athenea's occlusion mask (v3 section OCCL): an element's codebook
     /// entry + 1, 0 none (never culled); one word, its low byte(s) used.
     pub occlusion: Vec<u32>,
+    /// A paged tree's children (v3 section TREE, `athc_pages`): two words an
+    /// element, the page its children are in, then the first one's place in
+    /// that page (low 16 bits) and their count (high 16; 0 a leaf); or empty.
+    pub tree: Vec<u32>,
 }
 
 fn words_of(b: &[u8], at: &mut usize, n: usize) -> Vec<u32> {
@@ -538,7 +551,7 @@ impl AthcBlock {
         let shadow_bits = opt(x.shadow_words > 0, &mut at, x.shadow_words);
         let curvature = opt(x.curvature_words > 0, &mut at, x.curvature_words);
         let skin = opt(x.skin_words() > 0, &mut at, x.skin_words());
-        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new(), lod_error: Vec::new(), occlusion: Vec::new() })
+        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new(), lod_error: Vec::new(), occlusion: Vec::new(), tree: Vec::new() })
     }
 
     /// Every array after positions, in file order.
@@ -595,6 +608,7 @@ impl AthcBlock {
             lod_size: if self.lod_size.is_empty() { Vec::new() } else { self.lod_size[start..start + n].to_vec() },
             lod_error: if self.lod_error.is_empty() { Vec::new() } else { cut(&self.lod_error) },
             occlusion: if self.occlusion.is_empty() { Vec::new() } else { cut(&self.occlusion) },
+            tree: cut(&self.tree),
         }
     }
 
@@ -612,6 +626,7 @@ impl AthcBlock {
         self.shadow_bits.extend_from_slice(&other.shadow_bits);
         self.curvature.extend_from_slice(&other.curvature);
         self.skin.extend_from_slice(&other.skin);
+        self.tree.extend_from_slice(&other.tree);
         // A block with sizes and one without: the latter's are 0 (geometric).
         if !self.lod_size.is_empty() || !other.lod_size.is_empty() {
             self.lod_size.resize(self.n - other.n, 0.0);
@@ -2215,6 +2230,28 @@ impl<T: SplatReceiver> AthcDecoder<T> {
         };
         drop(bytes);
         let (h, x) = (file.header, file.extra);
+        if h.has(FLAG_PAGED) {
+            // A paged tree whole: its pages one after the other, each node's
+            // children by their place in the file.
+            let firsts: Vec<u32> = file
+                .chunks
+                .iter()
+                .scan(0u32, |at, b| {
+                    let f = *at;
+                    *at += b.n as u32;
+                    Some(f)
+                })
+                .collect();
+            begin(&mut self.splats, h.count as usize, &h, &x)?;
+            if !file.occlusion_codebook.is_empty() {
+                self.splats.set_lod_occlusion_codebook(&file.occlusion_codebook, h.bounds_min, h.bounds_max);
+            }
+            for (block, &first) in file.chunks.iter().zip(&firsts) {
+                let (counts, starts) = crate::athc_pages::children_of(block, |page, place| firsts[page as usize] + place);
+                emit_block(&mut self.splats, first as usize, block, &h, &x, Some((&counts, &starts)), None, true, self.options);
+            }
+            return self.splats.finish();
+        }
         // The whole file is here, splats too: the merged levels get their
         // whole coverage, whatever a v2 file capped (`coverage_ratios`).
         uncap_levels(&mut file);
@@ -2258,7 +2295,11 @@ impl<T: SplatReceiver> AthcDecoder<T> {
             let mut options = self.options;
             options.keep_linear |= flags & ATHV_KEEP_LINEAR != 0;
             begin(&mut self.splats, block.n, &h, &x)?;
-            emit_block(&mut self.splats, 0, &block, &h, &x, None, None, true, options);
+            // A paged tree's page names its children as Spark's paged index:
+            // their page as the 65 536-index chunk, then their place in it.
+            let children = (!block.tree.is_empty()).then(|| crate::athc_pages::children_of(&block, |page, place| page << 16 | place));
+            let children = children.as_ref().map(|(c, s)| (&c[..], &s[..]));
+            emit_block(&mut self.splats, 0, &block, &h, &x, children, None, true, options);
             return self.splats.finish();
         }
         let base = u32_at(b, 8);
@@ -2459,6 +2500,46 @@ mod tests {
         d.push(bytes).unwrap();
         d.finish().unwrap();
         d.into_splats()
+    }
+
+    #[test]
+    fn a_paged_tree_decodes_whole_and_page_by_page_to_the_same_tree() {
+        use crate::athc_v3::{athv_sections_page, parse_v3};
+        let bytes = crate::athc_pages::tests::sample_paged_file();
+        let layout = parse_v3(&bytes).unwrap();
+        let whole = decode(&bytes);
+        let n = layout.header.count as usize;
+        assert_eq!(whole.child_count.len(), n);
+        // Every node but the root named once, as a run, after its parent.
+        let mut named = vec![0; n];
+        for i in 0..n {
+            for c in whole.child_start[i]..whole.child_start[i] + whole.child_count[i] as usize {
+                assert!(c > i);
+                named[c] += 1;
+            }
+        }
+        assert_eq!(named[0], 0);
+        assert!(named[1..].iter().all(|&k| k == 1));
+        let headers = layout.v2_headers();
+        for (p, (block, row)) in layout.blocks.iter().zip(&layout.pages).enumerate() {
+            let parts: Vec<(&crate::athc_v3::Section, &[u8], u32)> = layout
+                .sections
+                .iter()
+                .zip(&block.spans)
+                .map(|(s, span)| (s, &bytes[span.offset as usize..(span.offset + span.stored as u64) as usize], span.raw))
+                .collect();
+            let page = athv_sections_page(&headers, 0, block.n, 0, 0, &parts);
+            let got = decode(&page);
+            for i in 0..block.n as usize {
+                let g = row.first as usize + i;
+                assert_eq!(got.child_count[i], whole.child_count[g], "page {p} node {i}");
+                assert_eq!(&got.center[3 * i..3 * i + 3], &whole.center[3 * g..3 * g + 3]);
+                if got.child_count[i] > 0 {
+                    let (cp, place) = (got.child_start[i] >> 16, got.child_start[i] & 0xffff);
+                    assert_eq!(layout.pages[cp].first as usize + place, whole.child_start[g]);
+                }
+            }
+        }
     }
 
     #[test]

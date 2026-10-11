@@ -973,6 +973,7 @@ pub fn reorder(b: &AthcBlock, order: &[u32]) -> AthcBlock {
         lod_size: Vec::new(),
         lod_error: Vec::new(),
         occlusion: pick(&b.occlusion),
+        tree: pick(&b.tree),
     }
 }
 

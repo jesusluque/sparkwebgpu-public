@@ -207,6 +207,11 @@ struct LodTree {
     chunk_to_page: Vec<u32>,
     /// athenea's occlusion codebook (8 words an entry) and the asset's box.
     occlusion: Option<(Vec<u32>, [f32; 6])>,
+    /// Splats a physical page (pool slot) holds: 65 536, or fewer for a
+    /// pager of small pages (athenea's error-band pages, thread CK). The
+    /// virtual index space keeps 65 536 a chunk (`child >> 16`); a resident
+    /// chunk's nodes sit at `page * slot + (child & 0xffff)`.
+    slot: u32,
 }
 
 /// Whether node `s` is hidden from `eye` by athenea's occlusion mask
@@ -353,15 +358,16 @@ fn set_lod_tree_data(state: &mut LodState, lod_id: u32, page_base: u32, _chunk_b
 }
 
 #[wasm_bindgen]
-pub fn new_lod_tree(capacity: u32) -> Result<Object, JsValue> {
+pub fn new_lod_tree(capacity: u32, slot: Option<u32>) -> Result<Object, JsValue> {
+    let slot = slot.filter(|&s| s > 0 && s <= MAX_SPLAT_CHUNK as u32).unwrap_or(MAX_SPLAT_CHUNK as u32);
     STATE.with_borrow_mut(|state| {
         let lod_id = state.next_id;
         let splats = Vec::with_capacity(capacity as usize);
         let splats = Rc::new(RefCell::new(splats));
-        let page_capacity = capacity.div_ceil(65536);
+        let page_capacity = capacity.div_ceil(slot);
         let page_to_chunk = Vec::with_capacity(page_capacity as usize);
         let chunk_to_page: Vec<u32> = Vec::with_capacity(page_capacity as usize);
-        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None });
+        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None, slot });
         state.next_id += 1;
 
         let result = Object::new();
@@ -378,10 +384,11 @@ pub fn new_shared_lod_tree(orig_lod_id: u32) -> Result<Object, JsValue> {
         let splats = lod_tree.splats.clone();
         let page_to_chunk = Vec::with_capacity(lod_tree.page_to_chunk.capacity());
         let chunk_to_page = Vec::with_capacity(lod_tree.chunk_to_page.capacity());
+        let slot = lod_tree.slot;
 
         let new_lod_id = state.next_id;
         state.next_id += 1;
-        state.lod_trees.insert(new_lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None });
+        state.lod_trees.insert(new_lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None, slot });
 
         let result = Object::new();
         Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(new_lod_id)).unwrap();
@@ -398,7 +405,7 @@ pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array, lod_error: Option<U
         let splats = Rc::new(RefCell::new(splats));
         let page_to_chunk = (0..pages).collect();
         let chunk_to_page: Vec<u32> = (0..pages).collect();
-        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None });
+        state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None, slot: MAX_SPLAT_CHUNK as u32 });
         state.next_id += 1;
 
         set_lod_tree_data(state, lod_id, 0, 0, num_splats, &lod_tree, lod_error.as_ref(), lod_occlusion.as_ref());
@@ -424,8 +431,11 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
             let lod_error = lod_errors.as_ref().map(|a| a.get(k as u32)).filter(|e| !e.is_falsy()).map(Uint32Array::from);
             let lod_occlusion = lod_occlusions.as_ref().map(|a| a.get(k as u32)).filter(|e| !e.is_falsy()).map(Uint32Array::from);
             let lod_tree = state.lod_trees.get_mut(&lod_id).unwrap();
-            let pages = count.div_ceil(65536);
-            let base_page = page_base >> 16;
+            let slot = lod_tree.slot;
+            // A range of `count` splats from a page: whole pages of the pool,
+            // whole chunks of the virtual space (one each for small pages).
+            let pages = count.div_ceil(slot).max(1);
+            let base_page = page_base / slot;
             let base_chunk = chunk_base >> 16;
 
             if (base_page + pages) > lod_tree.page_to_chunk.len() as u32 {
@@ -583,6 +593,7 @@ pub fn traverse_lod_trees(
 
     STATE.with_borrow_mut(|state| {
         let LodState { lod_trees, frontier, output, touched, touched_set, .. } = state;
+        let slots: Vec<u32> = lod_ids.iter().map(|id| lod_trees.get(id).map_or(MAX_SPLAT_CHUNK as u32, |t| t.slot)).collect();
         let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
             let lod_tree = lod_trees.get(&lod_id).unwrap();
             let LodTree { splats, page_to_chunk, chunk_to_page, .. } = &lod_tree;
@@ -619,7 +630,7 @@ pub fn traverse_lod_trees(
             let (lod_id, splats, ..) = instance;
             let root_page = root_pages[inst_index];
             let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
-            let root_index = root_page << 16;
+            let root_index = root_page * slots[inst_index];
             if hidden(inst_index as u32, root_index) {
                 occluded_count += 1;
                 continue;
@@ -701,7 +712,7 @@ pub fn traverse_lod_trees(
             for child in child_start..child_start + child_count as u32 {
                 let child_chunk = (child >> 16) as usize;
                 let child_page = chunk_to_page[child_chunk];
-                let paged_index = (child_page << 16) | (child & 0xffff);
+                let paged_index = child_page * slots[inst_index as usize] + (child & 0xffff);
                 // Occluded from the eye (athenea's mask): gone with its subtree.
                 if hidden(inst_index, paged_index) {
                     hidden_here += 1;
@@ -860,6 +871,7 @@ pub fn dynamic_traverse_lod_trees(
 
     STATE.with_borrow_mut(|state| {
         let LodState { lod_trees, .. } = state;
+        let slots: Vec<u32> = lod_ids.iter().map(|id| lod_trees.get(id).map_or(MAX_SPLAT_CHUNK as u32, |t| t.slot)).collect();
         let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
             let lod_tree = lod_trees.get(&lod_id).unwrap();
             let LodTree { splats, page_to_chunk, chunk_to_page, .. } = &lod_tree;
@@ -881,7 +893,7 @@ pub fn dynamic_traverse_lod_trees(
             let (lod_id, splats, ..) = instance;
             let root_page = root_pages[inst_index];
             let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
-            let root_index = root_page << 16;
+            let root_index = root_page * slots[inst_index];
             let root_scale = compute_pixel_scale(&splats[root_index as usize], instance);
             let frontier = vec![(root_index, root_scale)];
             let instance_output = Vec::with_capacity(1000);
@@ -907,7 +919,7 @@ pub fn dynamic_traverse_lod_trees(
 
             let mut output_count = 0;
 
-            for (instance, (mut instance_output, mut stack)) in iterator {
+            for (inst_index, (instance, (mut instance_output, mut stack))) in iterator.enumerate() {
                 let (lod_id, splats, _, chunk_to_page, ..) = instance;
                 let chunk_max = lod_chunk_max.entry(*lod_id).or_default();
                 let mut frontier = Vec::with_capacity(stack.len());
@@ -952,7 +964,7 @@ pub fn dynamic_traverse_lod_trees(
                     for child in child_start..child_start + child_count as u32 {
                         let child_chunk = (child >> 16) as usize;
                         let child_page = chunk_to_page[child_chunk];
-                        let paged_index = (child_page << 16) | (child & 0xffff);
+                        let paged_index = child_page * slots[inst_index] + (child & 0xffff);
                         let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
                         if pixel_scale <= current_scale {
                             if pixel_scale <= pixel_scale_limit {

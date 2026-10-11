@@ -46,6 +46,7 @@ pub mod athc_skin;
 pub mod athl;
 #[cfg(feature = "athc")]
 pub mod athc_prune;
+pub mod athc_pages;
 #[cfg(feature = "athc")]
 pub mod cpu_raster;
 pub mod decoder;

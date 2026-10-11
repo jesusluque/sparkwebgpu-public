@@ -703,11 +703,23 @@ export class CompactRelitPath {
       ...options,
       frame: options.frame ?? null,
     };
+    // The sky is prepared in the stage: its frame is the world-to-stage turn
+    // (the frame's inverse, as the relight plugin's stageTurn), not the
+    // frame itself.
+    let stageTurn: THREE.Matrix4 | null = null;
+    if (this.options.frame) {
+      const q = new THREE.Quaternion();
+      this.options.frame
+        .clone()
+        .invert()
+        .decompose(new THREE.Vector3(), q, new THREE.Vector3());
+      stageTurn = new THREE.Matrix4().makeRotationFromQuaternion(q);
+    }
     this.sky.set({
       image: options.hdri ?? null,
       rotation: this.options.rotation,
       intensity: this.options.intensity,
-      frame: this.options.frame,
+      frame: stageTurn,
     });
     this.frame = createStorage(device, 16, "compact frame");
     const bytes = UniformWriter.for(compactModule, "compactParams").data

@@ -193,7 +193,7 @@ impl ErrorOptions {
 
 /// A cluster: raw moments of its members by weight.
 #[derive(Clone, Copy, Debug, Default)]
-struct Cl {
+pub(crate) struct Cl {
     w: f64,
     m1: [f64; 3],
     m2: [f64; 6],
@@ -256,7 +256,7 @@ fn key_of(b: &AthcBlock, i: usize, skin_per: usize, influences: usize) -> u64 {
     key
 }
 
-fn clusters_of(b: &AthcBlock, linear: bool, influences: usize, gradient_words: usize) -> Vec<Cl> {
+pub(crate) fn clusters_of(b: &AthcBlock, linear: bool, influences: usize, gradient_words: usize) -> Vec<Cl> {
     let skin_per = influences + gradient_words;
     (0..b.n)
         .map(|i| {
@@ -363,6 +363,50 @@ fn det_floor(s: &[f64; 6], eps: f64) -> f64 {
 
 fn len3(v: &[f64; 3]) -> f64 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+/// The error cut's own merge cost (thread CG, `athc_lod_cut`): what merging
+/// `kids` into one gaussian loses, scale free -- BC's `cost` (`CostKind::
+/// Screen`) without its on-screen weight (the projection is the runtime's)
+/// and over any number of children: Runnalls' bound per unit of mass,
+/// `0.5 (ln det S - sum pi_i ln det S_i)` with the covariances floored at 1%
+/// of the merged mean variance, plus `lambda` x (the mass-weighted variance of
+/// the linear base colour + the key mix, `0.5 (1 - sum_k pi_k^2)`) plus
+/// `lambda_material` x the variance of (metallic, sqrt roughness,
+/// transmission). For two children the variances are BC's `share x |d|^2`.
+pub(crate) fn group_cost(kids: &[&Cl], o: &ErrorOptions) -> f64 {
+    if kids.len() < 2 {
+        return 0.0;
+    }
+    let mut m = *kids[0];
+    for k in &kids[1..] {
+        m = add(&m, k);
+    }
+    if m.w.is_nan() || m.w <= 0.0 {
+        return 0.0;
+    }
+    let (_, s) = mean_cov(&m);
+    let eps = (0.01 * (s[0] + s[1] + s[2]) / 3.0).max(1e-30);
+    let mut bk = det_floor(&s, eps).ln();
+    let cbar = m.c.map(|v| v / m.w);
+    let mbar = m.mat.map(|v| v / m.w);
+    let (mut col, mut mat) = (0.0, 0.0);
+    let mut keys: Vec<(u64, f64)> = Vec::new();
+    for k in kids {
+        let pi = k.w / m.w;
+        let (_, sk) = mean_cov(k);
+        bk -= pi * det_floor(&sk, eps).ln();
+        for d in 0..3 {
+            col += pi * (k.c[d] / k.w - cbar[d]).powi(2);
+            mat += pi * (k.mat[d] / k.w - mbar[d]).powi(2);
+        }
+        match keys.iter_mut().find(|(key, _)| *key == k.key) {
+            Some(e) => e.1 += pi,
+            None => keys.push((k.key, pi)),
+        }
+    }
+    let keyed = 0.5 * (1.0 - keys.iter().map(|(_, p)| p * p).sum::<f64>());
+    (0.5 * bk).max(0.0) + o.lambda * (col + keyed) + o.lambda_material * mat
 }
 
 /// How strictly a pass refuses merges.
@@ -1395,6 +1439,11 @@ pub struct TreeImport {
     pub tree_nodes: usize,
     pub made_here: usize,
     pub extent: f32,
+    /// Each level group's tree node (`u32::MAX`: made here), the levels in
+    /// the file's order (coarsest first): what `athc_lod_cut` reads
+    /// athenea's own errors of.
+    #[serde(skip)]
+    pub level_nodes: Vec<Vec<u32>>,
 }
 
 /// The `.athc` of athenea's merge tree (surfels-web/NOTES.md, "Merge
@@ -1635,6 +1684,7 @@ pub fn levels_from_tree(
                 bail!("level {} group {} is cell {}, not {}", fl, i, block.tail[i], code);
             }
         }
+        import.level_nodes.push(rows.clone());
         let tree_rows: Vec<u32> = rows.iter().cloned().filter(|&r| r != u32::MAX).collect();
         import.tree_nodes += tree_rows.len();
         import.made_here += rows.len() - tree_rows.len();

@@ -146,6 +146,7 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 | S0 | `CORE` | 1 | 36 | positions, shape, tail (as three arrays) |
 | S0p | `SHRS` | 1 | 4 · shWords | rest harmonics |
 | S0l | `LODS` | 1 | 4 | a merged node's LoD size by error, f32 (0 in a chunk: geometric); flag bit 6 (sparkwebGPU's, below) |
+| S0e | `LODE` | 1 | 8 | a merged node's LoD error cut bounds: f16 eps, f16 rho; f16 theta, 8+8-bit cone axis (0 in a chunk); flag bit 7 (sparkwebGPU's, below) |
 | S0s | `SKIN` | 1 | 4 · (influences + gradientWords) | a skinned cloud's rig (sparkwebGPU's, below) |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
 | S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
@@ -342,6 +343,66 @@ with bit 1 of its decode flags (word 152, `ATHV_LOD_SIZES`); the browser
 fetches `LODS` with the levels and never with a chunk. A v2 file never holds
 them, and a reader before them refuses the flag.
 
+### LoD error cut bounds (`LODE`)
+
+The run-time error cut (thread CG, `athc_lod_cut.rs`), athenea's research
+100 and `lod_tree_cut.slang` (treeErrorOwn / treeErrorUp / treeErrorKeep,
+treeBoundsUp for the cone) after Nanite: with header flag bit 7 a file
+carries, in a tier-1 section after `LODS`, two words for every element; a
+level group's are
+
+```text
+word 0   f16 eps (low) | f16 rho (high)        metres, each rounded up
+word 1   f16 theta (low) | cone axis (high)    radians; octahedral 2 x unorm8 (x low)
+                                               theta = +inf (0x7c00, axis 0): never culled
+```
+
+and a chunk element's (a splat, a leaf) are 0. With `r(n) = |scale(n)|`
+(`sqrt(tr Sigma)`), a leaf's eps 0 and own sphere `2 max sigma`:
+
+```text
+eps(n)   = max(r(n) |cost(n)|, max over children eps(c))
+rho(n)   = max(2 max sigma(n), max over children |mu(n) - mu(c)| + rho(c))
+theta(n) = max over children theta(c) + angle(n_c, n_n)      (leaf: 0)
+P(n)     = eps(n) ppu / max(d(n) - rho(n), 1e-3)             (pixels)
+drawn    : P(n) <= tau < P(parent)
+culled   : n . v < -sin(theta + asin(rho / d))               (with its subtree)
+```
+
+`eps` grows up the tree and each sphere holds its children's, so `P` is
+monotone and the cut is consistent without walking up. `cost` is athenea's
+`lodCost` when the levels are her merge tree (`usd-athc --tree --lod-errors`:
+computed over her whole binary tree, then read at the level groups that are
+her nodes), otherwise ours: `athc_merge::group_cost` of the node's children
+in the `.athc` tree, BC's merge cost without its on-screen weight (Runnalls'
+bound per unit mass with the covariances floored at 1% of the merged mean
+variance, plus 128 x the mass-weighted variance of the linear base colour
+and of the key mix, plus 32 x that of metallic, sqrt roughness and
+transmission). The two costs are on different scales: a tau for one is not
+a tau for the other. `--lod-error-weights colour=,normal=,guard=,floor=`
+gives athenea's bounded form (treeErrorBounded: `r (|cost| + w_c s_c +
+w_n theta^2 / alpha)`, a merge past the guards `max(guard e, floor r)`);
+the default is her treeErrorOwn. The cone axis is the node's normal (the
+normals stream), rounded to 8 bits a component with theta widened by the
+rounding; glass, thin walls, clouds without normals and `--double-sided`
+(or a constant `athenea:splat:doubleSided`) carry none. The decoder's
+synthetic root takes level 1's largest eps, its sphere round theirs, no
+cone.
+
+Spark's traversal (spark-rs `lod_tree.rs`) takes them as an opt-in mode:
+`WgpuLod`'s `lodErrorTau` (SparkRenderer's, tau in pixels, 0 off) refines
+a node with bounds while `P > tau` (a node without them, a tree without
+them, by the size cut), and `lodBackCull` drops wholly back-facing nodes
+with their subtrees. A merged ATHV page carries them after its sizes (or
+its group ranges), two words a node, with bit 2 of its decode flags
+(`ATHV_LOD_ERRORS`); the decoded splats carry them as `extra.lodError`; the
+browser fetches `LODE` with the levels and never with a chunk. A v2 file
+never holds them, and a reader before them refuses the flag.
+
+`usd-athc --lod-errors` (any conversion) and `athc-convert --lod-errors`
+write them; a file that has them keeps them unless its tree changes (a cut,
+`--error`, `--rebuild-frame`: then ours), `--no-lod-errors` drops them.
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only
@@ -420,6 +481,7 @@ cargo run -p build-lod --bin athc-convert -- in.athc out.athc --gzip --planes   
 cargo run -p build-lod --bin athc-convert -- hd.athc light.athc --gzip --planes --keep-splats 200000 --creases 0.03 --crease-depth 1
 #   --rebuild-frame SEED: build the levels again in an octree frame turned and shifted by SEED
 #   --lod-sizes: the merged nodes' LoD sizes by error (LODS, above)
+#   --lod-errors: the merged nodes' error cut bounds (LODE, above)
 ```
 
 The WASM decoder reads a v3 file whole (`new SplatMesh({ url })`) as it reads

@@ -211,6 +211,7 @@ type DecodedPackedResult = {
   readonly sh2Codes?: Uint32Array;
   readonly sh3Codes?: Uint32Array;
   readonly lodTree?: Uint32Array;
+  readonly lodError?: Uint32Array;
   readonly splatEncoding: SplatEncoding;
   readonly attribSpecs?: AttribValues["specs"];
   readonly attribColumns?: AttribValues["values"];
@@ -228,6 +229,7 @@ function toPackedResult(packed: DecodedPackedResult): PackedResult {
       sh2Codes: packed.sh2Codes,
       sh3Codes: packed.sh3Codes,
       lodTree: packed.lodTree,
+      lodError: packed.lodError,
       attribs: attribValues(packed),
     },
     splatEncoding: packed.splatEncoding,
@@ -388,6 +390,7 @@ type DecodedExtResult = {
   sh2Codes?: Uint32Array;
   sh3Codes?: [Uint32Array, Uint32Array];
   lodTree?: Uint32Array;
+  lodError?: Uint32Array;
   attribSpecs?: AttribValues["specs"];
   attribColumns?: AttribValues["values"];
 };
@@ -405,6 +408,7 @@ function toExtResult(packed: DecodedExtResult): ExtResult {
       sh2Codes: packed.sh2Codes,
       sh3Codes: packed.sh3Codes,
       lodTree: packed.lodTree,
+      lodError: packed.lodError,
       attribs: attribValues(packed),
     },
   };
@@ -693,11 +697,17 @@ function newSharedLodTree({
 function initLodTree({
   numSplats,
   lodTree,
+  lodError,
 }: {
   numSplats: number;
   lodTree: Uint32Array;
+  lodError?: Uint32Array;
 }) {
-  const { lodId, chunkToPage } = init_lod_tree(numSplats, lodTree) as {
+  const { lodId, chunkToPage } = init_lod_tree(
+    numSplats,
+    lodTree,
+    lodError,
+  ) as {
     lodId: number;
     chunkToPage: Uint32Array;
   };
@@ -717,6 +727,7 @@ function updateLodTrees({
     chunkBase: number;
     count: number;
     lodTreeData?: Uint32Array;
+    lodErrorData?: Uint32Array;
   }[];
 }) {
   const lodIds = new Uint32Array(ranges.map(({ lodId }) => lodId));
@@ -724,6 +735,9 @@ function updateLodTrees({
   const chunkBases = new Uint32Array(ranges.map(({ chunkBase }) => chunkBase));
   const counts = new Uint32Array(ranges.map(({ count }) => count));
   const lodTreeData = ranges.map(({ lodTreeData }) => lodTreeData);
+  const lodErrorData = ranges.some(({ lodErrorData }) => lodErrorData)
+    ? ranges.map(({ lodErrorData }) => lodErrorData)
+    : undefined;
 
   const result = update_lod_trees(
     lodIds,
@@ -731,6 +745,7 @@ function updateLodTrees({
     chunkBases,
     counts,
     lodTreeData,
+    lodErrorData,
   );
 }
 
@@ -740,10 +755,16 @@ function traverseLodTrees({
   lastPixelLimit,
   instances,
   traverseMode,
+  errorLimit,
+  backCull,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
   lastPixelLimit?: number;
+  /** The error cut: tau x the size of a pixel (athc_lod_cut.rs). */
+  errorLimit?: number;
+  /** Drop wholly back-facing nodes with their subtrees. */
+  backCull?: boolean;
   instances: Record<
     string,
     {
@@ -807,7 +828,10 @@ function traverseLodTrees({
     coneFoveates,
     coneFov0s,
     coneFovs,
+    errorLimit,
+    backCull,
   ) as {
+    culledCount?: number;
     instanceIndices: {
       lodId: number;
       numSplats: number;
@@ -816,7 +840,7 @@ function traverseLodTrees({
     chunks: [number, number][];
     pixelLimit?: number;
   };
-  const { instanceIndices, chunks, pixelLimit } = result;
+  const { instanceIndices, chunks, pixelLimit, culledCount } = result;
 
   const indices = keyInstances.reduce(
     (indices, [key, _instance], index) => {
@@ -834,6 +858,7 @@ function traverseLodTrees({
     keyIndices: indices,
     chunks,
     pixelLimit,
+    culledCount,
   };
 }
 

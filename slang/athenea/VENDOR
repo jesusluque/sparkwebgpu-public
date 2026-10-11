@@ -6,7 +6,7 @@ date     2026-10-05T21:14:43+02:00
 subject  A flattened version under any HDR, in a unit Spark keeps, says how it was made
 roots    shaders/athenea/common shaders/athenea/scene shaders/athenea/splat shaders/athenea/lod shaders/athenea/technique/display.slang shaders/athenea/technique/aces2_prepare.slang (and their imports)
 
-# sha256  path (under shaders/athenea/)
+# sha256  path (under shaders/athenea/), as at the commit
 875c3f2aaaa0bdb0b4e8eefd0b37fd8d8027b036447a857cdf8488800673db45  common/bake_fit.slang
 474c8466c72a8dcdd89bdea530e3ab90c1342112afd04b7aab9aa52b14016db0  common/color.slang
 b406ced13ad9262138a20396a850f86e5d8e304c70bc82028ea22fa2df990957  common/edit.slang
@@ -74,3 +74,6 @@ d908af49a8906b065e61f563c68846cae023e7b118c6172e5b713d2d0a7766a8  splat/splat_vi
 c026dfc69e07d938ad697ec14a7c426c44b683a4633c71f4dd64399afa99d659  technique/aces2.slang
 b9f3f0854fb70a8e65d727ae7430f48811be6e3828e288efa171ae38bdf3f5ce  technique/aces2_prepare.slang
 d8a8ee1c7d5969693623488e18ba08dcb7d7546cb17a87d5c4c0f941ae3ebce3  technique/display.slang
+
+# sha256  patch (slang/athenea_patches/), applied after the copy
+41886c9441f9c3f56c27f0adecdcd68a84ce8e453318a06005e75934e3b45842  0001-sharp-lobes-unwidened-polish-field.patch

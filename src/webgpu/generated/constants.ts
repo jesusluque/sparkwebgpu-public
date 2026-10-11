@@ -28,6 +28,8 @@ export const atheneaAdapterCompact = {
   kCompactBinned: 128,
   kCompactBins: 256,
   kCompactStableOrder: 256,
+  kCompactCoatFold: 512,
+  kCompactPolishField: 1024,
   kCompactNone: 4294967295,
   kCompactSheetAlpha: 0.1,
 } as const;
@@ -104,6 +106,9 @@ export const atheneaAdapterRelight = {
   kRelightJoint: 32768,
   kRelightSheetDraw: 65536,
   kRelightOpacitySwitch: 131072,
+  kRelightUnwiden: 262144,
+  kRelightCoatFold: 524288,
+  kRelightPolishField: 1048576,
   kRelightGroup: 256,
   kRelightStride: 5,
   kRelightStrideKept: 2,

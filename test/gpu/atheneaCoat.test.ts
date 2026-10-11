@@ -38,6 +38,7 @@ import {
 import { AtheneaSky, type SkyImage } from "../../src/webgpu/athenea/AtheneaSky";
 import { packLightRecords } from "../../src/webgpu/athenea/lights";
 import {
+  type AtheneaRelightOptions,
   FOOTPRINT_GAIN,
   atheneaRelightPlugin,
 } from "../../src/webgpu/athenea/relightPlugin";
@@ -395,6 +396,7 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       frame: THREE.Object3D | null,
       pixelDetail = false,
       footprint = 0,
+      extra: AtheneaRelightOptions = {},
     ) {
       const splats = new WgpuSplatRenderer(fakeRenderer as never, {
         depthTest: false,
@@ -413,6 +415,7 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
         frame,
         pixelDetail,
         footprint,
+        ...extra,
       });
       host.register(relight).attach(splats);
       await host.ready();
@@ -423,8 +426,12 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       const relit = relight.buffers?.("splat", { frame: null, mesh })
         .atheneaRelit as GPUBuffer;
       const got = new Float32Array(await read(relit));
+      // Floats a splat in the relit records (relight.slang's stride: 1
+      // without the kept terms or the draw's records, 5 with them).
+      const stride = 4 * relight.relitStrideOf(mesh);
       return {
         got,
+        stride,
         src,
         done: () => {
           host.detach();
@@ -458,16 +465,18 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
         const r = luma(ref, 4 * i);
         sumRef += r;
         sumNoCoat += luma(noCoat, 4 * i);
-        sumStaged += luma(staged.got, 20 * i);
-        sumTurned += luma(turned.got, 20 * i);
+        sumStaged += luma(staged.got, staged.stride * i);
+        sumTurned += luma(turned.got, turned.stride * i);
         for (let c = 0; c < 3; c++) {
           const w = ref[4 * i + c];
           worst = Math.max(
             worst,
-            Math.abs(staged.got[20 * i + c] - w) / Math.max(Math.abs(w), 0.05),
+            Math.abs(staged.got[staged.stride * i + c] - w) /
+              Math.max(Math.abs(w), 0.05),
           );
         }
-        turnedOff += Math.abs(luma(turned.got, 20 * i) - r) / Math.max(r, 0.02);
+        turnedOff +=
+          Math.abs(luma(turned.got, turned.stride * i) - r) / Math.max(r, 0.02);
       }
       log(
         `hood ${N} splats (t${transferCount}, ${skyName}): mean luminance athenea ${(sumRef / N).toFixed(4)}, without its coat ${(sumNoCoat / N).toFixed(4)} (coat ${((100 * (sumRef - sumNoCoat)) / sumRef).toFixed(1)}%); plugin in the stage ${(sumStaged / N).toFixed(4)} (worst ${worst.toExponential(2)}), turned with the car ${(sumTurned / N).toFixed(4)} (mean off ${(turnedOff / N).toFixed(3)})`,
@@ -482,7 +491,7 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       let filteredOff = 0;
       for (let i = 0; i < N; i++) {
         const r = luma(ref, 4 * i);
-        const f = luma(filtered.got, 20 * i);
+        const f = luma(filtered.got, filtered.stride * i);
         sumFiltered += f;
         filteredOff = Math.max(
           filteredOff,
@@ -505,7 +514,7 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
 
     it("hands the sharp coat to the draw with pixelDetail", async () => {
       expect(pool.id("curvature")).toBeGreaterThanOrEqual(0);
-      const detail = await plugin(car, true);
+      const detail = await plugin(car, true, 0, { unwiden: false });
       const words = new Uint32Array(detail.got.buffer);
       const half = (w: number) => {
         const e = (w >> 10) & 31;
@@ -517,14 +526,14 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       let held = 0;
       let colour = 0;
       for (let i = 0; i < N; i++) {
-        const centre = 20 * i + 16;
+        const centre = detail.stride * i + 16;
         const mark = half(words[centre + 3] >>> 16);
         if (mark > 1.5) sharp++;
         held +=
           0.2126 * half(words[centre + 2] & 0xffff) +
           0.7152 * half(words[centre + 2] >>> 16) +
           0.0722 * half(words[centre + 3] & 0xffff);
-        colour += luma(detail.got, 20 * i);
+        colour += luma(detail.got, detail.stride * i);
       }
       log(
         `pixelDetail: ${sharp} of ${N} splats sharp, the centre's sharp reading ${((100 * held) / colour).toFixed(1)}% of their colour`,
@@ -532,6 +541,36 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
       // The hood's coat (rough 0.03-0.07) goes to the blend per pixel.
       expect(sharp).toBeGreaterThan(0.5 * N);
       expect(held).toBeGreaterThan(0.3 * colour);
+      // athenea b26d276 (unwiden): the sharp coat is read at the roughness
+      // before the bake widened it -- the slopes record's roughness only;
+      // the colour (which holds the centre's reading) is the same.
+      const unwidened = await plugin(car, true, 0, { unwiden: true });
+      const uw = new Uint32Array(unwidened.got.buffer);
+      let sharper = 0;
+      let rougher = 0;
+      let before = 0;
+      let after = 0;
+      let colourOff = 0;
+      for (let i = 0; i < N; i++) {
+        const at = detail.stride * i;
+        for (let c = 0; c < 4; c++) {
+          if (uw[at + c] !== words[at + c]) colourOff++;
+        }
+        if (half(words[at + 19] >>> 16) < 1.5) continue;
+        const r0 = half(words[at + 11] >>> 16);
+        const r1 = half(uw[at + 11] >>> 16);
+        before += r0;
+        after += r1;
+        if (r1 < r0) sharper++;
+        if (r1 > r0) rougher++;
+      }
+      log(
+        `unwiden: ${sharper} of ${sharp} sharp coats sharper, mean roughness ${(before / sharp).toFixed(4)} -> ${(after / sharp).toFixed(4)}`,
+      );
+      expect(colourOff).toBe(0);
+      expect(rougher).toBe(0);
+      expect(after).toBeLessThan(before);
+      unwidened.done();
       detail.done();
     }, 300_000);
   },

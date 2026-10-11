@@ -11,6 +11,10 @@
 // with `-I slang` exactly as it does with `-I shaders` in athenea.
 //
 // The copies are never edited by hand: glue goes in slang/athenea_adapter/.
+// What athenea has fixed since the pinned commit and the adapter needs, before
+// a re-pin, goes in slang/athenea_patches/*.patch (unified diffs against
+// slang/athenea/, each naming the athenea commit it carries), applied in name
+// order after the copy; --check applies them too before comparing.
 // slang/athenea/VENDOR records the commit and a hash of every file, and
 // tools/slang-build skips any directory holding a VENDOR file (athenea's own
 // kernels are not ours to ship; the adapter imports what it needs).
@@ -106,13 +110,53 @@ while (queue.length) {
 const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
 const sorted = [...files.keys()].sort();
 
+const PATCH_DIR = path.join(SLANG_DIR, "athenea_patches");
+const patches = fs.existsSync(PATCH_DIR)
+  ? fs
+      .readdirSync(PATCH_DIR)
+      .filter((f) => f.endsWith(".patch"))
+      .sort()
+  : [];
+function applyPatches(dir) {
+  for (const f of patches) {
+    execFileSync(
+      "patch",
+      [
+        "-p1",
+        "--batch",
+        "--forward",
+        "--quiet",
+        "-d",
+        dir,
+        "-i",
+        path.join(PATCH_DIR, f),
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+  }
+}
+function writeCopies(dir) {
+  for (const p of sorted) {
+    const dest = path.join(dir, p.slice(PREFIX.length));
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, files.get(p));
+  }
+  applyPatches(dir);
+}
+
 if (flag("--check")) {
+  const expected = fs.mkdtempSync(path.join(os.tmpdir(), "vendor-athenea-"));
+  writeCopies(expected);
   const bad = sorted.filter((p) => {
-    const dest = path.join(OUT, p.slice(PREFIX.length));
+    const rel = p.slice(PREFIX.length);
+    const dest = path.join(OUT, rel);
     return (
-      !fs.existsSync(dest) || fs.readFileSync(dest, "utf8") !== files.get(p)
+      !fs.existsSync(dest) ||
+      fs.readFileSync(dest, "utf8") !==
+        fs.readFileSync(path.join(expected, rel), "utf8")
     );
   });
+  fs.rmSync(expected, { recursive: true, force: true });
   if (bad.length) {
     console.error(
       `vendor-athenea: ${bad.length} copies differ from ${commit}:`,
@@ -120,16 +164,14 @@ if (flag("--check")) {
     for (const p of bad) console.error(`  ${p}`);
     process.exit(1);
   }
-  console.log(`vendor-athenea: ${sorted.length} files match ${commit}`);
+  console.log(
+    `vendor-athenea: ${sorted.length} files match ${commit}${patches.length ? ` + ${patches.length} patch(es)` : ""}`,
+  );
   process.exit(0);
 }
 
 fs.rmSync(OUT, { recursive: true, force: true });
-for (const p of sorted) {
-  const dest = path.join(OUT, p.slice(PREFIX.length));
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.writeFileSync(dest, files.get(p));
-}
+writeCopies(OUT);
 
 const subject = git("log", "-1", "--format=%s", commit).trim();
 const date = git("log", "-1", "--format=%cI", commit).trim();
@@ -145,9 +187,18 @@ fs.writeFileSync(
     `subject  ${subject}`,
     `roots    ${ROOTS.map((r) => PREFIX + r).join(" ")} (and their imports)`,
     "",
-    "# sha256  path (under shaders/athenea/)",
+    "# sha256  path (under shaders/athenea/), as at the commit",
     ...sorted.map((p) => `${sha(files.get(p))}  ${p.slice(PREFIX.length)}`),
     "",
+    ...(patches.length
+      ? [
+          "# sha256  patch (slang/athenea_patches/), applied after the copy",
+          ...patches.map(
+            (f) => `${sha(fs.readFileSync(path.join(PATCH_DIR, f)))}  ${f}`,
+          ),
+          "",
+        ]
+      : []),
   ].join("\n"),
 );
 fs.writeFileSync(
@@ -156,8 +207,10 @@ fs.writeFileSync(
     "athenea shaders",
     "Copyright (c) 2026 jesus luque.",
     "",
-    "The .slang files under this directory are unmodified copies of",
-    `shaders/athenea/ in the athenea repository at commit ${commit}.`,
+    "The .slang files under this directory are copies of",
+    `shaders/athenea/ in the athenea repository at commit ${commit},`,
+    "unmodified but for the patches VENDOR lists (slang/athenea_patches/,",
+    "each carrying a later athenea commit by its author).",
     "Each keeps its original copyright header. They are vendored into",
     "sparkwebGPU by their author's decision (plan-athenea.md, section 6,",
     "2026-10-06) as a read-only dependency; changes belong upstream in",

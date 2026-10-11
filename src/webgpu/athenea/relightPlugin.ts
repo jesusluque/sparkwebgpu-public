@@ -207,6 +207,32 @@ export interface AtheneaRelightOptions {
    * glass seen from far away 0.56-0.62x as bright as with "relight".
    */
   sheetFloor?: "relight" | "draw";
+  /**
+   * athenea-pieces b26d276: the sharp per-pixel coat and polish
+   * (pixelDetail) read the sky at the roughness before the bake widened it
+   * by the surface's turn across the gaussian (Toksvig, mesh2splat's
+   * m2sSpread: r'^4 = r^4 + 2 s^2, s = the largest principal curvature times
+   * the wider size), with the pixel's own footprint term on top. Needs the
+   * cloud's curvature; nothing changes without pixelDetail. Default true:
+   * thread CV, athenea's T65 cut of the whole Corvette at /World/Camera,
+   * 1920, against her mesh path trace (lamps masked): the car 19.68 ->
+   * 20.58 dB, the door 25.99 -> 26.96, the hood 14.58 -> 15.87.
+   */
+  unwiden?: boolean;
+  /**
+   * athenea-pieces 35ae3cb: a coat's widening held to 0.3
+   * (kCoatFoldRoughness) where the bake's spread is large -- a joint's
+   * lacquer widened to near 1 drew a dark streak. Needs the curvature.
+   */
+  coatFold?: boolean;
+  /**
+   * athenea-pieces 35ae3cb: the material's own roughness (pbr bits 26..31,
+   * usd-athc from primvars:athenea:splat:materialRoughness) is read, and a
+   * polish whose material is at least 0.3 rough asks its own lobe's cells
+   * and the reflected field answers what they close. Clouds without the
+   * mark are unchanged.
+   */
+  polishField?: boolean;
   /** For investigations: the lighting's parts left out, or a debug view. */
   debug?: AtheneaRelightDebug;
   /**
@@ -482,6 +508,9 @@ export function atheneaRelightPlugin(
     cullBacks: false,
     cullBacksFacing: CULL_BACKS_FACING,
     sheetFloor: "relight",
+    unwiden: true,
+    coatFold: false,
+    polishField: false,
     cpcaBatch: CPCA_BATCH,
     releaseSky: false,
     frame: null,
@@ -983,6 +1012,9 @@ export function atheneaRelightPlugin(
       (footprintPixelOn ? C.kRelightFootprintPixel : 0) |
       (options.cullBacks ? C.kRelightCullBacks : 0) |
       (options.sheetFloor === "draw" ? C.kRelightSheetDraw : 0) |
+      (options.unwiden ? C.kRelightUnwiden : 0) |
+      (options.coatFold ? C.kRelightCoatFold : 0) |
+      (options.polishField ? C.kRelightPolishField : 0) |
       (options.debug?.noCells ? C.kRelightNoCells : 0) |
       (rebuilt ? C.kRelightCpca : 0) |
       (projected ? C.kRelightJoint : 0) |
@@ -1499,6 +1531,9 @@ export function atheneaRelightPlugin(
       if (o.cullBacksFacing !== undefined)
         options.cullBacksFacing = o.cullBacksFacing;
       if (o.sheetFloor !== undefined) options.sheetFloor = o.sheetFloor;
+      if (o.unwiden !== undefined) options.unwiden = o.unwiden;
+      if (o.coatFold !== undefined) options.coatFold = o.coatFold;
+      if (o.polishField !== undefined) options.polishField = o.polishField;
       if (o.debug !== undefined) options.debug = { ...o.debug };
       if (o.frame !== undefined) options.frame = o.frame;
       if (o.cpcaBatch !== undefined) options.cpcaBatch = o.cpcaBatch;

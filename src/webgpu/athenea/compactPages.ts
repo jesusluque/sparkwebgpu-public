@@ -4,11 +4,14 @@
 //
 // A paged tree written with `usd-athc --tree ... --pages --compact-basis`
 // carries, per page, a `CMPC` section (tier 4, after tier 3, so consecutive
-// pages are one Range): NODE_BYTES (64) a node as byte planes, the 40 the
-// GPU keeps then the traversal's LoD tree words (4) and LODE words (2); the
-// page's quantization box in its page-table row (words 17..29); and, among
-// the file's tables, the piece's shadow dictionary, material table and
-// athenea's joint CPCA basis in f16 (rust athc_compact.rs).
+// pages are one Range): NODE_BYTES (56) a node as byte planes, the 40 the
+// GPU keeps then the traversal's 16 (v2, thread CQ: the centre as a
+// correction to the compact position, the children, LODE's eps and rho);
+// the page's quantization box in its page-table row (words 17..29); and,
+// among the file's tables, the piece's shadow dictionary, material table
+// and athenea's joint CPCA basis in f16 -- or a reference to the ASSET
+// table (a `.cmpa` beside the pieces) that holds the basis once, and the
+// dictionary and materials when the pieces share them (rust athc_compact.rs).
 //
 // Here:
 //   - CompactPagePool: one GPU buffer, the pieces' tables (always resident)
@@ -33,9 +36,15 @@ import type { CompactCloud, CompactLayout, CompactRelitPath } from "./compact";
 
 /** Bytes a node in a CMPC section, by plane (rust athc_compact PLANE_WIDTHS). */
 export const COMPACT_PLANE_WIDTHS = [
-  2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 16, 8,
+  2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1,
 ] as const;
-export const COMPACT_NODE_BYTES = 64;
+export const COMPACT_NODE_BYTES = 56;
+/** The GPU's bytes a node, the traversal's (rust GPU_NODE_BYTES, TRAVERSAL_NODE_BYTES). */
+export const COMPACT_GPU_NODE_BYTES = 40;
+export const COMPACT_TRAVERSAL_NODE_BYTES = 16;
+/** Bytes a node of a compact LoD tree in the WASM traversal (CompactLodNode). */
+export const COMPACT_LOD_NODE_BYTES = 14;
 /** The planes the GPU keeps, by name (the rest are the traversal's). */
 const GPU_PLANES = [
   "posX",
@@ -54,12 +63,19 @@ const GPU_PLANES = [
   "weights2",
   "shadow",
 ] as const;
-const P_LOD_TREE = 15;
-const P_LOD_ERROR = 16;
+/** The traversal's planes (one byte each): the children's page, their word. */
+const P_CHILD_PAGE = 21;
+const P_KIDS = 23;
 /** Words a slot head (compact.slang kCompactChunkWords, rounded to 16). */
 const HEAD_WORDS = 12;
 const SLOT_HEAD_WORDS = 16;
 const TABLE_MAGIC = 0x54504d43; // "CMPT"
+const TABLE_VERSION = 2;
+const ASSET_MAGIC = 0x41504d43; // "CMPA"
+/** CMPT flags: the basis, the dictionary, the materials in the asset table. */
+const TABLE_ASSET_BASIS = 4;
+const TABLE_ASSET_CODEBOOK = 8;
+const TABLE_ASSET_MATERIALS = 16;
 
 /** Byte offset of plane k in a section of n nodes. */
 export function compactPlaneOffset(k: number, n: number) {
@@ -78,88 +94,153 @@ export interface CompactPieceTables {
   weightBits: number;
   linear: boolean;
   curvature: boolean;
+  /**
+   * What the asset table holds for the piece (TABLE_ASSET_* bits, 0: the
+   * piece holds its own), its id and its file name beside the piece.
+   */
+  assetFlags: number;
+  assetId: bigint;
+  assetName: string;
 }
 
-/** A piece's tables flag: its basis is the asset's (rust TABLE_ASSET_BASIS). */
-const TABLE_ASSET_BASIS = 4;
-const ASSET_MAGIC = 0x41504d43; // "CMPA"
-
-/**
- * An asset's compact table (a sidecar `.cmpa`, rust athc_basis_fit, thread
- * CR; thread CQ's CMPA v1 layout): the joint basis once for every piece.
- */
+/** An asset's shared compact tables (rust athc_compact CompactAsset, `.cmpa`). */
 export interface CompactAssetTables {
   basis: Uint32Array;
   clusters: number;
-  /** FNV-1a 64 of the blob (its id words 0), as [lo, hi]. */
-  id: [number, number];
+  codebook: Uint32Array;
+  materials: Uint32Array;
+  id: bigint;
+  bytes: number;
 }
 
-/** The asset blob (athc_basis_fit::asset_basis_bytes). */
-export function parseCompactAsset(bytes: Uint8Array): CompactAssetTables {
-  const w = new Uint32Array(
-    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+function wordsOf(bytes: Uint8Array) {
+  return new Uint32Array(
+    bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + (bytes.byteLength & ~3),
+    ),
   );
-  if (w[0] !== ASSET_MAGIC || w[1] !== 1) {
-    throw new Error("compact asset: not CMPA v1");
+}
+
+/** FNV-1a, 64 bits (rust athc_compact fnv1a64). */
+function fnv1a64(bytes: Uint8Array) {
+  let h = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= BigInt(bytes[i]);
+    h = (h * prime) & mask;
   }
-  if ((w[3] & 1) === 0) throw new Error("compact asset: no basis");
-  return {
-    basis: w.slice(w[7], w[7] + w[8]),
-    clusters: w[4],
-    id: [w[11], w[12]],
-  };
+  return h;
 }
 
-/** The asset table at `url` (a whole fetch: ~0.5 MB). */
-export async function loadCompactAsset(
-  url: string,
-): Promise<CompactAssetTables> {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${url}: ${response.status}`);
-  return parseCompactAsset(new Uint8Array(await response.arrayBuffer()));
-}
-
-/**
- * The tables blob (CompactTables::to_bytes). A piece whose basis is its
- * asset's (flag TABLE_ASSET_BASIS) holds the asset's id where the basis
- * would be, and takes the basis from `asset`.
- */
-export function parseCompactTables(
-  bytes: Uint8Array,
-  asset?: CompactAssetTables | null,
-): CompactPieceTables {
-  const w = new Uint32Array(
-    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-  );
-  if (w[0] !== TABLE_MAGIC || w[1] !== 1) {
-    throw new Error("compact tables: not CMPT v1");
+/** The tables blob (CompactTables::to_bytes, v2). */
+export function parseCompactTables(bytes: Uint8Array): CompactPieceTables {
+  const w = wordsOf(bytes);
+  if (w[0] !== TABLE_MAGIC || w[1] !== TABLE_VERSION) {
+    throw new Error(
+      `compact tables: not CMPT v${TABLE_VERSION} (a v1 file: athc-convert --compact-rebase)`,
+    );
   }
   if (w[2] !== COMPACT_NODE_BYTES || w[3] !== COMPACT_PLANE_WIDTHS.length) {
     throw new Error("compact tables: another layout");
   }
-  let basis: Uint32Array = w.slice(w[13], w[13] + w[14]);
-  if (w[10] & TABLE_ASSET_BASIS) {
-    if (!asset) throw new Error("compact tables: the basis is the asset's");
-    if (
-      basis[0] !== asset.id[0] ||
-      basis[1] !== asset.id[1] ||
-      asset.clusters !== w[7]
-    ) {
-      throw new Error("compact tables: another asset's basis");
-    }
-    basis = asset.basis;
-  }
+  const name = bytes.subarray(4 * w[18], 4 * w[18] + w[19]);
   return {
     codebook: w.slice(w[11], w[11] + 8 * w[5]),
     materials: w.slice(w[12], w[12] + 4 * w[6]),
-    basis,
+    basis: w.slice(w[13], w[13] + w[14]),
     clusters: w[7],
     normalBits: w[8],
     weightBits: w[9],
     linear: (w[10] & 1) !== 0,
     curvature: (w[10] & 2) !== 0,
+    assetFlags:
+      w[10] &
+      (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS),
+    assetId: BigInt(w[16]) | (BigInt(w[17]) << 32n),
+    assetName: new TextDecoder().decode(name),
   };
+}
+
+/** An asset table (`.cmpa`, CompactAsset::to_bytes), its id checked. */
+export function parseCompactAsset(bytes: Uint8Array): CompactAssetTables {
+  const w = wordsOf(bytes);
+  if (w[0] !== ASSET_MAGIC || w[1] !== 1) {
+    throw new Error("compact asset table: not CMPA v1");
+  }
+  const total = w[2];
+  if (w.length < total) throw new Error("compact asset table: too short");
+  const zeroed = new Uint8Array(bytes.subarray(0, 4 * total));
+  zeroed.fill(0, 44, 52);
+  const id = BigInt(w[11]) | (BigInt(w[12]) << 32n);
+  if (fnv1a64(zeroed) !== id) {
+    throw new Error("compact asset table: its id does not match its bytes");
+  }
+  return {
+    clusters: w[4],
+    basis: w.slice(w[7], w[7] + w[8]),
+    codebook: w.slice(w[9], w[9] + 8 * w[5]),
+    materials: w.slice(w[10], w[10] + 4 * w[6]),
+    id,
+    bytes: 4 * total,
+  };
+}
+
+/**
+ * A piece's tables as the pool uses them: the asset's arrays (the same
+ * objects, so the pool keeps them once) where the piece leaves them to it.
+ */
+export function resolveCompactTables(
+  t: CompactPieceTables,
+  asset?: CompactAssetTables,
+): CompactPieceTables {
+  if (!t.assetFlags) return t;
+  if (!asset) {
+    throw new Error(
+      `compact tables: the piece needs asset table ${t.assetName}`,
+    );
+  }
+  if (asset.id !== t.assetId) {
+    throw new Error(
+      `compact tables: asset table ${asset.id.toString(16)}, the piece wants ${t.assetId.toString(16)}`,
+    );
+  }
+  return {
+    ...t,
+    basis: t.assetFlags & TABLE_ASSET_BASIS ? asset.basis : t.basis,
+    codebook: t.assetFlags & TABLE_ASSET_CODEBOOK ? asset.codebook : t.codebook,
+    materials:
+      t.assetFlags & TABLE_ASSET_MATERIALS ? asset.materials : t.materials,
+    assetFlags: 0,
+  };
+}
+
+/**
+ * The traversal's input of a page (rust athc_compact traversal_input): its
+ * position planes then the traversal's planes, 22 bytes a node.
+ */
+export function compactTraversalInput(raw: Uint8Array, n: number) {
+  const out = new Uint8Array((6 + COMPACT_TRAVERSAL_NODE_BYTES) * n);
+  out.set(raw.subarray(0, 6 * n), 0);
+  const at = COMPACT_GPU_NODE_BYTES * n;
+  out.set(raw.subarray(at, at + COMPACT_TRAVERSAL_NODE_BYTES * n), 6 * n);
+  return out;
+}
+
+/** The pages a page's nodes have children in (other than itself). */
+export function compactChildPages(raw: Uint8Array, n: number, page: number) {
+  const pages = new Set<number>();
+  const pageAt = compactPlaneOffset(P_CHILD_PAGE, n);
+  const kidsAt = compactPlaneOffset(P_KIDS, n);
+  for (let i = 0; i < n; i++) {
+    // The count: bits 12-23 of the children word (bytes 1 and 2).
+    const count = (raw[kidsAt + n + i] >> 4) | (raw[kidsAt + 2 * n + i] << 4);
+    if (count === 0) continue;
+    const c = (page + (raw[pageAt + i] | (raw[pageAt + n + i] << 8))) & 0xffff;
+    if (c !== page) pages.add(c);
+  }
+  return [...pages];
 }
 
 /** Where each GPU plane sits in a slot of `slotNodes` (words), and its size. */
@@ -202,6 +283,11 @@ export class CompactPagePool {
     if (!pieces.length) throw new Error("CompactPagePool: no piece");
     const first = pieces[0];
     for (const p of pieces) {
+      if (p.assetFlags) {
+        throw new Error(
+          "CompactPagePool: resolve the pieces' asset tables first",
+        );
+      }
       if (
         p.clusters !== first.clusters ||
         p.normalBits !== first.normalBits ||
@@ -213,12 +299,17 @@ export class CompactPagePool {
         throw new Error("CompactPagePool: the pieces' bases or codes differ");
       }
     }
-    // Tables: the basis once, then each piece's codebook and materials.
+    // Tables: the basis once, then each piece's codebook and materials --
+    // once each when the pieces share their asset's (the same arrays).
     const tables: number[] = [];
+    const placed = new Map<Uint32Array, number>();
     const push = (w: Uint32Array) => {
+      const known = placed.get(w);
+      if (known !== undefined) return known;
       const at = Math.ceil(tables.length / 16) * 16;
       while (tables.length < at) tables.push(0);
       for (const v of w) tables.push(v);
+      placed.set(w, at);
       return at;
     };
     const basis = push(first.basis);
@@ -249,8 +340,14 @@ export class CompactPagePool {
       count: slots * slotNodes,
       chunks: slots,
       pieces: pieces.length,
-      materials: pieces.reduce((n, p) => n + p.materials.length / 4, 0),
-      codebookEntries: pieces.reduce((n, p) => n + p.codebook.length / 8, 0),
+      materials: [...new Set(pieces.map((p) => p.materials))].reduce(
+        (n, m) => n + m.length / 4,
+        0,
+      ),
+      codebookEntries: [...new Set(pieces.map((p) => p.codebook))].reduce(
+        (n, c) => n + c.length / 8,
+        0,
+      ),
       clusters: first.clusters,
       linear: first.linear,
       curvature: pieces.every((p) => p.curvature),
@@ -277,7 +374,7 @@ export class CompactPagePool {
   /**
    * Page `raw` (its CMPC section, n nodes) of piece `piece` into `slot`:
    * the head (its box, its piece's tables) and the GPU planes. Returns the
-   * traversal's words (LoD tree, 4 a node; LODE, 2 a node).
+   * traversal's input (compactTraversalInput: 22 bytes a node) and its box.
    */
   writePage(
     slot: number,
@@ -314,18 +411,11 @@ export class CompactPagePool {
       (this.slotsBase + slot * this.slotWords) * 4,
       out,
     );
-    const words32 = (k: number, per: number) => {
-      const from = compactPlaneOffset(k, n);
-      return new Uint32Array(
-        raw.buffer.slice(
-          raw.byteOffset + from,
-          raw.byteOffset + from + 4 * per * n,
-        ),
-      );
-    };
     return {
-      lodTree: words32(P_LOD_TREE, 4),
-      lodError: words32(P_LOD_ERROR, 2),
+      input: compactTraversalInput(raw, n),
+      box: new Float32Array(
+        Uint32Array.from({ length: 6 }, (_, k) => head[k] >>> 0).buffer,
+      ),
     };
   }
 
@@ -340,6 +430,7 @@ export type LodCall = (
     | "newLodTree"
     | "newSharedLodTree"
     | "updateLodTrees"
+    | "updateCompactLodTrees"
     | "traverseLodTrees",
   args: Record<string, unknown>,
 ) => Promise<unknown>;
@@ -352,8 +443,6 @@ export interface CompactPiece {
   prefix: Uint8Array;
   /** Bytes [offset, offset + bytes) of the file. */
   read: (offset: number, bytes: number) => Promise<Uint8Array>;
-  /** The asset's table, when the piece's basis is the asset's. */
-  asset?: CompactAssetTables | null;
 }
 
 export interface CompactBandOptions {
@@ -375,6 +464,11 @@ export interface CompactBandOptions {
   nodeOrder?: boolean;
   /** gunzip a stored section (DecompressionStream, or node's zlib). */
   gunzip: (bytes: Uint8Array) => Promise<Uint8Array>;
+  /**
+   * The asset table the pieces share (`openCompactAsset`, a `.cmpa`), for
+   * pieces written with one (thread CQ): its basis held once.
+   */
+  asset?: CompactAssetTables;
   /** The WASM traversal. */
   lod: LodCall;
 }
@@ -397,15 +491,16 @@ interface PieceState {
   inFlight: Set<number>;
 }
 
-/** The compact tables of a piece, from its prefix. */
-export function compactTablesOf(piece: CompactPiece): CompactPieceTables {
+/** The compact tables of a piece, from its prefix (the asset's where it shares them). */
+export function compactTablesOf(
+  piece: CompactPiece,
+  asset?: CompactAssetTables,
+): CompactPieceTables {
   const t = (piece.layout as unknown as { compactTable?: number[] })
     .compactTable;
   if (!t?.[0]) throw new Error(`${piece.name}: no compact tier`);
-  return parseCompactTables(
-    piece.prefix.subarray(t[0], t[0] + t[1]),
-    piece.asset,
-  );
+  const own = parseCompactTables(piece.prefix.subarray(t[0], t[0] + t[1]));
+  return resolveCompactTables(own, asset);
 }
 
 /** Streams the pieces' band pages' tier 4 into a CompactPagePool. */
@@ -449,7 +544,7 @@ export class CompactBandStreamer {
   ) {
     this.slotNodes = options.slotNodes ?? 3072;
     this.tau = options.tau ?? 1;
-    const tables = pieces.map(compactTablesOf);
+    const tables = pieces.map((p) => compactTablesOf(p, options.asset));
     this.pool = new CompactPagePool(
       device,
       tables,
@@ -488,6 +583,7 @@ export class CompactBandStreamer {
     const { lodId } = (await this.options.lod("newLodTree", {
       capacity: this.options.slots * this.slotNodes,
       slot: this.slotNodes,
+      compact: true,
     })) as { lodId: number };
     this.poolLodId = lodId;
     for (const p of this.pieces) {
@@ -526,7 +622,7 @@ export class CompactBandStreamer {
       const slot = this.takeSlot();
       if (slot === undefined) continue; // no room: dropped, asked again
       const row = piece.rows[page];
-      const { lodTree, lodError } = this.pool.writePage(
+      const { input, box } = this.pool.writePage(
         slot,
         piece.index,
         page,
@@ -536,20 +632,14 @@ export class CompactBandStreamer {
       );
       piece.slotOf.set(page, slot);
       this.slotOwner[slot] = { piece: piece.index, page };
-      const kids = new Set<number>();
-      for (let i = 0; i < row.count; i++) {
-        if ((lodTree[4 * i + 2] & 0xffff) === 0) continue;
-        const c = lodTree[4 * i + 3] >>> 16;
-        if (c !== page) kids.add(c);
-      }
-      piece.kids.set(page, [...kids]);
+      piece.kids.set(page, compactChildPages(raw, row.count, page));
       ranges.push({
         lodId: piece.lodId,
         pageBase: slot * this.slotNodes,
         chunkBase: page * 65536,
         count: row.count,
-        lodTreeData: lodTree,
-        lodErrorData: lodError,
+        input,
+        box,
       });
       this.stats.landed += 1;
     }
@@ -565,7 +655,7 @@ export class CompactBandStreamer {
     }
     for (const r of this.evictedRanges) ranges.unshift(r);
     this.evictedRanges = [];
-    if (ranges.length) await lod("updateLodTrees", { ranges });
+    if (ranges.length) await lod("updateCompactLodTrees", { ranges });
 
     // 2. The cut over the resident pages.
     camera.updateMatrixWorld();
@@ -695,7 +785,7 @@ export class CompactBandStreamer {
         pageBase: slot * this.slotNodes,
         chunkBase: page * 65536,
         count: key.rows[page].count,
-        lodTreeData: undefined,
+        input: undefined,
       });
       this.stats.evicted += 1;
       return slot;
@@ -793,8 +883,9 @@ export class CompactBandStreamer {
     return {
       gpuTables: this.pool.tableWords * 4,
       gpuSlots: this.options.slots * this.pool.slotWords * 4,
-      /** spark-rs LodSplat: 24 bytes a pool node. */
-      cpuTraversal: 24 * this.options.slots * this.slotNodes,
+      /** spark-rs CompactLodNode: 14 bytes a pool node. */
+      cpuTraversal:
+        COMPACT_LOD_NODE_BYTES * this.options.slots * this.slotNodes,
     };
   }
 
@@ -817,17 +908,27 @@ export class CompactBandStreamer {
 export async function openCompactPiece(
   url: string,
   name = url,
-  asset: CompactAssetTables | null = null,
 ): Promise<CompactPiece> {
   const { layout, prefix } = await readAthcLayout({ url });
   return {
     name,
     layout: layout as AthcV3Layout,
     prefix,
-    asset,
     read: async (offset, bytes) =>
       (await readRange({ url }, offset, bytes)).data,
   };
+}
+
+/**
+ * An asset table (`.cmpa`) the pieces share: by its URL, or a piece's
+ * (`assetName` beside it).
+ */
+export async function openCompactAsset(
+  url: string,
+): Promise<CompactAssetTables> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url}: ${response.status}`);
+  return parseCompactAsset(new Uint8Array(await response.arrayBuffer()));
 }
 
 /** gunzip with the browser's DecompressionStream. */

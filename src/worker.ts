@@ -14,6 +14,7 @@ import init_wasm, {
   type ChunkDecoder,
   tiny_lod_packedsplats,
   bhatt_lod_packedsplats,
+  update_compact_lod_trees,
   update_lod_trees,
   decode_to_extsplats,
   tiny_lod_extsplats,
@@ -46,6 +47,7 @@ const rpcHandlers = {
   disposeLodTree,
   setLodOcclusionCodebook,
   updateLodTrees,
+  updateCompactLodTrees,
   traverseLodTrees,
   getLodTreeLevel,
   nextChunk,
@@ -693,12 +695,17 @@ async function qualityLodExtSplats({
 function newLodTree({
   capacity,
   slot,
+  compact,
 }: {
   capacity: number;
   /** Splats a pool page holds (default 65 536; athenea's band pages fewer). */
   slot?: number;
+  /** A compact tree (14-byte nodes, updateCompactLodTrees; thread CQ). */
+  compact?: boolean;
 }) {
-  const { lodId } = new_lod_tree(capacity, slot) as { lodId: number };
+  const { lodId } = new_lod_tree(capacity, slot, compact) as {
+    lodId: number;
+  };
   return { lodId };
 }
 
@@ -786,6 +793,37 @@ function updateLodTrees({
     lodTreeData,
     lodErrorData,
     lodOcclusionData,
+  );
+}
+
+/**
+ * Pages of a compact tree (thread CQ): each its traversal input (position
+ * planes then the traversal's, 22 bytes a node; undefined evicts the page)
+ * and its box.
+ */
+function updateCompactLodTrees({
+  ranges,
+}: {
+  ranges: {
+    lodId: number;
+    pageBase: number;
+    chunkBase: number;
+    count: number;
+    input?: Uint8Array;
+    box?: ArrayLike<number>;
+  }[];
+}) {
+  const boxes = new Float32Array(6 * ranges.length);
+  ranges.forEach((r, k) => {
+    if (r.box) boxes.set(Array.from(r.box).slice(0, 6), 6 * k);
+  });
+  update_compact_lod_trees(
+    new Uint32Array(ranges.map((r) => r.lodId)),
+    new Uint32Array(ranges.map((r) => r.pageBase)),
+    new Uint32Array(ranges.map((r) => r.chunkBase)),
+    new Uint32Array(ranges.map((r) => r.count)),
+    ranges.map((r) => r.input) as unknown as never,
+    boxes,
   );
 }
 

@@ -601,12 +601,12 @@ is absent is drawn as a leaf (spark-rs `lod_tree.rs`, the tree's `slot`).
 #### The compact tier (`CMPC`, tier 4)
 
 `usd-athc --tree tree.usdc out.athc --pages --compact-basis basis.json`
-(thread CN, `athc_compact.rs`) adds a FOURTH tier for the compact relit path
-(`src/webgpu/athenea/compact.ts`, research/iphone-compact.md): what a phone
-draws of a relit page, without a byte of tiers 1 to 3.
+(thread CN, `athc_compact.rs`; v2 thread CQ) adds a FOURTH tier for the
+compact relit path (`src/webgpu/athenea/compact.ts`, research/iphone-compact.md):
+what a phone draws of a relit page, without a byte of tiers 1 to 3.
 
 - **`CMPC`**, the last section, tier 4, laid out after tier 3 (a run of
-  consecutive pages is one Range), 64 bytes a node (16 words, encoding 0) as
+  consecutive pages is one Range), 56 bytes a node (14 words, encoding 0) as
   byte planes, plane k at `n x (widths before k)`:
 
 ```text
@@ -615,53 +615,113 @@ opacity         u8 code (sqrt to 1, then LoD opacity 1..2 by 1/63)
 scale           u8 x3 ln in the page's range (0 = exactly 0)
 rotation        u32 the ext quaternion word  normal  3 bytes, octahedral 12+12
 curvature       s8 x3 signed log in the page's range
-material        u16 into the piece's table   cluster u8 (joint CPCA)
+material        u16 into the piece's (or the asset's) table   cluster u8 (joint CPCA)
 weights         3 x u32: 8 int4 a block (direct, indirect, reflected)
-shadow          u16 into the piece's dictionary            -- the GPU's 40 bytes
-lodTree         4 words, as the decoder gives the node (children page << 16 | place)
-lodError        the 2 LODE words                            -- the traversal's 24
+shadow          u16 into the piece's (or the asset's) dictionary  -- the GPU's 40
+-- the traversal's 16, one byte a plane:
+centre          i16 x3 (lo, hi planes): the f16 centre the decoder rounds the
+                node's position to, as a step in f16 order from
+                f16(the compact position) (-0 just below +0); 0 for a leaf
+child page      u16 (lo, hi): the children's page minus the node's own
+children        u32 (4 planes): place (bits 0-11) | count (12-23, 0 a leaf)
+                | flags (bit 24: a merge without LODE, eps holds its LoD size)
+eps, rho        f16 each (lo, hi planes): LODE's bounds; 0 for a leaf
 ```
 
+  The traversal reads exactly what the error cut reads (spark-rs
+  `lod_tree.rs`): a merge's centre, eps and rho and its children; of a leaf
+  only that it is one (its pixel scale decides nothing: a leaf in the
+  frontier is drawn whether it pops or not, as the pool never binds the
+  cut's count). The centre is exact (bit for bit the f16 of v1's LoD tree
+  words) because the correction is taken against the same f32 decode of the
+  compact position on both sides (`athc_compact::compact_position`, shared by
+  the writer and the WASM). Not kept: LODE's back-face cone (theta, axis;
+  athenea's trees hold none, theta infinite: a compact traversal does not
+  cull back faces), a LODE merge's size (so `lodErrorSizeK` has no size to
+  guard with), the occlusion index. v1 (thread CN) kept the LoD tree's 4
+  words and LODE's 2 (24 bytes, 64 a node): the same cut, node for node
+  (`test/unit/compactWords.test.ts`).
 - **the page's head** in its page-table row: rows are 32 words, word 16 the
   bytes of its `CMPC`, words 17-28 the head (box lo, hi; ln scale lo, hi;
   the curvature's range; three words a reader fills: the slot's codebook
   and materials offsets);
-- **the piece's tables**, global to its pages, after the page table (offset
-  u64 and bytes at header byte 192, the header 208 bytes): `CMPT` v1, the
-  shadow dictionary (k-means in Hamming space over every node, 1024 entries,
-  12 rounds; kept exactly when there are no more distinct masks), the
-  materials (every distinct pbr + lobes, 4 words each), the joint CPCA basis
-  in f16 (504 words a cluster). The basis is the one `--compact-basis`
-  names; athenea's q97 basis is local only, so a file made with it is never
-  published.
-- **the asset's basis, once** (thread CR; provisional until thread CQ's
-  asset table lands): `usd-athc ... --compact-asset asset.cmpa` writes the
-  basis into a sidecar shared by the asset's pieces and leaves the piece's
-  `CMPT` with flag 4 (`TABLE_ASSET_BASIS`) and, where the basis would be,
-  two words: the asset table's id. The sidecar is CQ's `CMPA` v1 layout
-  with the basis alone: 16 words (magic `CMPA`, version 1, words, flags 1,
-  clusters, 0, 0, basis at 16, basis words, end, end, id lo, id hi, 0 0 0)
-  then the f16 table; the id is FNV-1a 64 of the blob with its id words 0.
-  A reader loads the sidecar first (`loadCompactAsset`) and passes it to
-  `openCompactPiece`; a piece naming another id is refused. A set's
-  `corvette.json` names it as `compactAsset`.
-- **our own basis**: `fit-compact-basis <piece.athc>... --out basis`
-  (`athc_basis_fit.rs`) fits a joint CPCA in athenea's layout (C 256, K 8,
-  int4 weights) to the full transfer of the pieces' nodes: per-block energy
-  norms, k-means of the joint vectors (k-means++ seeds, Lloyd over every
-  node), per-cluster PCA of each block, and the scale per direction with
-  the least error through the int4 code and the GPU's int8 grid.
-  `--compare other.json` prints the same per-piece, per-block relMSE for
-  another basis.
+- **the piece's tables** after the page table (offset u64 and bytes at
+  header byte 192, the version at 204, the header 208 bytes): `CMPT` v2, 24
+  fixed words then the plane widths:
 
-A compact reader (`CompactBandStreamer`, `src/webgpu/athenea/compactPages.ts`)
-reads the tables with the page table, then only `CMPC` runs: each page goes
-into a pool slot of `slotNodes` (3072) nodes, its head then its planes, the
-GPU's 40 bytes a node; the LoD tree and LODE words go to the WASM traversal
-(one shared pool tree, a slot a page, as `WgpuBandPager`). The page plan,
-the eviction order and tau's fit are `WgpuBandPager`'s (`planBand`). The
-traversal's cut, slot indices, is the compact path's draw list
-(`CompactRelitPath.setPagedCloud` + `setDrawList`); compact.slang reads a
+```text
+0 "CMPT"  1 version 2  2 node bytes (56)  3 planes (31)  4 head words (12)
+5 dictionary entries  6 materials  7 clusters  8 normal bits  9 weight bits
+10 flags: 1 linear, 2 curvature, 4 the basis in the asset table,
+   8 the dictionary in it, 16 the materials in it
+11 dictionary at  12 materials at  13 basis at  14 basis words  15 words
+16 17 the asset table's id (u64)  18 its name at  19 its name's bytes (<= 64)
+```
+
+  the shadow dictionary (k-means in Hamming space over every node, 1024
+  entries, 12 rounds; kept exactly when there are no more distinct masks),
+  the materials (every distinct pbr + lobes, 4 words each), the joint CPCA
+  basis in f16 (504 words a cluster) -- each absent (0 entries) where the
+  flags give it to the asset table.
+
+#### An asset's pieces (`.cmpa`)
+
+athenea's whole car comes as one tree a part (by cryptoObject); every part
+carries the same CPCA basis, 516 KB in f16, which was 3.1 of the 3.6 MB of
+tables the six t48 pieces read. The **asset table** holds it once: a sidecar
+file beside the pieces (`car.cmpa`), which each piece names (`CMPT` words
+18-19) and identifies (words 16-17, its id); a reader fetches it once and
+the pool keeps one basis (and one dictionary and material table when shared):
+
+```text
+0 "CMPA"  1 version 1  2 words  3 flags (1 basis, 2 dictionary, 4 materials)
+4 clusters  5 dictionary entries  6 materials  7 basis at  8 basis words
+9 dictionary at  10 materials at  11 12 id: FNV-1a 64 of the blob with these two words 0
+13-15 0; the arrays at 16-word boundaries
+```
+
+```sh
+# The pieces one by one, sharing the basis (car.cmpa written by the first,
+# checked by the others):
+usd-athc --tree tree_Hood.usdc Hood.athc --pages --gzip --planes --transfer full \
+    --compact-basis basis.json --compact-asset out/car.cmpa
+# Or afterwards, over pieces written alone (v1 or v2): one table with the
+# basis, ONE shadow dictionary (4096 entries, k-means over every node of every
+# piece) and ONE material table; each piece written again to D (tiers 1-3 byte
+# for byte; its v1 traversal words checked node by node against v2's):
+athc-convert --compact-asset car.cmpa --out-dir D Hood.athc Front_Fender.athc ...
+#   --asset-entries N (0: each piece keeps its dictionary)  --piece-materials
+athc-convert --compact-rebase v1.athc v2.athc     # a v1 file to v2, its own tables
+```
+
+A dictionary and a material table per piece or per asset, measured on the six
+t48 pieces (1.71M nodes; per piece: 6 x 1024 entries, 6406 materials):
+
+| | bytes | mean Hamming distance to the mask (of 256) |
+|---|---|---|
+| dictionaries per piece (6 x 1024) | 196 608 | 1.00 |
+| one per asset, 1024 / 2048 / 4096 / 6144 | 32 768 / 65 536 / 131 072 / 196 608 | 1.73 / 1.37 / 1.07 / 0.91 |
+| materials per piece / per asset | 102 496 / 94 368 | exact |
+
+Per asset is cheaper (4096 entries: two thirds of the bytes for about the
+same distance; 6144: the same bytes, closer), and a piece's own dictionary
+costs 32 KB whatever its size (Door_001: 10k nodes, 3 bytes a node), so the
+whole car's ~100 parts would read ~3 MB of dictionaries. `athc-convert
+--compact-asset` shares both by default; `usd-athc --compact-asset` alone
+(pieces converted one at a time) shares the basis, and the dictionary and
+materials too when the table already holds them (every material of the
+piece must be in it).
+
+A compact reader (`CompactBandStreamer`, `src/webgpu/athenea/compactPages.ts`;
+`openCompactAsset(url)` and the option `asset` for shared tables) reads the
+tables with the page table, then only `CMPC` runs: each page goes into a
+pool slot of `slotNodes` (3072) nodes, its head then its planes, the GPU's 40
+bytes a node; the position and traversal planes (22 bytes a node) go to the
+WASM traversal (`update_compact_lod_trees`, one shared compact pool tree, a
+slot a page, 14 bytes a node where a full tree's `LodSplat` takes 24). The
+page plan, the eviction order and tau's fit are `WgpuBandPager`'s
+(`planBand`). The traversal's cut, slot indices, is the compact path's draw
+list (`CompactRelitPath.setPagedCloud` + `setDrawList`); compact.slang reads a
 slot's planes and head when `slotNodes` > 0.
 
 ### The curvature (`CURV`)

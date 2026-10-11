@@ -17,10 +17,8 @@
 //!    and the GPU's int8 grid (`JointBasis::decode`), leaves the least
 //!    squared error over the members (a fraction of the largest weight).
 //!
-//! The asset table (`AssetBasis`, a sidecar `.cmpa`): the basis ONCE per
-//! asset, in thread CQ's CMPA v1 layout (16 fixed words then the f16 table),
-//! named by an FNV-1a 64 id; a piece's CMPT then has flag `TABLE_ASSET_BASIS`
-//! and, in place of the basis, the two words of that id.
+//! The basis then goes once per asset into thread CQ's asset table
+//! (`usd-athc --compact-basis ours.json --compact-asset car.cmpa`).
 
 use anyhow::{bail, Result};
 
@@ -545,51 +543,6 @@ pub fn basis_json_bin(basis: &JointBasis, meta: serde_json::Value) -> (String, V
     (serde_json::to_string_pretty(&j).unwrap(), bin)
 }
 
-// --- the asset table (thread CQ's CMPA v1, the basis alone) -------------------
-
-pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"CMPA");
-pub const ASSET_VERSION: u32 = 1;
-const ASSET_FIXED_WORDS: usize = 16;
-
-/// FNV-1a, 64 bits.
-pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// An asset's basis, shared by its pieces: the blob (16 fixed words: magic,
-/// version, words, flags (1: basis), clusters, entries 0, materials 0, basis
-/// at, basis words, codebook at, materials at, id lo, id hi, 0 0 0; then the
-/// f16 table at 16) and its id (FNV-1a 64 of the blob with the id words 0).
-pub fn asset_basis_bytes(table_f16: &[u32], clusters: u32) -> (Vec<u8>, u64) {
-    let basis_at = ASSET_FIXED_WORDS;
-    let end = (basis_at + table_f16.len()).div_ceil(16) * 16;
-    let mut w = vec![0u32; end];
-    w[..11].copy_from_slice(&[
-        ASSET_MAGIC,
-        ASSET_VERSION,
-        end as u32,
-        1,
-        clusters,
-        0,
-        0,
-        basis_at as u32,
-        table_f16.len() as u32,
-        end as u32,
-        end as u32,
-    ]);
-    w[basis_at..basis_at + table_f16.len()].copy_from_slice(table_f16);
-    let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let id = fnv1a64(&bytes);
-    w[11] = id as u32;
-    w[12] = (id >> 32) as u32;
-    (w.iter().flat_map(|v| v.to_le_bytes()).collect(), id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,10 +571,5 @@ mod tests {
         let (json, bin) = basis_json_bin(&basis, serde_json::json!({ "source": "test" }));
         let back = JointBasis::parse(&json, &bin).unwrap();
         assert_eq!(back.table_f16(), basis.table_f16());
-        let (blob, id) = asset_basis_bytes(&basis.table_f16(), 4);
-        assert_eq!(&blob[..4], b"CMPA");
-        let mut zeroed = blob.clone();
-        zeroed[44..52].fill(0);
-        assert_eq!(fnv1a64(&zeroed), id);
     }
 }

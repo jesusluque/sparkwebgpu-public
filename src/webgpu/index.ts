@@ -129,19 +129,20 @@ export {
   encodeCompact,
 } from "./athenea/compact";
 export {
-  type CompactAssetTables,
   type CompactBandOptions,
   CompactBandStreamer,
   CompactPagePool,
   type CompactPiece,
-  compactSlotLayout,
+  type CompactAssetTables,
   type CompactPieceTables,
   type LodCall,
+  compactSlotLayout,
   gunzipStream,
-  loadCompactAsset,
+  openCompactAsset,
   openCompactPiece,
   parseCompactAsset,
   parseCompactTables,
+  resolveCompactTables,
   workerLodCall,
 } from "./athenea/compactPages";
 export {

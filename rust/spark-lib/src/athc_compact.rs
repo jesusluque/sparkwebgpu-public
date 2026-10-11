@@ -34,19 +34,27 @@ use crate::splat_encode::{
     set_lod_tree_size,
 };
 
-/// Bytes a node in a `CMPC` section.
-pub const NODE_BYTES: usize = 64;
+/// Bytes a node in a `CMPC` section (v2, thread CQ: the GPU's 40, then the
+/// traversal's 16).
+pub const NODE_BYTES: usize = 56;
 /// Bytes a node in each plane, in the order they are stored: position x, y,
 /// z (u16 in the page's box), albedo (3 x u8 sRGB), opacity (the code), ln
 /// scales (3 x u8 in the page's range, 0 = exactly 0), rotation (the ext
 /// quaternion word), normal (octahedral, 12 bits an axis), curvature (3 x
 /// signed log), material (u16), CPCA cluster (u8), the three blocks' 8 int4
 /// weights (a word each), shadow dictionary index (u16) -- the GPU's 40 --
-/// then the LoD tree's 4 words and the 2 LODE words (the traversal's 24).
-pub const PLANE_WIDTHS: [u32; 17] = [2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 16, 8];
+/// then the traversal's 16, one byte a plane (`TraversalNode`): the centre's
+/// correction (3 x i16, low byte then high), the children's page (u16, from
+/// the node's own page), the children word (u32: place, count, flags) and
+/// LODE's eps and rho (f16).
+pub const PLANE_WIDTHS: [u32; 31] =
+    [2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 pub const PLANES: usize = PLANE_WIDTHS.len();
 /// The planes the GPU keeps (the rest are the traversal's).
 pub const GPU_PLANES: usize = 15;
+/// Bytes a node the GPU keeps, and the traversal.
+pub const GPU_NODE_BYTES: usize = 40;
+pub const TRAVERSAL_NODE_BYTES: usize = 16;
 pub const P_POS_X: usize = 0;
 pub const P_ALBEDO: usize = 3;
 pub const P_OPACITY: usize = 4;
@@ -58,8 +66,19 @@ pub const P_MATERIAL: usize = 9;
 pub const P_CLUSTER: usize = 10;
 pub const P_WEIGHTS: usize = 11;
 pub const P_SHADOW: usize = 14;
-pub const P_LOD_TREE: usize = 15;
-pub const P_LOD_ERROR: usize = 16;
+/// The traversal's planes (one byte each): centre correction x lo, x hi, y
+/// lo, y hi, z lo, z hi; the children's page lo, hi; the children word's
+/// four bytes; eps lo, hi; rho lo, hi.
+pub const P_CENTRE: usize = 15;
+pub const P_CHILD_PAGE: usize = 21;
+pub const P_KIDS: usize = 23;
+pub const P_EPS: usize = 27;
+pub const P_RHO: usize = 29;
+/// The children word: place (bits 0-11) | count (12-23) | flags (24-31).
+pub const KIDS_PLACE_BITS: u32 = 12;
+pub const KIDS_COUNT_BITS: u32 = 12;
+/// A merge without LODE: the eps half is its LoD size (the size cut).
+pub const KIDS_SIZE_MODE: u32 = 1 << 24;
 /// Words of a page head (the page table row's words 17..29): box lo, hi
 /// (f32 x 3 each), ln scale lo, hi, the curvature's range (log2(1 +
 /// max / floor)), then three words a reader fills (compact.slang's chunk
@@ -67,8 +86,23 @@ pub const P_LOD_ERROR: usize = 16;
 pub const HEAD_WORDS: usize = 12;
 /// The blob of the tables (`CompactTables::to_bytes`).
 pub const TABLE_MAGIC: u32 = u32::from_le_bytes(*b"CMPT");
-pub const TABLE_VERSION: u32 = 1;
-const TABLE_FIXED_WORDS: usize = 16;
+/// v2 (thread CQ): the traversal's 16 bytes, and tables that may live in an
+/// asset table (`CompactAsset`) the asset's pieces share.
+pub const TABLE_VERSION: u32 = 2;
+const TABLE_FIXED_WORDS: usize = 24;
+/// The piece's tables flags.
+pub const TABLE_LINEAR: u32 = 1;
+pub const TABLE_CURVATURE: u32 = 2;
+/// The basis, the shadow dictionary, the materials: in the asset table.
+pub const TABLE_ASSET_BASIS: u32 = 4;
+pub const TABLE_ASSET_CODEBOOK: u32 = 8;
+pub const TABLE_ASSET_MATERIALS: u32 = 16;
+/// The asset table (`CompactAsset::to_bytes`, a sidecar `.cmpa`).
+pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"CMPA");
+pub const ASSET_VERSION: u32 = 1;
+const ASSET_FIXED_WORDS: usize = 16;
+/// Bytes of the asset's name a piece keeps (UTF-8, zero padded).
+pub const ASSET_NAME_BYTES: usize = 64;
 /// athenea's joint CPCA (inbox/q97): the transfer's three blocks.
 pub const JOINT_BLOCKS: [usize; 3] = [16, 48, 48];
 pub const JOINT_K: usize = 8;
@@ -307,14 +341,117 @@ pub fn decode_opacity(code: u8) -> f32 {
 
 // --- the tables -----------------------------------------------------------
 
+/// FNV-1a, 64 bits: an asset table's id.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn words_of(b: &[u8]) -> impl Fn(usize) -> Result<u32> + '_ {
+    move |k: usize| -> Result<u32> {
+        Ok(u32::from_le_bytes(b.get(4 * k..4 * k + 4).ok_or_else(|| anyhow!("compact tables too short"))?.try_into().unwrap()))
+    }
+}
+
+/// An asset's compact tables, shared by its pieces (thread CQ): athenea's
+/// joint CPCA basis once, and -- when its pieces were put together by
+/// `athc-convert --compact-asset` -- one shadow dictionary and one material
+/// table. A sidecar file (`<asset>.cmpa`); a piece names it and holds its id.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CompactAsset {
+    /// The basis in f16 (`JointBasis::table_f16`), empty if the pieces hold
+    /// their own.
+    pub basis: Vec<u32>,
+    pub clusters: u32,
+    /// The shadow dictionary (8 words an entry), empty: per piece.
+    pub codebook: Vec<u32>,
+    /// The materials (4 words an entry), empty: per piece.
+    pub materials: Vec<u32>,
+}
+
+impl CompactAsset {
+    pub fn flags(&self) -> u32 {
+        (!self.basis.is_empty() as u32) | (!self.codebook.is_empty() as u32) << 1 | (!self.materials.is_empty() as u32) << 2
+    }
+
+    /// The blob: 16 fixed words (magic, version, words, flags, clusters,
+    /// entries, materials, basis at, basis words, codebook at, materials at,
+    /// id lo, id hi, 0 0 0), then the arrays at 16-word boundaries. The id
+    /// is FNV-1a 64 of the blob with its two words 0.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let basis_at = ASSET_FIXED_WORDS;
+        let codebook_at = (basis_at + self.basis.len()).div_ceil(16) * 16;
+        let materials_at = (codebook_at + self.codebook.len()).div_ceil(16) * 16;
+        let total = (materials_at + self.materials.len()).div_ceil(16) * 16;
+        let mut w = vec![0u32; total];
+        w[..13].copy_from_slice(&[
+            ASSET_MAGIC,
+            ASSET_VERSION,
+            total as u32,
+            self.flags(),
+            self.clusters,
+            (self.codebook.len() / 8) as u32,
+            (self.materials.len() / 4) as u32,
+            basis_at as u32,
+            self.basis.len() as u32,
+            codebook_at as u32,
+            materials_at as u32,
+            0,
+            0,
+        ]);
+        w[basis_at..basis_at + self.basis.len()].copy_from_slice(&self.basis);
+        w[codebook_at..codebook_at + self.codebook.len()].copy_from_slice(&self.codebook);
+        w[materials_at..materials_at + self.materials.len()].copy_from_slice(&self.materials);
+        let mut bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let id = fnv1a64(&bytes);
+        bytes[44..48].copy_from_slice(&(id as u32).to_le_bytes());
+        bytes[48..52].copy_from_slice(&((id >> 32) as u32).to_le_bytes());
+        bytes
+    }
+
+    /// The asset's id (as its blob holds it).
+    pub fn id(&self) -> u64 {
+        let b = self.to_bytes();
+        u32::from_le_bytes(b[44..48].try_into().unwrap()) as u64 | (u32::from_le_bytes(b[48..52].try_into().unwrap()) as u64) << 32
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        let w = words_of(b);
+        if w(0)? != ASSET_MAGIC || w(1)? != ASSET_VERSION {
+            bail!("not a compact asset table (CMPA v{ASSET_VERSION})");
+        }
+        let total = w(2)? as usize;
+        if b.len() < 4 * total {
+            bail!("compact asset table: {} bytes of {}", b.len(), 4 * total);
+        }
+        let mut zeroed = b[..4 * total].to_vec();
+        zeroed[44..52].fill(0);
+        let id = w(11)? as u64 | (w(12)? as u64) << 32;
+        if fnv1a64(&zeroed) != id {
+            bail!("compact asset table: its id does not match its bytes");
+        }
+        let words = |at: u32, n: usize| -> Result<Vec<u32>> { (0..n).map(|k| w(at as usize + k)).collect() };
+        Ok(Self {
+            clusters: w(4)?,
+            basis: words(w(7)?, w(8)? as usize)?,
+            codebook: words(w(9)?, 8 * w(5)? as usize)?,
+            materials: words(w(10)?, 4 * w(6)? as usize)?,
+        })
+    }
+}
+
 /// A piece's tables, global to its pages (the blob among the file's tables).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompactTables {
-    /// The shadow dictionary: 8 words an entry.
+    /// The shadow dictionary: 8 words an entry (empty: the asset's).
     pub codebook: Vec<u32>,
-    /// The materials: pbr then 3 lobes words, 4 words an entry.
+    /// The materials: pbr then 3 lobes words, 4 words an entry (empty: the asset's).
     pub materials: Vec<u32>,
-    /// athenea's basis, f16 (`JointBasis::table_f16`).
+    /// athenea's basis, f16 (`JointBasis::table_f16`; empty: the asset's).
     pub basis: Vec<u32>,
     pub clusters: u32,
     pub normal_bits: u32,
@@ -322,27 +459,62 @@ pub struct CompactTables {
     /// The albedo is linear light (else sRGB; this writer stores sRGB).
     pub linear: bool,
     pub curvature: bool,
-    /// The basis is the asset's (a sidecar `.cmpa`, athc_basis_fit, thread
-    /// CR): `basis` then holds the asset table's id (2 words) instead.
-    pub asset_basis: bool,
+    /// What the asset table holds (`TABLE_ASSET_*`), its id and its name
+    /// (where a reader finds it beside the piece); 0 and "" without.
+    pub asset_flags: u32,
+    pub asset_id: u64,
+    pub asset_name: String,
 }
-
-/// The piece's tables flag: its basis is in the asset table (CQ's value).
-pub const TABLE_ASSET_BASIS: u32 = 4;
 
 impl CompactTables {
     pub fn entries(&self) -> usize {
         self.codebook.len() / 8
     }
 
+    /// The tables as a reader uses them: the asset's arrays in place of the
+    /// ones the piece leaves to it (its id checked).
+    pub fn resolve(&self, asset: Option<&CompactAsset>) -> Result<CompactTables> {
+        let mut t = self.clone();
+        if self.asset_flags == 0 {
+            return Ok(t);
+        }
+        let a = asset.ok_or_else(|| anyhow!("compact tables: the piece's arrays are in asset table {:?}", self.asset_name))?;
+        if a.id() != self.asset_id {
+            bail!("compact tables: asset table {:016x}, the piece wants {:016x}", a.id(), self.asset_id);
+        }
+        if self.asset_flags & TABLE_ASSET_BASIS != 0 {
+            if a.basis.is_empty() || a.clusters != self.clusters {
+                bail!("compact tables: the asset has no basis of {} clusters", self.clusters);
+            }
+            t.basis = a.basis.clone();
+        }
+        if self.asset_flags & TABLE_ASSET_CODEBOOK != 0 {
+            t.codebook = a.codebook.clone();
+        }
+        if self.asset_flags & TABLE_ASSET_MATERIALS != 0 {
+            t.materials = a.materials.clone();
+        }
+        t.asset_flags = 0;
+        Ok(t)
+    }
+
+    /// The blob (v2): 24 fixed words (magic, version, node bytes, planes,
+    /// head words, entries, materials, clusters, normal bits, weight bits,
+    /// flags, codebook at, materials at, basis at, basis words, total, asset
+    /// id lo, hi, asset name at, its bytes, 0 x 4), the plane widths, then
+    /// the asset's name and the arrays at 16-word boundaries.
     pub fn to_bytes(&self) -> Vec<u8> {
         let head = TABLE_FIXED_WORDS + PLANES;
-        let codebook_at = head.div_ceil(16) * 16;
+        let name_at = head.div_ceil(16) * 16;
+        let name = self.asset_name.as_bytes();
+        let name_words = if self.asset_flags == 0 { 0 } else { ASSET_NAME_BYTES / 4 };
+        let codebook_at = (name_at + name_words).div_ceil(16) * 16;
         let materials_at = (codebook_at + self.codebook.len()).div_ceil(16) * 16;
         let basis_at = (materials_at + self.materials.len()).div_ceil(16) * 16;
         let total = (basis_at + self.basis.len()).div_ceil(16) * 16;
         let mut w = vec![0u32; total];
-        w[..TABLE_FIXED_WORDS].copy_from_slice(&[
+        let flags = ((self.linear as u32) * TABLE_LINEAR) | ((self.curvature as u32) * TABLE_CURVATURE) | self.asset_flags;
+        w[..20].copy_from_slice(&[
             TABLE_MAGIC,
             TABLE_VERSION,
             NODE_BYTES as u32,
@@ -353,32 +525,41 @@ impl CompactTables {
             self.clusters,
             self.normal_bits,
             self.weight_bits,
-            (self.linear as u32) | (self.curvature as u32) << 1 | if self.asset_basis { TABLE_ASSET_BASIS } else { 0 },
+            flags,
             codebook_at as u32,
             materials_at as u32,
             basis_at as u32,
             self.basis.len() as u32,
             total as u32,
+            self.asset_id as u32,
+            (self.asset_id >> 32) as u32,
+            name_at as u32,
+            if name_words > 0 { name.len().min(ASSET_NAME_BYTES) as u32 } else { 0 },
         ]);
         w[TABLE_FIXED_WORDS..head].copy_from_slice(&PLANE_WIDTHS);
         w[codebook_at..codebook_at + self.codebook.len()].copy_from_slice(&self.codebook);
         w[materials_at..materials_at + self.materials.len()].copy_from_slice(&self.materials);
         w[basis_at..basis_at + self.basis.len()].copy_from_slice(&self.basis);
-        w.iter().flat_map(|v| v.to_le_bytes()).collect()
+        let mut bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        if name_words > 0 {
+            let n = name.len().min(ASSET_NAME_BYTES);
+            bytes[4 * name_at..4 * name_at + n].copy_from_slice(&name[..n]);
+        }
+        bytes
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        let w = |k: usize| -> Result<u32> {
-            Ok(u32::from_le_bytes(b.get(4 * k..4 * k + 4).ok_or_else(|| anyhow!("compact tables too short"))?.try_into().unwrap()))
-        };
+        let w = words_of(b);
         if w(0)? != TABLE_MAGIC || w(1)? != TABLE_VERSION {
-            bail!("not a compact table (CMPT v{TABLE_VERSION})");
+            bail!("not a compact table (CMPT v{TABLE_VERSION}; v1 files: athc-convert --compact-rebase)");
         }
         if w(2)? as usize != NODE_BYTES || w(3)? as usize != PLANES || w(4)? as usize != HEAD_WORDS {
             bail!("compact tables of another layout");
         }
         let words = |at: u32, n: usize| -> Result<Vec<u32>> { (0..n).map(|k| w(at as usize + k)).collect() };
         let flags = w(10)?;
+        let (name_at, name_len) = (w(18)? as usize, w(19)? as usize);
+        let name = b.get(4 * name_at..4 * name_at + name_len).ok_or_else(|| anyhow!("compact tables: the asset name"))?;
         Ok(Self {
             codebook: words(w(11)?, 8 * w(5)? as usize)?,
             materials: words(w(12)?, 4 * w(6)? as usize)?,
@@ -386,11 +567,153 @@ impl CompactTables {
             clusters: w(7)?,
             normal_bits: w(8)?,
             weight_bits: w(9)?,
-            linear: flags & 1 != 0,
-            curvature: flags & 2 != 0,
-            asset_basis: flags & TABLE_ASSET_BASIS != 0,
+            linear: flags & TABLE_LINEAR != 0,
+            curvature: flags & TABLE_CURVATURE != 0,
+            asset_flags: flags & (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS),
+            asset_id: w(16)? as u64 | (w(17)? as u64) << 32,
+            asset_name: String::from_utf8_lossy(name).into_owned(),
         })
     }
+}
+
+// --- the traversal's words --------------------------------------------------
+
+/// f16 bits in order (-0 just below +0): a correction is a difference of these.
+fn f16_order(x: u16) -> i32 {
+    if x & 0x8000 != 0 { -((x & 0x7fff) as i32) - 1 } else { x as i32 }
+}
+
+fn f16_from_order(v: i32) -> u16 {
+    if v < 0 { 0x8000 | (-(v + 1)) as u16 } else { v as u16 }
+}
+
+/// A compact position decoded (u16 `q` in [lo, hi]), as compact.slang and
+/// the traversal read it.
+#[inline]
+pub fn compact_position(q: u16, lo: f32, hi: f32) -> f32 {
+    lo + q as f32 * ((hi - lo) / 65535.0)
+}
+
+/// What the traversal keeps of a node: exactly what the error cut reads of
+/// the LoD tree words and LODE (spark-rs `lod_tree.rs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TraversalNode {
+    /// The centre, f16 bits as the decoder rounds it (a leaf's: its compact
+    /// position's; the cut never reads it).
+    pub centre: [u16; 3],
+    /// The children's page, their first's place in it, their count (0 a leaf).
+    pub child_page: u32,
+    pub place: u32,
+    pub count: u32,
+    /// LODE's eps and rho (f16 bits); a merge without LODE (`size_mode`):
+    /// eps is its LoD size, rho 0.
+    pub eps: u16,
+    pub rho: u16,
+    pub size_mode: bool,
+}
+
+/// Bytes of plane `first`.. of the traversal's, its planes from `base`.
+fn get_bytes_at(raw: &[u8], base: usize, first: usize, k: usize, n: usize, i: usize) -> u32 {
+    let mut v = 0u32;
+    for b in 0..k {
+        v |= (raw[base + (first + b - P_CENTRE) * n + i] as u32) << (8 * b);
+    }
+    v
+}
+
+/// Bytes a node of the traversal's input (`traversal_input`).
+pub const TRAVERSAL_INPUT_BYTES: usize = 6 + TRAVERSAL_NODE_BYTES;
+
+/// What a reader hands the traversal of a page (spark-rs
+/// `update_compact_lod_trees`): the position planes then the traversal's,
+/// 22 bytes a node.
+pub fn traversal_input(raw: &[u8], n: usize) -> Vec<u8> {
+    let mut v = raw[..6 * n].to_vec();
+    v.extend_from_slice(&raw[plane_offset(P_CENTRE, n)..plane_offset(P_CENTRE, n) + TRAVERSAL_NODE_BYTES * n]);
+    v
+}
+
+fn put_bytes(raw: &mut [u8], first: usize, k: usize, n: usize, i: usize, v: u32) {
+    for b in 0..k {
+        raw[plane_offset(first + b, n) + i] = (v >> (8 * b)) as u8;
+    }
+}
+
+/// The compact position's three u16 of node i.
+pub fn position_codes(raw: &[u8], n: usize, i: usize) -> [u16; 3] {
+    [0, 1, 2].map(|k| {
+        let at = plane_offset(P_POS_X + k, n) + 2 * i;
+        u16::from_le_bytes([raw[at], raw[at + 1]])
+    })
+}
+
+/// Node i of page `page` (its section `raw` of n nodes, its head) as the
+/// traversal reads it.
+pub fn traversal_node(raw: &[u8], n: usize, head: &[u32], page: u32, i: usize) -> TraversalNode {
+    traversal_node_at(raw, plane_offset(P_CENTRE, n), n, head, page, i)
+}
+
+/// `traversal_node` of a page's `traversal_input`.
+pub fn traversal_node_input(input: &[u8], n: usize, head: &[u32], page: u32, i: usize) -> TraversalNode {
+    traversal_node_at(input, 6 * n, n, head, page, i)
+}
+
+fn traversal_node_at(raw: &[u8], base: usize, n: usize, head: &[u32], page: u32, i: usize) -> TraversalNode {
+    let get_bytes = |first: usize, k: usize, n: usize, i: usize| get_bytes_at(raw, base, first, k, n, i);
+    let q = position_codes(raw, n, i);
+    let mut centre = [0u16; 3];
+    for k in 0..3 {
+        let p = compact_position(q[k], f32::from_bits(head[k]), f32::from_bits(head[3 + k]));
+        let d = get_bytes(P_CENTRE + 2 * k, 2, n, i) as u16 as i16 as i32;
+        centre[k] = f16_from_order(f16_order(f16::from_f32(p).to_bits()) + d);
+    }
+    let kids = get_bytes(P_KIDS, 4, n, i);
+    let count = (kids >> KIDS_PLACE_BITS) & ((1 << KIDS_COUNT_BITS) - 1);
+    TraversalNode {
+        centre,
+        child_page: if count > 0 { (page + get_bytes(P_CHILD_PAGE, 2, n, i)) & 0xffff } else { 0 },
+        place: kids & ((1 << KIDS_PLACE_BITS) - 1),
+        count,
+        eps: get_bytes(P_EPS, 2, n, i) as u16,
+        rho: get_bytes(P_RHO, 2, n, i) as u16,
+        size_mode: kids & KIDS_SIZE_MODE != 0,
+    }
+}
+
+/// Writes node i's traversal planes into `raw` (its position planes already
+/// written): from the LoD tree words the decoder gives it
+/// (`lod_tree_words`) and its LODE words. Only what the error cut reads is
+/// kept: a merge's centre, eps and rho (or its size, without LODE), its
+/// children; a leaf only that it is one. LODE's back-face cone (theta, axis)
+/// is not kept (a compact traversal does not cull back faces; athenea's
+/// trees hold none: theta infinite).
+pub fn put_traversal(raw: &mut [u8], n: usize, head: &[u32], page: u32, i: usize, tree: [u32; 4], lode: Option<[u32; 2]>) -> Result<()> {
+    let count = tree[2] & 0xffff;
+    if count == 0 {
+        return Ok(());
+    }
+    let (child_page, place) = (tree[3] >> 16, tree[3] & 0xffff);
+    if place >= 1 << KIDS_PLACE_BITS || count >= 1 << KIDS_COUNT_BITS {
+        bail!("compact traversal: children at place {place}, count {count}: the word holds 12 bits each");
+    }
+    let q = position_codes(raw, n, i);
+    let centre = [tree[0] as u16, (tree[0] >> 16) as u16, tree[1] as u16];
+    for k in 0..3 {
+        let p = compact_position(q[k], f32::from_bits(head[k]), f32::from_bits(head[3 + k]));
+        let d = f16_order(centre[k]) - f16_order(f16::from_f32(p).to_bits());
+        if d < i16::MIN as i32 || d > i16::MAX as i32 {
+            bail!("compact traversal: centre correction {d} past 16 bits");
+        }
+        put_bytes(raw, P_CENTRE + 2 * k, 2, n, i, d as i16 as u16 as u32);
+    }
+    put_bytes(raw, P_CHILD_PAGE, 2, n, i, child_page.wrapping_sub(page) & 0xffff);
+    let e = lode.unwrap_or([0, 0]);
+    let size_mode = e[0] == 0;
+    put_bytes(raw, P_KIDS, 4, n, i, place | count << KIDS_PLACE_BITS | if size_mode { KIDS_SIZE_MODE } else { 0 });
+    let (eps, rho) = if size_mode { (tree[1] >> 16, 0) } else { (e[0] & 0xffff, e[0] >> 16) };
+    put_bytes(raw, P_EPS, 2, n, i, eps);
+    put_bytes(raw, P_RHO, 2, n, i, rho);
+    Ok(())
 }
 
 // --- the pages ------------------------------------------------------------
@@ -406,6 +729,12 @@ pub struct CompactOptions {
     pub normal_bits: u32,
     /// Levels a side of the CPCA weights (7: int4).
     pub levels: i32,
+    /// The asset table the piece shares (thread CQ), and its name (where a
+    /// reader finds it beside the piece). Its basis must be the piece's; its
+    /// shadow dictionary and materials, when it has them, replace the
+    /// piece's (every material of the piece must be in it).
+    pub asset: Option<CompactAsset>,
+    pub asset_name: String,
 }
 
 impl Default for CompactOptions {
@@ -416,6 +745,8 @@ impl Default for CompactOptions {
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             normal_bits: 12,
             levels: 7,
+            asset: None,
+            asset_name: String::new(),
         }
     }
 }
@@ -437,8 +768,12 @@ pub struct CompactStats {
     /// and by block).
     pub transfer_rel_mse: f64,
     pub transfer_rel_mse_blocks: [f64; 3],
-    /// Bytes of the tables blob: codebook, materials, basis.
+    /// Bytes of the tables blob: codebook, materials, basis (0: the asset's).
     pub table_bytes: [usize; 3],
+    /// Nodes whose LODE had a back-face cone (theta finite), not kept.
+    pub back_cones_dropped: usize,
+    /// Merges without LODE (their size kept for the size cut).
+    pub size_mode_merges: usize,
     pub seconds: f32,
 }
 
@@ -498,6 +833,13 @@ pub fn lod_tree_words(block: &AthcBlock, i: usize) -> [u32; 4] {
 /// colours linear light when `linear` (stored as sRGB bytes, as the resident
 /// path does).
 pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &CompactOptions) -> Result<CompactPages> {
+    let asset = o.asset.as_ref();
+    let basis_f16 = basis.table_f16();
+    if let Some(a) = asset {
+        if !a.basis.is_empty() && (a.basis != basis_f16 || a.clusters as usize != basis.clusters) {
+            bail!("compact: the asset table's basis is not this basis");
+        }
+    }
     let t = std::time::Instant::now();
     let total: usize = pages.iter().map(|b| b.n).sum();
     for (p, b) in pages.iter().enumerate() {
@@ -522,7 +864,12 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
     let mut distinct: Vec<Mask> = masks.clone();
     distinct.sort_unstable();
     distinct.dedup();
-    let (codebook, labels): (Vec<Mask>, Vec<u32>) = if distinct.len() <= o.centroids {
+    let asset_codebook: Vec<Mask> = asset.map(|a| a.codebook.chunks_exact(8).map(mask_of).collect()).unwrap_or_default();
+    let (codebook, labels): (Vec<Mask>, Vec<u32>) = if !asset_codebook.is_empty() {
+        let mut labels = vec![0u32; masks.len()];
+        crate::athc_shadow_vq::assign(&masks, &asset_codebook, o.threads, &mut labels);
+        (asset_codebook.clone(), labels)
+    } else if distinct.len() <= o.centroids {
         let labels = masks.iter().map(|m| distinct.binary_search(m).unwrap() as u32).collect();
         (distinct.clone(), labels)
     } else {
@@ -546,6 +893,14 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
     // The materials: every distinct (pbr, lobes).
     let mut material_of: std::collections::HashMap<[u32; 4], u32> = std::collections::HashMap::new();
     let mut materials: Vec<u32> = Vec::new();
+    let asset_materials = asset.is_some_and(|a| !a.materials.is_empty());
+    if let Some(a) = asset.filter(|_| asset_materials) {
+        for (m, key) in a.materials.chunks_exact(4).enumerate() {
+            material_of.entry(key.try_into().unwrap()).or_insert(m as u32);
+        }
+    }
+    let (mut back_cones, mut size_mode) = (0usize, 0usize);
+    let mut used_materials = std::collections::HashSet::new();
 
     let mut out_pages = Vec::with_capacity(pages.len());
     let mut heads = Vec::with_capacity(pages.len());
@@ -558,7 +913,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
         bail!("compact: a {}-bit normal is {} bytes, the plane {}", nb, normal_bytes, PLANE_WIDTHS[P_NORMAL]);
     }
     let mut x = [0f32; 112];
-    for b in pages {
+    for (page, b) in pages.iter().enumerate() {
         let n = b.n;
         let mut raw = vec![0u8; n * NODE_BYTES];
         let at = |k: usize| plane_offset(k, n);
@@ -647,6 +1002,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
             let key = [b.pbr[i], lobes[0], lobes[1], lobes[2]];
             let m = match material_of.get(&key) {
                 Some(&m) => m,
+                None if asset_materials => bail!("compact: a material of the piece is not in the asset table"),
                 None => {
                     let m = (materials.len() / 4) as u32;
                     if m > 0xffff {
@@ -657,6 +1013,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
                     m
                 }
             };
+            used_materials.insert(m);
             raw[at(P_MATERIAL) + 2 * i..at(P_MATERIAL) + 2 * i + 2].copy_from_slice(&(m as u16).to_le_bytes());
             // The transfer: athenea's joint CPCA at `levels`.
             for v in 0..112 {
@@ -685,42 +1042,53 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
             }
             raw[at(P_SHADOW) + 2 * i..at(P_SHADOW) + 2 * i + 2].copy_from_slice(&(labels[node] as u16).to_le_bytes());
             let tree = lod_tree_words(b, i);
-            for (k, w) in tree.iter().enumerate() {
-                raw[at(P_LOD_TREE) + 16 * i + 4 * k..at(P_LOD_TREE) + 16 * i + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
-            }
-            if b.lod_error.len() == 2 * n {
-                for k in 0..2 {
-                    let off = at(P_LOD_ERROR) + 8 * i + 4 * k;
-                    raw[off..off + 4].copy_from_slice(&b.lod_error[2 * i + k].to_le_bytes());
+            let lode = (b.lod_error.len() == 2 * n).then(|| [b.lod_error[2 * i], b.lod_error[2 * i + 1]]);
+            if let Some(e) = lode {
+                if e[0] != 0 && f16::from_bits(e[1] as u16).to_f32().is_finite() {
+                    back_cones += 1;
                 }
             }
+            if tree[2] & 0xffff > 0 && lode.is_none_or(|e| e[0] == 0) {
+                size_mode += 1;
+            }
+            put_traversal(&mut raw, n, &head, page as u32, i, tree, lode)?;
             node += 1;
         }
         out_pages.push(raw);
         heads.push(head);
     }
+    let mut asset_flags = 0;
+    if let Some(a) = asset {
+        asset_flags |= if a.basis.is_empty() { 0 } else { TABLE_ASSET_BASIS };
+        asset_flags |= if asset_codebook.is_empty() { 0 } else { TABLE_ASSET_CODEBOOK };
+        asset_flags |= if asset_materials { TABLE_ASSET_MATERIALS } else { 0 };
+    }
     let tables = CompactTables {
-        codebook: codebook.iter().flat_map(mask_words).collect(),
-        materials,
-        basis: basis.table_f16(),
+        codebook: if asset_flags & TABLE_ASSET_CODEBOOK != 0 { Vec::new() } else { codebook.iter().flat_map(mask_words).collect() },
+        materials: if asset_materials { Vec::new() } else { materials },
+        basis: if asset_flags & TABLE_ASSET_BASIS != 0 { Vec::new() } else { basis_f16 },
         clusters: basis.clusters as u32,
         normal_bits: nb,
         weight_bits: 4,
         linear: false,
         curvature,
-        asset_basis: false,
+        asset_flags,
+        asset_id: if asset_flags != 0 { asset.unwrap().id() } else { 0 },
+        asset_name: if asset_flags != 0 { o.asset_name.clone() } else { String::new() },
     };
     let stats = CompactStats {
         nodes: total,
         pages: pages.len(),
-        materials: tables.materials.len() / 4,
+        materials: used_materials.len(),
         distinct_masks: distinct.len(),
-        codebook_entries: tables.entries(),
+        codebook_entries: codebook.len(),
         hamming,
         clusters_used: used.iter().filter(|&&u| u).count(),
         transfer_rel_mse: err2.iter().sum::<f64>() / ref2.iter().sum::<f64>().max(1e-30),
         transfer_rel_mse_blocks: [0, 1, 2].map(|k| err2[k] / ref2[k].max(1e-30)),
         table_bytes: [4 * tables.codebook.len(), 4 * tables.materials.len(), 4 * tables.basis.len()],
+        back_cones_dropped: back_cones,
+        size_mode_merges: size_mode,
         seconds: t.elapsed().as_secs_f32(),
     };
     Ok(CompactPages { tables, pages: out_pages, heads, stats })
@@ -740,12 +1108,12 @@ pub struct CompactNode {
     pub cluster: u32,
     pub weights: [i32; 24],
     pub cells: [u32; 8],
-    pub lod_tree: [u32; 4],
-    pub lod_error: [u32; 2],
+    pub traversal: TraversalNode,
 }
 
-/// Node i of a page section (`raw`, n nodes, `head`) with its piece's tables.
-pub fn decode_node(raw: &[u8], n: usize, head: &[u32; HEAD_WORDS], tables: &CompactTables, i: usize) -> CompactNode {
+/// Node i of page `page`'s section (`raw`, n nodes, `head`) with its
+/// piece's tables (resolved: `CompactTables::resolve`).
+pub fn decode_node(raw: &[u8], n: usize, head: &[u32; HEAD_WORDS], tables: &CompactTables, page: u32, i: usize) -> CompactNode {
     let field = |k: usize| -> u32 {
         let w = PLANE_WIDTHS[k] as usize;
         let at = plane_offset(k, n) + i * w;
@@ -754,10 +1122,6 @@ pub fn decode_node(raw: &[u8], n: usize, head: &[u32; HEAD_WORDS], tables: &Comp
             v |= (raw[at + b] as u32) << (8 * b);
         }
         v
-    };
-    let word = |k: usize, j: usize| -> u32 {
-        let at = plane_offset(k, n) + i * PLANE_WIDTHS[k] as usize + 4 * j;
-        u32::from_le_bytes(raw[at..at + 4].try_into().unwrap())
     };
     let f = |k: usize| f32::from_bits(head[k]);
     let center = [0, 1, 2].map(|k| f(k) + field(P_POS_X + k) as f32 * ((f(3 + k) - f(k)) / 65535.0));
@@ -795,9 +1159,261 @@ pub fn decode_node(raw: &[u8], n: usize, head: &[u32; HEAD_WORDS], tables: &Comp
         cluster: field(P_CLUSTER),
         weights,
         cells: tables.codebook[e..e + 8].try_into().unwrap(),
-        lod_tree: [0, 1, 2, 3].map(|j| word(P_LOD_TREE, j)),
-        lod_error: [word(P_LOD_ERROR, 0), word(P_LOD_ERROR, 1)],
+        traversal: traversal_node(raw, n, head, page, i),
     }
+}
+
+/// What a node's LoD tree words and LODE give the traversal
+/// (`TraversalNode`): the reference `traversal_node` must equal.
+pub fn traversal_of_words(raw: &[u8], n: usize, head: &[u32], i: usize, tree: [u32; 4], lode: Option<[u32; 2]>) -> TraversalNode {
+    let count = tree[2] & 0xffff;
+    if count == 0 {
+        let q = position_codes(raw, n, i);
+        let centre = [0, 1, 2].map(|k| f16::from_f32(compact_position(q[k], f32::from_bits(head[k]), f32::from_bits(head[3 + k]))).to_bits());
+        return TraversalNode { centre, ..Default::default() };
+    }
+    let e = lode.unwrap_or([0, 0]);
+    let size_mode = e[0] == 0;
+    TraversalNode {
+        centre: [tree[0] as u16, (tree[0] >> 16) as u16, tree[1] as u16],
+        child_page: tree[3] >> 16,
+        place: tree[3] & 0xffff,
+        count,
+        eps: if size_mode { (tree[1] >> 16) as u16 } else { e[0] as u16 },
+        rho: if size_mode { 0 } else { (e[0] >> 16) as u16 },
+        size_mode,
+    }
+}
+
+// --- an asset's pieces ------------------------------------------------------
+
+/// Bytes of a v1 `CMPC` node (thread CN): the GPU's 40, the LoD tree's 4
+/// words, the 2 LODE words.
+pub const V1_NODE_BYTES: usize = 64;
+
+/// A paged tree with its compact tier written again (thread CQ): the
+/// traversal's words in the v2 layout (from a v1 or v2 file), the tables
+/// sharing `asset` when given (its basis must be the piece's; its shadow
+/// dictionary and materials, when it has them, replace the piece's: the
+/// shadow index of each node is its true mask's nearest entry, read from
+/// tier 3). Tiers 1-3 are written again byte for byte (checked).
+pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &str, threads: usize) -> Result<(Vec<u8>, CompactStats)> {
+    use crate::athc_v3::{gunzip, parse_v3, read_v3, write_v3_paged_compact, SectionId, COMPRESSION_GZIP};
+    let t = std::time::Instant::now();
+    let layout = parse_v3(bytes)?;
+    let k4 = layout.sections.len().checked_sub(1).filter(|&k| layout.sections[k].id == SectionId::Compact).ok_or_else(|| anyhow!("rebase: no compact tier"))?;
+    let [at, len] = layout.compact_table;
+    let blob = &bytes[at as usize..(at + len) as usize];
+    let w = words_of(blob);
+    let version = w(1)?;
+    // The piece's own tables (v1: the same fields, no asset).
+    let old = match version {
+        1 => {
+            let words = |at: u32, n: usize| -> Result<Vec<u32>> { (0..n).map(|k| w(at as usize + k)).collect() };
+            if w(2)? as usize != V1_NODE_BYTES {
+                bail!("rebase: a v1 compact tier of {} bytes a node", w(2)?);
+            }
+            CompactTables {
+                codebook: words(w(11)?, 8 * w(5)? as usize)?,
+                materials: words(w(12)?, 4 * w(6)? as usize)?,
+                basis: words(w(13)?, w(14)? as usize)?,
+                clusters: w(7)?,
+                normal_bits: w(8)?,
+                weight_bits: w(9)?,
+                linear: w(10)? & 1 != 0,
+                curvature: w(10)? & 2 != 0,
+                ..Default::default()
+            }
+        }
+        2 => CompactTables::from_bytes(blob)?,
+        v => bail!("rebase: compact tables v{v}"),
+    };
+    if old.asset_flags != 0 {
+        bail!("rebase: the piece already shares asset table {:?}", old.asset_name);
+    }
+    let node_bytes = if version == 1 { V1_NODE_BYTES } else { NODE_BYTES };
+    for s in &layout.sections[..k4] {
+        if s.encoding == crate::athc_v3::ENCODING_CPCA {
+            bail!("rebase: section {:?} in CPCA (write it again with usd-athc)", s.id);
+        }
+    }
+    let compression = layout.sections[k4].compression;
+    if layout.sections.iter().any(|s| s.compression != compression) {
+        bail!("rebase: sections of different compressions");
+    }
+    let file = read_v3(bytes)?;
+    let skeleton = crate::athc_v3::read_v3_skeleton(bytes)?;
+    if let Some(a) = asset {
+        if !a.basis.is_empty() && (a.basis != old.basis || a.clusters != old.clusters) {
+            bail!("rebase: the asset table's basis is not the piece's");
+        }
+    }
+    let codebook: Vec<Mask> = asset.map(|a| a.codebook.chunks_exact(8).map(mask_of).collect()).unwrap_or_default();
+    let mut material_of: std::collections::HashMap<[u32; 4], u32> = std::collections::HashMap::new();
+    if let Some(a) = asset {
+        for (m, key) in a.materials.chunks_exact(4).enumerate() {
+            material_of.entry(key.try_into().unwrap()).or_insert(m as u32);
+        }
+    }
+    let shared_materials = asset.is_some_and(|a| !a.materials.is_empty());
+    let (mut pages, mut heads) = (Vec::new(), Vec::new());
+    let mut stats = CompactStats { pages: layout.blocks.len(), ..Default::default() };
+    let mut used_materials = std::collections::HashSet::new();
+    for (p, b) in layout.blocks.iter().enumerate() {
+        let n = b.n as usize;
+        let span = b.spans[k4];
+        let stored = &bytes[span.offset as usize..][..span.stored as usize];
+        let src = if compression == COMPRESSION_GZIP { gunzip(stored)? } else { stored.to_vec() };
+        if src.len() != n * node_bytes {
+            bail!("rebase: page {p}: {} bytes for {n} nodes", src.len());
+        }
+        let head = layout.pages[p].compact;
+        let mut raw = vec![0u8; n * NODE_BYTES];
+        // The GPU's planes, as they are (the same widths in both versions).
+        raw[..n * GPU_NODE_BYTES].copy_from_slice(&src[..n * GPU_NODE_BYTES]);
+        let block = &file.chunks[p];
+        let mut labels = vec![0u32; n];
+        if !codebook.is_empty() {
+            let masks: Vec<Mask> = block.shadow_bits.chunks_exact(8).map(mask_of).collect();
+            if masks.len() != n {
+                bail!("rebase: page {p} lacks its shadow bits");
+            }
+            crate::athc_shadow_vq::assign(&masks, &codebook, threads, &mut labels);
+        }
+        for i in 0..n {
+            if !codebook.is_empty() {
+                let at = plane_offset(P_SHADOW, n) + 2 * i;
+                raw[at..at + 2].copy_from_slice(&(labels[i] as u16).to_le_bytes());
+            }
+            let at = plane_offset(P_MATERIAL, n) + 2 * i;
+            let m = u16::from_le_bytes([raw[at], raw[at + 1]]) as usize;
+            used_materials.insert(old.materials[4 * m..4 * m + 4].to_vec());
+            if shared_materials {
+                let key: [u32; 4] = old.materials[4 * m..4 * m + 4].try_into().unwrap();
+                let to = *material_of.get(&key).ok_or_else(|| anyhow!("rebase: page {p}: a material not in the asset table"))?;
+                raw[at..at + 2].copy_from_slice(&(to as u16).to_le_bytes());
+            }
+            // The traversal's words: from what the tree holds (tiers 1-3),
+            // as the native writer makes them.
+            let tree = lod_tree_words(block, i);
+            let lode = (block.lod_error.len() == 2 * n).then(|| [block.lod_error[2 * i], block.lod_error[2 * i + 1]]);
+            put_traversal(&mut raw, n, &head, p as u32, i, tree, lode)?;
+            if version == 1 {
+                // A v1 file's own words: the same node for the traversal.
+                let word = |off: usize| u32::from_le_bytes(src[off..off + 4].try_into().unwrap());
+                let base = n * GPU_NODE_BYTES;
+                let t1 = [0, 1, 2, 3].map(|j| word(base + 16 * i + 4 * j));
+                let e1 = [word(base + 16 * n + 8 * i), word(base + 16 * n + 8 * i + 4)];
+                let a = traversal_of_words(&src, n, &head, i, t1, Some(e1));
+                let b2 = traversal_node(&raw, n, &head, p as u32, i);
+                if a != b2 {
+                    bail!("rebase: page {p} node {i}: the v1 words give {a:?}, tiers 1-3 {b2:?}");
+                }
+            }
+        }
+        stats.nodes += n;
+        pages.push(raw);
+        heads.push(head);
+    }
+    let mut flags = 0;
+    if let Some(a) = asset {
+        flags |= if a.basis.is_empty() { 0 } else { TABLE_ASSET_BASIS };
+        flags |= if codebook.is_empty() { 0 } else { TABLE_ASSET_CODEBOOK };
+        flags |= if shared_materials { TABLE_ASSET_MATERIALS } else { 0 };
+    }
+    let tables = CompactTables {
+        codebook: if flags & TABLE_ASSET_CODEBOOK != 0 { Vec::new() } else { old.codebook.clone() },
+        materials: if shared_materials { Vec::new() } else { old.materials.clone() },
+        basis: if flags & TABLE_ASSET_BASIS != 0 { Vec::new() } else { old.basis.clone() },
+        asset_flags: flags,
+        asset_id: if flags != 0 { asset.unwrap().id() } else { 0 },
+        asset_name: if flags != 0 { asset_name.to_string() } else { String::new() },
+        ..old.clone()
+    };
+    stats.materials = used_materials.len();
+    stats.codebook_entries = if codebook.is_empty() { old.entries() } else { codebook.len() };
+    stats.table_bytes = [4 * tables.codebook.len(), 4 * tables.materials.len(), 4 * tables.basis.len()];
+    let compact = CompactPages { tables, pages, heads, stats: stats.clone() };
+    let encodings: Vec<(SectionId, u32)> = layout.sections.iter().map(|s| (s.id, s.encoding)).collect();
+    let encoding = move |id: SectionId| encodings.iter().find(|(s, _)| *s == id).map_or(0, |e| e.1);
+    let (out, _) = write_v3_paged_compact(&file, &layout.pages, compression, &encoding, None, skeleton.as_ref(), &compact)?;
+    // Tiers 1-3: the same stored bytes, page for page.
+    let new = parse_v3(&out)?;
+    if new.sections[..k4] != layout.sections[..k4] {
+        bail!("rebase: the sections changed");
+    }
+    for (p, (a, b)) in layout.blocks.iter().zip(&new.blocks).enumerate() {
+        for k in 0..k4 {
+            let sa = &bytes[a.spans[k].offset as usize..][..a.spans[k].stored as usize];
+            let sb = &out[b.spans[k].offset as usize..][..b.spans[k].stored as usize];
+            if sa != sb {
+                bail!("rebase: page {p} section {:?} written differently", layout.sections[k].id);
+            }
+        }
+    }
+    stats.seconds = t.elapsed().as_secs_f32();
+    Ok((out, stats))
+}
+
+/// An asset table for pieces (paged trees with their compact tier, v1 or
+/// v2, each with its own tables): their one basis, and with `entries` > 0
+/// one shadow dictionary of that many entries (k-means in Hamming space
+/// over every node of every piece, `rounds`) and one material table (every
+/// piece's, in order). The pieces must share their basis.
+pub fn build_asset(pieces: &[&[u8]], entries: usize, rounds: usize, shared_materials: bool, threads: usize) -> Result<CompactAsset> {
+    use crate::athc_v3::parse_v3;
+    let mut asset = CompactAsset::default();
+    let mut masks: Vec<Mask> = Vec::new();
+    let mut seen = std::collections::HashSet::<[u32; 4]>::new();
+    for (k, bytes) in pieces.iter().enumerate() {
+        let layout = parse_v3(bytes)?;
+        let [at, len] = layout.compact_table;
+        if at == 0 {
+            bail!("asset: piece {k} has no compact tier");
+        }
+        let blob = &bytes[at as usize..(at + len) as usize];
+        let w = words_of(blob);
+        // v1 and v2 hold the basis and materials at the same words.
+        let words = |at: u32, n: usize| -> Result<Vec<u32>> { (0..n).map(|k| w(at as usize + k)).collect() };
+        if w(1)? == 2 && w(10)? & (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS) != 0 {
+            bail!("asset: piece {k} shares an asset table already");
+        }
+        let basis = words(w(13)?, w(14)? as usize)?;
+        if k == 0 {
+            asset.basis = basis;
+            asset.clusters = w(7)?;
+        } else if basis != asset.basis || w(7)? != asset.clusters {
+            bail!("asset: piece {k}'s basis is not piece 0's");
+        }
+        if shared_materials {
+            for key in words(w(12)?, 4 * w(6)? as usize)?.chunks_exact(4) {
+                let key: [u32; 4] = key.try_into().unwrap();
+                if seen.insert(key) {
+                    asset.materials.extend_from_slice(&key);
+                }
+            }
+        }
+        if entries > 0 {
+            for b in crate::athc_v3::read_v3(bytes)?.chunks {
+                masks.extend(b.shadow_bits.chunks_exact(8).map(mask_of));
+            }
+        }
+    }
+    if asset.materials.len() / 4 > 0x10000 {
+        bail!("asset: {} materials, the index is 16 bits", asset.materials.len() / 4);
+    }
+    if entries > 0 {
+        if entries > 0x10000 {
+            bail!("asset: {entries} entries, the index is 16 bits");
+        }
+        let mut distinct = masks.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let codebook =
+            if distinct.len() <= entries { distinct } else { crate::athc_shadow_vq::kmeans_hamming(&masks, entries, rounds, threads).0 };
+        asset.codebook = codebook.iter().flat_map(mask_words).collect();
+    }
+    Ok(asset)
 }
 
 #[cfg(test)]
@@ -926,12 +1542,12 @@ pub(crate) mod tests {
             let lo: Vec<f32> = (0..3).map(|k| f32::from_bits(head[k])).collect();
             let hi: Vec<f32> = (0..3).map(|k| f32::from_bits(head[3 + k])).collect();
             for i in 0..block.n {
-                let node = decode_node(&raw, block.n, head, &tables, i);
+                let node = decode_node(&raw, block.n, head, &tables, p as u32, i);
                 for k in 0..3 {
                     assert!((node.center[k] - block.positions[4 * i + k]).abs() <= (hi[k] - lo[k]) / 65535.0 + 1e-6);
                 }
-                assert_eq!(node.lod_tree, lod_tree_words(block, i));
-                assert_eq!(node.lod_error.to_vec(), block.lod_error[2 * i..2 * i + 2].to_vec());
+                let lode = [block.lod_error[2 * i], block.lod_error[2 * i + 1]];
+                assert_eq!(node.traversal, traversal_of_words(&raw, block.n, head, i, lod_tree_words(block, i), Some(lode)));
                 assert_eq!(node.material, [block.pbr[i], block.lobes[3 * i], block.lobes[3 * i + 1], block.lobes[3 * i + 2]]);
                 assert_eq!(node.cells.to_vec(), block.shadow_bits[8 * i..8 * i + 8].to_vec());
                 let mut x = [0f32; 112];
@@ -951,6 +1567,120 @@ pub(crate) mod tests {
                 assert!((node.curvature[0] - k0).abs() <= 0.03 * k0.abs() + 0.01, "{} {}", node.curvature[0], k0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::tests::sample_basis;
+    use super::*;
+    use crate::athc_v3::{parse_v3, write_v3_paged_compact, COMPRESSION_GZIP};
+
+    fn piece(seed_n: usize, page: usize, o: &CompactOptions) -> (Vec<u8>, CompactPages, crate::athc::AthcFile) {
+        let (paged, file) = crate::athc_pages::tests::sample_relit_paged(seed_n, page);
+        let c = build_compact(&file.chunks, false, &sample_basis(6), o).unwrap();
+        let (bytes, _) = write_v3_paged_compact(&file, &paged.rows, COMPRESSION_GZIP, &|_| 1, None, None, &c).unwrap();
+        (bytes, c, file)
+    }
+
+    fn nodes(bytes: &[u8], asset: Option<&CompactAsset>) -> Vec<CompactNode> {
+        let layout = parse_v3(bytes).unwrap();
+        let k4 = layout.sections.len() - 1;
+        let [at, n] = layout.compact_table;
+        let t = CompactTables::from_bytes(&bytes[at as usize..(at + n) as usize]).unwrap().resolve(asset).unwrap();
+        let mut out = Vec::new();
+        for (p, b) in layout.blocks.iter().enumerate() {
+            let span = b.spans[k4];
+            let raw = crate::athc_v3::gunzip(&bytes[span.offset as usize..][..span.stored as usize]).unwrap();
+            for i in 0..b.n as usize {
+                out.push(decode_node(&raw, b.n as usize, &layout.pages[p].compact, &t, p as u32, i));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn traversal_corrections_are_exact() {
+        // Every f16 the centre could be, against positions around it.
+        for bits in [0x0000u16, 0x8000, 0x0001, 0x8001, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x1234, 0x9234] {
+            assert_eq!(f16_from_order(f16_order(bits)), bits);
+        }
+        assert_eq!(f16_order(0x8000) + 1, f16_order(0x0000));
+        let n = 3;
+        let mut raw = vec![0u8; n * NODE_BYTES];
+        let head: Vec<u32> = [-2.0f32, -0.001, 0.0, 3.0, 0.002, 1e-3].iter().map(|v| v.to_bits()).collect();
+        for i in 0..n {
+            for k in 0..3 {
+                let at = plane_offset(P_POS_X + k, n) + 2 * i;
+                raw[at..at + 2].copy_from_slice(&(i as u16 * 21845 + 7).to_le_bytes());
+            }
+        }
+        let centres = [[0x8000u16, 0x0000, 0x0001], [0x3c00, 0x9000, 0x1400], [0xc000, 0x0400, 0x8001]];
+        for i in 0..n {
+            let c = centres[i];
+            let tree = [c[0] as u32 | (c[1] as u32) << 16, c[2] as u32 | 0x2c00 << 16, 2, 5 << 16 | (100 + i as u32)];
+            let lode = if i == 2 { None } else { Some([0x1234 | 0x0567 << 16, 0x7c00]) };
+            put_traversal(&mut raw, n, &head, 3, i, tree, lode).unwrap();
+            let t = traversal_node(&raw, n, &head, 3, i);
+            assert_eq!(t, traversal_of_words(&raw, n, &head, i, tree, lode), "{i}");
+            assert_eq!((t.child_page, t.place, t.count), (5, 100 + i as u32, 2));
+            assert_eq!(t.size_mode, i == 2);
+            assert_eq!(traversal_node_input(&traversal_input(&raw, n), n, &head, 3, i), t);
+        }
+    }
+
+    /// Pieces sharing an asset table: the basis once (the nodes as the
+    /// standalone piece's), then with the asset's dictionary and materials.
+    #[test]
+    fn pieces_share_an_asset_table() {
+        let o = CompactOptions { threads: 2, ..Default::default() };
+        let (alone, c, file) = piece(1500, 400, &o);
+        let asset = CompactAsset { basis: sample_basis(6).table_f16(), clusters: 6, ..Default::default() };
+        let blob = asset.to_bytes();
+        assert_eq!(CompactAsset::from_bytes(&blob).unwrap(), asset);
+        let mut bad = blob.clone();
+        bad[4 * 16] ^= 1;
+        assert!(CompactAsset::from_bytes(&bad).is_err());
+        let shared_o = CompactOptions { asset: Some(asset.clone()), asset_name: "car.cmpa".into(), ..o.clone() };
+        let (shared, sc, _) = piece(1500, 400, &shared_o);
+        assert!(sc.tables.basis.is_empty() && sc.tables.asset_flags == TABLE_ASSET_BASIS);
+        assert_eq!(sc.tables.asset_id, asset.id());
+        assert_eq!(nodes(&shared, Some(&asset)), nodes(&alone, None));
+        assert!(alone.len() - shared.len() >= 4 * c.tables.basis.len() - 64);
+        // Without its asset, or with another, a piece is refused.
+        let layout = parse_v3(&shared).unwrap();
+        let [at, n] = layout.compact_table;
+        let t = CompactTables::from_bytes(&shared[at as usize..(at + n) as usize]).unwrap();
+        assert_eq!(t.asset_name, "car.cmpa");
+        assert!(t.resolve(None).is_err());
+        let other = CompactAsset { clusters: 6, basis: sample_basis(5).table_f16(), ..Default::default() };
+        assert!(t.resolve(Some(&other)).is_err());
+        // The asset's dictionary and materials: every node's cells its
+        // mask's nearest entry, its material the same.
+        let asset2 = build_asset(&[&alone, &alone], 16, 4, true, 2).unwrap();
+        assert_eq!(asset2.codebook.len(), 16 * 8);
+        let (rebased, _) = rebase_compact(&alone, Some(&asset2), "car.cmpa", 2).unwrap();
+        let native = piece(1500, 400, &CompactOptions { asset: Some(asset2.clone()), asset_name: "car.cmpa".into(), ..o.clone() }).0;
+        assert_eq!(rebased, native, "rebase = the native writer");
+        let (a, b) = (nodes(&alone, None), nodes(&rebased, Some(&asset2)));
+        let masks: Vec<Mask> = file.chunks.iter().flat_map(|b| b.shadow_bits.chunks_exact(8).map(mask_of)).collect();
+        let entries: Vec<Mask> = asset2.codebook.chunks_exact(8).map(mask_of).collect();
+        for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!((x.center, x.material, x.cluster, x.weights, x.traversal), (y.center, y.material, y.cluster, y.weights, y.traversal));
+            let d = |e: &Mask| (0..4).map(|j| (masks[k][j] ^ e[j]).count_ones()).sum::<u32>();
+            assert_eq!(d(&mask_of(&y.cells)), entries.iter().map(d).min().unwrap());
+        }
+    }
+
+    /// CN's v1 fixture: rebased to v2, its traversal checked node by node
+    /// against its own v1 words (in rebase_compact), tiers 1-3 unchanged.
+    #[test]
+    fn a_v1_file_rebases() {
+        let v1 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/compact_pages.v1.athc")).unwrap();
+        let (v2, stats) = rebase_compact(&v1, None, "", 2).unwrap();
+        assert_eq!(stats.nodes, parse_v3(&v1).unwrap().header.count as usize);
+        let fixture = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/fixtures/athc/compact_pages.athc")).unwrap();
+        assert_eq!(v2, fixture, "the v2 fixture is the v1 one rebased");
     }
 }
 

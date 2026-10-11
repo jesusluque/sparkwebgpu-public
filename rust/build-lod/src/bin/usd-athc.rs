@@ -1617,20 +1617,25 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
                 if let Some(l) = arg(args, "--compact-levels") {
                     co.levels = l.parse().context("--compact-levels")?;
                 }
-                let mut c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
-                // `--compact-asset asset.cmpa`: the basis once per asset (thread
-                // CR, athc_basis_fit): the piece keeps the asset table's id.
-                if let Some(asset) = arg(args, "--compact-asset") {
-                    let (blob, id) = spark_lib::athc_basis_fit::asset_basis_bytes(&c.tables.basis, c.tables.clusters);
-                    match std::fs::read(asset) {
-                        Ok(old) if old != blob => bail!("--compact-asset {asset}: another basis is there"),
-                        Ok(_) => {}
-                        Err(_) => std::fs::write(asset, &blob)?,
-                    }
-                    c.tables.basis = vec![id as u32, (id >> 32) as u32];
-                    c.tables.asset_basis = true;
-                    c.stats.table_bytes[2] = 8;
+                // `--compact-asset car.cmpa` (thread CQ): the pieces of one asset
+                // share one table, the basis once (created here when missing,
+                // else its basis must be this one; a table that
+                // `athc-convert --compact-asset` gave a shadow dictionary and
+                // materials gives them to this piece too).
+                if let Some(asset_path) = arg(args, "--compact-asset") {
+                    let path = std::path::Path::new(asset_path);
+                    let asset = if path.exists() {
+                        spark_lib::athc_compact::CompactAsset::from_bytes(&std::fs::read(path)?)?
+                    } else {
+                        let a = spark_lib::athc_compact::CompactAsset { basis: basis.table_f16(), clusters: basis.clusters as u32, ..Default::default() };
+                        std::fs::write(path, a.to_bytes())?;
+                        eprintln!("compact asset table {asset_path}: the basis, id {:016x}", a.id());
+                        a
+                    };
+                    co.asset_name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    co.asset = Some(asset);
                 }
+                let c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
                 eprintln!("compact tier: {}", serde_json::to_string(&c.stats)?);
                 Some(c)
             }
@@ -1768,9 +1773,9 @@ fn main() -> Result<()> {
         "--lod-error-weights",
         "--cpca",
         "--compact-basis",
-        "--compact-asset",
         "--compact-centroids",
         "--compact-levels",
+        "--compact-asset",
     ];
     let mut paths = Vec::new();
     let mut skip = false;

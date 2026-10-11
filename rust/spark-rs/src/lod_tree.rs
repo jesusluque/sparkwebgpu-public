@@ -231,7 +231,9 @@ enum LodNodes {
     Compact { nodes: Vec<CompactLodNode>, wide: AHashMap<u32, u16>, margins: Vec<f32>, slot: u32 },
     /// 12-byte records (thread CT, QUANT_RECORD_BITS): each pool page's
     /// quantization, and the nodes that do not fit kept whole.
-    Quant { nodes: Vec<QuantNode>, pages: Vec<PageQuant>, full: AHashMap<u32, CompactLodNode>, wide: AHashMap<u32, u16>, slot: u32 },
+    /// A pool page's records in a block of its own (a page's landing never
+    /// moves the others: no copy of the whole tree, no doubled peak).
+    Quant { nodes: Vec<Box<[QuantNode]>>, pages: Vec<PageQuant>, full: AHashMap<u32, CompactLodNode>, wide: AHashMap<u32, u16>, slot: u32 },
 }
 
 /// A compact node's LodSplat from its 10 words (and its wide count).
@@ -277,7 +279,7 @@ impl LodNodes {
                         s.margin = p.margin;
                         s
                     }
-                    None => unpack_quant(&nodes[i], p, &QUANT_RECORD_BITS),
+                    None => unpack_quant(&nodes[i / *slot as usize][i % *slot as usize], p, &QUANT_RECORD_BITS),
                 }
             }
         }
@@ -288,7 +290,7 @@ impl LodNodes {
         match self {
             LodNodes::Full(v) => v.len(),
             LodNodes::Compact { nodes, .. } => nodes.len(),
-            LodNodes::Quant { nodes, .. } => nodes.len(),
+            LodNodes::Quant { nodes, slot, .. } => nodes.len() * *slot as usize,
         }
     }
 }
@@ -611,6 +613,12 @@ pub fn update_compact_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases
             if page.is_falsy() {
                 lod_tree.page_to_chunk[pool_page] = 0xFFFFFFFF;
                 lod_tree.chunk_to_page[chunk] = 0xFFFFFFFF;
+                // A quantized tree frees the page's block.
+                if let LodNodes::Quant { nodes, .. } = &mut *lod_tree.splats.borrow_mut() {
+                    if let Some(b) = nodes.get_mut(pool_page) {
+                        *b = Box::new([]);
+                    }
+                }
                 continue;
             }
             lod_tree.page_to_chunk[pool_page] = chunk as u32;
@@ -669,13 +677,11 @@ pub fn update_compact_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases
                     }
                 }
                 LodNodes::Quant { nodes, pages, full, wide, .. } => {
-                    if base + n > nodes.len() {
-                        // Steps of an eighth: a copy every few pages, at most 1/8 spare.
-                        if base + n > nodes.capacity() {
-                            nodes.reserve_exact((base + n - nodes.len()).max(nodes.len() / 8));
-                        }
-                        nodes.resize(base + n, QuantNode::default());
+                    if pool_page >= nodes.len() {
+                        nodes.resize_with(pool_page + 1, || Box::new([]));
                     }
+                    // The page's own block, its nodes' size.
+                    let mut block = vec![QuantNode::default(); n].into_boxed_slice();
                     if pool_page >= pages.len() {
                         pages.resize(pool_page + 1, PageQuant::default());
                     }
@@ -685,12 +691,11 @@ pub fn update_compact_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases
                         let packed = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_quant(t, c, chunk as u32) };
                         match packed {
                             Some(q) => {
-                                nodes[base + i] = q;
+                                block[i] = q;
                                 full.remove(&key);
                                 wide.remove(&key);
                             }
                             None => {
-                                nodes[base + i] = QuantNode::default();
                                 full.insert(key, compact_node(t));
                                 if t.count >= COMPACT_WIDE as u32 {
                                     wide.insert(key, t.count as u16);
@@ -700,6 +705,7 @@ pub fn update_compact_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases
                             }
                         }
                     }
+                    nodes[pool_page] = block;
                 }
                 LodNodes::Full(_) => return Err(JsValue::from_str("update_compact_lod_trees: not a compact tree")),
             }
@@ -869,7 +875,9 @@ pub fn traverse_lod_trees(
         let mut culled_count = 0u32;
         frontier.clear();
         output.clear();
-        output.reserve(max_splats);
+        // Not the budget (the node pool's is millions, 12 bytes each and kept
+        // by the heap): the vector grows with the cut (thread CT).
+        output.reserve(max_splats.min(1 << 16));
         touched.clear();
         touched_set.clear();
 

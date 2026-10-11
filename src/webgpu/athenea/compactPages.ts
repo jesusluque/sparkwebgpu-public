@@ -592,6 +592,17 @@ export interface CompactBandOptions {
     runBudget?: number;
     /** Inflated runs kept (an LRU), default 256. */
     inflatedRuns?: number;
+    /**
+     * The runs kept whatever the budget: those of the cut's nodes, parents
+     * and children ("neighbours", default), or none (an LRU by last use:
+     * a node whose run went is drawn as its parent or children until its
+     * run comes again by Range).
+     */
+    protect?: "neighbours" | "none";
+    /** New records a update at most (the rest drawn as parent or children meanwhile). */
+    uploadsPerUpdate?: number;
+    /** Runs inflated an update at most (the frame's decode budget); default 256. */
+    inflatesPerUpdate?: number;
   };
 }
 
@@ -690,8 +701,9 @@ export class CompactBandStreamer {
     substituted: 0,
     /** Node pool: cut nodes with no slot (past maxCapacity). */
     noSlot: 0,
-    /** CMPC v4: Range requests for dropped runs. */
+    /** CMPC v4: Range requests for dropped runs, and their bytes. */
     runRanges: 0,
+    runBytes: 0,
   };
 
   constructor(
@@ -725,7 +737,7 @@ export class CompactBandStreamer {
         max,
       );
       this.pool = pool;
-      this.nodes = new NodeSlotAllocator(pool.capacity);
+      this.nodes = new NodeSlotAllocator(pool.capacity, this.slotNodes);
       if (
         pieces.some((p) => {
           const k = p.layout.sections.findIndex(
@@ -819,7 +831,14 @@ export class CompactBandStreamer {
 
   /** Fetching or landed pages not yet in the pool. */
   get busy() {
-    return this.fetching > 0 || this.landed.length > 0;
+    return (
+      this.fetching > 0 ||
+      this.landed.length > 0 ||
+      // The node pool: runs coming again, or cut nodes not yet uploaded.
+      this.runFetches > 0 ||
+      this.wantedRuns.size > 0 ||
+      this.stats.missing > this.stats.noSlot
+    );
   }
 
   /**
@@ -1030,7 +1049,8 @@ export class CompactBandStreamer {
           const g = Math.floor(key / PAGE_PLACES);
           runs.mark(g, key - g * PAGE_PLACES, cls);
         };
-        for (let k = 0; k < list.length; k++) {
+        const protect = this.options.nodePool?.protect !== "none";
+        for (let k = 0; protect && k < list.length; k++) {
           mark(list[k], RUN_CUT);
           if (near.parents[k] !== 0xffffffff) mark(near.parents[k], RUN_CUT);
           const f = near.firstKids[k];
@@ -1208,7 +1228,37 @@ export class CompactBandStreamer {
     miss.sort((a, b) => keys[a] - keys[b]);
     const ready: number[] = [];
     const absent: number[] = [];
+    this.deferred = false;
+    const cap =
+      this.options.nodePool?.uploadsPerUpdate ?? Number.POSITIVE_INFINITY;
+    const inflateCap = this.options.nodePool?.inflatesPerUpdate ?? 256;
+    const inflating = new Set<number>();
     for (const k of miss) {
+      // A run with a cut node still to upload stays (any protection mode).
+      if (runs) {
+        const gm = Math.floor(keys[k] / PAGE_PLACES);
+        runs.mark(gm, keys[k] - gm * PAGE_PLACES, RUN_CUT);
+      }
+      if (ready.length >= cap) {
+        absent.push(k);
+        continue;
+      }
+      if (runs) {
+        // The decode budget: runs not inflated yet, at most inflateCap.
+        const g0 = Math.floor(keys[k] / PAGE_PLACES);
+        const r0 = runs.runOf(g0, keys[k] - g0 * PAGE_PLACES);
+        if (r0 && !runs.isInflated(g0, r0.r) && !runs.missing(g0, r0.r)) {
+          const rk = g0 * 64 + r0.r;
+          if (!inflating.has(rk)) {
+            if (inflating.size >= inflateCap) {
+              absent.push(k);
+              this.deferred = true;
+              continue;
+            }
+            inflating.add(rk);
+          }
+        }
+      }
       const g = Math.floor(keys[k] / PAGE_PLACES);
       const place = keys[k] - g * PAGE_PLACES;
       const r = runs?.runOf(g, place);
@@ -1340,6 +1390,9 @@ export class CompactBandStreamer {
     return result;
   }
 
+  /** Nodes left for the next update by the decode budget. */
+  private deferred = false;
+
   /** Runs to fetch again (dropped runs a cut node needs): page -> runs. */
   private wantedRuns = new Map<number, Set<number>>();
   private runFetches = 0;
@@ -1372,6 +1425,7 @@ export class CompactBandStreamer {
         const rs = list.slice(k, e);
         this.runFetches += 1;
         this.stats.runRanges += 1;
+        this.stats.runBytes += last[0] + last[1] - first[0];
         piece
           .read(first[0], last[0] + last[1] - first[0])
           .then((data) => {
@@ -1611,6 +1665,8 @@ export class CompactBandStreamer {
         cpuTraversal,
         cpuCompressed: this.runs?.bytes ?? this.payload?.compressedBytes ?? 0,
         cpuDecoded: this.runs?.inflatedBytes ?? this.payload?.decodedBytes ?? 0,
+        /** The node pool's JS index (slots by node) and per-slot arrays. */
+        cpuNodeIndex: this.nodes?.bytes ?? 0,
       };
     }
     return {

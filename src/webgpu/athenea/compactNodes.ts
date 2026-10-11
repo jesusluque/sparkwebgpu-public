@@ -75,6 +75,63 @@ function planeOffsets(n: number) {
 // ------------------------------------------------------------- the slots
 
 /**
+ * Node keys (`page * PAGE_PLACES + place`) to slots: an Int32Array of a
+ * page's places for each page with a node held (-1 none), freed when its
+ * last node goes. About 16 KB a page, where a Map takes ~40 bytes a node.
+ */
+export class NodeIndex {
+  private pages = new Map<number, { slots: Int32Array; count: number }>();
+  size = 0;
+
+  /** Places a page holds at most (a pool slot's nodes). */
+  constructor(readonly places = PAGE_PLACES) {}
+
+  get(key: number): number | undefined {
+    const p = this.pages.get(Math.floor(key / PAGE_PLACES));
+    if (!p) return undefined;
+    const s = p.slots[key % PAGE_PLACES];
+    return s < 0 ? undefined : s;
+  }
+
+  set(key: number, slot: number) {
+    const g = Math.floor(key / PAGE_PLACES);
+    let p = this.pages.get(g);
+    if (!p) {
+      p = { slots: new Int32Array(this.places).fill(-1), count: 0 };
+      this.pages.set(g, p);
+    }
+    const k = key % PAGE_PLACES;
+    if (p.slots[k] < 0) {
+      p.count += 1;
+      this.size += 1;
+    }
+    p.slots[k] = slot;
+  }
+
+  delete(key: number) {
+    const g = Math.floor(key / PAGE_PLACES);
+    const p = this.pages.get(g);
+    if (!p) return;
+    const k = key % PAGE_PLACES;
+    if (p.slots[k] < 0) return;
+    p.slots[k] = -1;
+    p.count -= 1;
+    this.size -= 1;
+    if (p.count === 0) this.pages.delete(g);
+  }
+
+  clear() {
+    this.pages.clear();
+    this.size = 0;
+  }
+
+  /** Bytes held by the index. */
+  get bytes() {
+    return this.pages.size * this.places * 4;
+  }
+}
+
+/**
  * Node slots: a key (a node's page and place, `page * PAGE_PLACES + place`)
  * to a slot. A frame's cut is `use`d (its slots stamped with the frame);
  * the nodes that were in the last cut and are not in this one go to an
@@ -87,13 +144,18 @@ export class NodeSlotAllocator {
   private free: number[] = [];
   private idle: number[] = [];
   private idleHead = 0;
-  readonly slotOf = new Map<number, number>();
+  readonly slotOf: NodeIndex;
   /** The frame being built (`begin`); a slot stamped with it is in its cut. */
   frame = 1;
   private lastCut: Uint32Array = new Uint32Array(0);
   readonly stats = { allocated: 0, reused: 0, evicted: 0, failed: 0 };
 
-  constructor(public capacity: number) {
+  constructor(
+    public capacity: number,
+    /** Places a page holds at most (NodeIndex). */
+    places = PAGE_PLACES,
+  ) {
+    this.slotOf = new NodeIndex(places);
     this.keyOf = new Int32Array(capacity).fill(-1);
     this.stamp = new Uint32Array(capacity);
     for (let s = capacity - 1; s >= 0; s--) this.free.push(s);
@@ -203,6 +265,11 @@ export class NodeSlotAllocator {
   /** The key held in slot s, or -1. */
   keyIn(s: number) {
     return this.keyOf[s];
+  }
+
+  /** JS bytes of the allocator: its index and its per-slot arrays. */
+  get bytes() {
+    return this.slotOf.bytes + this.capacity * 8;
   }
 
   /** Forget every node (slots all free). */
@@ -458,9 +525,11 @@ export class CompactNodePool {
     if (need <= this.capacity || this.capacity >= this.maxCapacity) {
       return false;
     }
-    let next = this.capacity;
-    while (next < need) next = Math.ceil(next * 1.5);
-    next = Math.min(next, this.maxCapacity);
+    // A tenth over the cut, at least a quarter more (a copy each time).
+    const next = Math.min(
+      Math.ceil(Math.max(need * 1.1, this.capacity * 1.25)),
+      this.maxCapacity,
+    );
     const buffer = this.createBuffer(next);
     const enc = this.device.createCommandEncoder({ label: "node pool grow" });
     enc.copyBufferToBuffer(this.buffer, 0, buffer, 0, this.buffer.size);
@@ -798,6 +867,11 @@ export class RunPayloadStore {
     return dropped;
   }
 
+  /** Whether run r is inflated already (no inflate to pack it). */
+  isInflated(page: number, r: number) {
+    return this.inflated.has(this.key(page, r));
+  }
+
   /** Run r's inflated planes, or null when the run was dropped. */
   planes(page: number, r: number): Uint8Array | null {
     const k = this.key(page, r);
@@ -808,8 +882,14 @@ export class RunPayloadStore {
       this.stats.hits += 1;
       return hit;
     }
-    const b = this.pages.get(page)?.bytes[r];
-    if (!b) return null;
+    const rp = this.pages.get(page);
+    const b = rp?.bytes[r];
+    if (!rp || !b) return null;
+    // Used now: last to go by recency (classes left as marked).
+    if (rp.stamp[r] !== this.frame) {
+      rp.stamp[r] = this.frame;
+      rp.cls[r] = RUN_OTHER;
+    }
     const t0 = performance.now();
     const p = inflateSync(b);
     this.stats.inflateMs += performance.now() - t0;

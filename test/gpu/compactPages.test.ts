@@ -30,15 +30,19 @@ import { describe, expect, it, vi } from "vitest";
 import type { AthcV3Layout } from "../../src/athc";
 import { CompactRelitPath } from "../../src/webgpu/athenea/compact";
 import {
+  COMPACT_LOD_NODE_BYTES,
   CompactBandStreamer,
   type CompactPiece,
   type LodCall,
+  parseCompactAsset,
+  parseCompactTables,
 } from "../../src/webgpu/athenea/compactPages";
 import {
   encodeJointCpca,
   halfToFloat,
   parseJointCpca,
 } from "../../src/webgpu/athenea/cpcaJoint";
+import { makeLodCall } from "../unit/compactLod";
 import {
   type Streams,
   compare,
@@ -98,77 +102,7 @@ wasm.initSync({
 });
 
 /** The loader worker's LoD calls (src/worker.ts), in-process. */
-const lodCall: LodCall = async (name, a) => {
-  if (name === "newLodTree")
-    return wasm.new_lod_tree(a.capacity as number, a.slot as number);
-  if (name === "newSharedLodTree")
-    return wasm.new_shared_lod_tree(a.lodId as number);
-  if (name === "updateLodTrees") {
-    const r = a.ranges as {
-      lodId: number;
-      pageBase: number;
-      chunkBase: number;
-      count: number;
-      lodTreeData?: Uint32Array;
-      lodErrorData?: Uint32Array;
-    }[];
-    wasm.update_lod_trees(
-      new Uint32Array(r.map((x) => x.lodId)),
-      new Uint32Array(r.map((x) => x.pageBase)),
-      new Uint32Array(r.map((x) => x.chunkBase)),
-      new Uint32Array(r.map((x) => x.count)),
-      r.map((x) => x.lodTreeData) as unknown as never,
-      (r.some((x) => x.lodErrorData)
-        ? r.map((x) => x.lodErrorData)
-        : undefined) as unknown as never,
-      undefined,
-    );
-    return {};
-  }
-  const inst = Object.entries(
-    a.instances as Record<
-      string,
-      {
-        lodId: number;
-        rootPage: number;
-        viewToObjectCols: number[];
-        lodScale: number;
-        behindFoveate: number;
-        coneFov0: number;
-        coneFov: number;
-        coneFoveate: number;
-      }
-    >,
-  );
-  const f = (k: (i: (typeof inst)[number][1]) => number) =>
-    new Float32Array(inst.map(([, i]) => k(i)));
-  const result = wasm.traverse_lod_trees(
-    a.maxSplats as number,
-    a.pixelScaleLimit as number,
-    undefined,
-    new Uint32Array(inst.map(([, i]) => i.lodId)),
-    new Uint32Array(inst.map(([, i]) => i.rootPage)),
-    new Float32Array(inst.flatMap(([, i]) => i.viewToObjectCols)),
-    f((i) => i.lodScale),
-    f((i) => i.behindFoveate),
-    f((i) => i.coneFoveate),
-    f((i) => i.coneFov0),
-    f((i) => i.coneFov),
-    a.errorLimit as number | undefined,
-    undefined,
-    undefined,
-  ) as {
-    instanceIndices: { numSplats: number; indices: Uint32Array }[];
-  };
-  const keyIndices: Record<
-    string,
-    { numSplats: number; indices: Uint32Array }
-  > = {};
-  inst.forEach(([key], k) => {
-    keyIndices[key] = result.instanceIndices[k];
-  });
-  return { keyIndices };
-};
+const lodCall: LodCall = makeLodCall(wasm);
 
 interface Io {
   ranges: number;
@@ -217,6 +151,22 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
     const sky = { width: hdr.width, height: hdr.height, data: hdr.data };
     const io: Io = { ranges: 0, bytes: 0 };
     const pieces = PIECES.map((p) => openPiece(p, io));
+    // The asset table the pieces share (thread CQ), beside them.
+    const shared = parseCompactTables(
+      pieces[0].prefix.subarray(
+        (pieces[0].layout as unknown as { compactTable: number[] })
+          .compactTable[0],
+        (pieces[0].layout as unknown as { compactTable: number[] })
+          .compactTable[0] +
+          (pieces[0].layout as unknown as { compactTable: number[] })
+            .compactTable[1],
+      ),
+    );
+    const asset = shared.assetFlags
+      ? parseCompactAsset(
+          new Uint8Array(readFileSync(`${DIR}/${shared.assetName}`)),
+        )
+      : undefined;
     const totalPages = pieces.reduce(
       (n, p) => n + (p.layout.pages?.length ?? 0),
       0,
@@ -331,6 +281,7 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
       nodeOrder: true,
       gunzip,
       lod: lodCall,
+      asset,
     });
     await A.init();
     pathA.setPagedCloud(A.pool);
@@ -397,7 +348,7 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
           perResidentNodeGpu: +(usedGpu / Math.max(1, s.residentNodes)).toFixed(
             2,
           ),
-          perResidentNodeCpu: 24,
+          perResidentNodeCpu: COMPACT_LOD_NODE_BYTES,
           poolAllocated: resident.gpuSlots + resident.gpuTables,
           all: memory,
         },
@@ -420,6 +371,7 @@ describe.skipIf(!wideDevice || !DIR)("the compact path over band pages", () => {
       nodeOrder: true,
       gunzip,
       lod: lodCall,
+      asset,
     });
     await B.init();
     pathB.setPagedCloud(B.pool);

@@ -133,11 +133,15 @@ export {
   CompactBandStreamer,
   CompactPagePool,
   type CompactPiece,
+  type CompactAssetTables,
   type CompactPieceTables,
   type LodCall,
   gunzipStream,
+  openCompactAsset,
   openCompactPiece,
+  parseCompactAsset,
   parseCompactTables,
+  resolveCompactTables,
   workerLodCall,
 } from "./athenea/compactPages";
 export {

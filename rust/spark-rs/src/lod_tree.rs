@@ -4,7 +4,7 @@ use ahash::{AHashMap, AHashSet};
 use glam::{Vec3, Vec3A};
 use half::f16;
 use itertools::izip;
-use js_sys::{Array, Object, Reflect, Uint32Array};
+use js_sys::{Array, Object, Reflect, Uint32Array, Uint8Array};
 use ordered_float::OrderedFloat;
 use wasm_bindgen::prelude::*;
 
@@ -200,9 +200,67 @@ impl LodSplat {
 //     }
 // }
 
+/// A node of a compact tree (thread CQ, spark-lib athc_compact
+/// `TraversalNode`): 14 bytes where `LodSplat` takes 24, what the error cut
+/// reads and no more -- the centre (f16 x 3), LODE's eps and rho (f16; a
+/// merge without LODE: its size in eps, rho's sign bit set), the children's
+/// chunk (u16) and their place (12 bits) and count (4 bits, 15: in the
+/// tree's `wide` map; 0 a leaf). No back-face cone, no occlusion, no size
+/// for a merge with LODE (so no `errorSizeK` guard): a compact traversal
+/// draws exactly the nodes of the plain error cut.
+#[derive(Debug, Clone, Copy, Default)]
+struct CompactLodNode([u16; 7]);
+
+const COMPACT_WIDE: u16 = 15;
+const COMPACT_SIZE_MODE: u16 = 0x8000;
+
+#[derive(Debug, Clone)]
+enum LodNodes {
+    Full(Vec<LodSplat>),
+    Compact { nodes: Vec<CompactLodNode>, wide: AHashMap<u32, u16> },
+}
+
+impl Default for LodNodes {
+    fn default() -> Self {
+        LodNodes::Full(Vec::new())
+    }
+}
+
+impl LodNodes {
+    fn get(&self, i: usize) -> LodSplat {
+        match self {
+            LodNodes::Full(v) => v[i].clone(),
+            LodNodes::Compact { nodes, wide } => {
+                let w = nodes[i].0;
+                let code = w[6] >> 12;
+                let count = if code == COMPACT_WIDE { wide.get(&(i as u32)).copied().unwrap_or(0) } else { code };
+                let center = [f16::from_bits(w[0]), f16::from_bits(w[1]), f16::from_bits(w[2])];
+                let child_start = if count > 0 { (w[5] as u32) << 16 | (w[6] & 0xfff) as u32 } else { 0 };
+                let mut s = LodSplat::new_f16(center, f16::ZERO, child_start, count);
+                if w[4] & COMPACT_SIZE_MODE != 0 {
+                    s.size = f16::from_bits(w[3]);
+                } else {
+                    s.eps = f16::from_bits(w[3]);
+                    s.rho = f16::from_bits(w[4]);
+                    s.theta = f16::INFINITY;
+                }
+                s
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        match self {
+            LodNodes::Full(v) => v.len(),
+            LodNodes::Compact { nodes, .. } => nodes.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct LodTree {
-    splats: Rc<RefCell<Vec<LodSplat>>>,
+    splats: Rc<RefCell<LodNodes>>,
     page_to_chunk: Vec<u32>,
     chunk_to_page: Vec<u32>,
     /// athenea's occlusion codebook (8 words an entry) and the asset's box.
@@ -307,7 +365,10 @@ thread_local! {
 
 fn set_lod_tree_data(state: &mut LodState, lod_id: u32, page_base: u32, _chunk_base: u32, count: u32, lod_tree_data: &Uint32Array, lod_error: Option<&Uint32Array>, lod_occlusion: Option<&Uint32Array>) {
     let lod_tree = state.lod_trees.get(&lod_id).unwrap();
-    let mut splats = lod_tree.splats.borrow_mut();
+    let mut nodes = lod_tree.splats.borrow_mut();
+    let LodNodes::Full(splats) = &mut *nodes else {
+        panic!("a compact LoD tree takes update_compact_lod_trees");
+    };
 
     if state.buffer.is_empty() {
         state.buffer.resize(MAX_SPLAT_CHUNK * 4, 0);
@@ -358,11 +419,15 @@ fn set_lod_tree_data(state: &mut LodState, lod_id: u32, page_base: u32, _chunk_b
 }
 
 #[wasm_bindgen]
-pub fn new_lod_tree(capacity: u32, slot: Option<u32>) -> Result<Object, JsValue> {
+pub fn new_lod_tree(capacity: u32, slot: Option<u32>, compact: Option<bool>) -> Result<Object, JsValue> {
     let slot = slot.filter(|&s| s > 0 && s <= MAX_SPLAT_CHUNK as u32).unwrap_or(MAX_SPLAT_CHUNK as u32);
     STATE.with_borrow_mut(|state| {
         let lod_id = state.next_id;
-        let splats = Vec::with_capacity(capacity as usize);
+        let splats = if compact.unwrap_or(false) {
+            LodNodes::Compact { nodes: Vec::with_capacity(capacity as usize), wide: AHashMap::new() }
+        } else {
+            LodNodes::Full(Vec::with_capacity(capacity as usize))
+        };
         let splats = Rc::new(RefCell::new(splats));
         let page_capacity = capacity.div_ceil(slot);
         let page_to_chunk = Vec::with_capacity(page_capacity as usize);
@@ -401,8 +466,7 @@ pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array, lod_error: Option<U
     STATE.with_borrow_mut(|state| {
         let lod_id = state.next_id;
         let pages = num_splats.div_ceil(65536);
-        let splats = Vec::with_capacity(num_splats as usize);
-        let splats = Rc::new(RefCell::new(splats));
+        let splats = Rc::new(RefCell::new(LodNodes::Full(Vec::with_capacity(num_splats as usize))));
         let page_to_chunk = (0..pages).collect();
         let chunk_to_page: Vec<u32> = (0..pages).collect();
         state.lod_trees.insert(lod_id, LodTree { splats, page_to_chunk, chunk_to_page, occlusion: None, slot: MAX_SPLAT_CHUNK as u32 });
@@ -472,10 +536,80 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
     })
 }
 
+/// Pages of a compact tree (`new_lod_tree(.., compact = true)`, thread CQ):
+/// for each range, `pages[k]` the page's traversal input (spark-lib
+/// `athc_compact::traversal_input`: its position planes then the
+/// traversal's, 22 bytes a node) or falsy to evict it, and its box (lo xyz,
+/// hi xyz) in `boxes[6k..]`. A range is one page: `chunk_base >> 16` its
+/// page in the tree's virtual space, `page_base` its pool slot's first node.
+#[wasm_bindgen]
+pub fn update_compact_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32], counts: &[u32], pages: &Array, boxes: &[f32]) -> Result<(), JsValue> {
+    if boxes.len() != 6 * lod_ids.len() || page_bases.len() != lod_ids.len() || chunk_bases.len() != lod_ids.len() || counts.len() != lod_ids.len() {
+        return Err(JsValue::from_str("update_compact_lod_trees: ranges of different lengths"));
+    }
+    STATE.with_borrow_mut(|state| {
+        for (k, page) in pages.iter().enumerate() {
+            let (lod_id, page_base, chunk_base, count) = (lod_ids[k], page_bases[k], chunk_bases[k], counts[k]);
+            let lod_tree = state.lod_trees.get_mut(&lod_id).ok_or_else(|| JsValue::from_str("no such LoD tree"))?;
+            let slot = lod_tree.slot;
+            if count > slot {
+                return Err(JsValue::from_str("update_compact_lod_trees: a page past its slot"));
+            }
+            let (pool_page, chunk) = ((page_base / slot) as usize, (chunk_base >> 16) as usize);
+            if pool_page >= lod_tree.page_to_chunk.len() {
+                lod_tree.page_to_chunk.resize(pool_page + 1, 0xFFFFFFFF);
+            }
+            if chunk >= lod_tree.chunk_to_page.len() {
+                lod_tree.chunk_to_page.resize(chunk + 1, 0xFFFFFFFF);
+            }
+            if page.is_falsy() {
+                lod_tree.page_to_chunk[pool_page] = 0xFFFFFFFF;
+                lod_tree.chunk_to_page[chunk] = 0xFFFFFFFF;
+                continue;
+            }
+            lod_tree.page_to_chunk[pool_page] = chunk as u32;
+            lod_tree.chunk_to_page[chunk] = pool_page as u32;
+            let input = Uint8Array::from(page).to_vec();
+            let n = count as usize;
+            if input.len() != n * spark_lib::athc_compact::TRAVERSAL_INPUT_BYTES {
+                return Err(JsValue::from_str("update_compact_lod_trees: a page's input of the wrong size"));
+            }
+            let head: Vec<u32> = boxes[6 * k..6 * k + 6].iter().map(|v| v.to_bits()).collect();
+            let mut store = lod_tree.splats.borrow_mut();
+            let LodNodes::Compact { nodes, wide } = &mut *store else {
+                return Err(JsValue::from_str("update_compact_lod_trees: not a compact tree"));
+            };
+            let base = page_base as usize;
+            if base + n > nodes.len() {
+                nodes.resize((nodes.len() * 2).max(base + n), CompactLodNode::default());
+            }
+            for i in 0..n {
+                let t = spark_lib::athc_compact::traversal_node_input(&input, n, &head, chunk as u32, i);
+                let code = if t.count >= COMPACT_WIDE as u32 { COMPACT_WIDE } else { t.count as u16 };
+                if code == COMPACT_WIDE {
+                    wide.insert((base + i) as u32, t.count as u16);
+                } else {
+                    wide.remove(&((base + i) as u32));
+                }
+                nodes[base + i] = CompactLodNode([
+                    t.centre[0],
+                    t.centre[1],
+                    t.centre[2],
+                    t.eps,
+                    t.rho | if t.size_mode { COMPACT_SIZE_MODE } else { 0 },
+                    t.child_page as u16,
+                    (t.place as u16 & 0xfff) | code << 12,
+                ]);
+            }
+        }
+        Ok(())
+    })
+}
+
 #[allow(dead_code)]
 struct LodInstance<'a> {
     lod_id: u32,
-    splats: Ref<'a, Vec<LodSplat>>,
+    splats: Ref<'a, LodNodes>,
     page_to_chunk: &'a [u32],
     chunk_to_page: &'a [u32],
     origin: Vec3A,
@@ -519,7 +653,7 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
         let lod_tree = lod_trees.get(&lod_id).unwrap();
         let splats = lod_tree.splats.borrow();
 
-        let root_size = splats[0].size();
+        let root_size = splats.get(0).size();
         let level_size = root_size / (1.25f32.powi(level as i32));
 
         let mut nodes = vec![0];
@@ -528,7 +662,7 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
         while !nodes.is_empty() {
             let mut new_nodes = Vec::new();
             for node in nodes {
-                let splat = &splats[node as usize];
+                let splat = &splats.get(node as usize);
                 let &LodSplat { child_count, child_start, .. } = splat;
                 if splat.size() <= level_size {
                     output_nodes.push(node);
@@ -618,7 +752,7 @@ pub fn traverse_lod_trees(
             .map(|id| if occlusion_cull.unwrap_or(false) { lod_trees.get(id).and_then(|t| t.occlusion.as_ref()) } else { None })
             .collect();
         let hidden = |inst: u32, index: u32| -> bool {
-            occlusions[inst as usize].is_some_and(|o| occluded(&instances[inst as usize].1[index as usize], instances[inst as usize].4, o))
+            occlusions[inst as usize].is_some_and(|o| occluded(&instances[inst as usize].1.get(index as usize), instances[inst as usize].4, o))
         };
         let mut occluded_count = 0u32;
 
@@ -639,7 +773,7 @@ pub fn traverse_lod_trees(
                 occluded_count += 1;
                 continue;
             }
-            let pixel_scale = compute_pixel_scale(&splats[root_index as usize], instance);
+            let pixel_scale = compute_pixel_scale(&splats.get(root_index as usize), instance);
             frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
             num_splats += 1;
 
@@ -653,7 +787,7 @@ pub fn traverse_lod_trees(
         let culled = |inst: u32, index: u32| -> bool {
             back_cull_min.is_some_and(|min| {
                 let i = &instances[inst as usize];
-                let s = &i.1[index as usize];
+                let s = &i.1.get(index as usize);
                 s.size() / (s.center() - i.4).length().max(1.0e-6) > min && s.back_facing(i.4)
             })
         };
@@ -666,7 +800,7 @@ pub fn traverse_lod_trees(
 
             let instance = &instances[inst_index as usize];
             let (lod_id, splats, _page_to_chunk, chunk_to_page, ..) = instance;
-            let LodSplat { child_count, child_start, .. } = splats[paged_index as usize];
+            let LodSplat { child_count, child_start, .. } = splats.get(paged_index as usize);
 
             if child_count == 0 {
                 _ = frontier.pop();
@@ -722,7 +856,7 @@ pub fn traverse_lod_trees(
                     hidden_here += 1;
                     continue;
                 }
-                let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
+                let pixel_scale = compute_pixel_scale(&splats.get(paged_index as usize), instance);
                 if pixel_scale <= pixel_scale_limit {
                     // In the cut: drawn, unless a coarse node facing away.
                     if culled(inst_index, paged_index) {
@@ -803,7 +937,7 @@ pub fn traverse_lod_trees(
     })
 }
 
-type Inst<'a> = (u32, Ref<'a, Vec<LodSplat>>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32, f32);
+type Inst<'a> = (u32, Ref<'a, LodNodes>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32, f32);
 
 fn compute_pixel_scale<'a>(splat: &LodSplat, instance: &Inst<'a>) -> f32 {
     let &(_, _, _, _, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard) = instance;
@@ -903,7 +1037,7 @@ pub fn dynamic_traverse_lod_trees(
             let root_page = root_pages[inst_index];
             let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
             let root_index = root_page * slots[inst_index];
-            let root_scale = compute_pixel_scale(&splats[root_index as usize], instance);
+            let root_scale = compute_pixel_scale(&splats.get(root_index as usize), instance);
             let frontier = vec![(root_index, root_scale)];
             let instance_output = Vec::with_capacity(1000);
             outputs.push((instance_output, frontier));
@@ -940,7 +1074,7 @@ pub fn dynamic_traverse_lod_trees(
                         continue;
                     }
 
-                    let LodSplat { child_count, child_start, .. } = splats[paged_index as usize];
+                    let LodSplat { child_count, child_start, .. } = splats.get(paged_index as usize);
                     if child_count == 0 {
                         instance_output.push((paged_index, pixel_scale));
                         leaf_count += 1;
@@ -974,7 +1108,7 @@ pub fn dynamic_traverse_lod_trees(
                         let child_chunk = (child >> 16) as usize;
                         let child_page = chunk_to_page[child_chunk];
                         let paged_index = child_page * slots[inst_index] + (child & 0xffff);
-                        let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
+                        let pixel_scale = compute_pixel_scale(&splats.get(paged_index as usize), instance);
                         if pixel_scale <= current_scale {
                             if pixel_scale <= pixel_scale_limit {
                                 instance_output.push((paged_index, pixel_scale));

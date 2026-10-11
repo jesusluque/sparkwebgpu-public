@@ -1617,7 +1617,20 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
                 if let Some(l) = arg(args, "--compact-levels") {
                     co.levels = l.parse().context("--compact-levels")?;
                 }
-                let c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
+                let mut c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
+                // `--compact-asset asset.cmpa`: the basis once per asset (thread
+                // CR, athc_basis_fit): the piece keeps the asset table's id.
+                if let Some(asset) = arg(args, "--compact-asset") {
+                    let (blob, id) = spark_lib::athc_basis_fit::asset_basis_bytes(&c.tables.basis, c.tables.clusters);
+                    match std::fs::read(asset) {
+                        Ok(old) if old != blob => bail!("--compact-asset {asset}: another basis is there"),
+                        Ok(_) => {}
+                        Err(_) => std::fs::write(asset, &blob)?,
+                    }
+                    c.tables.basis = vec![id as u32, (id >> 32) as u32];
+                    c.tables.asset_basis = true;
+                    c.stats.table_bytes[2] = 8;
+                }
                 eprintln!("compact tier: {}", serde_json::to_string(&c.stats)?);
                 Some(c)
             }
@@ -1755,6 +1768,7 @@ fn main() -> Result<()> {
         "--lod-error-weights",
         "--cpca",
         "--compact-basis",
+        "--compact-asset",
         "--compact-centroids",
         "--compact-levels",
     ];

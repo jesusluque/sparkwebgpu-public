@@ -322,7 +322,13 @@ pub struct CompactTables {
     /// The albedo is linear light (else sRGB; this writer stores sRGB).
     pub linear: bool,
     pub curvature: bool,
+    /// The basis is the asset's (a sidecar `.cmpa`, athc_basis_fit, thread
+    /// CR): `basis` then holds the asset table's id (2 words) instead.
+    pub asset_basis: bool,
 }
+
+/// The piece's tables flag: its basis is in the asset table (CQ's value).
+pub const TABLE_ASSET_BASIS: u32 = 4;
 
 impl CompactTables {
     pub fn entries(&self) -> usize {
@@ -347,7 +353,7 @@ impl CompactTables {
             self.clusters,
             self.normal_bits,
             self.weight_bits,
-            (self.linear as u32) | (self.curvature as u32) << 1,
+            (self.linear as u32) | (self.curvature as u32) << 1 | if self.asset_basis { TABLE_ASSET_BASIS } else { 0 },
             codebook_at as u32,
             materials_at as u32,
             basis_at as u32,
@@ -382,6 +388,7 @@ impl CompactTables {
             weight_bits: w(9)?,
             linear: flags & 1 != 0,
             curvature: flags & 2 != 0,
+            asset_basis: flags & TABLE_ASSET_BASIS != 0,
         })
     }
 }
@@ -701,6 +708,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
         weight_bits: 4,
         linear: false,
         curvature,
+        asset_basis: false,
     };
     let stats = CompactStats {
         nodes: total,

@@ -48,6 +48,7 @@ pub mod athl;
 pub mod athc_prune;
 pub mod athc_pages;
 pub mod athc_compact;
+pub mod athc_basis_fit;
 #[cfg(feature = "athc")]
 pub mod cpu_raster;
 pub mod decoder;

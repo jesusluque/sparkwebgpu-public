@@ -80,8 +80,55 @@ export interface CompactPieceTables {
   curvature: boolean;
 }
 
-/** The tables blob (CompactTables::to_bytes). */
-export function parseCompactTables(bytes: Uint8Array): CompactPieceTables {
+/** A piece's tables flag: its basis is the asset's (rust TABLE_ASSET_BASIS). */
+const TABLE_ASSET_BASIS = 4;
+const ASSET_MAGIC = 0x41504d43; // "CMPA"
+
+/**
+ * An asset's compact table (a sidecar `.cmpa`, rust athc_basis_fit, thread
+ * CR; thread CQ's CMPA v1 layout): the joint basis once for every piece.
+ */
+export interface CompactAssetTables {
+  basis: Uint32Array;
+  clusters: number;
+  /** FNV-1a 64 of the blob (its id words 0), as [lo, hi]. */
+  id: [number, number];
+}
+
+/** The asset blob (athc_basis_fit::asset_basis_bytes). */
+export function parseCompactAsset(bytes: Uint8Array): CompactAssetTables {
+  const w = new Uint32Array(
+    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+  );
+  if (w[0] !== ASSET_MAGIC || w[1] !== 1) {
+    throw new Error("compact asset: not CMPA v1");
+  }
+  if ((w[3] & 1) === 0) throw new Error("compact asset: no basis");
+  return {
+    basis: w.slice(w[7], w[7] + w[8]),
+    clusters: w[4],
+    id: [w[11], w[12]],
+  };
+}
+
+/** The asset table at `url` (a whole fetch: ~0.5 MB). */
+export async function loadCompactAsset(
+  url: string,
+): Promise<CompactAssetTables> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url}: ${response.status}`);
+  return parseCompactAsset(new Uint8Array(await response.arrayBuffer()));
+}
+
+/**
+ * The tables blob (CompactTables::to_bytes). A piece whose basis is its
+ * asset's (flag TABLE_ASSET_BASIS) holds the asset's id where the basis
+ * would be, and takes the basis from `asset`.
+ */
+export function parseCompactTables(
+  bytes: Uint8Array,
+  asset?: CompactAssetTables | null,
+): CompactPieceTables {
   const w = new Uint32Array(
     bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
   );
@@ -91,10 +138,22 @@ export function parseCompactTables(bytes: Uint8Array): CompactPieceTables {
   if (w[2] !== COMPACT_NODE_BYTES || w[3] !== COMPACT_PLANE_WIDTHS.length) {
     throw new Error("compact tables: another layout");
   }
+  let basis = w.slice(w[13], w[13] + w[14]);
+  if (w[10] & TABLE_ASSET_BASIS) {
+    if (!asset) throw new Error("compact tables: the basis is the asset's");
+    if (
+      basis[0] !== asset.id[0] ||
+      basis[1] !== asset.id[1] ||
+      asset.clusters !== w[7]
+    ) {
+      throw new Error("compact tables: another asset's basis");
+    }
+    basis = asset.basis;
+  }
   return {
     codebook: w.slice(w[11], w[11] + 8 * w[5]),
     materials: w.slice(w[12], w[12] + 4 * w[6]),
-    basis: w.slice(w[13], w[13] + w[14]),
+    basis,
     clusters: w[7],
     normalBits: w[8],
     weightBits: w[9],
@@ -293,6 +352,8 @@ export interface CompactPiece {
   prefix: Uint8Array;
   /** Bytes [offset, offset + bytes) of the file. */
   read: (offset: number, bytes: number) => Promise<Uint8Array>;
+  /** The asset's table, when the piece's basis is the asset's. */
+  asset?: CompactAssetTables | null;
 }
 
 export interface CompactBandOptions {
@@ -341,7 +402,10 @@ export function compactTablesOf(piece: CompactPiece): CompactPieceTables {
   const t = (piece.layout as unknown as { compactTable?: number[] })
     .compactTable;
   if (!t?.[0]) throw new Error(`${piece.name}: no compact tier`);
-  return parseCompactTables(piece.prefix.subarray(t[0], t[0] + t[1]));
+  return parseCompactTables(
+    piece.prefix.subarray(t[0], t[0] + t[1]),
+    piece.asset,
+  );
 }
 
 /** Streams the pieces' band pages' tier 4 into a CompactPagePool. */
@@ -489,6 +553,16 @@ export class CompactBandStreamer {
       });
       this.stats.landed += 1;
     }
+    if (this.evictedSlots.size) {
+      // The pages just evicted are gone from the pool: out of the draw list
+      // now, before a frame drawn while the traversal runs reads their slots.
+      const keep = this.drawList.filter(
+        (i) => !this.evictedSlots.has(Math.floor(i / this.slotNodes)),
+      );
+      this.evictedSlots.clear();
+      this.drawList = keep;
+      path?.setDrawList(keep);
+    }
     for (const r of this.evictedRanges) ranges.unshift(r);
     this.evictedRanges = [];
     if (ranges.length) await lod("updateLodTrees", { ranges });
@@ -601,6 +675,7 @@ export class CompactBandStreamer {
   }
 
   private evictedRanges: Record<string, unknown>[] = [];
+  private evictedSlots = new Set<number>();
 
   /** A free slot, else one evicted from the last plan's order. */
   private takeSlot(): number | undefined {
@@ -614,6 +689,7 @@ export class CompactBandStreamer {
       key.slotOf.delete(page);
       key.kids.delete(page);
       this.slotOwner[slot] = null;
+      this.evictedSlots.add(slot);
       this.evictedRanges.push({
         lodId: key.lodId,
         pageBase: slot * this.slotNodes,
@@ -741,12 +817,14 @@ export class CompactBandStreamer {
 export async function openCompactPiece(
   url: string,
   name = url,
+  asset: CompactAssetTables | null = null,
 ): Promise<CompactPiece> {
   const { layout, prefix } = await readAthcLayout({ url });
   return {
     name,
     layout: layout as AthcV3Layout,
     prefix,
+    asset,
     read: async (offset, bytes) =>
       (await readRange({ url }, offset, bytes)).data,
   };

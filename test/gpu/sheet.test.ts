@@ -53,6 +53,7 @@ describe.skipIf(!device)("thin sheets", () => {
     options: WgpuSplatRendererOptions,
     sx = SX,
     sy = SY,
+    sz = sy,
   ): Promise<{ alpha: number; red: number; peak: number }> {
     const a = new Uint32Array(4);
     const b = new Uint32Array(4);
@@ -65,7 +66,7 @@ describe.skipIf(!device)("thin sheets", () => {
       -Z,
       sx * px,
       sy * px,
-      sy * px,
+      sz * px,
       0,
       0,
       0,
@@ -239,6 +240,31 @@ describe.skipIf(!device)("thin sheets", () => {
       expect(Math.abs(faded.red / full.red - 1)).toBeLessThan(0.12);
       // The slanted sheet (2 x 0.08 px: 1 px^2 over A0 = 0.5): unfaded.
       expect(slant.peak).toBeCloseTo(0.1, 2);
+    });
+  }
+
+  // A sheet's surfel (one zero scale: half of athenea's merged glass, thread
+  // CM) is floored after the filter as the 3D splat is, and reflects the
+  // same light; a plain surfel of the same alpha is not floored.
+  const R = 2;
+  for (const [name, options] of [
+    ["quads", {}],
+    ["the projector", { projectOnce: true }],
+    ["tiles", { rasterizer: "tiles" }],
+  ] as [string, WgpuSplatRendererOptions][]) {
+    it(`floors a sheet's surfel as its 3D splat (${name})`, async () => {
+      const own = 1 / 32;
+      const flat = await draw(-own, options, R, R, 0);
+      const round = await draw(-own, options, R, R, R);
+      const plain = await draw(own, options, R, R, 0);
+      if (process.env.SHEET_LOG)
+        process.stderr.write(
+          `${name} surfel ${JSON.stringify({ flat, round, plain })}\n`,
+        );
+      expect(flat.peak).toBeCloseTo(0.1, 2);
+      expect(plain.peak).toBeLessThan(0.05);
+      expect(Math.abs(flat.alpha / round.alpha - 1)).toBeLessThan(0.1);
+      expect(Math.abs(flat.red / round.red - 1)).toBeLessThan(0.1);
     });
   }
 });

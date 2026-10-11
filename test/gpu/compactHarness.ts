@@ -38,6 +38,8 @@ export interface Streams {
   curvature: Uint32Array | null;
   shadowBits: Uint32Array;
   q8: Uint32Array;
+  /** The full transfer (112 halves, 56 words a splat), for transferResident "words". */
+  transfer?: Uint32Array;
 }
 
 const SPECS: Record<string, AttributeSpec> = {
@@ -77,8 +79,23 @@ export function poolOf(
   if (s.curvature)
     pool.setColumn({ spec: SPECS.curvature, words: s.curvature });
   pool.setColumn({ spec: SPECS.shadowBits, words: s.shadowBits });
-  pool.setColumn(q8Column(s.q8.subarray(0, n * Q8_RECORD_WORDS)));
-  pool.cpcaJoint = { basis, table: packJointBasis(basis), values: 112 };
+  if (s.transfer) {
+    pool.setColumn({
+      spec: {
+        name: "transfer",
+        format: "f16",
+        components: 112,
+        lodMerge: "weightedMean",
+        packed: true,
+      } as AttributeSpec,
+      words: s.transfer,
+    });
+  }
+  // The full transfer (transferResident "words") or athenea's records.
+  if (!s.transfer) {
+    pool.setColumn(q8Column(s.q8.subarray(0, n * Q8_RECORD_WORDS)));
+    pool.cpcaJoint = { basis, table: packJointBasis(basis), values: 112 };
+  }
   return pool;
 }
 
@@ -255,6 +272,10 @@ export interface RunOptions {
   shapes?: boolean;
   /** Reference only: more WgpuSplatRenderer options. */
   renderer?: Record<string, unknown>;
+  /** Reference only: opacities past 1 are LoD opacity (a cut with merged nodes). */
+  lodOpacity?: boolean;
+  /** Reference only: the relight plugin's transferResident (default "cpca8"). */
+  transferResident?: "cpca8" | "words";
 }
 
 function median(v: number[]) {
@@ -326,7 +347,9 @@ export async function referenceRun(
       get: (r: object) => (r === tgt.texture ? { texture: color } : undefined),
     },
   };
-  const source = GpuSplatSource.fromExt(d, s.ext0, s.ext1, n);
+  const source = GpuSplatSource.fromExt(d, s.ext0, s.ext1, n, {
+    lodOpacity: o.lodOpacity,
+  });
   source.attribs = poolOf(s, n, basis);
   const splats = new WgpuSplatRenderer(fakeRenderer as never, {
     depthTest: false,
@@ -337,7 +360,7 @@ export async function referenceRun(
   const host = new PluginHost({ capabilities: splats.capabilities, tier: 2 });
   const relight = atheneaRelightPlugin({
     hdri: o.sky,
-    transferResident: "cpca8",
+    transferResident: o.transferResident ?? "cpca8",
   });
   host.register(relight).attach(splats);
   const mesh = splats.add(source);

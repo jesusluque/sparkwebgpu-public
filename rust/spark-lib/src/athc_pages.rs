@@ -48,6 +48,9 @@ use crate::athc_v3::{BlockEntry, Section};
 pub const TREE_WORDS: usize = 2;
 /// Words a row of the page table (`PageRow::to_words`).
 pub const PAGE_ROW_WORDS: usize = 16;
+/// Words a row with the compact tier (`athc_compact`, thread CN): word 16
+/// the bytes of its tier-4 section, 17..29 its compact head.
+pub const PAGE_ROW_WORDS_COMPACT: usize = 32;
 /// The parent error of a root, as athenea writes it: always needed.
 pub const ROOT_PARENT_ERROR: f32 = 3.0e38;
 
@@ -74,6 +77,10 @@ pub struct PageRow {
     pub eps_min: f32,
     pub offset: u64,
     pub tier_bytes: [u32; 3],
+    /// The compact tier (rows of `PAGE_ROW_WORDS_COMPACT`): its bytes and
+    /// the page's head (`athc_compact::HEAD_WORDS`); 0 without.
+    pub tier4_bytes: u32,
+    pub compact: [u32; crate::athc_compact::HEAD_WORDS],
 }
 
 impl PageRow {
@@ -111,7 +118,18 @@ impl PageRow {
             eps_min: f(10),
             offset: w[11] as u64 | (w[12] as u64) << 32,
             tier_bytes: [w[13], w[14], w[15]],
+            tier4_bytes: w.get(16).copied().unwrap_or(0),
+            compact: std::array::from_fn(|k| w.get(17 + k).copied().unwrap_or(0)),
         }
+    }
+
+    /// `to_words` with the compact tier's words (`PAGE_ROW_WORDS_COMPACT`).
+    pub fn to_words_compact(&self) -> [u32; PAGE_ROW_WORDS_COMPACT] {
+        let mut w = [0u32; PAGE_ROW_WORDS_COMPACT];
+        w[..PAGE_ROW_WORDS].copy_from_slice(&self.to_words());
+        w[16] = self.tier4_bytes;
+        w[17..17 + crate::athc_compact::HEAD_WORDS].copy_from_slice(&self.compact);
+        w
     }
 
     /// The page's byte ranges from its block's entry: where it starts, and
@@ -124,10 +142,13 @@ impl PageRow {
     /// section's span).
     pub fn fill_ranges(&mut self, e: &BlockEntry, sections: &[Section]) {
         self.offset = e.spans.first().map_or(0, |s| s.offset);
+        let tier = |t: u32| -> u32 {
+            sections.iter().zip(&e.spans).filter(|(s, _)| s.tier.clamp(1, 4) == t).map(|(_, sp)| sp.stored).sum()
+        };
         for t in 1..=3u32 {
-            self.tier_bytes[t as usize - 1] =
-                sections.iter().zip(&e.spans).filter(|(s, _)| s.tier.clamp(1, 3) == t).map(|(_, sp)| sp.stored).sum();
+            self.tier_bytes[t as usize - 1] = tier(t);
         }
+        self.tier4_bytes = tier(4);
     }
 
     /// The nearest point of the box to `eye`, and its distance.
@@ -797,6 +818,67 @@ pub(crate) mod tests {
         assert!(e >= nb.iter().map(|b| b.eps).fold(0.0, f32::max));
         assert!(r > 0.3, "{r}");
         assert_eq!(paged.rows[0].eps_max, ROOT_PARENT_ERROR);
+    }
+
+    /// A paged tree of `leaves` leaves (pages of `per`) whose nodes carry
+    /// every stream the compact tier reads (normals, pbr, lobes, curvature,
+    /// shadow bits, a full transfer of 112), deterministic; and its file.
+    pub(crate) fn sample_relit_paged(leaves: usize, per: usize) -> (PagedTree, AthcFile) {
+        sample_relit_paged_spread(leaves, per, 0.0)
+    }
+
+    /// `sample_relit_paged` with the row bent in 3D and stretched `spread`
+    /// times along x (0: as `tree` lays it).
+    pub(crate) fn sample_relit_paged_spread(leaves: usize, per: usize, spread: f32) -> (PagedTree, AthcFile) {
+        let (mut b, parent, start, size) = tree(leaves);
+        if spread > 0.0 {
+            for i in 0..b.n {
+                let x = b.positions[4 * i];
+                b.positions[4 * i] = spread * x;
+                b.positions[4 * i + 1] = (x * 7.0).sin() * 0.2;
+                b.positions[4 * i + 2] = (x * 5.0).cos() * 0.1;
+                // Gaussians as much bigger: a few pixels from a few metres.
+                let sh = &mut b.shape[4 * i..4 * i + 4];
+                let g = (3.0 * spread).ln();
+                sh[1] = pack_halves(crate::athc::low_half(sh[1]) + g, crate::athc::high_half(sh[1]) + g);
+                sh[2] = pack_halves(crate::athc::low_half(sh[2]) + g, crate::athc::high_half(sh[2]));
+            }
+        }
+        let nb = bounds(&b, &parent, &size);
+        let page = her_pages(&parent, &nb, &start, per);
+        let ids: Vec<u32> = (0..b.n as u32).collect();
+        let mut r = 0x9e3779b9u32;
+        let mut rand = move || {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            r
+        };
+        for k in 0..b.n {
+            let t = k as f32 * 0.37;
+            b.normals.push(crate::athc::pack_normal([t.sin() * 0.3, t.cos() * 0.3, 0.9]));
+            b.pbr.push(rand() % 5);
+            b.lobes.extend_from_slice(&[rand() % 3, 0, 7]);
+            b.curvature.extend_from_slice(&[pack_halves(0.5 * t.sin(), -0.02), pack_halves(3.0 + t.cos(), 0.0)]);
+            // A few dozen distinct masks, so the dictionary keeps them exactly.
+            let m = rand() % 40;
+            b.shadow_bits.extend((0..8).map(|w| if w == m % 8 { 0xffff_0000 ^ m } else { m.wrapping_mul(2654435761) ^ w }));
+            for v in 0..56 {
+                let x = 0.1 * ((k * 7 + v) as f32 * 0.13).sin();
+                b.transfer.push(pack_halves(x, 0.5 * x));
+            }
+        }
+        let input = PageInput { block: &b, parent: &parent, page: &page, bounds: &nb, ids: &ids, first_leaf: &start, sh_words: 0, page_box: PageBox::Parents };
+        let paged = pack_pages(&input).unwrap();
+        let file = AthcFile {
+            header: AthcHeader { flags: crate::athc::FLAG_PAGED | crate::athc::FLAG_NODE_COVERAGE, bounds_min: [0.0; 3], bounds_max: [3.0, 0.0, 0.0], ..Default::default() },
+            extra: ExtraHeader { transfer_count: 112, ..Default::default() },
+            levels: Vec::new(),
+            starts: Vec::new(),
+            chunks: paged.pages.clone(),
+            occlusion_codebook: Vec::new(),
+        };
+        (paged, file)
     }
 
     /// A small paged tree written as v3 (gzip, byte planes), for decoder tests.

@@ -129,6 +129,18 @@ export {
   encodeCompact,
 } from "./athenea/compact";
 export {
+  type CompactBandOptions,
+  CompactBandStreamer,
+  CompactPagePool,
+  type CompactPiece,
+  type CompactPieceTables,
+  type LodCall,
+  gunzipStream,
+  openCompactPiece,
+  parseCompactTables,
+  workerLodCall,
+} from "./athenea/compactPages";
+export {
   ATHENEA_SKIN_ID,
   type AtheneaSkinOptions,
   type AtheneaSkinPlugin,

@@ -27,6 +27,15 @@
 // offsets, the codebooks, the materials, and athenea's basis in f16 (504
 // words a cluster: per block its mean and its 8 directions times scale/127).
 //
+// PAGED (slotNodes > 0; thread CN, src/webgpu/athenea/compactPages.ts): the
+// gaussians are athenea's error-band pages, each in a pool slot of slotNodes
+// (3072) at slotsBase + slot x slotWords: the slot's head (its page's box and
+// ranges, kCompactChunkWords; word 9 its piece's codebook, word 10 its
+// materials, in words; word 11 the faint dither's seed) then the planes at the plane uniforms' offsets within
+// the slot, slotNodes elements each. Gaussian i is slot i / slotNodes,
+// element i % slotNodes; the codebooks, materials and the basis are global
+// to a piece (the pool's tables, always resident).
+//
 // Passes a frame:
 //   atheneaCompactProject  a thread a cluster: the dome's projections (as
 //                          cpca_joint.slang's atheneaJointProject), when the
@@ -84,6 +93,9 @@ public static const uint kCompactNone = 0xFFFFFFFFu;
 public struct CompactParams {
     public uint  count;
     public uint  flags;
+    public uint  slotNodes;    ///< paged: gaussians a slot (0: one resident cloud)
+    public uint  slotWords;    ///< paged: words a slot
+    public uint  slotsBase;    ///< paged: the first slot, words
     public uint  chunkTable;   ///< words, kCompactChunkWords a chunk
     public uint  pieceTable;   ///< words, a piece's codebook start (words)
     public uint  posX;         ///< plane starts, words
@@ -173,10 +185,25 @@ float3 sunIrradiance() { return frameFloat4(compactParams.tableBase + compactPar
 
 // ---------------------------------------------------------------- the planes
 
+/// Where element i of the plane at `plane` is: the plane's first word for
+/// its slot, and its place in it.
+uint planeOf(uint plane, uint i, out uint element) {
+    const uint nodes = compactParams.slotNodes;
+    if (nodes == 0u) {
+        element = i;
+        return plane;
+    }
+    const uint slot = i / nodes;
+    element = i - slot * nodes;
+    return compactParams.slotsBase + slot * compactParams.slotWords + plane;
+}
+
 /// `width` bytes (1..4) of element i of the plane at word `plane`.
 uint fieldAt(uint plane, uint width, uint i) {
-    const uint at = i * width;
-    const uint w = plane + (at >> 2u);
+    uint e;
+    const uint base = planeOf(plane, i, e);
+    const uint at = e * width;
+    const uint w = base + (at >> 2u);
     const uint shift = (at & 3u) * 8u;
     uint v = compactData[w] >> shift;
     if (shift + width * 8u > 32u) {
@@ -185,8 +212,25 @@ uint fieldAt(uint plane, uint width, uint i) {
     return width >= 4u ? v : v & ((1u << (width * 8u)) - 1u);
 }
 
+/// Word k of gaussian i's chunk (resident) or slot head (paged).
+uint chunkWord(uint i, uint k) {
+    const uint nodes = compactParams.slotNodes;
+    if (nodes == 0u) {
+        return compactData[compactParams.chunkTable + (i / kCompactChunk) * kCompactChunkWords + k];
+    }
+    return compactData[compactParams.slotsBase + (i / nodes) * compactParams.slotWords + k];
+}
+
+/// A gaussian's id for the faint splats' dither: its index, or, paged, its
+/// node's place in its piece (slot head word 11, the page's base) -- the
+/// same whatever slot the page is in.
+uint stableIndexOf(uint i) {
+    const uint nodes = compactParams.slotNodes;
+    return nodes == 0u ? i : chunkWord(i, 11u) + (i % nodes);
+}
+
 float chunkFloat(uint i, uint k) {
-    return asfloat(compactData[compactParams.chunkTable + (i / kCompactChunk) * kCompactChunkWords + k]);
+    return asfloat(chunkWord(i, k));
 }
 
 public struct CompactSplat {
@@ -264,13 +308,16 @@ float3 curvatureOf(uint i) {
 }
 
 uint4 materialOf(uint i) {
-    const uint at = compactParams.materials + fieldAt(compactParams.material, 2u, i) * kCompactMaterialWords;
+    const uint table = compactParams.slotNodes == 0u ? compactParams.materials : chunkWord(i, 10u);
+    const uint at = table + fieldAt(compactParams.material, 2u, i) * kCompactMaterialWords;
     return uint4(compactData[at], compactData[at + 1u], compactData[at + 2u], compactData[at + 3u]);
 }
 
 /// Where splat i's open-direction cells are in `compact` (words).
 uint cellBaseOf(uint i) {
-    return compactData[compactParams.pieceTable + i / kCompactPiece] + fieldAt(compactParams.shadow, 2u, i) * 8u;
+    const uint book = compactParams.slotNodes == 0u ? compactData[compactParams.pieceTable + i / kCompactPiece]
+                                                    : chunkWord(i, 9u);
+    return book + fieldAt(compactParams.shadow, 2u, i) * 8u;
 }
 
 // ------------------------------------------------------- the joint CPCA's terms
@@ -286,10 +333,11 @@ float weightOf(uint w, uint k) {
 
 /// Block b's 8 int8 weights of splat i (two words).
 uint2 weightsOf(uint i, uint b) {
-    const uint plane = compactParams.weights + b * compactParams.weightsStride;
+    uint e;
+    const uint plane = planeOf(compactParams.weights + b * compactParams.weightsStride, i, e);
     if (compactParams.weightBits == 4u) {
         // Back on the int8 grid the records were measured on.
-        const uint w = compactData[plane + i];
+        const uint w = compactData[plane + e];
         uint2 out = uint2(0u);
         [unroll] for (uint k = 0; k < 8u; ++k) {
             const int q4 = int(((w >> (4u * k)) & 0xFu) << 28u) >> 28;
@@ -303,7 +351,7 @@ uint2 weightsOf(uint i, uint b) {
         }
         return out;
     }
-    return uint2(compactData[plane + 2u * i], compactData[plane + 2u * i + 1u]);
+    return uint2(compactData[plane + 2u * e], compactData[plane + 2u * e + 1u]);
 }
 
 /// Term `term` of a cluster's projections (atheneaCompactProject) for a
@@ -853,16 +901,22 @@ uint cullKeyOf(uint i) {
 [numthreads(256, 1, 1)]
 void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
     const uint t = gaussianIndex(tid);
+    const bool stable = hasFlag(kCompactStableOrder);
+    if (stable && t >= compactParams.capacity) {
+        return;
+    }
     if (t >= compactParams.count) {
+        // kCompactStableOrder sorts every slot: the ones past the list sort
+        // last (the nearest key), past the drawn count, and draw nothing.
+        if (stable) {
+            sortKeys[t] = (1u << kCompactKeyBits) - 1u;
+            sortVals[t] = kCompactNone;
+        }
         return;
     }
     // With a draw list (a LoD cut chosen on the host), thread t culls its
     // t-th entry; else gaussian t.
     const uint i = hasFlag(kCompactDrawList) ? compactFrame[compactParams.drawList + t] : t;
-    const bool stable = hasFlag(kCompactStableOrder);
-    if (stable && t >= compactParams.capacity) {
-        return;
-    }
     const uint key = cullKeyOf(i);
     if (stable) {
         // The radix sort is stable: equal keys keep the list's order.
@@ -940,7 +994,7 @@ bool projectCompact(CompactSplat g, float3 v, uint index, inout float alpha, out
         det = a * d - b * b;
         float fa = mass / sqrt(det);
         if (fa < faintTarget) {
-            uint x = (index * 0x9e3779b9u) ^ 0x85ebca6bu;
+            uint x = (stableIndexOf(index) * 0x9e3779b9u) ^ 0x85ebca6bu;
             x ^= x >> 16u;
             x *= 0x7feb352du;
             x ^= x >> 15u;

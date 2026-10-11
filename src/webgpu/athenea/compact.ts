@@ -92,6 +92,11 @@ export interface CompactLayout {
   words: Record<string, number>;
   /** Bytes by category: per-gaussian planes and the tables. */
   bytes: Record<string, number>;
+  /**
+   * Band pages in pool slots (compactPages.ts CompactPagePool): `words`
+   * are then offsets within a slot, the gaussians slotNodes a slot.
+   */
+  paged?: { slotNodes: number; slotWords: number; slotsBase: number };
 }
 
 export interface CompactCloud {
@@ -773,8 +778,9 @@ export class CompactRelitPath {
   }
 
   setCloud(cloud: CompactCloud) {
-    this.data?.destroy();
+    if (this.ownsData) this.data?.destroy();
     this.cloud = cloud;
+    this.ownsData = true;
     this.data = createStorage(
       this.device,
       cloud.data.byteLength,
@@ -787,6 +793,25 @@ export class CompactRelitPath {
       cloud.data.byteOffset,
       cloud.data.byteLength,
     );
+    this.afterCloud(cloud);
+  }
+
+  /**
+   * Band pages in a pool (compactPages.ts): the pool's buffer is read as it
+   * is (not owned), the gaussians its slot indices; the draw list
+   * (setDrawList, the traversal's cut) says which are drawn.
+   */
+  setPagedCloud(pool: { buffer: GPUBuffer; cloud: CompactCloud }) {
+    if (this.ownsData) this.data?.destroy();
+    this.cloud = pool.cloud;
+    this.data = pool.buffer;
+    this.ownsData = false;
+    this.afterCloud(pool.cloud);
+  }
+
+  private ownsData = false;
+
+  private afterCloud(cloud: CompactCloud) {
     const words =
       cloud.layout.clusters * K.kCompactProjWords + K.kCompactSunWords;
     this.projWords = words;
@@ -891,9 +916,13 @@ export class CompactRelitPath {
     const p = (camera as THREE.PerspectiveCamera).projectionMatrix.elements;
     const near = (camera as THREE.PerspectiveCamera).near ?? 0.01;
     const far = (camera as THREE.PerspectiveCamera).far ?? 1000;
+    const paged = cloud.layout.paged;
     return UniformWriter.for(compactModule, "compactParams").setAll({
       count: this.listed,
       flags: this.flags(),
+      slotNodes: paged?.slotNodes ?? 0,
+      slotWords: paged?.slotWords ?? 0,
+      slotsBase: paged?.slotsBase ?? 0,
       drawList: this.projWords,
       chunkTable: W.chunkTable,
       pieceTable: W.pieceTable,
@@ -976,11 +1005,7 @@ export class CompactRelitPath {
     params: UniformWriter,
     profiler: GpuProfiler | null,
   ) {
-    if (this.sky.dirty) {
-      // On a submit of its own, so its source images can go right after.
-      this.sky.prepareNow();
-      if (this.options.releaseSky) this.sky.releaseSources();
-    }
+    this.prepareSky();
     const key = `${this.sky.version}`;
     if (key === this.projectedKey) return;
     this.projectedKey = key;
@@ -995,6 +1020,13 @@ export class CompactRelitPath {
     });
     pass.end();
     this.stats.projected += 1;
+  }
+
+  /** The dome prepared when changed, on a submit of its own (its source images can go right after). */
+  private prepareSky() {
+    if (!this.sky.dirty) return;
+    this.sky.prepareNow();
+    if (this.options.releaseSky) this.sky.releaseSources();
   }
 
   /** Forces the projections again (as a change of the lights would). */
@@ -1019,6 +1051,10 @@ export class CompactRelitPath {
     const cloud = this.cloud;
     if (!cloud) return;
     const profiler = o.profiler ?? null;
+    // The dome first: the uniform carries its prepared size (envBaseSide),
+    // which a frame's projections would otherwise read before it is set,
+    // and keep (thread CN: a fresh path's highlights came out ~10-20 % off).
+    this.prepareSky();
     const params = this.params(camera, width, height);
     // Nothing moved and the light is the same: the records in the sort's
     // buffers are this frame's, and only the draw runs.
@@ -1062,7 +1098,10 @@ export class CompactRelitPath {
         label: "compact.cull",
         timestampWrites: profiler?.timestampWrites("compact.cull"),
       });
-      const n = this.listed;
+      // Stable order sorts every slot: the cull fills those past the list.
+      const n = this.options.stableOrder
+        ? Math.max(this.listed, this.capacity)
+        : this.listed;
       const row = K.kCompactDispatchRow;
       this.registry.get(compactModule, "atheneaCompactCull").dispatch(pass, {
         grid: [Math.min(n, row), Math.ceil(n / row)],
@@ -1230,6 +1269,7 @@ export class CompactRelitPath {
     const n = cloud.layout.count;
     const out = createStorage(this.device, n * 48, "compact colours");
     const encoder = this.device.createCommandEncoder();
+    this.prepareSky();
     const params = this.params(camera, width, height);
     this.prepareLight(encoder, params, null);
     const pass = encoder.beginComputePass({ label: "compact.colours" });
@@ -1277,7 +1317,7 @@ export class CompactRelitPath {
   }
 
   dispose() {
-    this.data?.destroy();
+    if (this.ownsData) this.data?.destroy();
     this.bins?.destroy();
     this.frame.destroy();
     this.drawUniform.destroy();

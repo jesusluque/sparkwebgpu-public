@@ -89,6 +89,8 @@ export class GpuSplatSource {
       sh2?: Uint32Array;
       sh3a?: Uint32Array;
       sh3b?: Uint32Array;
+      /** Opacities past 1 are Spark's LoD opacity (merged nodes). */
+      lodOpacity?: boolean;
     } = {},
   ) {
     const words = new Uint32Array(count * 8);
@@ -109,7 +111,16 @@ export class GpuSplatSource {
       }
       sh = upload(device, shWords, "ext SH");
     }
-    return new GpuSplatSource("ext", count, src, sh, numSh);
+    return new GpuSplatSource(
+      "ext",
+      count,
+      src,
+      sh,
+      numSh,
+      undefined,
+      undefined,
+      options.lodOpacity ?? false,
+    );
   }
 
   /** From a loaded PackedSplats (await packedSplats.initialized first). */

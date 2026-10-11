@@ -478,7 +478,7 @@ type FetchOptions = {
 };
 
 /** Bytes offset .. offset + bytes of the file, and the file's size. */
-async function readRange(
+export async function readRange(
   { url, fileBytes, requestHeader, withCredentials, signal }: FetchOptions,
   offset: number,
   bytes: number,

@@ -931,7 +931,7 @@ pub fn unpack_rgb9e5(word: u32) -> [f32; 3] {
     [(word & 511) as f32 * step, ((word >> 9) & 511) as f32 * step, ((word >> 18) & 511) as f32 * step]
 }
 
-fn linear_to_srgb(v: f32) -> f32 {
+pub fn linear_to_srgb(v: f32) -> f32 {
     if v <= 0.003_130_8 { 12.92 * v.max(0.0) } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 

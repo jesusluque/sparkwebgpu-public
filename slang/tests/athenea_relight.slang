@@ -143,6 +143,7 @@ float3 relitTowardAt<let kTransfer : int>(uint i, bool pixel, out uint4 slopesOu
     surface.transmission = hasPbr ? pbrTransmission(pbr) : 0.0;
     surface.thinWalled = hasPbr && pbrThinWalled(pbr);
     surface.schlickMetal = hasPbr && pbrSchlickMetal(pbr);
+    surface.materialRoughness = -1.0;
     surface.ior = params.ior;
     surface.backFacing = splatFacing(r, scale, position, params.eyeCloud.xyz) < 0.0;
     surface.hasBehind = false;

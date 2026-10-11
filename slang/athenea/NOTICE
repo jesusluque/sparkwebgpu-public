@@ -1,8 +1,10 @@
 athenea shaders
 Copyright (c) 2026 jesus luque.
 
-The .slang files under this directory are unmodified copies of
-shaders/athenea/ in the athenea repository at commit 89a04d92055965a92f74d44e0b20c78b96606ef4.
+The .slang files under this directory are copies of
+shaders/athenea/ in the athenea repository at commit 89a04d92055965a92f74d44e0b20c78b96606ef4,
+unmodified but for the patches VENDOR lists (slang/athenea_patches/,
+each carrying a later athenea commit by its author).
 Each keeps its original copyright header. They are vendored into
 sparkwebGPU by their author's decision (plan-athenea.md, section 6,
 2026-10-06) as a read-only dependency; changes belong upstream in

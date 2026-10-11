@@ -75,6 +75,19 @@ public static const uint kRelightSheetDraw = 65536u;     // thin sheets marked (
 // source) while it is at most opacitySwitchPx on screen: generate's
 // GEN_OPACITY_SWITCH, the same test, so a sheet's alpha is the one drawn.
 public static const uint kRelightOpacitySwitch = 131072u;
+// athenea-pieces b26d276 / 35ae3cb (slang/athenea_patches/0001): the bake
+// widened each gaussian's roughness by the surface's turn across it
+// (mesh2splat's m2sSpread, Toksvig: alpha'^2 = alpha^2 + 2 spread^2, spread =
+// the shape operator's largest principal curvature times the wider size).
+// kRelightUnwiden: the sharp per-pixel lobes (kRelightSlope) read the sky at
+// the roughness before that widening, their pixel's footprint term added on
+// top. kRelightCoatFold: a coat's widening held to kCoatFoldRoughness (0.3)
+// where the spread is large. kRelightPolishField: the material's own
+// roughness (pbr bits 26..31) is read, and a polish at least
+// kPolishFieldRoughness rough has the reflected field answer its closed part.
+public static const uint kRelightUnwiden = 262144u;
+public static const uint kRelightCoatFold = 524288u;
+public static const uint kRelightPolishField = 1048576u;
 public static const uint kRelightGroup = 256;
 /// Five uint4 a splat in `relit`: the colour (asuint float4: linear rgb,
 /// alpha, -1 to keep the splat's alpha, -2 to keep its whole rgba), the
@@ -239,6 +252,7 @@ SplatSurface surfaceOf<let kCpca : int>(uint i, Gsplat g, float3x3 r, float3 clo
     surface.transmission = hasPbr ? pbrTransmission(pbr) : 0.0;
     surface.thinWalled = hasPbr && pbrThinWalled(pbr);
     surface.schlickMetal = hasPbr && pbrSchlickMetal(pbr);
+    surface.materialRoughness = hasPbr && hasFlag(kRelightPolishField) ? pbrMaterialRoughness(pbr) : -1.0;
     surface.ior = relightParams.ior;
     surface.backFacing = splatFacing(r, g.scales, g.center, relightParams.eyeObject.xyz) < 0.0;
     surface.hasBehind = false;
@@ -414,6 +428,18 @@ bool curvatureOf(uint i, out float3 k) {
 float normalSpreadOf(uint i) {
     const uint id = relightParams.curvature;
     return hasAttr(id) ? f16tof32(readAttribU(relightPool, id, i, 3u)) : 0.0;
+}
+
+/// How far the bake widened a gaussian's roughness (athenea's
+/// slope.bakeSpread, splat_project): the largest principal curvature of the
+/// shape operator (xx, xy, yy) times the wider of the first two sizes.
+public float bakeSpreadOf(float3 shapeUV, float3 scales) {
+    const float a = shapeUV.x;
+    const float b = shapeUV.y;
+    const float c = shapeUV.z;
+    const float kMax = abs(0.5 * (a + c)) + sqrt(0.25 * (a - c) * (a - c) + b * b);
+    const float s = kMax * max(scales.x, scales.y);
+    return isfinite(s) ? s : 0.0;
 }
 
 /// splat_project's projection of a gaussian, as far as SplatSlope needs it:
@@ -658,6 +684,14 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
     float3 dx = float3(0.0);
     float3 dy = float3(0.0);
     const bool turns = projected && normalTurnPerPixel(r, shapeUV, cloudNormal, tx3, ty3, dx, dy);
+    // The bake's spread (splat_project's slope.bakeSpread): the shape
+    // operator's largest principal curvature times the wider size.
+    const float spread = curved ? bakeSpreadOf(shapeUV, g.scales) : 0.0;
+    // The roughnesses as stored (the bake's), before the footprint
+    // prefilter: the sharp lobes are unwidened from these.
+    const float storedPolish = surface.roughness;
+    const float storedCoat = surface.lobes.coatRoughness;
+    float sharpPixelVariance = 0.0;
     // The footprint prefilter: the lobes widened by how the normal turns
     // over what the splat's one colour stands for. Without the per-pixel
     // slope that is its gaussian, or the pixel where the splat is smaller;
@@ -666,6 +700,7 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
         const float gain = relightParams.footprint;
         const float kappa = relightParams.filter.x;
         const float pixelVariance = turns ? relightParams.filter.z * (dot(dx, dx) + dot(dy, dy)) : 0.0;
+        sharpPixelVariance = hasFlag(kRelightSlope) ? pixelVariance : 0.0;
         const bool splatTerms = !hasFlag(kRelightSlope);
         const float3 shape = splatTerms ? shapeUV : float3(0.0);
         const float spread = splatTerms ? normalSpreadOf(i) : 0.0;
@@ -675,6 +710,15 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
             surface.lobes.coatRoughness =
                 footprintRoughness(surface.lobes.coatRoughness, shape, g.scales, gain, kappa, spread, pixelVariance);
         }
+    }
+    // A FOLD'S COAT (athenea's kCoatFoldRoughness, splat_project): the
+    // bake's widening held to 0.3 where the surface turns faster than a
+    // gaussian is wide. After the footprint prefilter, so the prefilter's
+    // own widening is held too (before it, the splat term re-widened a fold
+    // past 0.3 again without pixelDetail).
+    if (curved && hasFlag(kRelightCoatFold) && surface.lobes.coatWeight > 0.0) {
+        const float coat = surface.lobes.coatRoughness;
+        surface.lobes.coatRoughness = max(unwidened(coat, spread), min(coat, kCoatFoldRoughness));
     }
     if (turns && hasFlag(kRelightSlope) && shadowWords() >= 8u && transferCount() >= 9u) {
         const float4 w0 = relightParams.row0;
@@ -704,6 +748,28 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
                                       0u, 0u, envTexels, envSh, envOfLight, relightParams.envLights,
                                       relightParams.envBaseSide, envSun, relightPool, relightPool,
                                       hasFlag(kRelightIndirect), slope);
+    }
+    // THE SHARP LOBES, UNWIDENED (athenea's `unwidened`): they are drawn
+    // per pixel along a mirror that already turns with the surface, so the
+    // bake's widening by that turn counted it twice. Read at the stored
+    // roughness less the bake's spread, with only the pixel's own footprint
+    // term on top -- which is what the per-pixel mirror does not resolve --
+    // and not the stored roughness's widening unwidened (the same unless the
+    // spread passes the stored roughness).
+    if (kTransfer >= 2 && slope.sharpOn && hasFlag(kRelightUnwiden) && spread > 0.0) {
+        const float gain = relightParams.footprint;
+        const float kappa = relightParams.filter.x;
+        const bool pixelTerm = gain > 0.0 && sharpPixelVariance > 0.0;
+        if (slope.sharpWeight > 0.0) {
+            const float own = unwidened(min(storedCoat, slope.sharpRoughness), spread);
+            slope.sharpRoughness =
+                pixelTerm ? footprintRoughness(own, float3(0.0), g.scales, gain, kappa, 0.0, sharpPixelVariance) : own;
+        }
+        if (any(slope.sharpPolish > float3(0.0))) {
+            const float own = unwidened(min(storedPolish, slope.sharpPolishRoughness), spread);
+            slope.sharpPolishRoughness =
+                pixelTerm ? footprintRoughness(own, float3(0.0), g.scales, gain, kappa, 0.0, sharpPixelVariance) : own;
+        }
     }
     float alpha = -1.0;
     bool sheet = false;

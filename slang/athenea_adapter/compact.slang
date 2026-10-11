@@ -96,6 +96,14 @@ public static const uint kCompactDrawList = 64u;   // the cull walks a list of g
 public static const uint kCompactBinned = 128u;    // the shade walks the drawn slots by cluster (binsIn)
 public static const uint kCompactBins = 256u;      // clusters a cloud may have (u8 ids)
 public static const uint kCompactStableOrder = 256u; // each listed gaussian its own slot (culled: ~0), for repeatable images
+// athenea 35ae3cb, as relight.slang's kRelightCoatFold and kRelightPolishField:
+// a coat's bake widening held to kCoatFoldRoughness (0.3) where the surface
+// turns fast under the gaussian; the material's own roughness (pbr bits
+// 26..31) read, and a polish at least kPolishFieldRoughness rough has the
+// reflected field answer its closed part. (The compact path has no sharp
+// per-pixel lobes, so athenea's unwidened lobes, b26d276, do not apply.)
+public static const uint kCompactCoatFold = 512u;
+public static const uint kCompactPolishField = 1024u;
 public static const uint kCompactNone = 0xFFFFFFFFu;
 
 public struct CompactParams {
@@ -634,7 +642,11 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
                          ((1.0 - s.transmission) * front + transmittedWeightOf(s) * passes * behind);
     const float3 seen = envRadiance(envTexels, dome, mirror, s.roughness, side);
     const float openAll = saturate(openness / 0.28209479177387814);
-    const float narrowed = specularOpenness(nDotV, openAll, s.roughness);
+    // athenea 35ae3cb: a polish as wide as the field asks its own lobe's
+    // cells, and the field answers what they close.
+    const bool polishField = hasField && s.materialRoughness >= kPolishFieldRoughness;
+    const float narrowed = polishField ? splatLobeOpen(s, compactData, mirror, s.roughness, s.normal)
+                                       : specularOpenness(nDotV, openAll, s.roughness);
     const float3 sunPolish = !(disc.w > 0.0) ? float3(0.0)
                                              : splatPolish(s, nDotV) * irradiance *
                                                    (sunShare * sunReflectPdf(mirror, disc.xyz, s.roughness, disc.w));
@@ -656,7 +668,10 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
     if (hasField) {
         return body2 +
                layers.under * thinWallGainOf(s) *
-                   (max(splatPolish(s, nDotV) * (narrowed * seen), float3(0.0)) + sunPolish) +
+                   (max(splatPolish(s, nDotV) *
+                            (narrowed * seen + (polishField ? (1.0 - narrowed) * coupling * fieldPolish : float3(0.0))),
+                        float3(0.0)) +
+                    sunPolish) +
                coat + sheen;
     }
     return body2 + layers.under * thinWallGainOf(s) * (splatPolish(s, nDotV) * narrowed * seen + sunPolish) + coat +
@@ -701,6 +716,10 @@ struct CompactSurface {
     uint index;
 };
 
+/// The material's own roughness (athenea's pbrMaterialRoughness on the
+/// material table's pbr word), -1 where the asset does not carry it.
+float compactMaterialRoughness(uint i) { return pbrMaterialRoughness(materialOf(i).x); }
+
 CompactSurface surfaceOf(uint i, CompactSplat g) {
     CompactSurface o;
     const float3x3 r = splatRotation(g.quaternion);
@@ -724,6 +743,7 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
     surface.transmission = pbrTransmission(pbr);
     surface.thinWalled = pbrThinWalled(pbr);
     surface.schlickMetal = pbrSchlickMetal(pbr);
+    surface.materialRoughness = hasFlag(kCompactPolishField) ? compactMaterialRoughness(i) : -1.0;
     surface.ior = compactParams.ior;
     surface.backFacing = splatFacing(r, g.scales, g.center, compactParams.eyeObject.xyz) < 0.0;
     surface.hasBehind = false;
@@ -759,6 +779,16 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
                                             compactParams.footprintClamp);
             surface.lobes.coatRoughness = footprintOf(surface.lobes.coatRoughness, shapeUV, g.scales,
                                                       compactParams.footprint, compactParams.footprintClamp);
+        }
+        // A fold's coat (relight.slang's kRelightCoatFold, after the footprint).
+        if (hasFlag(kCompactCoatFold) && surface.lobes.coatWeight > 0.0) {
+            const float a = shapeUV.x, b = shapeUV.y, c = shapeUV.z;
+            const float kMax = abs(0.5 * (a + c)) + sqrt(0.25 * (a - c) * (a - c) + b * b);
+            const float spread = kMax * max(g.scales.x, g.scales.y);
+            const float coat = surface.lobes.coatRoughness;
+            if (isfinite(spread)) {
+                surface.lobes.coatRoughness = max(unwidened(coat, spread), min(coat, kCoatFoldRoughness));
+            }
         }
     }
     o.surface = surface;

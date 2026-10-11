@@ -146,6 +146,12 @@ export {
   workerLodCall,
 } from "./athenea/compactPages";
 export {
+  CompactNodePool,
+  NODE_RECORD_WORDS,
+  NodeSlotAllocator,
+  PagePayloadStore,
+} from "./athenea/compactNodes";
+export {
   ATHENEA_SKIN_ID,
   type AtheneaSkinOptions,
   type AtheneaSkinPlugin,

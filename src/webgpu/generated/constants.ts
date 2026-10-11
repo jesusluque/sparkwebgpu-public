@@ -5,6 +5,7 @@
 export const atheneaAdapterCompact = {
   kCompactChunk: 8192,
   kCompactChunkWords: 12,
+  kCompactHeadWords: 16,
   kCompactPiece: 16384,
   kCompactMaterialWords: 4,
   kCompactClusterWords: 504,

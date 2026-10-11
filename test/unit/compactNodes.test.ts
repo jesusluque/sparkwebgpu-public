@@ -1,0 +1,189 @@
+// The node pool's CPU parts (thread CT, compactNodes.ts): the slot
+// allocator (free list, idle FIFO, the last cut's slots, growth) and the
+// pages' payload store (compressed as fetched, an LRU of decompressed).
+
+import { gzipSync } from "node:zlib";
+import { describe, expect, it } from "vitest";
+import {
+  NODE_RECORD_WORDS,
+  NodeSlotAllocator,
+  PagePayloadStore,
+  nodeRecordLayout,
+  packPageRecords,
+} from "../../src/webgpu/athenea/compactNodes";
+import {
+  COMPACT_NODE_BYTES,
+  COMPACT_PLANE_WIDTHS,
+  compactPlaneOffset,
+} from "../../src/webgpu/athenea/compactPages";
+
+/** One frame: keys used or allocated, then committed. */
+function frame(a: NodeSlotAllocator, keys: number[]) {
+  a.begin();
+  const out = keys.map((k) => a.use(k));
+  keys.forEach((k, j) => {
+    if (out[j] < 0) out[j] = a.allocate(k);
+  });
+  const cut = Uint32Array.from(out.filter((s) => s >= 0));
+  a.commit(cut);
+  return out;
+}
+
+describe("NodeSlotAllocator", () => {
+  it("gives each node one slot and keeps it while it stays in the cut", () => {
+    const a = new NodeSlotAllocator(8);
+    const f1 = frame(a, [10, 11, 12]);
+    expect(new Set(f1).size).toBe(3);
+    expect(f1).toEqual([0, 1, 2]); // lowest first: runs of slots
+    const f2 = frame(a, [12, 11, 13]);
+    expect(f2[0]).toBe(f1[2]);
+    expect(f2[1]).toBe(f1[1]);
+    expect(a.used).toBe(4); // 10 idle, still held
+    expect(a.stats.reused).toBe(2);
+  });
+
+  it("reuses an idle node's slot when it comes back (the hysteresis)", () => {
+    const a = new NodeSlotAllocator(8);
+    const f1 = frame(a, [1, 2]);
+    frame(a, [3]); // 1, 2 idle
+    frame(a, [4]);
+    const f4 = frame(a, [1]);
+    expect(f4[0]).toBe(f1[0]);
+    expect(a.stats.allocated).toBe(4);
+  });
+
+  it("takes idle slots oldest first, never this cut's", () => {
+    const a = new NodeSlotAllocator(4);
+    frame(a, [1, 2]); // slots 0, 1
+    frame(a, [3, 4]); // slots 2, 3; 1, 2 idle
+    frame(a, [3, 4]); // nothing changes
+    const f = frame(a, [3, 4, 5]); // full: an idle one goes
+    expect(f.slice(0, 2)).toEqual([2, 3]);
+    expect([0, 1]).toContain(f[2]);
+    expect(a.stats.evicted).toBe(1);
+    expect(a.used).toBe(4);
+    // The evicted key is gone, the other idle one held.
+    a.begin();
+    const held = [1, 2].map((k) => a.use(k)).filter((s) => s >= 0);
+    expect(held.length).toBe(1);
+  });
+
+  it("takes the last cut's slots when no idle one is left", () => {
+    const a = new NodeSlotAllocator(4);
+    frame(a, [1, 2, 3, 4]);
+    const f = frame(a, [5, 6, 3]);
+    expect(f.every((s) => s >= 0)).toBe(true);
+    expect(new Set(f).size).toBe(3);
+    expect(a.stats.failed).toBe(0);
+    // A cut over the capacity fails the rest.
+    const g = frame(a, [7, 8, 9, 10, 11]);
+    expect(g.filter((s) => s < 0).length).toBe(1);
+  });
+
+  it("grows with the new slots free", () => {
+    const a = new NodeSlotAllocator(2);
+    frame(a, [1, 2]);
+    a.grow(4);
+    const f = frame(a, [1, 2, 3, 4]);
+    expect(f).toEqual([0, 1, 2, 3]);
+    expect(a.stats.failed).toBe(0);
+  });
+
+  it("releases a slot", () => {
+    const a = new NodeSlotAllocator(2);
+    a.begin();
+    const s = a.allocate(9);
+    a.release(s);
+    expect(a.keyIn(s)).toBe(-1);
+    expect(a.use(9)).toBe(-1);
+    expect(a.allocate(10)).toBe(s);
+  });
+});
+
+describe("PagePayloadStore", () => {
+  const section = (n: number, seed: number) =>
+    Uint8Array.from(
+      { length: n * COMPACT_NODE_BYTES },
+      (_, i) => (i * 7 + seed) & 0xff,
+    );
+
+  it("keeps the stored form, decompresses on a miss, LRU of decoded pages", () => {
+    const s = new PagePayloadStore(2);
+    const raws = [0, 1, 2].map((p) => section(10, p));
+    raws.forEach((raw, p) => {
+      s.put(p, 10, new Uint8Array(gzipSync(raw)), raw);
+    });
+    expect(s.pages).toBe(3);
+    expect(s.decodedBytes).toBe(2 * raws[0].length); // the last two landed
+    expect(s.sectionOf(2)).toBe(raws[2]); // a hit, the same bytes
+    expect(s.stats.hits).toBe(1);
+    const again = s.sectionOf(0) as Uint8Array; // a miss: gunzipped
+    expect(s.stats.decodes).toBe(1);
+    expect(Array.from(again)).toEqual(Array.from(raws[0]));
+    expect(s.decodedBytes).toBe(2 * raws[0].length);
+    // 1 was the least recent: gone from the LRU, 2 and 0 kept.
+    s.sectionOf(2);
+    s.sectionOf(0);
+    expect(s.stats.decodes).toBe(1);
+    s.drop(0);
+    expect(s.sectionOf(0)).toBeNull();
+    expect(s.pages).toBe(2);
+    const compressed = [1, 2].reduce((n, p) => n + gzipSync(raws[p]).length, 0);
+    expect(s.compressedBytes).toBe(compressed);
+  });
+
+  it("keeps an uncompressed section as it is", () => {
+    const s = new PagePayloadStore(0);
+    const raw = section(4, 3);
+    s.put(5, 4, null, raw);
+    expect(s.sectionOf(5)).toBe(raw);
+    expect(s.stats.decodes).toBe(0);
+  });
+});
+
+describe("node records", () => {
+  it("hold each GPU plane's bytes at the record's offsets, and the origin", () => {
+    const n = 5;
+    const raw = Uint8Array.from(
+      { length: n * COMPACT_NODE_BYTES },
+      (_, i) => (i * 13 + 1) & 0xff,
+    );
+    const out = new Uint8Array(2 * NODE_RECORD_WORDS * 4);
+    packPageRecords(raw, n, [3, 1], 77, out, 0);
+    const at = nodeRecordLayout();
+    const planes: Record<string, number> = {
+      posX: 0,
+      posY: 1,
+      posZ: 2,
+      albedo: 3,
+      opacity: 4,
+      scale: 5,
+      rotation: 6,
+      normal: 7,
+      curvature: 8,
+      material: 9,
+      cluster: 10,
+      weights: 11,
+      weights1: 12,
+      weights2: 13,
+      shadow: 14,
+    };
+    const used = new Set<number>();
+    [3, 1].forEach((place, r) => {
+      for (const [name, k] of Object.entries(planes)) {
+        const w = COMPACT_PLANE_WIDTHS[k];
+        for (let b = 0; b < w; b++) {
+          const byte = r * 44 + at[name] + b;
+          if (r === 0) used.add(byte);
+          expect(out[byte]).toBe(raw[compactPlaneOffset(k, n) + place * w + b]);
+        }
+      }
+      const o = new DataView(out.buffer).getUint32(r * 44 + 40, true);
+      expect(o & 0xffff).toBe(77);
+      expect(o >>> 16).toBe(place);
+    });
+    // The 40 payload bytes, each once.
+    expect(used.size).toBe(40);
+    expect(Math.max(...used)).toBe(39);
+  });
+});

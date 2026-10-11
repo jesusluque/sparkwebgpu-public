@@ -104,6 +104,11 @@ pub const FLAG_NODE_COVERAGE: u32 = 256;
 /// Each element carries an index into the file's occlusion codebook (v3
 /// section OCCL, the codebook after the starts; athenea's occlusion masks).
 pub const FLAG_OCCLUSION: u32 = 512;
+/// The merged levels carry a second opacity (v3 section LODM): each merge's
+/// mass ratio W / A held at 0.99, beside its stored opacity (the producer's
+/// composited coverage). The player picks one per node by its size on
+/// screen (`opacitySwitchPx`). v3 only.
+pub const FLAG_LOD_MASS: u32 = 1024;
 /// Words an occlusion codebook entry holds (256 bits).
 pub const OCCLUSION_WORDS: usize = 8;
 pub const KNOWN_FLAGS: u32 = FLAG_OCCLUSION
@@ -114,6 +119,7 @@ pub const KNOWN_FLAGS: u32 = FLAG_OCCLUSION
     | FLAG_TRANSFER
     | FLAG_LOD_SIZE
     | FLAG_LOD_ERROR
+    | FLAG_LOD_MASS
     | FLAG_NODE_COVERAGE;
 
 /// Spark's LoD pages (and athenea's default chunk): 65 536 splats.
@@ -508,6 +514,10 @@ pub struct AthcBlock {
     /// athenea's occlusion mask (v3 section OCCL): an element's codebook
     /// entry + 1, 0 none (never culled); one word, its low byte(s) used.
     pub occlusion: Vec<u32>,
+    /// A merged node's second opacity (v3 section LODM, FLAG_LOD_MASS): its
+    /// mass ratio held at 0.99, as f32 bits; 0 for a splat (a leaf has one
+    /// opacity) or a node without it; or empty.
+    pub lod_mass: Vec<u32>,
 }
 
 fn words_of(b: &[u8], at: &mut usize, n: usize) -> Vec<u32> {
@@ -538,7 +548,7 @@ impl AthcBlock {
         let shadow_bits = opt(x.shadow_words > 0, &mut at, x.shadow_words);
         let curvature = opt(x.curvature_words > 0, &mut at, x.curvature_words);
         let skin = opt(x.skin_words() > 0, &mut at, x.skin_words());
-        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new(), lod_error: Vec::new(), occlusion: Vec::new() })
+        Ok(Self { n, positions, shape, sh, tail, normals, emission, pbr, lobes, transfer, shadow_bits, curvature, skin, lod_size: Vec::new(), lod_error: Vec::new(), occlusion: Vec::new(), lod_mass: Vec::new() })
     }
 
     /// Every array after positions, in file order.
@@ -595,6 +605,7 @@ impl AthcBlock {
             lod_size: if self.lod_size.is_empty() { Vec::new() } else { self.lod_size[start..start + n].to_vec() },
             lod_error: if self.lod_error.is_empty() { Vec::new() } else { cut(&self.lod_error) },
             occlusion: if self.occlusion.is_empty() { Vec::new() } else { cut(&self.occlusion) },
+            lod_mass: if self.lod_mass.is_empty() { Vec::new() } else { cut(&self.lod_mass) },
         }
     }
 
@@ -619,6 +630,15 @@ impl AthcBlock {
                 self.lod_size.resize(self.n, 0.0);
             } else {
                 self.lod_size.extend_from_slice(&other.lod_size);
+            }
+        }
+        // And the second opacities (0: none).
+        if !self.lod_mass.is_empty() || !other.lod_mass.is_empty() {
+            self.lod_mass.resize(self.n - other.n, 0);
+            if other.lod_mass.is_empty() {
+                self.lod_mass.resize(self.n, 0);
+            } else {
+                self.lod_mass.extend_from_slice(&other.lod_mass);
             }
         }
         // And the occlusion indices (0: none).
@@ -1160,6 +1180,10 @@ pub fn merge_root(level1: &AthcBlock, sh_words: usize) -> AthcBlock {
     // A LoD size at least its children's (athc_lod_error).
     if !level1.lod_size.is_empty() {
         root.lod_size = vec![level1.lod_size.iter().cloned().fold(0.0, f32::max)];
+    }
+    // No second opacity of its own (the slice took its heaviest child's).
+    if !root.lod_mass.is_empty() {
+        root.lod_mass = vec![0];
     }
     // Its LoD error over level 1's (athc_lod_cut): no merge cost of its own.
     if level1.lod_error.len() == level1.n * crate::athc_lod_cut::LOD_ERROR_WORDS {
@@ -1939,6 +1963,13 @@ pub fn merged_pages_of(file: &AthcFile, header_page: &[u8]) -> Result<(VirtualTr
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
+        if !merged.lod_mass.is_empty() {
+            let flags = u32::from_le_bytes(out[152..156].try_into().unwrap()) | ATHV_LOD_MASS;
+            out[152..156].copy_from_slice(&flags.to_le_bytes());
+            for v in &merged.lod_mass[base as usize..(base + n) as usize] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         pages.push(out);
     }
     Ok((tree, pages))
@@ -2021,6 +2052,9 @@ pub const ATHV_LOD_ERRORS: u32 = 4;
 /// An ATHV merged page's decode flags, bit 3: its nodes' occlusion indices
 /// (`AthcBlock::occlusion`, a word each) follow the errors.
 pub const ATHV_OCCLUSION: u32 = 8;
+/// An ATHV merged page's decode flags, bit 4: its nodes' second opacities
+/// (`AthcBlock::lod_mass`, f32 bits each) follow the occlusion indices.
+pub const ATHV_LOD_MASS: u32 = 16;
 
 /// Feeds `block`'s elements to `receiver` as splats base .. base + n, with
 /// `children` (counts, virtual starts) when they are tree nodes.
@@ -2155,6 +2189,11 @@ pub fn emit_block<T: SplatReceiver>(
     // athenea's occlusion indices (entry + 1, 0 none), nodes and splats alike.
     if lod_tree && block.occlusion.len() == block.n && block.occlusion.iter().any(|&v| v != 0) {
         receiver.set_lod_occlusion(base, block.n, &block.occlusion);
+    }
+    // The merged nodes' second opacities (FLAG_LOD_MASS), 0 none.
+    if lod_tree && block.lod_mass.len() == block.n && block.lod_mass.iter().any(|&v| v != 0) {
+        let mass: Vec<f32> = block.lod_mass.iter().map(|&w| f32::from_bits(w)).collect();
+        receiver.set_lod_mass(base, block.n, &mass);
     }
     // LoD errors for the error cut (athc_lod_cut), for the nodes that have them.
     if lod_tree && block.lod_error.len() == block.n * crate::athc_lod_cut::LOD_ERROR_WORDS && block.lod_error.iter().any(|&v| v != 0) {
@@ -2308,6 +2347,12 @@ impl<T: SplatReceiver> AthcDecoder<T> {
                     bail!("ATHV page shorter than its occlusion indices");
                 }
                 block.occlusion = words_of(b, &mut after, n);
+            }
+            if u32_at(b, 152) & ATHV_LOD_MASS != 0 {
+                if b.len() < after + 4 * n {
+                    bail!("ATHV page shorter than its second opacities");
+                }
+                block.lod_mass = words_of(b, &mut after, n);
             }
             Some(ranges)
         } else {

@@ -71,6 +71,10 @@ pub enum SectionId {
     /// element's codebook entry + 1 (0: none), one word (a byte of it used
     /// with 256 entries). Read by the traversal, so tier 1.
     Occlusion,
+    /// A merged node's second opacity (FLAG_LOD_MASS): its mass ratio held
+    /// at 0.99, f32, beside the stored one (the producer's coverage); 0 in a
+    /// chunk. Read where the splats are, so tier 1.
+    LodMass,
     /// sparkwebGPU's skin (`athc_skin`): influences then weight gradients,
     /// what a skeleton needs to carry the splats -- geometry, so tier 1.
     Skin,
@@ -98,6 +102,7 @@ impl SectionId {
             Self::LodSize => b"LODS",
             Self::LodError => b"LODE",
             Self::Occlusion => b"OCCL",
+            Self::LodMass => b"LODM",
             Self::Skin => b"SKIN",
             Self::TransferDirect => b"TXDI",
             Self::TransferIndirect => b"TXIN",
@@ -108,12 +113,13 @@ impl SectionId {
         })
     }
 
-    pub const ALL: [SectionId; 12] = [
+    pub const ALL: [SectionId; 13] = [
         Self::Core,
         Self::Sh,
         Self::LodSize,
         Self::LodError,
         Self::Occlusion,
+        Self::LodMass,
         Self::Skin,
         Self::Material,
         Self::Shadow,
@@ -134,6 +140,7 @@ impl SectionId {
             Self::LodSize => "LODS",
             Self::LodError => "LODE",
             Self::Occlusion => "OCCL",
+            Self::LodMass => "LODM",
             Self::Skin => "SKIN",
             Self::Material => "MATL",
             Self::Shadow => "SHAD",
@@ -148,7 +155,7 @@ impl SectionId {
     /// materials, 3 relit (shadow bits and transfer).
     pub fn tier(self) -> u32 {
         match self {
-            Self::Core | Self::Sh | Self::LodSize | Self::LodError | Self::Occlusion | Self::Skin => 1,
+            Self::Core | Self::Sh | Self::LodSize | Self::LodError | Self::Occlusion | Self::LodMass | Self::Skin => 1,
             Self::Material => 2,
             _ => 3,
         }
@@ -223,7 +230,7 @@ impl Want {
         let [direct, indirect, _] = transfer_split_words(x.transfer_count);
         let words = self.transfer_values.div_ceil(2);
         match id {
-            SectionId::Core | SectionId::Sh | SectionId::LodSize | SectionId::LodError | SectionId::Occlusion | SectionId::Skin => true,
+            SectionId::Core | SectionId::Sh | SectionId::LodSize | SectionId::LodError | SectionId::Occlusion | SectionId::LodMass | SectionId::Skin => true,
             SectionId::Material => self.material,
             SectionId::Shadow | SectionId::Curvature => self.transfer_values > 0,
             SectionId::TransferDirect => words > 0,
@@ -320,6 +327,7 @@ pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Sec
             if h.has(crate::athc::FLAG_LOD_ERROR) { crate::athc_lod_cut::LOD_ERROR_WORDS as u32 } else { 0 },
         ),
         (SectionId::Occlusion, if h.has(crate::athc::FLAG_OCCLUSION) { 1 } else { 0 }),
+        (SectionId::LodMass, if h.has(crate::athc::FLAG_LOD_MASS) { 1 } else { 0 }),
         (SectionId::Skin, x.skin_words()),
         (SectionId::Material, material),
         (SectionId::Shadow, x.shadow_words),
@@ -375,6 +383,13 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
         SectionId::Occlusion => {
             if block.occlusion.len() == block.n {
                 put_words(&mut out, &block.occlusion);
+            } else {
+                out.resize(4 * block.n, 0);
+            }
+        }
+        SectionId::LodMass => {
+            if block.lod_mass.len() == block.n {
+                put_words(&mut out, &block.lod_mass);
             } else {
                 out.resize(4 * block.n, 0);
             }
@@ -840,6 +855,16 @@ fn write_v3_impl(
             to.occlusion = if from.occlusion.is_empty() { vec![0; from.n] } else { from.occlusion.clone() };
         }
     }
+    // So do the merged nodes' second opacities (FLAG_LOD_MASS), the levels'.
+    if file.levels.iter().any(|(_, b)| !b.lod_mass.is_empty()) {
+        if file.levels.iter().any(|(_, b)| !b.lod_mass.is_empty() && b.lod_mass.len() != b.n) {
+            bail!(".athc v3: second opacities must be one for every group of a level");
+        }
+        v2.header.flags |= crate::athc::FLAG_LOD_MASS;
+        for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
+            to.lod_mass = if from.lod_mass.is_empty() { vec![0; from.n] } else { from.lod_mass.clone() };
+        }
+    }
     // So does a producer's own coverage (FLAG_NODE_COVERAGE): the levels'
     // opacities as they are, never capped.
     if file.header.has(crate::athc::FLAG_NODE_COVERAGE) {
@@ -1173,6 +1198,11 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
             SectionId::Occlusion => {
                 if v.iter().any(|&w| w != 0) {
                     block.occlusion = v;
+                }
+            }
+            SectionId::LodMass => {
+                if v.iter().any(|&w| w != 0) {
+                    block.lod_mass = v;
                 }
             }
             SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {

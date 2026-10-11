@@ -114,6 +114,7 @@ export type AthcSection = {
     | "LODS"
     | "LODE"
     | "OCCL"
+    | "LODM"
     | "SKIN"
     | "MATL"
     | "SHAD"
@@ -272,6 +273,10 @@ export function athcNeeds(
       return true;
     // athenea's occlusion indices (levels and chunks alike): the traversal's.
     case "OCCL":
+      return true;
+    // The merged nodes' second opacities (generate's opacity switch). A
+    // chunk's are 0: see sectionsFor.
+    case "LODM":
       return true;
     // A skinned cloud's rig (athc_skin.rs): read whole-file only for now;
     // a paged skinned cloud is drawn in its bind pose.
@@ -667,7 +672,7 @@ function sectionsFor(
       (id) =>
         athcNeeds(layout, id, want) &&
         (core || (id !== "CORE" && id !== "SHRS")) &&
-        (levels || (id !== "LODS" && id !== "LODE")),
+        (levels || (id !== "LODS" && id !== "LODE" && id !== "LODM")),
     );
 }
 

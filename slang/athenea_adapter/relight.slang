@@ -71,6 +71,10 @@ public static const uint kRelightCpca = 16384u;          // the transfer is rebu
 // openness and the reflected block, which cpca_joint.slang rebuilt.
 public static const uint kRelightJoint = 32768u;
 public static const uint kRelightSheetDraw = 65536u;     // thin sheets marked (kRelightSheet): the draw floors them after its AA
+// A merged node's second opacity (.athc LODM, a.w's high half of an ext
+// source) while it is at most opacitySwitchPx on screen: generate's
+// GEN_OPACITY_SWITCH, the same test, so a sheet's alpha is the one drawn.
+public static const uint kRelightOpacitySwitch = 131072u;
 public static const uint kRelightGroup = 256;
 /// Five uint4 a splat in `relit`: the colour (asuint float4: linear rgb,
 /// alpha, -1 to keep the splat's alpha, -2 to keep its whole rgba), the
@@ -115,7 +119,8 @@ public struct AtheneaRelightParams {
     public uint  cpcaScratch;      ///< kRelightCpca: where the batch's transfer starts in envOfLight, words
     public uint  cpcaWords;        ///< kRelightCpca: words a slot of it
     public uint  jointTable;       ///< kRelightJoint: where the clusters' projections start in envOfLight, words
-    public uint  pad2;
+    public float opacitySwitchPx;  ///< kRelightOpacitySwitch: the size on screen (2 max sigma, px) up to which
+                                   ///< a merged node takes its second opacity
     public float4 encoding;        ///< packed src: rgbMin, rgbMax, lnScaleMin, lnScaleMax
     public float4 row0;            ///< object to world, rows of a 3x4
     public float4 row1;
@@ -147,7 +152,16 @@ bool hasAttr(uint id) { return id != ATTRIB_NONE; }
 
 Gsplat readSplat(uint i) {
     if (hasFlag(kRelightExt)) {
-        return readExtSplat(relightSrc[2u * i], relightSrc[2u * i + 1u], int(i));
+        Gsplat e = readExtSplat(relightSrc[2u * i], relightSrc[2u * i + 1u], int(i));
+        if (hasFlag(kRelightOpacitySwitch)) {
+            const float second = unpackHalf2x16(relightSrc[2u * i].w).y;
+            const float sigma = max(e.scales.x, max(e.scales.y, e.scales.z));
+            const float dist = max(length(e.center - relightParams.eyeObject.xyz), 1.0e-6);
+            if (second > 0.0 && 2.0 * sigma * abs(relightParams.focal.y) <= relightParams.opacitySwitchPx * dist) {
+                e.rgba.a = second;
+            }
+        }
+        return e;
     }
     Gsplat s = readPackedSplat(relightSrc[i], int(i), relightParams.encoding);
     if (hasFlag(kRelightLodOpacity)) {

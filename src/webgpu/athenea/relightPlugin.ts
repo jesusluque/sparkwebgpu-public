@@ -836,6 +836,9 @@ export function atheneaRelightPlugin(
     ];
     const w = size?.width ?? 1;
     const h = size?.height ?? 1;
+    // The renderer's opacitySwitchPx (generate's GEN_OPACITY_SWITCH): a
+    // merged sheet's alpha is the one generate draws.
+    const switchPx = r.options.opacitySwitchPx ?? 0;
     const projection = {
       view0: eyeRow(0, 1),
       view1: eyeRow(1, 1),
@@ -862,6 +865,9 @@ export function atheneaRelightPlugin(
       (options.debug?.noCells ? C.kRelightNoCells : 0) |
       (rebuilt ? C.kRelightCpca : 0) |
       (projected ? C.kRelightJoint : 0) |
+      (switchPx > 0 && size && source.format === "ext"
+        ? C.kRelightOpacitySwitch
+        : 0) |
       (DEBUG_VIEWS[options.debug?.view ?? "none"] ?? 0);
     const e = world.elements;
     const row = (k: number) => [e[k], e[k + 4], e[k + 8], e[k + 12]];
@@ -884,6 +890,7 @@ export function atheneaRelightPlugin(
       emissionScale: options.emission,
       curvature: id("curvature"),
       footprint: options.footprint,
+      opacitySwitchPx: switchPx,
       listBase: source.count * C.kRelightStride,
       cpcaWords: projected ? JOINT.kJointEyeSlotWords : rebuiltWords,
       encoding: source.encoding,
@@ -1121,7 +1128,7 @@ export function atheneaRelightPlugin(
     // The colours of the splats the LoD draws: a list of them when it cuts
     // some (relightList), every splat otherwise. The kept terms above stay
     // per splat of the cloud: they change only with the sky, lights or place.
-    const key = `${placed}|${flags & eyeFlags}|${identity(mesh.lodIndices)}|${mesh.lodIndices?.length ?? -1}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${options.glassCover}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
+    const key = `${placed}|${flags & eyeFlags}|${identity(mesh.lodIndices)}|${mesh.lodIndices?.length ?? -1}|${eye.toArray().join()}|${iorOf(mesh)}|${options.emission}|${options.footprint}|${options.footprintClamp}|${options.cullBacksFacing}|${options.glassCover}|${switchPx > 0 ? `${switchPx}|${p[5]}|${h}` : ""}|${slopeOn || footprintPixelOn ? `${toEye.join()}|${p.join()}|${w}x${h}` : ""}`;
     if (state.relitKey === key) return;
     if (kept) flags |= C.kRelightCache;
     params.set("flags", flags);

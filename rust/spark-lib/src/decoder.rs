@@ -135,6 +135,11 @@ pub trait SplatReceiver: 'static {
     /// athenea's occlusion indices (an entry of the file's codebook + 1, 0
     /// none), a word a node.
     fn set_lod_occlusion(&mut self, base: usize, count: usize, index: &[u32]) {}
+    /// A merged node's second opacity (.athc FLAG_LOD_MASS: its mass ratio
+    /// held at 0.99), 0 none; the player picks it by the node's size on
+    /// screen. Only ExtSplats keep it (a.w's high half).
+    #[allow(unused_variables)]
+    fn set_lod_mass(&mut self, base: usize, count: usize, mass: &[f32]) {}
     /// The file's occlusion codebook (8 words an entry) and the asset's box.
     fn set_lod_occlusion_codebook(&mut self, codebook: &[u32], bounds_min: [f32; 3], bounds_max: [f32; 3]) {}
     fn finish(&mut self) -> anyhow::Result<()> { Ok(()) }

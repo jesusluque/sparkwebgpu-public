@@ -822,6 +822,67 @@ mod tests {
         assert!((first..m.n).any(|i| m.positions[i * 4 + 3] != 0.37));
     }
 
+    #[derive(Default)]
+    struct Masses {
+        mass: Vec<(usize, Vec<f32>)>,
+    }
+
+    impl crate::decoder::SplatReceiver for Masses {
+        fn set_lod_mass(&mut self, base: usize, count: usize, mass: &[f32]) {
+            self.mass.push((base, mass[..count].to_vec()));
+        }
+        fn set_batch(&mut self, _: usize, _: usize, _: &crate::decoder::SplatProps) {}
+        fn set_center(&mut self, _: usize, _: usize, _: &[f32]) {}
+        fn set_opacity(&mut self, _: usize, _: usize, _: &[f32]) {}
+        fn set_rgb(&mut self, _: usize, _: usize, _: &[f32]) {}
+        fn set_rgba(&mut self, _: usize, _: usize, _: &[f32]) {}
+        fn set_scale(&mut self, _: usize, _: usize, _: &[f32]) {}
+        fn set_quat(&mut self, _: usize, _: usize, _: &[f32]) {}
+    }
+
+    /// The merged nodes' second opacities (LODM, FLAG_LOD_MASS) through v3,
+    /// the merged pages and the whole-file decoder; none for the splats or
+    /// the synthetic root.
+    #[test]
+    fn second_opacities_go_through_v3_and_the_merged_pages() {
+        use crate::athc::{ATHV_LOD_MASS, FLAG_LOD_MASS, FLAG_NODE_COVERAGE};
+        use crate::decoder::ChunkReceiver;
+        let mut f = fixture("two_cards.athc");
+        f.header.flags |= FLAG_NODE_COVERAGE;
+        for (l, (_, b)) in f.levels.iter_mut().enumerate() {
+            b.lod_mass = (0..b.n).map(|i| (0.5 + 0.01 * (l * 7 + i) as f32).min(0.99).to_bits()).collect();
+        }
+        let bytes = crate::athc_v3::write_v3(&f, crate::athc_v3::COMPRESSION_GZIP).unwrap();
+        let back = crate::athc_v3::read_v3(&bytes).unwrap();
+        assert!(back.header.has(FLAG_LOD_MASS));
+        for ((_, a), (_, b)) in back.levels.iter().zip(&f.levels) {
+            assert_eq!(a.lod_mass, b.lod_mass);
+        }
+        assert!(back.chunks.iter().all(|c| c.lod_mass.is_empty()));
+        let mut head = f.header.to_bytes().to_vec();
+        head.extend_from_slice(&f.extra.to_bytes());
+        let (tree, pages) = crate::athc::merged_pages_of(&back, &head).unwrap();
+        let flags = u32::from_le_bytes(pages[0][152..156].try_into().unwrap());
+        assert_ne!(flags & ATHV_LOD_MASS, 0);
+        let mut d = crate::athc::AthcDecoder::new(Masses::default());
+        d.push(&pages[0]).unwrap();
+        ChunkReceiver::finish(&mut d).unwrap();
+        let paged: Vec<f32> = d.into_splats().mass.into_iter().flat_map(|(_, v)| v).collect();
+        let want: Vec<f32> = f.levels.iter().flat_map(|(_, b)| b.lod_mass.iter().map(|&w| f32::from_bits(w))).collect();
+        let first = if tree.synth_root { 1 } else { 0 };
+        assert_eq!(paged.len(), tree.merged as usize);
+        assert_eq!(&paged[first..first + want.len()], &want[..]);
+        if tree.synth_root {
+            assert_eq!(paged[0], 0.0);
+        }
+        let mut d = crate::athc::AthcDecoder::new(Masses::default());
+        d.push(&bytes).unwrap();
+        ChunkReceiver::finish(&mut d).unwrap();
+        let whole = d.into_splats().mass;
+        assert_eq!(whole.len(), 1, "only the merged block carries them");
+        assert_eq!(&whole[0].1[first..first + want.len()], &want[..]);
+    }
+
     /// athenea's occlusion rule: the four cells toward the eye, all closed.
     #[test]
     fn occlusion_reads_the_cells_toward_the_eye() {

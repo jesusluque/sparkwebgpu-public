@@ -91,6 +91,7 @@ const {
   GEN_COV_TRANSFORM,
   GEN_LOD_FADE,
   GEN_ADDITIVE,
+  GEN_OPACITY_SWITCH,
 } = kernelsGenerate;
 const {
   DRAW_EXT,
@@ -279,6 +280,15 @@ export interface WgpuSplatRendererOptions {
    */
   faintSplats?: "keep" | "drop";
   /**
+   * A merged LoD node that carries a second opacity (.athc `LODM`: athenea's
+   * mass ratio W / A held at 0.99, beside the stored composited coverage;
+   * ext sources only, in a.w's high half) is drawn at it while its size on
+   * screen, 2 x its widest sigma, is at most this many pixels, and at the
+   * stored opacity above. Chosen per splat in generate, every frame. Leaves
+   * have one opacity. 0 (default): always the stored one.
+   */
+  opacitySwitchPx?: number;
+  /**
    * A thin sheet of glass held to athenea's 0.1 alpha floor in the draw
    * (atheneaRelightPlugin's sheetFloor "draw"): the floor faded by the
    * splat's area on screen (splat_shape.slang sheetFadeOf). The value is
@@ -442,6 +452,8 @@ export class WgpuSplatRenderer {
    * per-pixel slope) takes the frame to be.
    */
   lastDrawSize: { width: number; height: number } | null = null;
+  /** The height in pixels of the frame being rendered (opacitySwitchPx). */
+  private frameHeight = 0;
   private accumBytes = 0;
   private accumulator: GPUBuffer | null = null;
   private metric: GPUBuffer | null = null;
@@ -542,6 +554,7 @@ export class WgpuSplatRenderer {
       covSplats: false,
       surfels: "auto",
       faintSplats: "keep",
+      opacitySwitchPx: 0,
       sheetFade: 0,
       aaFilter: "gaussian",
       enable2DGS: false,
@@ -952,6 +965,9 @@ export class WgpuSplatRenderer {
 
   private renderFrame(camera: THREE.Camera, target?: THREE.RenderTarget) {
     this.activeProfiler();
+    this.frameHeight = target
+      ? target.height
+      : (canvasContext(this.renderer)?.canvas?.height ?? 0);
     const total = this.meshes.reduce((n, m) => n + this.meshCount(m), 0);
     this.stats.frames += 1;
     if (total === 0) return;
@@ -989,6 +1005,7 @@ export class WgpuSplatRenderer {
   ) {
     // Times generate and sort; the draw is inside three's pass.
     this.activeProfiler();
+    this.frameHeight = target.height;
     const total = this.meshes.reduce((n, m) => n + this.meshCount(m), 0);
     this.stats.frames += 1;
     if (total === 0) return;
@@ -1254,6 +1271,7 @@ export class WgpuSplatRenderer {
         packed,
         origin,
         cull,
+        camera,
       });
       base += count;
     }
@@ -1280,6 +1298,8 @@ export class WgpuSplatRenderer {
       origin?: THREE.Vector3;
       /** Frustum culling params (cullParams); no culling when absent. */
       cull?: ReturnType<WgpuSplatRenderer["cullParams"]>;
+      /** The camera, for sizes on screen (opacitySwitchPx). */
+      camera?: THREE.Camera;
     },
   ) {
     const { base, count, cameraPos, cameraDir } = out;
@@ -1312,6 +1332,10 @@ export class WgpuSplatRenderer {
     if (out.lod && mesh.lodFaded) flags |= GEN_LOD_FADE;
     if (this.isAdditive(mesh) && !out.packed) flags |= GEN_ADDITIVE;
     if (source.lodOpacity) flags |= GEN_LOD_OPACITY;
+    const switchPx = this.options.opacitySwitchPx ?? 0;
+    const focalPx = out.camera ? this.switchFocalPx(out.camera) : 0;
+    if (switchPx > 0 && source.format === "ext" && focalPx > 0)
+      flags |= GEN_OPACITY_SWITCH;
     if (this.options.sortRadial) flags |= GEN_SORT_RADIAL;
     if (dyno && mesh.dyno?.generator) flags |= GEN_DYNO_SOURCE;
     if (this.options.covSplats && !out.noCov) {
@@ -1330,6 +1354,8 @@ export class WgpuSplatRenderer {
       numSh: source.numSh,
       srcCount: source.count,
       shStride: source.shStride,
+      switchFocalPx: focalPx,
+      switchPx,
       rotate: [rotation.x, rotation.y, rotation.z, rotation.w],
       translateScale: [
         position.x,
@@ -1448,6 +1474,15 @@ export class WgpuSplatRenderer {
       range = { lo: near + 100, hi: far + 100 };
     }
     return (range.hi - range.lo) / 2 ** 24 <= 2.5e-4 ? range : null;
+  }
+
+  // The focal length in pixels of this frame's `camera` (opacitySwitchPx's
+  // sizes on screen); 0 when unknown (no switch).
+  private switchFocalPx(camera: THREE.Camera): number {
+    const cam = camera as THREE.PerspectiveCamera;
+    const height = this.frameHeight || this.lastDrawSize?.height || 0;
+    if (!cam.isPerspectiveCamera || !(height > 0)) return 0;
+    return (Math.abs(cam.projectionMatrix.elements[5]) * height) / 2;
   }
 
   // generate's copy of the draw's early outs (GEN_CULL), for this camera.

@@ -152,6 +152,7 @@ aligned  blocks: levels coarsest first, then chunks; each on its own page,
 | S0l | `LODS` | 1 | 4 | a merged node's LoD size by error, f32 (0 in a chunk: geometric); flag bit 6 (sparkwebGPU's, below) |
 | S0e | `LODE` | 1 | 8 | a merged node's LoD error cut bounds: f16 eps, f16 rho; f16 theta, 8+8-bit cone axis (0 in a chunk); flag bit 7 (sparkwebGPU's, below) |
 | S0o | `OCCL` | 1 | 4 | athenea's occlusion mask: the element's codebook entry + 1 (0: none), in a word; flag bit 9 (below) |
+| S0m | `LODM` | 1 | 4 | a merged node's second opacity, f32 (its mass ratio held at 0.99; 0 in a chunk and for none); flag bit 10 (below) |
 | S0s | `SKIN` | 1 | 4 · (influences + gradientWords) | a skinned cloud's rig (sparkwebGPU's, below) |
 | S4 | `MATL` | 2 | 4 · (normals + emission + pbr + lobes) | the material streams, as present |
 | S3 | `SHAD` | 3 | 4 · shadowWords | open-direction bits |
@@ -431,6 +432,36 @@ tree marks it -- `coverage` is then the composited coverage and the mass
 ratio has moved to `coverageMass` (pieces/t21) -- or with `--node-coverage`
 (then the opacities are read as they are), and reads `coverage` as the
 merges' opacity.
+
+### Two opacities a merged node (`LODM`, flag bit 10)
+
+athenea's coverage trees (pieces/t21f) carry both opacities of each merge:
+`opacity` is the composited coverage of its leaves fitted over its core,
+`primvars:athenea:splat:coverageMass` the mass ratio W / A. Under Spark's
+mass-keeping draw the coverage is right while a merge resolves on screen
+and under-covers once merges are sub-pixel and blurred together; the mass
+ratio held at 0.99 is right there (research/errcut.md, rounds 3 and 4). With
+header flag bit 10 (`FLAG_LOD_MASS`) a file keeps both: the stored opacity
+(the coverage, with `FLAG_NODE_COVERAGE`) and, in a tier-1 section after
+`OCCL`, one f32 an element: a level group's mass ratio clamped to
+[1.01/255, 0.99], 0 for a group without one; a chunk's (a leaf, one
+opacity) all 0, which a reader takes as none. `usd-athc --tree` writes it
+whenever the tree has `coverageMass` (not with `--mass-capped`,
+`--mass-coverage` or `--no-lod-mass`). A merged ATHV page carries its nodes'
+after the occlusion indices, f32 each, with decode flag bit 4
+(`ATHV_LOD_MASS`); the browser fetches `LODM` with the levels and never with
+a chunk; the decoder's synthetic root has none.
+
+The decoder hands it to the receiver (`set_lod_mass`). ExtSplats keep it in
+the high half of word a.w, as f16 (the low half is the opacity; a source
+splat's high half is otherwise 0); PackedSplats have no room and drop it.
+The player chooses per splat, every frame, in generate (and in the relight
+pass, so a merged glass sheet's alpha is the one drawn): with the renderer's
+`opacitySwitchPx` T > 0, a node with a second opacity whose size on screen,
+2 x its widest sigma x focal / distance (object space, as the LoD
+traversal's size / distance), is at most T pixels is drawn at the second
+opacity, a larger one at the stored coverage. Leaves keep their own.
+A v2 file never holds it, and a reader before it refuses the flag.
 
 ### Occlusion masks (`OCCL` and the codebook, flag bit 9)
 

@@ -826,6 +826,47 @@ The node pool (`CompactBandStreamer` option `nodePool`, `compactNodes.ts`;
   a cut node still to upload always stays), at most 256 runs inflated an
   update; a desktop keeps the cut's neighbours' runs (`"neighbours"`).
 
+On an orbit (thread CU):
+
+- **conservative occlusion**: a quantized node's exact centre lies within
+  its page's margin of the stored one, so its occlusion test takes the box
+  of centres (split by orthant; in each, both octahedral coordinates are
+  monotone in every component, so the 8 corners give their range) and
+  hides the node only if every cell any direction from that box can read
+  is closed. No node is hidden that the exact centre keeps (spark-rs test
+  `car_occlusion` over the whole car's 10.7M nodes at athenea's cameras and
+  24 random eyes: 0; the box keeps at most 0.06 % of the hidden ones);
+- **the traversal** runs on a stack instead of a heap when the budget does
+  not bind (`traverse_lod_trees` `unordered`: the same cut, else it runs
+  again in order), reads each node once a visit, decodes the log codes by a
+  table per page and emits the cut to JS in chunks: about 3x faster
+  (Camera, tau 3: 128 to 40 ms in the browser), the WASM heap's high-water
+  6 MB lower;
+- each cut node comes with its **angle on screen** (`screens`; a leaf half
+  its parent's sphere, foveated): the misses are decoded largest first, a
+  run's weight its misses' area;
+- the runs are inflated and packed in a **decoder worker** (`runWorker.ts`,
+  `nodePool.decoder`, default on; `?decoder=0` the main thread's): a slot
+  whose record is on its way is held, not drawn (its parent or children
+  are); the records join the draw list as they come back
+  (`CompactBandStreamer.refresh`, each frame, over the misses only);
+  `decodeAhead` (2048) runs out at most;
+- **the view ahead**: the camera extrapolated 2.5 updates (`aheadMs`,
+  `?ahead=0` off) is traversed too, and its dropped runs asked for after
+  the cut's own; Range requests for runs start as earlier ones end (12 in
+  flight), not at the next update;
+- the slot allocator idles every slot a frame used (a substitute, a record
+  on its way), and the page plan takes the pool's room (`planBand`'s
+  `room`): a full pool of needed and kept pages no longer asks for pages
+  it cannot land, again and again (no settle after an orbit).
+
+The whole car on a phone (393 x 852, tau 3 and 2.5, a 120-degree orbit at
+1 degree a frame): the cut missing in a frame 4-6 % at Camera and the
+close-up (CT: 17-26 %), under 0.5 % by screen area, 0.4 % far; 60 fps
+with 2-frame hitches at most (CT: 53-55 fps, 60-70 ms); settled 2.6-3.1 s
+after load (CT: 5.6-7.1 s) and within the harness's 3.5 s after the orbit
+(CT: 6-63 s).
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only

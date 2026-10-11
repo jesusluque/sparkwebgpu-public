@@ -692,10 +692,13 @@ async function qualityLodExtSplats({
 
 function newLodTree({
   capacity,
+  slot,
 }: {
   capacity: number;
+  /** Splats a pool page holds (default 65 536; athenea's band pages fewer). */
+  slot?: number;
 }) {
-  const { lodId } = new_lod_tree(capacity) as { lodId: number };
+  const { lodId } = new_lod_tree(capacity, slot) as { lodId: number };
   return { lodId };
 }
 

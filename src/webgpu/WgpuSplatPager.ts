@@ -100,16 +100,17 @@ export class WgpuSplatPager extends SplatPager {
       device.limits.maxBufferSize,
     );
     const maxWords = Math.max(coreWords, shWords);
-    const fitPages = Math.floor(limit / (PAGE_SPLATS * maxWords * 4));
+    const pageSplats = options.pageSplats ?? PAGE_SPLATS;
+    const fitPages = Math.floor(limit / (pageSplats * maxWords * 4));
     const wanted = options.maxSplats ?? 256 * PAGE_SPLATS;
     super({
       ...options,
       renderer: unusedRenderer,
-      maxSplats: Math.min(wanted, fitPages * PAGE_SPLATS),
+      maxSplats: Math.min(wanted, fitPages * pageSplats),
     });
     if (this.maxSplats < wanted) {
       console.warn(
-        `WgpuSplatPager: ${this.maxPages} pages fit maxStorageBufferBindingSize (${limit}), not ${wanted / PAGE_SPLATS}`,
+        `WgpuSplatPager: ${this.maxPages} pages fit maxStorageBufferBindingSize (${limit}), not ${wanted / pageSplats}`,
       );
     }
     this.device = device;
@@ -190,6 +191,7 @@ export class WgpuSplatPager extends SplatPager {
       pages: o.pages,
       transferForm: o.transferForm,
       cloudPages: this.cloudPages,
+      pageSplats: this.pageSplats,
     };
     let plan = planAttribPaging(this.attribSchema, this.maxPages, options);
     if (plan.bytes > limit) {
@@ -266,7 +268,7 @@ export class WgpuSplatPager extends SplatPager {
       : null;
     const attribs = this.ensureAttribs(chunk);
     if (!attribs) return;
-    attribs.uploadPage(page * PAGE_SPLATS, count, chunk);
+    attribs.uploadPage(page * this.pageSplats, count, chunk);
     this.residency?.onPageUpload(page, count, chunk);
   }
 
@@ -336,7 +338,7 @@ export class WgpuSplatPager extends SplatPager {
     extArray?: Uint32Array,
     attribs?: unknown,
   ) {
-    const base = page * PAGE_SPLATS;
+    const base = page * this.pageSplats;
     const core = this.pools.core;
     const count = packedArray.length / 4;
     this.pageCounts[page] = count;

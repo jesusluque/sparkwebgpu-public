@@ -27,6 +27,11 @@ pub const V3_HEADER_BYTES: usize = 160;
 pub const SECTION_ENTRY_BYTES: usize = 32;
 pub const BLOCK_ENTRY_HEAD: usize = 32;
 pub const BLOCK_ENTRY_PER_SECTION: usize = 16;
+/// A block's kind in the block index: a level's groups, a chunk of splats,
+/// or a paged tree's page (`athc_pages`).
+pub const BLOCK_LEVEL: u32 = 0;
+pub const BLOCK_CHUNK: u32 = 1;
+pub const BLOCK_PAGE: u32 = 2;
 
 pub const COMPRESSION_NONE: u32 = 0;
 pub const COMPRESSION_GZIP: u32 = 1;
@@ -71,6 +76,11 @@ pub enum SectionId {
     /// element's codebook entry + 1 (0: none), one word (a byte of it used
     /// with 256 entries). Read by the traversal, so tier 1.
     Occlusion,
+    /// A paged tree's children (`athc_pages`, FLAG_PAGED): two words an
+    /// element, the page its children are in, the first one's place in it
+    /// (low 16 bits) and their count (high 16). Read by the traversal, so
+    /// tier 1.
+    Tree,
     /// sparkwebGPU's skin (`athc_skin`): influences then weight gradients,
     /// what a skeleton needs to carry the splats -- geometry, so tier 1.
     Skin,
@@ -98,6 +108,7 @@ impl SectionId {
             Self::LodSize => b"LODS",
             Self::LodError => b"LODE",
             Self::Occlusion => b"OCCL",
+            Self::Tree => b"TREE",
             Self::Skin => b"SKIN",
             Self::TransferDirect => b"TXDI",
             Self::TransferIndirect => b"TXIN",
@@ -108,12 +119,13 @@ impl SectionId {
         })
     }
 
-    pub const ALL: [SectionId; 12] = [
+    pub const ALL: [SectionId; 13] = [
         Self::Core,
         Self::Sh,
         Self::LodSize,
         Self::LodError,
         Self::Occlusion,
+        Self::Tree,
         Self::Skin,
         Self::Material,
         Self::Shadow,
@@ -134,6 +146,7 @@ impl SectionId {
             Self::LodSize => "LODS",
             Self::LodError => "LODE",
             Self::Occlusion => "OCCL",
+            Self::Tree => "TREE",
             Self::Skin => "SKIN",
             Self::Material => "MATL",
             Self::Shadow => "SHAD",
@@ -148,7 +161,7 @@ impl SectionId {
     /// materials, 3 relit (shadow bits and transfer).
     pub fn tier(self) -> u32 {
         match self {
-            Self::Core | Self::Sh | Self::LodSize | Self::LodError | Self::Occlusion | Self::Skin => 1,
+            Self::Core | Self::Sh | Self::LodSize | Self::LodError | Self::Occlusion | Self::Tree | Self::Skin => 1,
             Self::Material => 2,
             _ => 3,
         }
@@ -223,7 +236,13 @@ impl Want {
         let [direct, indirect, _] = transfer_split_words(x.transfer_count);
         let words = self.transfer_values.div_ceil(2);
         match id {
-            SectionId::Core | SectionId::Sh | SectionId::LodSize | SectionId::LodError | SectionId::Occlusion | SectionId::Skin => true,
+            SectionId::Core
+            | SectionId::Sh
+            | SectionId::LodSize
+            | SectionId::LodError
+            | SectionId::Occlusion
+            | SectionId::Tree
+            | SectionId::Skin => true,
             SectionId::Material => self.material,
             SectionId::Shadow | SectionId::Curvature => self.transfer_values > 0,
             SectionId::TransferDirect => words > 0,
@@ -320,6 +339,7 @@ pub fn sections_of(h: &AthcHeader, x: &ExtraHeader, compression: u32) -> Vec<Sec
             if h.has(crate::athc::FLAG_LOD_ERROR) { crate::athc_lod_cut::LOD_ERROR_WORDS as u32 } else { 0 },
         ),
         (SectionId::Occlusion, if h.has(crate::athc::FLAG_OCCLUSION) { 1 } else { 0 }),
+        (SectionId::Tree, if h.has(crate::athc::FLAG_PAGED) { crate::athc_pages::TREE_WORDS as u32 } else { 0 }),
         (SectionId::Skin, x.skin_words()),
         (SectionId::Material, material),
         (SectionId::Shadow, x.shadow_words),
@@ -391,6 +411,13 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
             let from = tx_from as usize;
             put_words(&mut out, &columns(&block.transfer, block.n, w, from, from + s.words as usize));
         }
+        SectionId::Tree => {
+            if block.tree.len() == block.n * s.words as usize {
+                put_words(&mut out, &block.tree);
+            } else {
+                out.resize(4 * block.n * s.words as usize, 0);
+            }
+        }
         SectionId::Shadow => put_words(&mut out, &block.shadow_bits),
         SectionId::Curvature => put_words(&mut out, &block.curvature),
         SectionId::Skin => put_words(&mut out, &block.skin),
@@ -408,6 +435,7 @@ fn section_bytes(block: &AthcBlock, s: &Section, x: &ExtraHeader, tx_from: u32) 
 pub fn section_arrays(id: SectionId, words: u32, h: &AthcHeader, x: &ExtraHeader) -> Vec<u32> {
     let arrays: Vec<u32> = match id {
         SectionId::Core => vec![4, 4, 1],
+        SectionId::Tree => vec![1, 1],
         SectionId::Material => [
             if h.has(FLAG_NORMALS) { 1 } else { 0 },
             if h.has(FLAG_EMISSION) { 1 } else { 0 },
@@ -651,6 +679,9 @@ pub struct V3Layout {
     /// athenea's occlusion codebook (8 words an entry; empty: none), read
     /// from the tables (it sits before the data).
     pub occlusion_codebook: Vec<u32>,
+    /// A paged tree's page table (FLAG_PAGED, `athc_pages`), one row a page
+    /// (block), read from the tables; empty otherwise.
+    pub pages: Vec<crate::athc_pages::PageRow>,
 }
 
 /// v2 (in memory) to v3 bytes.
@@ -726,7 +757,83 @@ pub fn write_v3_full(
     encoding: &dyn Fn(SectionId) -> u32,
     skeleton: Option<&crate::athc_skin::AthcSkeleton>,
 ) -> Result<Vec<u8>> {
-    write_v3_impl(file, compression, legacy, encoding, skeleton, None).map(|(out, _)| out)
+    write_v3_impl(file, compression, legacy, encoding, skeleton, None, None).map(|(out, _)| out)
+}
+
+/// A paged tree (`athc_pages`: FLAG_PAGED, its pages as `file.chunks`, each
+/// with its TREE words, no levels) as v3, with the page table `pages` (their
+/// byte ranges filled in here) among the tables, each section in the
+/// encoding `encoding` gives it (CPCA with `cpca` for the transfer).
+pub fn write_v3_paged(
+    file: &AthcFile,
+    pages: &[crate::athc_pages::PageRow],
+    compression: u32,
+    encoding: &dyn Fn(SectionId) -> u32,
+    cpca: Option<&crate::athc_cpca::CpcaOptions>,
+    skeleton: Option<&crate::athc_skin::AthcSkeleton>,
+) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
+    let pick = |id: SectionId| if cpca.is_some() && id.is_transfer() { ENCODING_CPCA } else { encoding(id) };
+    let o = cpca.map(|c| crate::athc_cpca::CpcaOptions { gzip: compression == COMPRESSION_GZIP, ..*c });
+    write_v3_impl(file, compression, false, &pick, skeleton, o.as_ref(), Some(pages))
+}
+
+/// A paged tree's headers settled from its blocks, as `AthcFile::write`
+/// settles a v2 file's (which needs levels, and a paged tree has none).
+fn paged_settled(file: &AthcFile) -> Result<AthcFile> {
+    let first = file.chunks.first().ok_or_else(|| anyhow!("a paged .athc holds at least one page"))?;
+    if !file.levels.is_empty() {
+        bail!("a paged .athc holds no levels");
+    }
+    if file.chunks.iter().any(|b| b.tree.len() != b.n * crate::athc_pages::TREE_WORDS) {
+        bail!("a paged .athc: every page carries its TREE words");
+    }
+    let per = |v: &[u32]| v.len().checked_div(first.n).unwrap_or(0) as u32;
+    let mut h = file.header;
+    let mut x = ExtraHeader::default();
+    if !first.pbr.is_empty() {
+        x.pbr_words = 1;
+        x.lobes_words = per(&first.lobes);
+    }
+    if !first.transfer.is_empty() {
+        x.transfer_count = file.extra.transfer_count;
+        x.transfer_words = per(&first.transfer);
+        x.shadow_words = per(&first.shadow_bits);
+    }
+    x.curvature_words = per(&first.curvature);
+    let any = |f: &dyn Fn(&AthcBlock) -> bool| file.chunks.iter().any(f);
+    h.flags = (if first.normals.is_empty() { 0 } else { FLAG_NORMALS })
+        | (h.flags & (crate::athc::FLAG_LINEAR | crate::athc::FLAG_NODE_COVERAGE))
+        | (if first.emission.is_empty() { 0 } else { FLAG_EMISSION })
+        | (if x.pbr_words > 0 { FLAG_MATERIAL } else { 0 })
+        | (if x.transfer_words > 0 { FLAG_TRANSFER } else { 0 })
+        | (if any(&|b| !b.lod_error.is_empty()) { crate::athc::FLAG_LOD_ERROR } else { 0 })
+        | (if any(&|b| !b.lod_size.is_empty()) { crate::athc::FLAG_LOD_SIZE } else { 0 })
+        | (if any(&|b| !b.occlusion.is_empty()) { crate::athc::FLAG_OCCLUSION } else { 0 })
+        | crate::athc::FLAG_PAGED;
+    h.version = 2;
+    h.count = file.chunks.iter().map(|c| c.n as u32).sum();
+    h.sh_words = per(&first.sh);
+    h.levels = 0;
+    h.chunks = file.chunks.len() as u32;
+    h.chunk_splats = file.chunks.iter().map(|c| c.n as u32).max().unwrap_or(0);
+    h.finest_groups = 0;
+    let mut out = file.clone();
+    out.header = h;
+    out.extra = x;
+    out.starts.clear();
+    let w = crate::athc_lod_cut::LOD_ERROR_WORDS;
+    for b in out.chunks.iter_mut() {
+        if h.has(crate::athc::FLAG_LOD_ERROR) && b.lod_error.is_empty() {
+            b.lod_error = vec![0; b.n * w];
+        }
+        if h.has(crate::athc::FLAG_LOD_SIZE) && b.lod_size.is_empty() {
+            b.lod_size = vec![0.0; b.n];
+        }
+        if h.has(crate::athc::FLAG_OCCLUSION) && b.occlusion.is_empty() {
+            b.occlusion = vec![0; b.n];
+        }
+    }
+    Ok(out)
 }
 
 /// What CPCA did to one transfer section over the file (`write_v3_cpca`).
@@ -764,7 +871,7 @@ pub fn write_v3_cpca(
 ) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
     let pick = |id: SectionId| if id.is_transfer() { ENCODING_CPCA } else { encoding(id) };
     let o = crate::athc_cpca::CpcaOptions { gzip: compression == COMPRESSION_GZIP, ..*cpca };
-    write_v3_impl(file, compression, false, &pick, skeleton, Some(&o))
+    write_v3_impl(file, compression, false, &pick, skeleton, Some(&o), None)
 }
 
 fn write_v3_impl(
@@ -774,12 +881,23 @@ fn write_v3_impl(
     encoding: &dyn Fn(SectionId) -> u32,
     skeleton: Option<&crate::athc_skin::AthcSkeleton>,
     cpca: Option<&crate::athc_cpca::CpcaOptions>,
+    pages: Option<&[crate::athc_pages::PageRow]>,
 ) -> Result<(Vec<u8>, Vec<CpcaSectionStats>)> {
     let mut cpca_stats: Vec<CpcaSectionStats> = Vec::new();
+    if pages.is_some() != file.header.has(crate::athc::FLAG_PAGED) {
+        bail!(".athc v3: a paged tree is written with its page table (write_v3_paged), and only it");
+    }
+    if let Some(p) = pages {
+        if p.len() != file.chunks.len() {
+            bail!(".athc v3: {} page rows for {} pages", p.len(), file.chunks.len());
+        }
+    }
+    let paged = pages.is_some();
     // The v2 writer settles flags, counts and the extra header; the
-    // curvature (no v2 holds it) comes back from the cloud as it was.
-    let mut v2 = AthcFile::read(&file.write()?)?;
-    if file.has_curvature() {
+    // curvature (no v2 holds it) comes back from the cloud as it was. A
+    // paged tree has no v2 form: its headers are settled here.
+    let mut v2 = if paged { paged_settled(file)? } else { AthcFile::read(&file.write()?)? };
+    if file.has_curvature() && !paged {
         let per = |b: &AthcBlock| b.curvature.len().checked_div(b.n).unwrap_or(0);
         if file.chunks.iter().chain(file.levels.iter().map(|(_, b)| b)).any(|b| per(b) != 2) {
             bail!(".athc v3: curvature must be two words for every element of every block");
@@ -802,7 +920,7 @@ fn write_v3_impl(
         }
         v2.extra.skin_influences = s.influences;
         v2.extra.skin_gradient_words = s.gradient_words;
-        for (to, from) in v2.chunks.iter_mut().zip(&file.chunks) {
+        for (to, from) in v2.chunks.iter_mut().zip(&file.chunks).filter(|_| !paged) {
             to.skin = from.skin.clone();
         }
         for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
@@ -831,7 +949,7 @@ fn write_v3_impl(
         }
     }
     // So do athenea's occlusion masks (every block: levels and chunks).
-    if file.levels.iter().map(|(_, b)| b).chain(&file.chunks).any(|b| !b.occlusion.is_empty()) {
+    if !paged && file.levels.iter().map(|(_, b)| b).chain(&file.chunks).any(|b| !b.occlusion.is_empty()) {
         v2.header.flags |= crate::athc::FLAG_OCCLUSION;
         for ((_, to), (_, from)) in v2.levels.iter_mut().zip(&file.levels) {
             to.occlusion = if from.occlusion.is_empty() { vec![0; from.n] } else { from.occlusion.clone() };
@@ -850,7 +968,7 @@ fn write_v3_impl(
     }
     // So do merged opacities past 0.99 (athc::coverage_ratios), which the
     // v2 writer caps as athenea's files hold them.
-    if file.over_capped() {
+    if file.over_capped() && !paged {
         for (to, from) in v2.chunks.iter_mut().zip(&file.chunks) {
             to.positions = from.positions.clone();
         }
@@ -877,11 +995,34 @@ fn write_v3_impl(
         .map(|(level, b)| (0, *level, 0, b))
         .chain(v2.chunks.iter().enumerate().map(|(c, b)| (1, 0, c as u32 * h.chunk_splats, b)))
         .collect();
+    // A paged tree's blocks are its pages (kind 2), each starting at its
+    // first node in page order.
+    let blocks: Vec<(u32, u32, u32, &AthcBlock)> = if paged {
+        let mut first = 0u32;
+        v2.chunks
+            .iter()
+            .map(|b| {
+                let at = first;
+                first += b.n as u32;
+                (BLOCK_PAGE, 0, at, b)
+            })
+            .collect()
+    } else {
+        blocks
+    };
     // The occlusion codebook (athenea's masks) widens the header by 16 bytes:
     // its offset and entries at 160 (a reader finds the section table where
     // the header says, so an older one skips them).
     let codebook = &file.occlusion_codebook;
-    let header_bytes = if codebook.is_empty() { V3_HEADER_BYTES } else { V3_HEADER_BYTES + 16 };
+    // A paged tree's page table widens it by 16 more: its offset, pages and
+    // words a row at 176 (the codebook's 16 bytes then present, 0 without).
+    let header_bytes = if paged {
+        V3_HEADER_BYTES + 32
+    } else if codebook.is_empty() {
+        V3_HEADER_BYTES
+    } else {
+        V3_HEADER_BYTES + 16
+    };
     let section_table = header_bytes as u64;
     let block_index = section_table + (SECTION_ENTRY_BYTES * sections.len()) as u64;
     let entry = BLOCK_ENTRY_HEAD + BLOCK_ENTRY_PER_SECTION * sections.len();
@@ -890,7 +1031,10 @@ fn write_v3_impl(
     let skeleton_offset = if blob.is_empty() { 0 } else { (starts + 4 * v2.starts.len() as u64).div_ceil(16) * 16 };
     let after_skeleton = if blob.is_empty() { starts + 4 * v2.starts.len() as u64 } else { skeleton_offset + blob.len() as u64 };
     let codebook_offset = if codebook.is_empty() { 0 } else { after_skeleton.div_ceil(16) * 16 };
-    let data_start = aligned(if codebook.is_empty() { after_skeleton } else { codebook_offset + 4 * codebook.len() as u64 });
+    let after_codebook = if codebook.is_empty() { after_skeleton } else { codebook_offset + 4 * codebook.len() as u64 };
+    let page_table = if paged { after_codebook.div_ceil(16) * 16 } else { 0 };
+    let row_words = crate::athc_pages::PAGE_ROW_WORDS as u64;
+    let data_start = aligned(if paged { page_table + 4 * row_words * blocks.len() as u64 } else { after_codebook });
 
     let mut data = Vec::new();
     let mut entries = Vec::new();
@@ -971,9 +1115,13 @@ fn write_v3_impl(
     }
     put_words(&mut out, &[x.skin_influences, x.skin_gradient_words]);
     out.extend_from_slice(&skeleton_offset.to_le_bytes());
-    if !codebook.is_empty() {
+    if !codebook.is_empty() || paged {
         out.extend_from_slice(&codebook_offset.to_le_bytes());
         put_words(&mut out, &[(codebook.len() / crate::athc::OCCLUSION_WORDS) as u32, 0]);
+    }
+    if paged {
+        out.extend_from_slice(&page_table.to_le_bytes());
+        put_words(&mut out, &[blocks.len() as u32, row_words as u32]);
     }
     out.resize(header_bytes, 0);
     for s in &sections {
@@ -1006,6 +1154,14 @@ fn write_v3_impl(
     if !codebook.is_empty() {
         out.resize(codebook_offset as usize, 0);
         put_words(&mut out, codebook);
+    }
+    if let Some(pages) = pages {
+        out.resize(page_table as usize, 0);
+        for (row, e) in pages.iter().zip(&entries) {
+            let mut row = *row;
+            row.fill_ranges(e, &sections);
+            put_words(&mut out, &row.to_words());
+        }
     }
     out.resize(data_start as usize, 0);
     out.extend_from_slice(&data);
@@ -1134,7 +1290,25 @@ pub fn parse_v3(bytes: &[u8]) -> Result<V3Layout> {
                 .collect::<Result<Vec<_>>>()?;
         }
     }
-    Ok(V3Layout { header, extra, sections, blocks, starts_offset, skeleton_offset, occlusion_codebook })
+    // A paged tree's page table: its offset, rows and words a row at 176.
+    let mut pages = Vec::new();
+    if header.flags & crate::athc::FLAG_PAGED != 0 {
+        if section_table < V3_HEADER_BYTES + 32 {
+            bail!(".athc v3: a paged tree's header has no page table");
+        }
+        let (at, rows, words) = (u64_at(bytes, 176)? as usize, u32_at(bytes, 184)? as usize, u32_at(bytes, 188)? as usize);
+        if rows != block_count || words < crate::athc_pages::PAGE_ROW_WORDS || header.levels != 0 {
+            bail!(".athc v3: a page table of {rows} rows of {words} words for {block_count} blocks");
+        }
+        for r in 0..rows {
+            let row: Vec<u32> = (0..crate::athc_pages::PAGE_ROW_WORDS).map(|k| u32_at(bytes, at + 4 * (r * words + k))).collect::<Result<_>>()?;
+            pages.push(crate::athc_pages::PageRow::from_words(&row));
+        }
+        if blocks.iter().any(|b| b.kind != BLOCK_PAGE) {
+            bail!(".athc v3: a paged tree's blocks are all pages");
+        }
+    }
+    Ok(V3Layout { header, extra, sections, blocks, starts_offset, skeleton_offset, occlusion_codebook, pages })
 }
 
 /// One block's elements from its sections' bytes (`raw[k]`: section k,
@@ -1178,6 +1352,7 @@ pub fn block_from_sections(layout: &V3Layout, n: usize, raw: &[Option<Vec<u8>>])
             SectionId::TransferDirect | SectionId::TransferIndirect | SectionId::TransferField => {
                 parts.push((s.words as usize, v))
             }
+            SectionId::Tree => block.tree = v,
             SectionId::Shadow => block.shadow_bits = v,
             SectionId::Curvature => block.curvature = v,
             SectionId::Skin => block.skin = v,
@@ -1469,7 +1644,7 @@ pub fn read_v3(bytes: &[u8]) -> Result<AthcFile> {
             })
             .collect::<Result<Vec<_>>>()?;
         let block = block_from_sections(&layout, b.n as usize, &raw)?;
-        if b.kind == 0 {
+        if b.kind == BLOCK_LEVEL {
             levels.push((b.level, block));
         } else {
             chunks.push(block);

@@ -29,6 +29,14 @@ export function makeLodCall(wasm: Wasm): LodCall {
     if (name === "newSharedLodTree") {
       return wasm.new_shared_lod_tree(a.lodId as number);
     }
+    if (name === "setLodOcclusionCodebook") {
+      wasm.set_lod_occlusion_codebook(
+        a.lodId as number,
+        a.codebook as Uint32Array,
+        a.bounds as Float32Array,
+      );
+      return {};
+    }
     if (name === "updateLodTrees") {
       const r = a.ranges as {
         lodId: number;
@@ -90,10 +98,13 @@ export function makeLodCall(wasm: Wasm): LodCall {
       f((i) => i.coneFov0),
       f((i) => i.coneFov),
       a.errorLimit as number | undefined,
-      undefined,
-      undefined,
+      a.backCullMin as number | undefined,
+      a.occlusionCull as boolean | undefined,
     ) as {
       instanceIndices: { numSplats: number; indices: Uint32Array }[];
+      culledCount?: number;
+      occludedCount?: number;
+      chunks?: [number, number][];
     };
     const keyIndices: Record<
       string,
@@ -102,6 +113,11 @@ export function makeLodCall(wasm: Wasm): LodCall {
     inst.forEach(([key], k) => {
       keyIndices[key] = result.instanceIndices[k];
     });
-    return { keyIndices };
+    return {
+      keyIndices,
+      culledCount: result.culledCount,
+      occludedCount: result.occludedCount,
+      chunks: result.chunks,
+    };
   };
 }

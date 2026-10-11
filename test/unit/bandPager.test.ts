@@ -4,6 +4,8 @@ import {
   BAND_KEEP,
   type BandMesh,
   bandTauToFit,
+  foveateOf,
+  pageFoveate,
   pageNeeded,
   planBand,
   planBandFitted,
@@ -223,5 +225,52 @@ describe("band pages (athenea's error-band paging)", () => {
     const loose = planBandFitted([{ ...mesh(eye, unit), unit }], 100);
     expect(loose.fit).toBe(0);
     expect(loose.plan.neededPages).toBe(8);
+  });
+});
+
+describe("foveation of pages (thread CS)", () => {
+  const f = { coneFov0: 60, coneFov: 90, coneFoveate: 0.4, behindFoveate: 0.2 };
+  it("follows Spark's curve", () => {
+    expect(foveateOf(1, f)).toBe(1);
+    expect(foveateOf(Math.cos(Math.PI / 6) + 1e-6, f)).toBe(1);
+    expect(foveateOf(Math.cos(Math.PI / 4), f)).toBeCloseTo(0.4, 6);
+    expect(foveateOf(0, f)).toBe(0.2);
+    expect(foveateOf(-0.5, f)).toBe(0.2);
+  });
+  it("bounds a box by its nearest direction to the forward", () => {
+    const eye = [0, 0, 0];
+    const fwd = [1, 0, 0];
+    // Ahead: full detail; behind: behindFoveate; the eye inside: 1.
+    expect(pageFoveate(row(5, 6, 1), eye, fwd, f)).toBe(1);
+    expect(pageFoveate(row(-6, -5, 1), eye, fwd, f)).toBe(0.2);
+    expect(pageFoveate(row(-1, 1, 1), eye, fwd, f)).toBe(1);
+    // A box straddling the cone's edge: its nearest point counts.
+    const side: AthcPageRow = {
+      ...row(1, 1.2, 1),
+      lo: [1, 0.5, -0.1],
+      hi: [1.2, 3, 0.1],
+    };
+    expect(pageFoveate(side, eye, fwd, f)).toBe(1);
+  });
+  it("lets a page out of view go coarser in the plan", () => {
+    const r = [row(-10, 10, 100), row(-6, -5, 1)];
+    const mesh = (foveate?: (p: number) => number): BandMesh<number> => ({
+      key: 0,
+      rows: r,
+      pageBytes: [1, 1],
+      eye: [0, 0, 0],
+      limit: 0.1,
+      foveate,
+      resident: () => false,
+      inFlight: () => false,
+      children: () => [],
+    });
+    expect(planBand([mesh()], 10).needed.get(0)?.has(1)).toBe(true);
+    const fv = (p: number) => pageFoveate(r[p], [0, 0, 0], [1, 0, 0], f);
+    expect(
+      planBand([mesh(fv)], 10)
+        .needed.get(0)
+        ?.has(1),
+    ).toBe(false);
   });
 });

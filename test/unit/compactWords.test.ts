@@ -52,7 +52,8 @@ const lod = makeLodCall(wasm);
 const SLOT = 3072;
 const V1_GPU = 40;
 const V1_NODE = 64;
-const V2_NODE = 56;
+// The current writer's node (v3, thread CS: v2's 56 + cone, occlusion, spare).
+const V2_NODE = 64;
 const PIECES = [
   "Hood",
   "Front_Fender",

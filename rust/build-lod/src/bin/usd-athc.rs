@@ -1530,13 +1530,103 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
         let marks = if flag("--closed") { None } else { marks };
         let bounds = athenea_tree_errors(&packed.block, &tree.parent, tree.leaves, &tree.cost, &weights, double_sided, marks.as_deref());
         let page_box = if flag("--page-box-own") { PageBox::Own } else { PageBox::Parents };
+        // `--split-roots N:i` (thread CS): only the i-th of N runs of the
+        // tree's roots (whole subtrees, balanced by roots and nodes), so a forest whose
+        // roots overflow page 0 (a page is at most a pool slot, 3072 nodes,
+        // and the compact traversal's place and count 12 bits) goes into N
+        // files. Her pages kept in order, renumbered, and consecutive pages
+        // merged while they fit `--split-page-nodes` (3000, her P).
+        let split = arg(args, "--split-roots")
+            .map(|v| -> Result<(usize, usize)> {
+                let (n, i) = v.split_once(':').context("--split-roots N:i")?;
+                Ok((n.parse()?, i.parse()?))
+            })
+            .transpose()?;
+        let (block_s, parent_s, page_s, bounds_s, ids_s, first_leaf_s);
+        let (block_ref, parent_ref, page_ref, bounds_ref, ids_ref, first_leaf_ref) = if let Some((parts, which)) = split {
+            let n = tree.parent.len();
+            if parts == 0 || which >= parts {
+                bail!("--split-roots {parts}:{which}");
+            }
+            // Each node's root (parents come after their children).
+            let mut root = vec![0u32; n];
+            let mut size = vec![0usize; n];
+            for k in (0..n).rev() {
+                let p = tree.parent[k] as usize;
+                root[k] = if p == k || p >= n { k as u32 } else { root[p] };
+            }
+            for k in 0..n {
+                size[root[k] as usize] += 1;
+            }
+            let roots: Vec<usize> = (0..n).filter(|&k| root[k] as usize == k).collect();
+            // Largest first, each to the part with the fewest nodes among
+            // those with the fewest roots: roots and nodes both balanced
+            // (her forests are a few large subtrees and thousands of lone
+            // leaves).
+            let mut by_size = roots.clone();
+            by_size.sort_by_key(|&r| std::cmp::Reverse(size[r]));
+            let mut part_of = vec![usize::MAX; n];
+            let (mut nodes_in, mut roots_in) = (vec![0usize; parts], vec![0usize; parts]);
+            for &r in &by_size {
+                let q = (0..parts).min_by_key(|&q| (roots_in[q], nodes_in[q])).unwrap();
+                part_of[r] = q;
+                nodes_in[q] += size[r];
+                roots_in[q] += 1;
+            }
+            let sel: Vec<u32> = (0..n as u32).filter(|&k| part_of[root[k as usize] as usize] == which).collect();
+            let mut new_of = vec![u32::MAX; n];
+            for (j, &k) in sel.iter().enumerate() {
+                new_of[k as usize] = j as u32;
+            }
+            // Her pages in order, the empty ones gone, consecutive ones merged.
+            let cap: usize = arg(args, "--split-page-nodes").map(|v| v.parse()).transpose()?.unwrap_or(3000);
+            let pages_in = page.iter().copied().max().unwrap_or(0) as usize + 1;
+            let mut count = vec![0usize; pages_in];
+            for &k in &sel {
+                count[page[k as usize] as usize] += 1;
+            }
+            let mut new_page = vec![0u32; pages_in];
+            let (mut cur, mut fill, mut started) = (0u32, 0usize, false);
+            for (q, &c) in count.iter().enumerate() {
+                if c == 0 {
+                    continue;
+                }
+                if started && fill + c > cap {
+                    cur += 1;
+                    fill = 0;
+                }
+                started = true;
+                new_page[q] = cur;
+                fill += c;
+            }
+            eprintln!(
+                "--split-roots {parts}:{which}: {} of {} roots, {} of {n} nodes, {} of her {pages_in} pages into {}",
+                roots.iter().filter(|&&r| part_of[r] == which).count(),
+                roots.len(),
+                sel.len(),
+                count.iter().filter(|&&c| c > 0).count(),
+                cur + 1
+            );
+            block_s = spark_lib::athc_build::reorder(&packed.block, &sel);
+            parent_s = sel.iter().map(|&k| {
+                let p = tree.parent[k as usize] as usize;
+                if p == k as usize || p >= n { new_of[k as usize] } else { new_of[p] }
+            }).collect::<Vec<u32>>();
+            page_s = sel.iter().map(|&k| new_page[page[k as usize] as usize]).collect::<Vec<u32>>();
+            bounds_s = sel.iter().map(|&k| bounds[k as usize]).collect::<Vec<_>>();
+            ids_s = sel.iter().map(|&k| ids[k as usize]).collect::<Vec<u32>>();
+            first_leaf_s = sel.iter().map(|&k| first_leaf[k as usize]).collect::<Vec<u32>>();
+            (&block_s, &parent_s[..], &page_s[..], &bounds_s[..], &ids_s[..], &first_leaf_s[..])
+        } else {
+            (&packed.block, &tree.parent[..], &page[..], &bounds[..], &ids[..], &first_leaf[..])
+        };
         let input = PageInput {
-            block: &packed.block,
-            parent: &tree.parent,
-            page: &page,
-            bounds: &bounds,
-            ids: &ids,
-            first_leaf: &first_leaf,
+            block: block_ref,
+            parent: parent_ref,
+            page: page_ref,
+            bounds: bounds_ref,
+            ids: ids_ref,
+            first_leaf: first_leaf_ref,
             sh_words: packed.sh_words as usize,
             page_box,
         };
@@ -1635,7 +1725,17 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
                     co.asset_name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
                     co.asset = Some(asset);
                 }
-                let c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
+                let mut c = spark_lib::athc_compact::build_compact(&file.chunks, packed.linear, &basis, &co)?;
+                // athenea's occlusion codebook once per asset (thread CS):
+                // the piece's must be the table's.
+                if let Some(a) = &co.asset {
+                    if !a.occlusion.is_empty() && !file.occlusion_codebook.is_empty() {
+                        if a.occlusion != file.occlusion_codebook {
+                            bail!("--compact-asset: the piece's occlusion codebook is not the asset table's");
+                        }
+                        c.tables.asset_flags |= spark_lib::athc_compact::TABLE_ASSET_OCCLUSION;
+                    }
+                }
                 eprintln!("compact tier: {}", serde_json::to_string(&c.stats)?);
                 Some(c)
             }
@@ -1776,6 +1876,8 @@ fn main() -> Result<()> {
         "--compact-centroids",
         "--compact-levels",
         "--compact-asset",
+        "--split-roots",
+        "--split-page-nodes",
     ];
     let mut paths = Vec::new();
     let mut skip = false;

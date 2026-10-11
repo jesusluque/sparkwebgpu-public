@@ -133,7 +133,10 @@ impl LodSplat {
     /// -sin(theta + asin(rho / d)).
     fn back_facing(&self, eye: Vec3A) -> bool {
         let theta = self.theta.to_f32();
-        if !self.has_error() || !theta.is_finite() {
+        // A leaf (no error) culls with its own cone when it has one (a
+        // compact v3 tree's closed parts, thread CS): its sphere 0.
+        // ([0, 0] LODE words, theta's bits 0: no cone.)
+        if !theta.is_finite() || (!self.has_error() && (self.child_count > 0 || self.theta.to_bits() == 0)) {
             return false;
         }
         let v = eye - self.center();
@@ -208,8 +211,12 @@ impl LodSplat {
 /// tree's `wide` map; 0 a leaf). No back-face cone, no occlusion, no size
 /// for a merge with LODE (so no `errorSizeK` guard): a compact traversal
 /// draws exactly the nodes of the plain error cut.
+///
+/// v3 (thread CS) adds 6 bytes: LODE's cone word (lo, hi; a closed part's
+/// leaf its own, theta 0) and athenea's occlusion index -- the back-face
+/// cull of closed parts and the occlusion cull. v2 trees: NO_CONE, 0.
 #[derive(Debug, Clone, Copy, Default)]
-struct CompactLodNode([u16; 7]);
+struct CompactLodNode([u16; 10]);
 
 const COMPACT_WIDE: u16 = 15;
 const COMPACT_SIZE_MODE: u16 = 0x8000;
@@ -239,11 +246,14 @@ impl LodNodes {
                 let mut s = LodSplat::new_f16(center, f16::ZERO, child_start, count);
                 if w[4] & COMPACT_SIZE_MODE != 0 {
                     s.size = f16::from_bits(w[3]);
+                    s.theta = f16::INFINITY;
                 } else {
                     s.eps = f16::from_bits(w[3]);
                     s.rho = f16::from_bits(w[4]);
-                    s.theta = f16::INFINITY;
+                    s.theta = f16::from_bits(w[7]);
+                    s.cone_axis = w[8];
                 }
+                s.occlusion = w[9];
                 s
             }
         }
@@ -571,7 +581,9 @@ pub fn update_compact_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases
             lod_tree.chunk_to_page[chunk] = pool_page as u32;
             let input = Uint8Array::from(page).to_vec();
             let n = count as usize;
-            if input.len() != n * spark_lib::athc_compact::TRAVERSAL_INPUT_BYTES {
+            if input.len() != n * spark_lib::athc_compact::TRAVERSAL_INPUT_BYTES
+                && input.len() != n * spark_lib::athc_compact::TRAVERSAL_INPUT_BYTES_V2
+            {
                 return Err(JsValue::from_str("update_compact_lod_trees: a page's input of the wrong size"));
             }
             let head: Vec<u32> = boxes[6 * k..6 * k + 6].iter().map(|v| v.to_bits()).collect();
@@ -599,6 +611,9 @@ pub fn update_compact_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases
                     t.rho | if t.size_mode { COMPACT_SIZE_MODE } else { 0 },
                     t.child_page as u16,
                     (t.place as u16 & 0xfff) | code << 12,
+                    t.cone as u16,
+                    (t.cone >> 16) as u16,
+                    t.occlusion,
                 ]);
             }
         }
@@ -707,7 +722,10 @@ pub fn traverse_lod_trees(
     // one it refines) whose whole normal cone faces away, when it is wider
     // than `back_cull_min` on screen (the same angle units as the limit: a
     // node at full detail is never culled). None: off.
-    let back_cull_min = back_cull_min.filter(|m| m.is_finite() && *m >= 0.0);
+    // Negative (the compact path, thread CS): any size, and a node wholly
+    // facing away is pruned with its subtree (its cone bounds its leaves).
+    let prune_backs = back_cull_min.is_some_and(|m| m < 0.0);
+    let back_cull_min = back_cull_min.map(|m| m.max(0.0)).filter(|m| m.is_finite());
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
     if view_to_objects.len() != num_instances * 16 {
@@ -788,7 +806,7 @@ pub fn traverse_lod_trees(
             back_cull_min.is_some_and(|min| {
                 let i = &instances[inst as usize];
                 let s = &i.1.get(index as usize);
-                s.size() / (s.center() - i.4).length().max(1.0e-6) > min && s.back_facing(i.4)
+                (min <= 0.0 || s.size() / (s.center() - i.4).length().max(1.0e-6) > min) && s.back_facing(i.4)
             })
         };
 
@@ -801,6 +819,15 @@ pub fn traverse_lod_trees(
             let instance = &instances[inst_index as usize];
             let (lod_id, splats, _page_to_chunk, chunk_to_page, ..) = instance;
             let LodSplat { child_count, child_start, .. } = splats.get(paged_index as usize);
+
+            // A node wholly facing away (its cone bounds every leaf under it:
+            // a closed part's) is gone with its subtree: not refined, its
+            // children's pages not asked for (thread CS).
+            if prune_backs && culled(inst_index, paged_index) {
+                _ = frontier.pop();
+                culled_count += 1;
+                continue;
+            }
 
             if child_count == 0 {
                 _ = frontier.pop();

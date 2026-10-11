@@ -94,11 +94,15 @@
 //!
 //! An asset's compact pieces (thread CQ, `spark_lib::athc_compact`; paged trees
 //! written by `usd-athc --tree ... --pages --compact-basis`, v1 or v2):
-//!   athc-convert --compact-rebase in.athc out.athc   the compact tier in the v2 layout
-//!                         (the traversal's 16 bytes a node), its own tables
+//!   athc-convert --compact-rebase in.athc out.athc   the compact tier in the v3 layout
+//!                         (the traversal's 24 bytes a node: v2's 16, the cone, occlusion), its own tables
 //!   athc-convert --compact-asset car.cmpa --out-dir D a.athc b.athc ...   one asset table
 //!                         for the pieces (D/car.cmpa: the basis once) and each piece written
 //!                         to D under its name, sharing it; tiers 1-3 byte for byte
+//!   --table-only          (thread CS) the asset table alone, for pieces in CPCA the rebase
+//!                         cannot write again: convert them with usd-athc --compact-asset over it.
+//!                         athenea's occlusion codebook goes in it once when every piece has the
+//!                         same (CMPA flag 8, with the pieces' box union; --no-asset-occlusion)
 //!   --asset-entries N     one shadow dictionary of N entries for every piece (4096; 0: each
 //!                         piece keeps its own), k-means over every node (--asset-rounds 12)
 //!   --piece-materials     each piece keeps its material table (default: one for the asset)
@@ -505,7 +509,25 @@ fn compact_asset(args: &[String]) -> Result<()> {
     let inputs: Vec<Vec<u8>> = paths.iter().map(std::fs::read).collect::<std::io::Result<_>>()?;
     let refs: Vec<&[u8]> = inputs.iter().map(|b| b.as_slice()).collect();
     let t = std::time::Instant::now();
-    let asset = build_asset(&refs, entries, rounds, shared_materials, threads)?;
+    let mut asset = build_asset(&refs, entries, rounds, shared_materials, threads)?;
+    // athenea's occlusion codebook, once per asset (thread CS): the same in
+    // every piece, with the asset's box (the pieces' boxes' union).
+    let layouts: Vec<_> = refs.iter().map(|b| spark_lib::athc_v3::parse_v3(b)).collect::<Result<_>>()?;
+    if layouts.iter().all(|l| !l.occlusion_codebook.is_empty()) && !args.iter().any(|a| a == "--no-asset-occlusion") {
+        if layouts.iter().any(|l| l.occlusion_codebook != layouts[0].occlusion_codebook) {
+            bail!("--compact-asset: the pieces' occlusion codebooks differ");
+        }
+        let mut b = [f32::MAX, f32::MAX, f32::MAX, f32::MIN, f32::MIN, f32::MIN];
+        for l in &layouts {
+            for k in 0..3 {
+                b[k] = b[k].min(l.header.bounds_min[k]);
+                b[3 + k] = b[3 + k].max(l.header.bounds_max[k]);
+            }
+        }
+        asset.occlusion = layouts[0].occlusion_codebook.clone();
+        asset.occlusion_box = b;
+        eprintln!("occlusion: {} entries once, the asset's box {:?}", asset.occlusion.len() / 8, b);
+    }
     std::fs::create_dir_all(&out_dir)?;
     let name = std::path::Path::new(&asset_path).file_name().context("--compact-asset: a file name")?.to_string_lossy().into_owned();
     let blob = asset.to_bytes();
@@ -519,6 +541,12 @@ fn compact_asset(args: &[String]) -> Result<()> {
         asset.id(),
         t.elapsed().as_secs_f32()
     );
+    // `--table-only`: the asset table alone (pieces written in CPCA, which
+    // the rebase cannot write again: convert them with usd-athc
+    // --compact-asset over this table).
+    if args.iter().any(|a| a == "--table-only") {
+        return Ok(());
+    }
     let mut report = Vec::new();
     for (path, bytes) in paths.iter().zip(&inputs) {
         let (out, stats) = rebase_compact(bytes, Some(&asset), &name, threads)?;

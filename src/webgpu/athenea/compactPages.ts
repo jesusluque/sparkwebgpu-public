@@ -31,20 +31,33 @@ import {
   readAthcLayout,
   readRange,
 } from "../../athc";
-import { BAND_NEAR, type BandMesh, planBand } from "../WgpuBandPager";
+import {
+  BAND_NEAR,
+  type BandMesh,
+  type Foveation,
+  pageFoveate,
+  planBand,
+} from "../WgpuBandPager";
 import type { CompactCloud, CompactLayout, CompactRelitPath } from "./compact";
 
-/** Bytes a node in a CMPC section, by plane (rust athc_compact PLANE_WIDTHS). */
+/**
+ * Bytes a node in a CMPC section, by plane (rust athc_compact PLANE_WIDTHS):
+ * v3 (thread CS) appends the cone word (4), the occlusion index (2) and 2
+ * spare to v2's 31 planes, at the same offsets.
+ */
 export const COMPACT_PLANE_WIDTHS = [
   2, 2, 2, 3, 1, 3, 4, 3, 3, 2, 1, 4, 4, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-  1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 ] as const;
-export const COMPACT_NODE_BYTES = 56;
+export const COMPACT_NODE_BYTES = 64;
+export const COMPACT_NODE_BYTES_V2 = 56;
+const COMPACT_PLANES_V2 = 31;
 /** The GPU's bytes a node, the traversal's (rust GPU_NODE_BYTES, TRAVERSAL_NODE_BYTES). */
 export const COMPACT_GPU_NODE_BYTES = 40;
-export const COMPACT_TRAVERSAL_NODE_BYTES = 16;
-/** Bytes a node of a compact LoD tree in the WASM traversal (CompactLodNode). */
-export const COMPACT_LOD_NODE_BYTES = 14;
+export const COMPACT_TRAVERSAL_NODE_BYTES = 24;
+export const COMPACT_TRAVERSAL_NODE_BYTES_V2 = 16;
+/** Bytes a node of a compact LoD tree in the WASM traversal (CompactLodNode, v3). */
+export const COMPACT_LOD_NODE_BYTES = 20;
 /** The planes the GPU keeps, by name (the rest are the traversal's). */
 const GPU_PLANES = [
   "posX",
@@ -70,12 +83,14 @@ const P_KIDS = 23;
 const HEAD_WORDS = 12;
 const SLOT_HEAD_WORDS = 16;
 const TABLE_MAGIC = 0x54504d43; // "CMPT"
-const TABLE_VERSION = 2;
+const TABLE_VERSION = 3;
 const ASSET_MAGIC = 0x41504d43; // "CMPA"
 /** CMPT flags: the basis, the dictionary, the materials in the asset table. */
 const TABLE_ASSET_BASIS = 4;
 const TABLE_ASSET_CODEBOOK = 8;
 const TABLE_ASSET_MATERIALS = 16;
+/** v3: the occlusion codebook in the asset table. */
+const TABLE_ASSET_OCCLUSION = 32;
 
 /** Byte offset of plane k in a section of n nodes. */
 export function compactPlaneOffset(k: number, n: number) {
@@ -86,6 +101,8 @@ export function compactPlaneOffset(k: number, n: number) {
 
 /** A piece's compact tables (rust athc_compact CompactTables). */
 export interface CompactPieceTables {
+  /** CMPT 2 (no cones, no occlusion indices) or 3 (thread CS). */
+  version: number;
   codebook: Uint32Array;
   materials: Uint32Array;
   basis: Uint32Array;
@@ -109,6 +126,12 @@ export interface CompactAssetTables {
   clusters: number;
   codebook: Uint32Array;
   materials: Uint32Array;
+  /**
+   * athenea's occlusion codebook (8 words an entry; empty: none) and the
+   * asset's box (min xyz, max xyz), once per asset (thread CS).
+   */
+  occlusion: Uint32Array;
+  occlusionBox: Float32Array;
   id: bigint;
   bytes: number;
 }
@@ -137,16 +160,21 @@ function fnv1a64(bytes: Uint8Array) {
 /** The tables blob (CompactTables::to_bytes, v2). */
 export function parseCompactTables(bytes: Uint8Array): CompactPieceTables {
   const w = wordsOf(bytes);
-  if (w[0] !== TABLE_MAGIC || w[1] !== TABLE_VERSION) {
+  if (w[0] !== TABLE_MAGIC || (w[1] !== TABLE_VERSION && w[1] !== 2)) {
     throw new Error(
-      `compact tables: not CMPT v${TABLE_VERSION} (a v1 file: athc-convert --compact-rebase)`,
+      `compact tables: not CMPT v2 or v${TABLE_VERSION} (a v1 file: athc-convert --compact-rebase)`,
     );
   }
-  if (w[2] !== COMPACT_NODE_BYTES || w[3] !== COMPACT_PLANE_WIDTHS.length) {
+  const v2 = w[1] === 2;
+  if (
+    w[2] !== (v2 ? COMPACT_NODE_BYTES_V2 : COMPACT_NODE_BYTES) ||
+    w[3] !== (v2 ? COMPACT_PLANES_V2 : COMPACT_PLANE_WIDTHS.length)
+  ) {
     throw new Error("compact tables: another layout");
   }
   const name = bytes.subarray(4 * w[18], 4 * w[18] + w[19]);
   return {
+    version: w[1],
     codebook: w.slice(w[11], w[11] + 8 * w[5]),
     materials: w.slice(w[12], w[12] + 4 * w[6]),
     basis: w.slice(w[13], w[13] + w[14]),
@@ -157,7 +185,10 @@ export function parseCompactTables(bytes: Uint8Array): CompactPieceTables {
     curvature: (w[10] & 2) !== 0,
     assetFlags:
       w[10] &
-      (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS),
+      (TABLE_ASSET_BASIS |
+        TABLE_ASSET_CODEBOOK |
+        TABLE_ASSET_MATERIALS |
+        TABLE_ASSET_OCCLUSION),
     assetId: BigInt(w[16]) | (BigInt(w[17]) << 32n),
     assetName: new TextDecoder().decode(name),
   };
@@ -182,6 +213,14 @@ export function parseCompactAsset(bytes: Uint8Array): CompactAssetTables {
     basis: w.slice(w[7], w[7] + w[8]),
     codebook: w.slice(w[9], w[9] + 8 * w[5]),
     materials: w.slice(w[10], w[10] + 4 * w[6]),
+    occlusion:
+      w[3] & 8 ? w.slice(w[13], w[13] + 8 * w[14]) : new Uint32Array(0),
+    occlusionBox:
+      w[3] & 8
+        ? new Float32Array(
+            w.slice(w[13] + 8 * w[14], w[13] + 8 * w[14] + 6).buffer,
+          )
+        : new Float32Array(6),
     id,
     bytes: 4 * total,
   };
@@ -212,19 +251,23 @@ export function resolveCompactTables(
     codebook: t.assetFlags & TABLE_ASSET_CODEBOOK ? asset.codebook : t.codebook,
     materials:
       t.assetFlags & TABLE_ASSET_MATERIALS ? asset.materials : t.materials,
-    assetFlags: 0,
+    assetFlags: t.assetFlags & TABLE_ASSET_OCCLUSION,
   };
 }
 
 /**
  * The traversal's input of a page (rust athc_compact traversal_input): its
- * position planes then the traversal's planes, 22 bytes a node.
+ * position planes then the traversal's planes, 22 bytes a node (v2) or 30 (v3).
  */
 export function compactTraversalInput(raw: Uint8Array, n: number) {
-  const out = new Uint8Array((6 + COMPACT_TRAVERSAL_NODE_BYTES) * n);
+  const t =
+    raw.length === n * COMPACT_NODE_BYTES_V2
+      ? COMPACT_TRAVERSAL_NODE_BYTES_V2
+      : COMPACT_TRAVERSAL_NODE_BYTES;
+  const out = new Uint8Array((6 + t) * n);
   out.set(raw.subarray(0, 6 * n), 0);
   const at = COMPACT_GPU_NODE_BYTES * n;
-  out.set(raw.subarray(at, at + COMPACT_TRAVERSAL_NODE_BYTES * n), 6 * n);
+  out.set(raw.subarray(at, at + t * n), 6 * n);
   return out;
 }
 
@@ -283,7 +326,7 @@ export class CompactPagePool {
     if (!pieces.length) throw new Error("CompactPagePool: no piece");
     const first = pieces[0];
     for (const p of pieces) {
-      if (p.assetFlags) {
+      if (p.assetFlags & ~TABLE_ASSET_OCCLUSION) {
         throw new Error(
           "CompactPagePool: resolve the pieces' asset tables first",
         );
@@ -389,7 +432,10 @@ export class CompactPagePool {
         `CompactPagePool: a page of ${n} in slots of ${this.slotNodes}`,
       );
     }
-    if (raw.length !== n * COMPACT_NODE_BYTES) {
+    if (
+      raw.length !== n * COMPACT_NODE_BYTES &&
+      raw.length !== n * COMPACT_NODE_BYTES_V2
+    ) {
       throw new Error(`CompactPagePool: ${raw.length} bytes for ${n} nodes`);
     }
     const out = this.staging;
@@ -431,6 +477,7 @@ export type LodCall = (
     | "newSharedLodTree"
     | "updateLodTrees"
     | "updateCompactLodTrees"
+    | "setLodOcclusionCodebook"
     | "traverseLodTrees",
   args: Record<string, unknown>,
 ) => Promise<unknown>;
@@ -453,6 +500,31 @@ export interface CompactBandOptions {
   tau?: number;
   /** Fit tau to the pool when the needed set does not (bandTauToFit). */
   tauToFit?: boolean;
+  /**
+   * Spark's foveation (thread CS): nodes outside the view cut coarser, and
+   * the pages planned with the same weight (pageFoveate). Default: full
+   * detail within the camera's diagonal field + 8 degrees, coneFoveate 0.4
+   * at 30 degrees more, behindFoveate 0.2 (WgpuLod's). null: none (CN's).
+   */
+  foveation?: Partial<Foveation> | null;
+  /**
+   * The trees' object-to-world (the car's frame: athenea's Z-up stage
+   * turned to three's Y-up). The traversal and the planner take the eye in
+   * the trees' own space (thread CS: CN's took the world's, the eye 90
+   * degrees off about x for a Z-up car). Default identity.
+   */
+  frame?: THREE.Matrix4;
+  /**
+   * The back-face cull of closed parts (athenea:splat:closed, CMPC v3's
+   * cones): a node or leaf whose whole cone faces away (n . v < -sin theta)
+   * is not drawn. Default true (v2 pieces carry no cones: nothing culled).
+   */
+  backCull?: boolean;
+  /**
+   * athenea's occlusion masks (the asset table's codebook, CMPC v3's
+   * indices): opt-in, default false.
+   */
+  occlusion?: boolean;
   maxRangeBytes?: number;
   /** Fetches in flight. */
   fetchers?: number;
@@ -532,6 +604,9 @@ export class CompactBandStreamer {
     residentPages: 0,
     residentNodes: 0,
     cut: 0,
+    /** Nodes the last traversal culled from behind (closed parts), and by occlusion. */
+    culled: 0,
+    occluded: 0,
     tau: 0,
     traverseMs: 0,
     starved: 0,
@@ -586,12 +661,24 @@ export class CompactBandStreamer {
       compact: true,
     })) as { lodId: number };
     this.poolLodId = lodId;
+    // athenea's occlusion codebook, once per asset (the WASM keeps it a
+    // tree), and the asset's box its rule tests the eye against.
+    const asset = this.options.asset;
+    const occlusion = asset?.occlusion.length ? asset : null;
     for (const p of this.pieces) {
       p.lodId = (
         (await this.options.lod("newSharedLodTree", { lodId })) as {
           lodId: number;
         }
       ).lodId;
+      if (occlusion) {
+        await this.options.lod("setLodOcclusionCodebook", {
+          lodId: p.lodId,
+          // Copies: the worker's call transfers (detaches) its buffers.
+          codebook: occlusion.occlusion.slice(),
+          bounds: occlusion.occlusionBox.slice(),
+        });
+      }
     }
   }
 
@@ -661,9 +748,34 @@ export class CompactBandStreamer {
     camera.updateMatrixWorld();
     const tanY = Math.tan((camera.fov * Math.PI) / 360);
     const pixel = (2 * tanY) / height;
-    const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
+    // The view in the trees' space.
+    const view = this.options.frame
+      ? this.options.frame.clone().invert().multiply(camera.matrixWorld)
+      : camera.matrixWorld;
+    const eye = new THREE.Vector3().setFromMatrixPosition(view);
+    const fov = this.foveationFor(camera);
+    const forward = new THREE.Vector3()
+      .setFromMatrixColumn(view, 2)
+      .negate()
+      .normalize();
+    const eyeArr = [eye.x, eye.y, eye.z];
+    const fwdArr = [forward.x, forward.y, forward.z];
+    const foveateFor = (p: PieceState) =>
+      fov
+        ? (page: number) => pageFoveate(p.rows[page], eyeArr, fwdArr, fov)
+        : undefined;
     if (this.options.tauToFit) {
-      this.tau = Math.max(this.options.tau ?? 1, this.tauToFitNow(eye, pixel));
+      const fit = Math.max(
+        this.options.tau ?? 1,
+        this.tauToFitNow(eye, pixel, foveateFor),
+      );
+      // Pruned (wanted pages): the set grows as tau falls, so tau comes
+      // down by at most 1/1.25 a traversal (up at once: never past the pool).
+      const next =
+        this.wanted && fit < this.tau ? Math.max(fit, this.tau / 1.25) : fit;
+      // Still coming down: the caller keeps traversing a still view.
+      this.converging = next < this.tau * 0.999;
+      this.tau = next;
     }
     this.stats.tau = this.tau;
     const errorLimit = pixel * this.tau;
@@ -675,27 +787,50 @@ export class CompactBandStreamer {
         instanceId: p.piece.name,
         lodId: p.lodId,
         rootPage: root,
-        viewToObjectCols: camera.matrixWorld.elements.slice(),
+        viewToObjectCols: view.elements.slice(),
         lodScale: 1,
-        behindFoveate: 1,
-        coneFov0: 0,
-        coneFov: 0,
-        coneFoveate: 1,
+        behindFoveate: fov ? fov.behindFoveate : 1,
+        coneFov0: fov ? fov.coneFov0 : 0,
+        coneFov: fov ? fov.coneFov : 0,
+        coneFoveate: fov ? fov.coneFoveate : 1,
       };
     }
     let list = new Uint32Array(0);
     if (Object.keys(instances).length) {
       const t0 = performance.now();
-      const { keyIndices } = (await lod("traverseLodTrees", {
-        maxSplats: this.options.slots * this.slotNodes,
-        pixelScaleLimit: pixel,
-        instances,
-        traverseMode: "standard",
-        errorLimit,
-      })) as {
+      const { keyIndices, culledCount, occludedCount, chunks } = (await lod(
+        "traverseLodTrees",
+        {
+          maxSplats: this.options.slots * this.slotNodes,
+          pixelScaleLimit: pixel,
+          instances,
+          traverseMode: "standard",
+          errorLimit,
+          // Negative: any size, pruned with the subtree (spark-rs).
+          backCullMin: this.options.backCull === false ? undefined : -1,
+          occlusionCull: this.options.occlusion === true,
+        },
+      )) as {
         keyIndices: Record<string, { numSplats: number; indices: Uint32Array }>;
+        culledCount?: number;
+        occludedCount?: number;
+        chunks?: [number, number][];
       };
       this.stats.traverseMs = performance.now() - t0;
+      // The pages the traversal asked for, by tree (spark-rs touched).
+      if (this.pruning() && chunks) {
+        const wanted = new Map<number, Set<number>>();
+        for (const [lodId, chunk] of chunks) {
+          const set = wanted.get(lodId) ?? new Set<number>();
+          wanted.set(lodId, set);
+          set.add(chunk);
+        }
+        this.wanted = wanted;
+      } else {
+        this.wanted = null;
+      }
+      this.stats.culled = culledCount ?? 0;
+      this.stats.occluded = occludedCount ?? 0;
       const parts = Object.values(keyIndices).map((k) =>
         k.indices.subarray(0, k.numSplats),
       );
@@ -731,6 +866,8 @@ export class CompactBandStreamer {
       pageBytes: p.pageBytes,
       eye: [eye.x, eye.y, eye.z],
       limit: errorLimit,
+      foveate: foveateFor(p),
+      wanted: this.wantedOf(p),
       resident: (page) => p.slotOf.has(page),
       inFlight: (page) => p.inFlight.has(page),
       children: (page) => p.kids.get(page),
@@ -793,10 +930,63 @@ export class CompactBandStreamer {
     return undefined;
   }
 
-  private tauToFitNow(eye: THREE.Vector3, pixel: number) {
+  /** The foveation for this camera (options.foveation), or null. */
+  private foveationFor(camera: THREE.PerspectiveCamera): Foveation | null {
+    const o = this.options.foveation;
+    if (o === null) return null;
+    const tanY = Math.tan((camera.fov * Math.PI) / 360);
+    const diag =
+      (2 *
+        Math.atan(tanY * Math.sqrt(1 + camera.aspect * camera.aspect)) *
+        180) /
+      Math.PI;
+    const coneFov0 = o?.coneFov0 ?? Math.min(diag + 8, 179);
+    return {
+      coneFov0,
+      coneFov: o?.coneFov ?? Math.min(coneFov0 + 30, 180),
+      coneFoveate: o?.coneFoveate ?? 0.4,
+      behindFoveate: o?.behindFoveate ?? 0.2,
+    };
+  }
+
+  /**
+   * Whether the traversal prunes what the page table cannot see (the back
+   * cull of closed parts, the occlusion masks): the needed set is then the
+   * pages it asked for (planBand's `wanted`).
+   */
+  private pruning() {
+    const v3 = this.pool.pieces.some((t) => t.version >= 3);
+    const occlusion = (this.options.asset?.occlusion.length ?? 0) > 0;
+    return (
+      (v3 && this.options.backCull !== false) ||
+      (v3 && occlusion && this.options.occlusion === true)
+    );
+  }
+
+  /** tau fell at the last update (pruned planning): not settled yet. */
+  converging = false;
+
+  /** The pages of each tree the last traversal asked for (null: no pruning). */
+  private wanted: Map<number, Set<number>> | null = null;
+
+  private wantedOf(p: PieceState) {
+    const w = this.wanted;
+    if (!w) return undefined;
+    const set = w.get(p.lodId);
+    return (page: number) => page === 0 || (set?.has(page) ?? false);
+  }
+
+  private tauToFitNow(
+    eye: THREE.Vector3,
+    pixel: number,
+    foveateFor: (p: PieceState) => ((page: number) => number) | undefined,
+  ) {
     const t: number[] = [];
     for (const p of this.pieces) {
+      const fv = foveateFor(p);
+      const wanted = this.wantedOf(p);
       p.rows.forEach((row, page) => {
+        if (wanted && !wanted(page)) return;
         if (page === 0) return;
         let d2 = 0;
         for (let k = 0; k < 3; k++) {
@@ -804,7 +994,8 @@ export class CompactBandStreamer {
           const v = Math.max(row.lo[k] - e, 0, e - row.hi[k]);
           d2 += v * v;
         }
-        t.push(row.epsMax / Math.max(Math.sqrt(d2), BAND_NEAR) / pixel);
+        const f = fv ? fv(page) : 1;
+        t.push((f * row.epsMax) / Math.max(Math.sqrt(d2), BAND_NEAR) / pixel);
       });
     }
     const room = this.options.slots - this.pieces.length;

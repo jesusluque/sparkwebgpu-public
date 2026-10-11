@@ -30,9 +30,9 @@ import athenea.common.octahedral;
 import athenea.light.environment;
 import athenea.splat.splat_relight;
 
-/// Five uint4 a source splat (relight.slang's kRelightStride): the colour,
-/// asuint of (linear rgb, alpha, -1 or -2); the kept terms; then the three
-/// the draw reads.
+/// atheneaColourParams.stride uint4 a source splat (relight.slang's
+/// relightParams.stride): the colour, asuint of (linear rgb, alpha, -1 or
+/// -2); then the kept terms; then, at a stride of 5, the three the draw reads.
 public StructuredBuffer<uint4> atheneaRelit;
 /// Three uint4 an accumulator slot: the draw's copy of those three
 /// (generate writes it as atheneaPixelOut, the draw reads it).
@@ -51,22 +51,34 @@ public struct AtheneaPixelParams {
 };
 public ConstantBuffer<AtheneaPixelParams> atheneaPixelParams;
 
-static const uint kStride = 5u;
+/// How the records are laid out: `stride` uint4 a splat, and whether the
+/// draw's per-pixel records are kept (pixel != 0: stride 5, atheneaPixelOut
+/// as large as the accumulator; else it is a placeholder, never written).
+public struct AtheneaColourParams {
+    public uint stride;
+    public uint pixel;
+    public uint pad0;
+    public uint pad1;
+};
+public ConstantBuffer<AtheneaColourParams> atheneaColourParams;
+
 static const uint kPixel = 2u;
 
 public struct AtheneaRelightColour : ISplatColour {
     public static float4 colour(float4 rgba, SplatColourInput i) {
-        const uint at = kStride * i.index;
+        const uint at = atheneaColourParams.stride * i.index;
         const float4 c = asfloat(atheneaRelit[at]);
-        const uint o = 3u * i.outIndex;
         const bool keepAll = c.a < -1.5;
-        // The draw reads the slope and polish records only under the
-        // centre's mark (AtheneaRelightBlend): copied only then.
-        const uint4 head = keepAll ? uint4(0u) : atheneaRelit[at + kPixel + 2u];
-        atheneaPixelOut[o + 2u] = head;
-        if (highHalf(head.w) > 0.5) {
-            atheneaPixelOut[o] = atheneaRelit[at + kPixel];
-            atheneaPixelOut[o + 1u] = atheneaRelit[at + kPixel + 1u];
+        if (atheneaColourParams.pixel != 0u) {
+            const uint o = 3u * i.outIndex;
+            // The draw reads the slope and polish records only under the
+            // centre's mark (AtheneaRelightBlend): copied only then.
+            const uint4 head = keepAll ? uint4(0u) : atheneaRelit[at + kPixel + 2u];
+            atheneaPixelOut[o + 2u] = head;
+            if (highHalf(head.w) > 0.5) {
+                atheneaPixelOut[o] = atheneaRelit[at + kPixel];
+                atheneaPixelOut[o + 1u] = atheneaRelit[at + kPixel + 1u];
+            }
         }
         if (keepAll) {
             return rgba;

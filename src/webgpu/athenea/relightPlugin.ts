@@ -237,6 +237,15 @@ export interface AtheneaRelightOptions {
   transferResident?: TransferResident;
   /** Splats a CPCA batch rebuilds at once (its scratch: this x the transfer's words). */
   cpcaBatch?: number;
+  /**
+   * Free the dome's source image and residual on the GPU (AtheneaSky
+   * releaseSources: rgba32float with mips, ~21 MB for a 1k HDRI) once the
+   * sky is prepared; what the relight reads stays. A later change of the
+   * dome (its image, turn or intensity) uploads the image again. For a
+   * phone's budget (default false: a 4k dome's upload on every turn of the
+   * rotation slider is slow).
+   */
+  releaseSky?: boolean;
 }
 
 /** How the TX transfer is kept on the GPU (AtheneaRelightOptions.transferResident). */
@@ -313,8 +322,10 @@ export interface AtheneaRelightPlugin extends SplatPlugin {
   };
   /** How the transfer is kept (AtheneaRelightOptions.transferResident). */
   readonly transferResident: TransferResident;
-  /** For tests: `mesh`'s relit records (relight.slang kRelightStride a splat). */
+  /** For tests: `mesh`'s relit records (relitStrideOf(mesh) uint4 a splat, the colour first). */
   relitBufferOf(mesh: WgpuSplatMesh): GPUBuffer | null;
+  /** uint4 records a splat in relitBufferOf(mesh) (relight.slang relightParams.stride). */
+  relitStrideOf(mesh: WgpuSplatMesh): number;
 }
 
 interface PoolOnGpu {
@@ -345,6 +356,8 @@ interface MeshState {
   listBase: number;
   /** `relit` is shared with the other meshes of one paged pool. */
   shared: boolean;
+  /** uint4 records a splat (relight.slang relightParams.stride). */
+  stride: number;
 }
 
 const STREAMS = [
@@ -470,6 +483,7 @@ export function atheneaRelightPlugin(
     cullBacksFacing: CULL_BACKS_FACING,
     sheetFloor: "relight",
     cpcaBatch: CPCA_BATCH,
+    releaseSky: false,
     frame: null,
   };
   const transferResident = initial.transferResident ?? "words";
@@ -699,7 +713,29 @@ export function atheneaRelightPlugin(
       )
       .join();
 
+  // The draw's per-pixel records exist only while its blend term runs
+  // (pixelDetail): without it generate is handed a placeholder it never
+  // writes (atheneaColourParams.pixel = 0), not 48 bytes an accumulator slot
+  // (12 MB on a phone).
+  const blendOn = () =>
+    Boolean(options.pixelDetail || options.debug?.alwaysBlend);
+  let pixelPlaceholder: GPUBuffer | null = null;
+  /** The sky was prepared this frame and releaseSky is on. */
+  let skyRelease = false;
   const pixelBuffer = (device: GPUDevice, slots: number): GPUBuffer => {
+    if (!blendOn()) {
+      if (pixel) {
+        retired.push(pixel);
+        pixel = null;
+        pixelLayout = "";
+      }
+      pixelPlaceholder ??= createStorage(
+        device,
+        PIXEL_RECORD_BYTES,
+        "relight pixel (none)",
+      );
+      return pixelPlaceholder;
+    }
     const bytes = Math.max(slots, 1) * PIXEL_RECORD_BYTES;
     if (!pixel || pixel.size < bytes) {
       pixel?.destroy();
@@ -729,31 +765,53 @@ export function atheneaRelightPlugin(
     return group.length > 1 && group.includes(mesh) ? group : null;
   };
 
+  /**
+   * uint4 records a splat in a mesh's relit buffer: the colour; the kept
+   * terms (a mesh of its own: kRelightCache); the draw's three while the
+   * blend term runs. A paged pool's shared records keep no kept terms.
+   */
+  const strideFor = (mesh: WgpuSplatMesh): number =>
+    blendOn()
+      ? C.kRelightStride
+      : sharingOf(mesh)
+        ? C.kRelightStrideColour
+        : C.kRelightStrideKept;
+
   const stateOf = (device: GPUDevice, mesh: WgpuSplatMesh): MeshState => {
     // The records, then room for a LoD list of every splat (relightList).
     const count = Math.max(mesh.source.count, 1);
     const listWords = Math.ceil(count / 4);
     const group = sharingOf(mesh);
+    const stride = strideFor(mesh);
     let s = states.get(mesh);
     if (group) {
-      const bytes = (count * C.kRelightStride + group.length * listWords) * 16;
+      // The group's lists one after another (each from a uint4): the meshes
+      // draw distinct slots of the pool, so together they list at most
+      // `count` splats (one list region, not one a mesh).
+      const lengths = group.map((m) => m.lodIndices?.length ?? 0);
+      const listsWords = Math.max(
+        listWords + group.length,
+        lengths.reduce((n, l) => n + Math.ceil(l / 4), 0),
+      );
+      const bytes = (count * stride + listsWords) * 16;
       let relit = sharedRelit.get(mesh.source.src);
-      if (!relit || relit.size < bytes) {
-        relit?.destroy();
+      if (!relit || relit.size < bytes || relit.size > 2 * bytes) {
+        if (relit) retired.push(relit);
         relit = createStorage(device, bytes, "relit splats (shared)");
         // A pool given up (reallocated): its records go.
         for (const [src, b] of sharedRelit) {
           if (!renderer?.meshes.some((m) => m.source.src === src)) {
-            b.destroy();
+            retired.push(b);
             sharedRelit.delete(src);
           }
         }
         sharedRelit.set(mesh.source.src, relit);
       }
-      const listBase =
-        count * C.kRelightStride + group.indexOf(mesh) * listWords;
-      if (!s || s.relit !== relit || s.listBase !== listBase) {
-        if (s && !s.shared) s.relit.destroy();
+      const at = group.indexOf(mesh);
+      let listBase = count * stride;
+      for (let k = 0; k < at; k++) listBase += Math.ceil(lengths[k] / 4);
+      if (!s || s.relit !== relit || s.stride !== stride) {
+        if (s && !s.shared) retired.push(s.relit);
         s = {
           relit,
           pool: s?.pool ?? null,
@@ -762,21 +820,28 @@ export function atheneaRelightPlugin(
           listKey: "",
           listBase,
           shared: true,
+          stride,
         };
         states.set(mesh, s);
       }
+      // A neighbour's list grew or shrank: this one moves (copied again).
+      if (s.listBase !== listBase) {
+        s.listBase = listBase;
+        s.listKey = "";
+      }
     } else {
-      const bytes = (count * C.kRelightStride + listWords) * 16;
+      const bytes = (count * stride + listWords) * 16;
       if (!s || s.shared || s.relit.size !== bytes) {
-        if (s && !s.shared) s.relit.destroy();
+        if (s && !s.shared) retired.push(s.relit);
         s = {
           relit: createStorage(device, bytes, "relit splats"),
           pool: s?.pool ?? null,
           viewlessKey: "",
           relitKey: "",
           listKey: "",
-          listBase: count * C.kRelightStride,
+          listBase: count * stride,
           shared: false,
+          stride,
         };
         states.set(mesh, s);
       }
@@ -941,6 +1006,7 @@ export function atheneaRelightPlugin(
       curvature: id("curvature"),
       footprint: options.footprint,
       listBase: state.listBase,
+      stride: state.stride,
       cpcaWords: projected ? JOINT.kJointEyeSlotWords : rebuiltWords,
       encoding: source.encoding,
       row0: row(0),
@@ -1183,7 +1249,7 @@ export function atheneaRelightPlugin(
     params.set("flags", flags);
     let listCount = 0;
     if (list) {
-      const listKey = `${identity(list)}|${list.length}`;
+      const listKey = `${identity(list)}|${list.length}|${state.listBase}`;
       if (state.listKey !== listKey) {
         device.queue.writeBuffer(
           state.relit,
@@ -1232,11 +1298,21 @@ export function atheneaRelightPlugin(
     stats,
     transferResident,
     relitBufferOf: (mesh) => states.get(mesh)?.relit ?? null,
+    relitStrideOf: (mesh) => states.get(mesh)?.stride ?? strideFor(mesh),
+    uniforms: [
+      {
+        block: "atheneaColourParams",
+        stage: "splat",
+        write(w, ctx) {
+          w.set("stride", ctx.mesh ? strideFor(ctx.mesh) : C.kRelightStride);
+          w.set("pixel", blendOn() ? 1 : 0);
+        },
+      },
+    ],
     // AtheneaRelightBlend shades only the splats the pass marks, which it
     // does with pixelDetail alone (kRelightSlope): without it the draw is
     // the plain one, with no record read per fragment.
-    blendActive: () =>
-      Boolean(options.pixelDetail || options.debug?.alwaysBlend),
+    blendActive: blendOn,
     get sky() {
       return sky;
     },
@@ -1266,6 +1342,8 @@ export function atheneaRelightPlugin(
             });
             sky.prepare(encoder);
             stats.skies += 1;
+            // Freed once this frame is submitted (onFrame of the next).
+            if (options.releaseSky) skyRelease = true;
             lightsDirty = true;
           }
           ies ??= {
@@ -1366,6 +1444,9 @@ export function atheneaRelightPlugin(
       emptyPool = null;
       pixel?.destroy();
       pixel = null;
+      pixelPlaceholder?.destroy();
+      pixelPlaceholder = null;
+      for (const b of retired.splice(0)) b.destroy();
       pixelParams?.destroy();
       pixelParams = null;
       pixelLayout = "";
@@ -1373,6 +1454,10 @@ export function atheneaRelightPlugin(
     },
     onFrame(frame) {
       for (const b of retired.splice(0)) b.destroy();
+      if (skyRelease) {
+        sky?.releaseSources();
+        skyRelease = false;
+      }
       // A new accumulator layout clears the draw's records (the pass), so
       // the relit meshes' must be written again.
       const was = dirty || layoutOf(frame.renderer) !== pixelLayout;
@@ -1412,6 +1497,7 @@ export function atheneaRelightPlugin(
       if (o.debug !== undefined) options.debug = { ...o.debug };
       if (o.frame !== undefined) options.frame = o.frame;
       if (o.cpcaBatch !== undefined) options.cpcaBatch = o.cpcaBatch;
+      if (o.releaseSky !== undefined) options.releaseSky = o.releaseSky;
       if (skyChanged && sky) sky.dirty = true;
       lightsDirty = true;
       dirty = true;

@@ -103,6 +103,8 @@ export const atheneaAdapterRelight = {
   kRelightSheetDraw: 65536,
   kRelightGroup: 256,
   kRelightStride: 5,
+  kRelightStrideKept: 2,
+  kRelightStrideColour: 1,
   kRelightPixel: 2,
   kRelightKeepAll: -2,
   kRelightSheet: 8,
@@ -112,7 +114,6 @@ export const atheneaAdapterRelight = {
 
 /** slang/athenea_adapter/relight_colour.slang */
 export const atheneaAdapterRelightColour = {
-  kStride: 5,
   kPixel: 2,
 } as const;
 

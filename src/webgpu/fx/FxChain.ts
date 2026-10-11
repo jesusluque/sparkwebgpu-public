@@ -106,14 +106,20 @@ export class FxChain {
     picture: FxBuffer,
     ctx: FxContext = {},
     window = picture.rect,
+    consumable = false,
   ): FxBuffer | null {
     const top = this.link({ picture });
-    const out = this.graph.render(top, window, {
-      projectWidth: picture.width,
-      projectHeight: picture.height,
-      ...this.context,
-      ...ctx,
-    });
+    const out = this.graph.render(
+      top,
+      window,
+      {
+        projectWidth: picture.width,
+        projectHeight: picture.height,
+        ...this.context,
+        ...ctx,
+      },
+      consumable ? [picture] : [],
+    );
     for (const [k, v] of out.values) this.values.set(k, v);
     for (const [k, p] of out.pending) {
       p.then((v) => this.values.set(k, v));
@@ -125,7 +131,8 @@ export class FxChain {
   apply(texture: GPUTexture, opts: BridgeOptions = {}) {
     if (!this.active) return;
     const picture = this.bridge.read(texture, opts);
-    const out = this.render(picture);
+    // The texture's picture is ours: back to the pool once the first effect read it.
+    const out = this.render(picture, {}, picture.rect, true);
     // All identities: the texture already holds the answer.
     if (out !== picture) {
       this.bridge.write(out, texture, opts);

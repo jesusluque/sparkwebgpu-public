@@ -261,7 +261,7 @@ export const reflection = {
           "components": 1
         },
         {
-          "name": "pad2",
+          "name": "stride",
           "offset": 92,
           "size": 4,
           "scalar": "uint32",

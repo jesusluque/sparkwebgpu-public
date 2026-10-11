@@ -78,7 +78,14 @@ public static const uint kRelightGroup = 256;
 /// `slopes` record, its `sharpPolish` record, and (centre x, centre y in
 /// pixels as f32; halves: the centre's sharp reading the colour still holds,
 /// rgb, and the mark: 0 none, 1 slope, 2 sharp).
-public static const uint kRelightStride = 5;
+// A splat's records in `relit`: its colour, then the kept terms (when
+// kRelightCache can be set), then the three the draw reads per pixel (only
+// while it does: pixelDetail). relightParams.stride is how many a buffer
+// holds; the host sizes it to what the options need (a phone's paged pool
+// with neither keeps one uint4 a splat, not five).
+public static const uint kRelightStride = 5;       // the most: colour, kept, the draw's three
+public static const uint kRelightStrideKept = 2;   // colour and kept terms
+public static const uint kRelightStrideColour = 1; // the colour alone
 public static const uint kRelightPixel = 2;   // the first of the three
 public static const float kRelightKeepAll = -2.0;
 /// A thin sheet's colour word under kRelightSheetDraw: alpha kRelightSheet +
@@ -115,7 +122,8 @@ public struct AtheneaRelightParams {
     public uint  cpcaScratch;      ///< kRelightCpca: where the batch's transfer starts in envOfLight, words
     public uint  cpcaWords;        ///< kRelightCpca: words a slot of it
     public uint  jointTable;       ///< kRelightJoint: where the clusters' projections start in envOfLight, words
-    public uint  pad2;
+    public uint  stride;           ///< uint4 records a splat in `relit` (kRelightStride*): 1 the colour
+                                   ///< alone, 2 with the kept terms, 5 with the draw's three as well
     public float4 encoding;        ///< packed src: rgbMin, rgbMax, lnScaleMin, lnScaleMax
     public float4 row0;            ///< object to world, rows of a 3x4
     public float4 row1;
@@ -589,7 +597,7 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
     SplatSlope slope = noSlope();
     if (kTransfer >= 2 && hasFlag(kRelightCache) && surface.transferCount != kTransferZonalCount &&
         dot(cloudNormal, storedFacing(r, g.scales, i)) > 0.0) {
-        const uint4 kept = relit[i * kRelightStride + 1u];
+        const uint4 kept = relit[i * relightParams.stride + 1u];
         if (kept.w != 0u) {
             slope.cached = true;
             slope.cachedDome = uint(highHalf(kept.w) + 0.5) - 1u;
@@ -775,14 +783,18 @@ void relightAt<let kTransfer : int, let kCpca : int>(uint t) {
         return;
     }
     RelightPixel pixel;
-    relit[i * kRelightStride] = asuint(relitColour<kTransfer, kCpca>(i, pixel));
-    // The draw reads the slope and polish records only under a mark in the
-    // centre's (kRelightSlope): without it they are left as they are.
-    if (hasFlag(kRelightSlope)) {
-        relit[i * kRelightStride + kRelightPixel] = pixel.slopes;
-        relit[i * kRelightStride + kRelightPixel + 1u] = pixel.polish;
+    const uint at = i * relightParams.stride;
+    relit[at] = asuint(relitColour<kTransfer, kCpca>(i, pixel));
+    // The draw's three only where the buffer keeps them (pixelDetail). It
+    // reads the slope and polish records only under a mark in the centre's
+    // (kRelightSlope): without it they are left as they are.
+    if (relightParams.stride >= kRelightStride) {
+        if (hasFlag(kRelightSlope)) {
+            relit[at + kRelightPixel] = pixel.slopes;
+            relit[at + kRelightPixel + 1u] = pixel.polish;
+        }
+        relit[at + kRelightPixel + 2u] = pixel.centre;
     }
-    relit[i * kRelightStride + kRelightPixel + 2u] = pixel.centre;
 }
 
 /// splat_project's catcherOpacity (a shadow catcher, athenea mesh2splat
@@ -877,8 +889,10 @@ void atheneaRelightCatcher(uint3 tid: SV_DispatchThreadID) {
     }
     const Gsplat g = readSplat(i);
     const float alpha = isActive(g.flags) ? catcherOpacity(i, splatRotation(g.quaternion), g.scales, g.rgba.a) : 0.0;
-    relit[i * kRelightStride] = asuint(float4(0.0, 0.0, 0.0, alpha));
-    relit[i * kRelightStride + kRelightPixel + 2u] = uint4(0u);
+    relit[i * relightParams.stride] = asuint(float4(0.0, 0.0, 0.0, alpha));
+    if (relightParams.stride >= kRelightStride) {
+        relit[i * relightParams.stride + kRelightPixel + 2u] = uint4(0u);
+    }
 }
 
 void viewlessAt<let kCpca : int>(uint i) {
@@ -887,7 +901,7 @@ void viewlessAt<let kCpca : int>(uint i) {
         return;
     }
     const Gsplat g = readSplat(i);
-    relit[i * kRelightStride + 1u] = isActive(g.flags) ? viewless<kCpca>(i, g) : uint4(0u);
+    relit[i * relightParams.stride + 1u] = isActive(g.flags) ? viewless<kCpca>(i, g) : uint4(0u);
 }
 
 /// The kept terms (splatTransferViewless), when the sky, the lights, the

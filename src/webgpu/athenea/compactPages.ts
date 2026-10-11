@@ -1173,10 +1173,17 @@ export class CompactBandStreamer {
       inFlight: (page) => p.inFlight.has(page),
       children: (page) => p.kids.get(page),
     }));
+    // The pool's room (thread CU): a page asked for only when a free or
+    // evictable slot will take it. Without it a pool full of needed pages
+    // and pages kept by hysteresis fetched the next pages again and again,
+    // never landing them (busy for good: no settle after an orbit).
+    let pendingPages = this.landed.length;
+    for (const p of this.pieces) pendingPages += p.inFlight.size;
     const plan = planBand(
       meshes,
       this.options.slots,
       this.options.maxRangeBytes ?? 8 << 20,
+      { free: this.freeSlots.length, pending: pendingPages },
     );
     this.lastPlan = plan;
     const s = this.stats;

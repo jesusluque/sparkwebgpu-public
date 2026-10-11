@@ -64,6 +64,10 @@ pub struct CloudStreams {
     pub thin_walled: Vec<u32>,
     /// `schlickMetal` (int[]): a Schlick metal (OpenPBR, glTF), pbr bit 25
     pub schlick_metal: Vec<u32>,
+    /// `materialRoughness` (float[]): the material's own roughness before
+    /// the bake widened `roughness` (athenea 35ae3cb), pbr bits 26..31;
+    /// negative for a part not named. Empty when absent.
+    pub material_roughness: Vec<f32>,
     /// The layers over the base (`packing.slang` `SplatLobes`), one array
     /// each, empty where the stage does not carry it: `specularWeight`,
     /// `specularColor` (3), `specularIor`, `coatWeight`, `coatRoughness`,
@@ -442,12 +446,15 @@ fn saturate(v: f32) -> f32 {
 /// `packPbr` (splat_encoding.slang): a thin wall rides on the transmission
 /// two higher, a Schlick metal four higher (`streams.slang`).
 pub fn pack_pbr(metallic: f32, roughness: f32, transmission: f32) -> u32 {
-    let schlick = transmission >= 4.0 - 0.5;
-    let rest = if schlick {
-        transmission - 4.0
-    } else {
-        transmission
-    };
+    // athenea's kMaterialRoughnessMark (splat_encoding packPbr, 35ae3cb):
+    // eight times one more than the material's own 5-bit roughness step,
+    // over the thin wall's and the Schlick's marks -> bit 26 says it is
+    // there, bits 27..31 hold it.
+    let owned = (transmission.max(0.0) / MATERIAL_ROUGHNESS_MARK).floor();
+    let own = if owned >= 1.0 { Some((owned - 1.0).clamp(0.0, 31.0) as u32) } else { None };
+    let marked = transmission - owned * MATERIAL_ROUGHNESS_MARK;
+    let schlick = marked >= 4.0 - 0.5;
+    let rest = if schlick { marked - 4.0 } else { marked };
     let thin = rest >= 2.0 - 0.5;
     let byte = |v: f32| (saturate(v) * 255.0 + 0.5) as u32;
     byte(metallic)
@@ -455,6 +462,31 @@ pub fn pack_pbr(metallic: f32, roughness: f32, transmission: f32) -> u32 {
         | (byte(if thin { rest - 2.0 } else { rest }) << 16)
         | if thin { 1 << 24 } else { 0 }
         | if schlick { 1 << 25 } else { 0 }
+        | own.map_or(0, |r| (1 << 26) | (r << 27))
+}
+
+/// athenea's `kMaterialRoughnessMark`: what the material's own roughness
+/// adds to the transmission handed to `pack_pbr`.
+pub const MATERIAL_ROUGHNESS_MARK: f32 = 8.0;
+
+/// The mark `pack_pbr` takes the material's own roughness from (athenea's
+/// `splatMaterialRoughness`): 0 where it is unknown (negative or NaN).
+pub fn material_roughness_mark(own: f32) -> f32 {
+    if own >= 0.0 {
+        MATERIAL_ROUGHNESS_MARK * (1.0 + (own.min(1.0) * 31.0).round())
+    } else {
+        0.0
+    }
+}
+
+/// The material's own roughness on a pbr word (athenea's
+/// `pbrMaterialRoughness`), or -1 where it does not carry it.
+pub fn pbr_material_roughness(word: u32) -> f32 {
+    if (word >> 26) & 1 != 0 {
+        (word >> 27) as f32 / 31.0
+    } else {
+        -1.0
+    }
 }
 
 /// `axesOfQuaternion`: m[row][col], the columns the turned basis.
@@ -589,6 +621,7 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
     // `writeAthc` keeps lobes only where it keeps pbr.
     let thin = pbr && !s.thin_walled.is_empty() && s.thin_walled.len() >= n;
     let schlick = pbr && !s.schlick_metal.is_empty() && s.schlick_metal.len() >= n;
+    let own_roughness = pbr && !s.material_roughness.is_empty() && s.material_roughness.len() >= n;
     let lobes = pbr && s.lobes.present(n);
     let normals = o.normals && !s.normals.is_empty();
     let curvature = o.curvature && !s.curvature.is_empty();
@@ -741,7 +774,8 @@ pub fn pack_streams_kept(s: &CloudStreams, o: &BuildOptions) -> Result<(PackedCl
                 s.transmission[i]
             };
             let mark = (if thin && s.thin_walled[i] != 0 { 2.0 } else { 0.0 })
-                + (if schlick && s.schlick_metal[i] != 0 { 4.0 } else { 0.0 });
+                + (if schlick && s.schlick_metal[i] != 0 { 4.0 } else { 0.0 })
+                + (if own_roughness { material_roughness_mark(s.material_roughness[i]) } else { 0.0 });
             b.pbr.push(pack_pbr(m, r, t + mark));
         }
         if lobes {
@@ -2278,6 +2312,28 @@ pub fn crop_box_kept(cloud: &PackedCloud, lo: [f32; 3], hi: [f32; 3]) -> (Packed
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// athenea's packPbr marks (35ae3cb): the material's own roughness rides
+    /// over the thin wall's and the Schlick's, and the low 24 bits are the
+    /// word without it.
+    #[test]
+    fn pack_pbr_carries_the_material_roughness() {
+        for own in [-1.0f32, 0.0, 0.22, 0.34, 1.0] {
+            for (thin, schlick) in [(false, false), (true, false), (false, true), (true, true)] {
+                let t = 0.25;
+                let marks = (if thin { 2.0 } else { 0.0 }) + (if schlick { 4.0 } else { 0.0 });
+                let plain = pack_pbr(0.5, 0.4, t + marks);
+                let w = pack_pbr(0.5, 0.4, t + marks + material_roughness_mark(own));
+                assert_eq!(w & 0x03ff_ffff, plain, "own {own} thin {thin} schlick {schlick}");
+                let back = pbr_material_roughness(w);
+                if own < 0.0 {
+                    assert_eq!(back, -1.0);
+                } else {
+                    assert!((back - own).abs() <= 0.5 / 31.0 + 1e-6, "{own} -> {back}");
+                }
+            }
+        }
+    }
 
     const TWO_CARDS: &[u8] = include_bytes!("../../../test/fixtures/athc/two_cards.athc");
 

@@ -1912,7 +1912,23 @@ export class CompactBandStreamer {
   }
 
   /** The worker's messages: records and draw lists, landed pages, runs to fetch. */
+  /** Main-thread ms in the worker's messages since the reader reset it (thread CU). */
+  cutterMs = 0;
+  cutterMsgs = 0;
+  cutterTypes: Record<string, number> = {};
+
   private onCutter(m: FromCutter) {
+    const t0 = performance.now();
+    try {
+      this.onCutterInner(m);
+    } finally {
+      this.cutterMs += performance.now() - t0;
+      this.cutterMsgs += 1;
+      this.cutterTypes[m.t] = (this.cutterTypes[m.t] ?? 0) + 1;
+    }
+  }
+
+  private onCutterInner(m: FromCutter) {
     if (m.t === "frame") {
       const pool = this.pool as CompactNodePool;
       if (m.grow > pool.capacity && pool.grow(m.grow)) {
@@ -1920,8 +1936,18 @@ export class CompactBandStreamer {
       }
       if (m.slots.length) pool.writeRecords(m.slots, m.records);
       if (m.drawList) {
+        // Owned by the path (no copy); the list it replaces goes back to the
+        // worker for its next one (no allocation churn on this thread: the
+        // GC paused frames for 7-13 ms).
+        const path = this.lastPath;
+        const old = path?.drawListHeld;
         this.drawList = m.drawList;
-        this.lastPath?.setDrawList(m.drawList);
+        path?.setDrawList(m.drawList, true);
+        if (old && old !== m.drawList && path?.drawListHeld === m.drawList) {
+          this.post({ t: "recycle", buffer: old.buffer as ArrayBuffer }, [
+            old.buffer,
+          ]);
+        }
       }
       const st = m.stats;
       this.remoteStats = { ...st };
@@ -1957,7 +1983,7 @@ export class CompactBandStreamer {
         input: m.input,
       });
     } else if (m.t === "want") {
-      this.runQueue.push(m);
+      for (const spans of m.ranges) this.runQueue.push(spans);
       this.fetchQueued();
     } else if (m.t === "keys") {
       this.remoteKeys = m.keys;
@@ -1967,12 +1993,12 @@ export class CompactBandStreamer {
   }
 
   /** The worker's runs to fetch (a page's at a time), 12 Ranges in flight. */
-  private runQueue: Extract<FromCutter, { t: "want" }>[] = [];
+  private runQueue: [number, number, number, number][][] = [];
   private remoteFetches = 0;
 
   private fetchQueued() {
     while (this.remoteFetches < 16 && this.runQueue.length) {
-      const m = this.runQueue.shift() as Extract<FromCutter, { t: "want" }>;
+      const m = this.runQueue.shift() as [number, number, number, number][];
       this.remoteFetches += 1;
       this.fetchWanted(m).finally(() => {
         this.remoteFetches -= 1;
@@ -1981,30 +2007,26 @@ export class CompactBandStreamer {
     }
   }
 
-  private fetchWanted(m: Extract<FromCutter, { t: "want" }>) {
-    const first = m.spans[0];
-    const last = m.spans[m.spans.length - 1];
+  private fetchWanted(spans: [number, number, number, number][]) {
+    const first = spans[0];
+    const last = spans[spans.length - 1];
     const piece = this.pieces[this.pageOwner[first[0]].piece].piece;
     const at = first[2];
     return piece
       .read(at, last[2] + last[3] - at)
       .then((data) => {
-        const items = m.spans.map(([g, r, off, len]) => ({
-          g,
-          r,
-          bytes: data.slice(off - at, off - at + len),
-        }));
-        this.post(
-          { t: "runs", items },
-          items.map((i) => i.bytes.buffer),
-        );
+        // The Range whole (transferred): the worker cuts its runs out.
+        const buf =
+          data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+            ? data
+            : data.slice();
+        this.post({ t: "runs", data: buf, at, spans }, [buf.buffer]);
       })
       .catch((e) => {
         console.warn(e);
         this.post({
           t: "runs",
-          items: [],
-          asked: m.spans.map(([g, r]) => g * 64 + r),
+          asked: spans.map(([g, r]) => g * 64 + r),
         });
       });
   }

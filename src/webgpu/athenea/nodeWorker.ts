@@ -68,10 +68,14 @@ export type ToCutter =
   | { t: "drop"; g: number }
   | {
       t: "runs";
-      items: { g: number; r: number; bytes: Uint8Array }[];
+      /** A Range's bytes (from file offset `at`) and its runs; none: it failed. */
+      data?: Uint8Array;
+      at?: number;
+      spans?: [g: number, r: number, offset: number, bytes: number][];
       /** A failed Range's runs (to ask again). */
       asked?: number[];
     }
+  | { t: "recycle"; buffer: ArrayBuffer }
   | { t: "keys"; id: number };
 
 export interface CutterStats {
@@ -124,8 +128,11 @@ export type FromCutter =
   | { t: "landed"; g: number; input: Uint8Array }
   | {
       t: "want";
-      /** One Range of a piece's file: its runs (page, run, offset, bytes), by offset. */
-      spans: [g: number, r: number, offset: number, bytes: number][];
+      /**
+       * Ranges of a piece's file, each its runs (page, run, offset, bytes)
+       * by offset; one message for all a fetchRuns asks (thread CU).
+       */
+      ranges: [g: number, r: number, offset: number, bytes: number][][];
     }
   | { t: "keys"; id: number; keys: Int32Array };
 
@@ -243,8 +250,16 @@ export class NodeCutter {
         this.runs.drop(m.g);
         this.alloc.releasePage(m.g);
         break;
+      case "recycle":
+        if (this.spare.length < 2) this.spare.push(m.buffer);
+        break;
       case "runs":
-        for (const { g, r, bytes } of m.items) this.gotRun(g, r, bytes);
+        if (m.data && m.spans) {
+          const at = m.at ?? 0;
+          for (const [g, r, off, len] of m.spans) {
+            this.gotRun(g, r, m.data.subarray(off - at, off - at + len));
+          }
+        }
         // A want's reply (its Range done, or failed: its runs asked again).
         if (m.asked) for (const rk of m.asked) this.asked.delete(rk);
         this.fetches = Math.max(0, this.fetches - 1);
@@ -533,14 +548,17 @@ export class NodeCutter {
     s.busyMs += s.sliceMs;
     const grow = this.grow;
     this.grow = 0;
-    this.post({
-      t: "frame",
-      grow,
-      slots: outSlots,
-      records,
-      drawList,
-      stats: { ...s },
-    });
+    // Nothing to write nor show: no message (each is a task on the main thread).
+    if (x || drawList || grow) {
+      this.post({
+        t: "frame",
+        grow,
+        slots: outSlots,
+        records,
+        drawList,
+        stats: { ...s },
+      });
+    }
     void gen;
     this.schedule();
   }
@@ -600,10 +618,17 @@ export class NodeCutter {
       this.wantAhead.size > 0;
   }
 
-  /** Packing resumed (a dropped run came). */
+  /** Packing resumed (a dropped run came): in at most ~8 ms, with the others. */
   private wake() {
-    this.schedule();
+    if (this.wakeTimer) return;
+    this.wakeTimer = true;
+    setTimeout(() => {
+      this.wakeTimer = false;
+      this.schedule();
+    }, 8);
   }
+
+  private wakeTimer = false;
 
   /**
    * The draw list of the current cut: its nodes held, the misses as their
@@ -691,11 +716,12 @@ export class NodeCutter {
         holes += 1;
         holeArea += a;
       }
-      result = new Uint32Array(this.base.length + sn);
+      result = this.listBuffer(this.base.length + sn);
       result.set(this.base);
       result.set(subs.subarray(0, sn), this.base.length);
     } else {
-      result = this.base.slice();
+      result = this.listBuffer(this.base.length);
+      result.set(this.base);
       holes = misses.length;
     }
     const s = this.stats;
@@ -705,6 +731,24 @@ export class NodeCutter {
     s.missing = misses.length;
     s.substituted = substituted;
     return result;
+  }
+
+  /** Draw lists the main thread gave back, for the next ones. */
+  private spare: ArrayBuffer[] = [];
+
+  /** A list of n words, in a recycled buffer when one is big enough. */
+  private listBuffer(n: number) {
+    const i = this.spare.findIndex((b) => b.byteLength >= 4 * n);
+    if (i >= 0) {
+      const b = this.spare.splice(i, 1)[0];
+      return new Uint32Array(b, 0, n);
+    }
+    // Room to grow: the next lists of the cut fit it.
+    return new Uint32Array(
+      new ArrayBuffer(4 * Math.ceil(n * 1.1 + 1024)),
+      0,
+      n,
+    );
   }
 
   // ---------------------------------------------------- the view ahead
@@ -781,7 +825,28 @@ export class NodeCutter {
    * time (the cut's first), sorted by file offset, joined across pages
    * while the gap is under 4 KB and a Range under 1 MB.
    */
+  private outWants: [number, number, number, number][][] = [];
+
   private fetchRuns() {
+    this.fetchRunsInner();
+    // One message for the Ranges of the next few ms (each is a task on the
+    // main thread; a reply a Range freed one at a time).
+    if (this.outWants.length && !this.wantTimer) {
+      this.wantTimer = true;
+      setTimeout(() => {
+        this.wantTimer = false;
+        this.fetchRunsInner();
+        if (this.outWants.length) {
+          this.post({ t: "want", ranges: this.outWants });
+          this.outWants = [];
+        }
+      }, 4);
+    }
+  }
+
+  private wantTimer = false;
+
+  private fetchRunsInner() {
     const runs = this.runs;
     for (const set of [this.wantNow, this.wantAhead] as (
       | Map<number, number>
@@ -859,9 +924,8 @@ export class NodeCutter {
       // The main thread fetches the group's one Range, posted back as "runs"
       // (one reply a want: in flight until then).
       this.fetches += 1;
-      this.post({
-        t: "want",
-        spans: grp.map((sp) => {
+      this.outWants.push(
+        grp.map((sp) => {
           const g = Math.floor(sp[3] / 64);
           return [g, sp[3] - g * 64, sp[1], sp[2]] as [
             number,
@@ -870,7 +934,7 @@ export class NodeCutter {
             number,
           ];
         }),
-      });
+      );
       return;
     }
     this.fetches += 1;

@@ -84,6 +84,12 @@ static const float SHEET_ALPHA = 0.1;
 // SHEET_VARYING + its alpha before the floor (in [0, 1]), from which the
 // fragment takes both its alpha and its colour's scale (sheetUnmark).
 static const float SHEET_VARYING = 8.0;
+// A faded sheet floored: SHEET_FLOORED + its floor in SHEET_STEPS steps of
+// SHEET_ALPHA (an integer) + its alpha over the floor (in [0, 1)).
+static const float SHEET_FLOORED = 16.0;
+// A faded sheet over its floor: SHEET_OWN + its own alpha.
+static const float SHEET_OWN = 12.0;
+static const float SHEET_STEPS = 1023.0;
 
 // erf(x), Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
 float erfApprox(float x) {
@@ -221,7 +227,9 @@ struct DrawParams {
 
     float falloff;
     uint flags;
-    uint pad0;
+    // A thin sheet's floor faded by its size on screen (sheetFade): 0 keeps
+    // SHEET_ALPHA whatever the size; m > 0 scales it by sheetFadeOf's g.
+    float sheetFade;
     uint pad1;
 
     // DRAW_DISK_CLIP, as SparkPortals' DISK_PORTAL_FRAGMENT_SHADER: a disk in
@@ -445,6 +453,12 @@ struct SplatShape {
     // the anti-alias compensation (rgba.a holds the floored one); -1 when
     // the splat is not one.
     float sheet;
+    // A thin sheet's floor as drawn (SHEET_ALPHA, or less where sheetFade
+    // fades it), the alpha its footprint ends at, and its colour's scale
+    // (1: drawn at its own alpha, over the floor).
+    float sheetLow;
+    float sheetCut;
+    float sheetScale;
     // DRAW_AA_BOX (not surfels): the sigmas of the unfiltered Gaussian along
     // axis1 and axis2 (scaled pixels); the quad's axes then reach
     // adjustedStdDev sigmas plus the box's square (boxFrame).
@@ -453,17 +467,27 @@ struct SplatShape {
 
 // rgba with the additive mark as alpha's sign, for the draw's varyings and
 // the tile rasterizer's records (alpha is never 0 past projectSplat); a
-// sheet's alpha SHEET_VARYING + its alpha before the floor.
+// sheet's alpha: unfaded SHEET_VARYING + its alpha before the floor; faded,
+// SHEET_OWN + its alpha where that is over the floor, else SHEET_FLOORED +
+// the floor in SHEET_STEPS steps of SHEET_ALPHA + the colour's scale
+// (sheetUnmark).
 float4 markedRgba(SplatShape s) {
     if (s.sheet >= 0.0) {
-        return float4(s.rgba.rgb, SHEET_VARYING + s.sheet);
+        if (s.sheetLow == SHEET_ALPHA) {
+            return float4(s.rgba.rgb, SHEET_VARYING + s.sheet);
+        }
+        if (s.sheetScale >= 1.0) {
+            return float4(s.rgba.rgb, SHEET_OWN + min(s.rgba.a, 1.0));
+        }
+        const float q = round(s.sheetLow / SHEET_ALPHA * SHEET_STEPS);
+        return float4(s.rgba.rgb, SHEET_FLOORED + q + min(s.sheetScale, 0.999));
     }
     return s.additive ? float4(s.rgba.rgb, -s.rgba.a) : s.rgba;
 }
 
 // A marked alpha (markedRgba's, not additive) back to the alpha drawn and
 // the scale of the colour, in linear light: a sheet's max(own, SHEET_ALPHA)
-// and own / that; anything else its own and 1. The scale goes on the
+// and own / that (faded: sheetFloor's); anything else its own and 1. The scale goes on the
 // colour after the blend terms (athenea scales the colour and its per-pixel
 // records alike).
 float sheetUnmark(float marked, out float scale) {
@@ -471,25 +495,121 @@ float sheetUnmark(float marked, out float scale) {
     if (marked < SHEET_VARYING - 0.5) {
         return marked;
     }
-    const float own = marked - SHEET_VARYING;
-    const float alpha = max(own, SHEET_ALPHA);
-    scale = own / alpha;
-    return alpha;
+    if (marked < SHEET_OWN - 0.5) {
+        // Unfaded: athenea's max(own, SHEET_ALPHA).
+        const float own = marked - SHEET_VARYING;
+        const float alpha = max(own, SHEET_ALPHA);
+        scale = own / alpha;
+        return alpha;
+    }
+    if (marked < SHEET_FLOORED - 0.5) {
+        // Faded, at its own alpha over the floor: unscaled.
+        return marked - SHEET_OWN;
+    }
+    // Faded and floored: SHEET_FLOORED + q + the colour's scale, the floor
+    // q / SHEET_STEPS of SHEET_ALPHA.
+    const float v = marked - SHEET_FLOORED;
+    const float q = floor(v);
+    scale = v - q;
+    return q * (SHEET_ALPHA / SHEET_STEPS);
 }
 
 // The alpha a splat's footprint ends at (the falloff's cut): minAlpha; a
 // sheet's athenea's 1/255 (splat_project's cutoffPower, min(2 ln(255
 // alpha), 9): 2.54 sigma at SHEET_ALPHA where minAlpha's is 2.80; a dozen
-// sheets deep that is 3.5% of what the headlight cover lets through).
-float cutAlpha(bool sheet) {
-    return sheet ? max(params.minAlpha, 1.0 / 255.0) : params.minAlpha;
+// sheets deep that is 3.5% of what the headlight cover lets through). A
+// sheet whose floor sheetFade lowered ends where the full floor's would
+// (its cut scaled with it), down to minAlpha.
+float cutAlpha(bool sheet, float cut) {
+    return sheet ? cut : params.minAlpha;
+}
+
+// THE SHEET FLOOR'S FADE (sheetFade = A0 > 0, in px^2). athenea's floor
+// holds a sheet splat at SHEET_ALPHA after the AA compensation, however
+// small it lands. A sheet tiled by splats of on-screen sigmas s1, s2 at a
+// density rho per px^2 then covers, per pixel, an optical depth
+//   tau = rho 0.1 2 pi sqrt((s1^2 + b) (s2^2 + b))      (b: the AA blur)
+// = tau_inf / (c(s1) c(s2)), c(s) = s^2 / (s^2 + b) the blur's mass-keeping
+// share, tau_inf = rho 0.1 2 pi s1 s2 the splats' own footprint at 0.1
+// (which the "relight" floor keeps at any size: scale-invariant). The
+// excess 1 / (c1 c2) is athenea's calibration where its splats are about a
+// pixel (its bakes are made at the camera's resolution; the headlight
+// cover close up wants it, thread CA), but it grows without bound as the
+// splats shrink: rho grows as the distance squared while the blurred
+// footprint stays ~2 pi b, so far glass stacks into a dark blotch (the
+// published Corvette's glass far away at 0.52-0.66 of "relight"). The
+// fade keeps the excess a splat of A0 px^2 has and stops it growing past
+// that: with s_e^2 = s1 s2 (the round splat of the same area, 2 pi s_e^2)
+// and 2 pi s0^2 = A0, g = min(1, c(s_e) / c(s0)). From A0 up nothing
+// changes; under it a round splat's floored mass is its own footprint at
+// 0.1 times 1 / c(s0), at any distance. Measured on the Corvette (thread
+// CH): A0 = 3 keeps the headlight cover close up within 3% of athenea's
+// raster and makes the far glass's brightness against the path trace
+// match the close view's. The box filter (DRAW_AA_BOX) takes its own axis
+// shares.
+float sheetFadeOf(float major2, float minor2, float blur) {
+    const float a0 = params.sheetFade;
+    if (!(a0 > 0.0)) {
+        return 1.0;
+    }
+    const float ref2 = a0 / (2.0 * PI);
+    const float e2 = sqrt(max(major2 * minor2, 0.0));
+    if (!(e2 < ref2)) {
+        return 1.0;
+    }
+    if (hasFlag(DRAW_AA_BOX)) {
+        const float h = 0.5 * params.focalAdjustment;
+        const float c0 = boxAxis(0.0, sqrt(ref2), h);
+        return c0 > 0.0 ? min(1.0, sqr(boxAxis(0.0, sqrt(e2), h) / c0)) : 1.0;
+    }
+    if (!(blur > 0.0)) {
+        return 1.0;
+    }
+    return min(1.0, e2 * (ref2 + blur) / (ref2 * (e2 + blur)));
 }
 
 // A sheet's floor on the alpha the anti-alias compensation left (`paid`
-// alpha): the alpha drawn, and its alpha before the floor in s.sheet.
-float sheetFloor(inout SplatShape s, float paid) {
+// alpha), faded by g (sheetFadeOf): the alpha drawn (0: not drawn), with
+// its alpha before the floor in s.sheet, the floor as drawn, the footprint's
+// cut and the colour's scale. Unfaded (g = 1): max(paid, SHEET_ALPHA), cut
+// at athenea's 1/255, the colour scaled by paid / SHEET_ALPHA. Faded, the
+// floor low = g SHEET_ALPHA keeps the unfaded floor's mass times g: its
+// cut scales with it down to minAlpha, and what that cut takes is added
+// back (a Gaussian of peak a cut at alpha t covers 2 pi s^2 (a - t)); a
+// floor under the faint path's FAINT_ALPHA x minAlpha is drawn at that
+// alpha with the probability that keeps the mass (as the faint path). The
+// colour's scale paid / low keeps the reflection, alpha x colour, as the
+// unfaded floor leaves it.
+float sheetFloor(inout SplatShape s, float paid, float g, uint splatIndex) {
     s.sheet = paid;
-    return max(paid, SHEET_ALPHA);
+    s.sheetScale = 1.0;
+    s.sheetCut = max(params.minAlpha, 1.0 / 255.0);
+    if (g >= 1.0) {
+        s.sheetLow = SHEET_ALPHA;
+        if (paid < SHEET_ALPHA) {
+            s.sheetScale = paid / SHEET_ALPHA;
+        }
+        return max(paid, SHEET_ALPHA);
+    }
+    const float low = SHEET_ALPHA * g;
+    const float keep = 1.0 - 1.0 / (255.0 * SHEET_ALPHA);
+    s.sheetCut = max(params.minAlpha, low / (255.0 * SHEET_ALPHA));
+    s.sheetLow = low;
+    if (paid >= low) {
+        return paid;
+    }
+    float target = low;
+    const float faintTarget = FAINT_ALPHA * params.minAlpha;
+    if (target < faintTarget) {
+        if (faintHash(splatIndex) >= target / faintTarget) {
+            return 0.0;
+        }
+        target = faintTarget;
+    }
+    s.sheetCut = max(params.minAlpha, target / (255.0 * SHEET_ALPHA));
+    s.sheetLow = target * keep + s.sheetCut;
+    s.sheetScale = paid / low;
+    return s.sheetLow;
 }
 
 // projectSplat's surfel: the record and the cuts, with s's centre and
@@ -574,6 +694,9 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     s.rows.w = float3(0.0);
     s.additive = false;
     s.sheet = -1.0;
+    s.sheetLow = SHEET_ALPHA;
+    s.sheetCut = params.minAlpha;
+    s.sheetScale = 1.0;
     s.box = float2(0.0);
 
     float3 center, scales, xxyyzz, xyxzyz;
@@ -726,7 +849,13 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     if (sheet) {
         // A thin sheet: floored after the compensation (SHEET_ALPHA), never
         // faint.
-        rgba.a = sheetFloor(s, blurred);
+        const float spread = sqrt(max(0.0, sqr(0.5 * (a0 - d0)) + b * b));
+        const float major = 0.5 * (a0 + d0) + spread;
+        const float minor = max(0.5 * (a0 + d0) - spread, 0.0);
+        rgba.a = sheetFloor(s, blurred, sheetFadeOf(major, minor, fullBlurAmount), splatIndex);
+        if (rgba.a == 0.0) {
+            return false;
+        }
     } else if (hasFlag(DRAW_FAINT) && rgba.a <= 1.0 && params.falloff == 1.0 && detOrig > 0.0 && blurred < faintTarget) {
         const float mass = rgba.a * sqrt(detOrig);
         const float tr = a0 + d0;
@@ -769,7 +898,7 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
     // which ties the quad's edge to adjustedStdDev.
     float f = params.falloff;
     float floorAlpha = (1.0 - f) * rgba.a;
-    const float cutAt = cutAlpha(sheet);
+    const float cutAt = cutAlpha(sheet, s.sheetCut);
     if (rgba.a <= 1.0 && f > 0.0 && floorAlpha < cutAt && adjustedStdDev * sqrt(eigen1) <= params.maxPixelRadius) {
         float cut = sqrt(max(0.0, 2.0 * log(f * rgba.a / (cutAt - floorAlpha))));
         if (cut < adjustedStdDev) {
@@ -793,6 +922,9 @@ bool projectSplat(uint splatIndex, out SplatShape s) {
 bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d, float focus, float adjustedStdDev,
                   bool sheet) {
     const float detOrig = a * d - b * b;
+    const float spread = sqrt(max(0.0, sqr(0.5 * (a - d)) + b * b));
+    const float major = 0.5 * (a + d) + spread;
+    const float minor = max(0.5 * (a + d) - spread, 0.0);
     float share = 1.0;
     if (focus > 0.0) {
         a += focus;
@@ -806,7 +938,10 @@ bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d
     float alpha = s.rgba.a * peak;
     const float faintTarget = FAINT_ALPHA * params.minAlpha;
     if (sheet) {
-        alpha = sheetFloor(s, alpha);
+        alpha = sheetFloor(s, alpha, sheetFadeOf(major, minor, 0.0), splatIndex);
+        if (alpha == 0.0) {
+            return false;
+        }
     } else if (hasFlag(DRAW_FAINT) && s.rgba.a <= 1.0 && params.falloff == 1.0 && alpha < faintTarget) {
         if (!(alpha > 0.0) || faintHash(splatIndex) >= alpha / faintTarget) {
             return false;
@@ -821,7 +956,7 @@ bool projectBoxed(inout SplatShape s, uint splatIndex, float a, float b, float d
     // under minAlpha (on the sigmas; the half pixel is added after).
     const float f = params.falloff;
     const float floorAlpha = (1.0 - f) * alpha;
-    const float cutAt = cutAlpha(sheet);
+    const float cutAt = cutAlpha(sheet, s.sheetCut);
     if (alpha <= 1.0 && f > 0.0 && floorAlpha < cutAt) {
         adjustedStdDev = min(adjustedStdDev, sqrt(max(0.0, 2.0 * log(f * alpha / (cutAt - floorAlpha)))));
     }

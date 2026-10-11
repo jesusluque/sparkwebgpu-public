@@ -279,6 +279,19 @@ export interface WgpuSplatRendererOptions {
    */
   faintSplats?: "keep" | "drop";
   /**
+   * A thin sheet of glass held to athenea's 0.1 alpha floor in the draw
+   * (atheneaRelightPlugin's sheetFloor "draw"): the floor faded by the
+   * splat's area on screen (splat_shape.slang sheetFadeOf). The value is
+   * the area A0 in px^2 under which it fades: g = min(1, c(s_e) / c(s0)),
+   * c(s) = s^2 / (s^2 + blurAmount), 2 pi s_e^2 the splat's unblurred area,
+   * 2 pi s0^2 = A0. 0 (default): the floor stays 0.1 at any size, so far
+   * glass (many sheet splats under a pixel) darkens as the distance
+   * squared. With A0 a sheet under A0 covers the same multiple of its own
+   * footprint at any distance. 3 matched the Corvette's far glass to its
+   * close view against athenea's path trace (thread CH).
+   */
+  sheetFade?: number;
+  /**
    * The anti-alias filter. "gaussian" (default, as WebGL Spark): each splat
    * is convolved with a Gaussian of `blurAmount` px^2 (0.3), its alpha
    * scaled to keep its mass. "box": the mean of the splat's Gaussian over
@@ -529,6 +542,7 @@ export class WgpuSplatRenderer {
       covSplats: false,
       surfels: "auto",
       faintSplats: "keep",
+      sheetFade: 0,
       aaFilter: "gaussian",
       enable2DGS: false,
       srgbBlend: false,
@@ -2030,6 +2044,7 @@ export class WgpuSplatRenderer {
       clipXY: o.clipXY,
       focalAdjustment: o.focalAdjustment,
       falloff: o.falloff,
+      sheetFade: o.sheetFade,
       diskCenter: disk ? [...disk.center.toArray(), disk.radius] : [0, 0, 0, 0],
       diskNormal: disk
         ? [...disk.normal.toArray(), disk.twoSided ? 1 : 0]

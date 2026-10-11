@@ -8,6 +8,13 @@
 // plain one covers paid of a tenth -- the headlight cover that let 0.27 of
 // the room through where athenea lets 0.18 -- and reflects the same light.
 //
+// sheetFade A0 (the floor faded by the splat's area on screen): a round
+// sheet under A0 px^2 covers its own footprint at the floor, 0.1 x 2 pi
+// s^2, times the same constant 1 / c(s0) a splat of A0 does, not the
+// blur's 0.1 x 2 pi (s^2 + b) at any size (far glass, many splats under a
+// pixel, stacked into a dark blotch); the slanted one, over A0 in area,
+// keeps athenea's 0.1.
+//
 // The source alpha's sign stands in for the relight's sheet: the default
 // colour plugin hands it on, generate marks the splat.
 
@@ -44,6 +51,8 @@ describe.skipIf(!device)("thin sheets", () => {
   async function draw(
     alpha: number,
     options: WgpuSplatRendererOptions,
+    sx = SX,
+    sy = SY,
   ): Promise<{ alpha: number; red: number; peak: number }> {
     const a = new Uint32Array(4);
     const b = new Uint32Array(4);
@@ -54,9 +63,9 @@ describe.skipIf(!device)("thin sheets", () => {
       0.5 * px,
       0.5 * px,
       -Z,
-      SX * px,
-      SY * px,
-      SY * px,
+      sx * px,
+      sy * px,
+      sy * px,
       0,
       0,
       0,
@@ -181,6 +190,55 @@ describe.skipIf(!device)("thin sheets", () => {
       // sheet's over its whole footprint (paid x 0.1 x the colour).
       expect(sheet.red / (linear * paid * sheetMass)).toBeCloseTo(1, 1);
       expect(plain.red / (linear * plainMass)).toBeCloseTo(1, 1);
+    });
+  }
+
+  // A round sheet under a pixel (sigma RS before the blur).
+  const RS = 0.2;
+  const c = (s2: number) => s2 / (s2 + BLUR);
+  const S0 = 1 / (2 * Math.PI); // A0 = 1 px^2
+  const g = c(RS * RS) / c(S0);
+  for (const [name, options] of [
+    ["quads", {}],
+    ["the projector", { projectOnce: true }],
+    ["tiles", { rasterizer: "tiles" }],
+  ] as [string, WgpuSplatRendererOptions][]) {
+    it(`fades a sub-pixel sheet's floor with sheetFade (${name})`, async () => {
+      const full = await draw(-0.05, options, RS, RS);
+      const faded = await draw(-0.05, { ...options, sheetFade: 1 }, RS, RS);
+      const off = await draw(-0.05, { ...options, sheetFade: 0.01 }, RS, RS);
+      const slant = await draw(-0.1, { ...options, sheetFade: 0.5 });
+      const blurred = 2 * Math.PI * (RS * RS + BLUR);
+      const cut = inside(2 * Math.log(25.5));
+      // Unfaded: 0.1 over the blur's area. Faded: 0.1 g over it, cut where
+      // the full floor's is: the splat's own footprint at 0.1.
+      const fullMass = 0.1 * blurred * cut;
+      const fadedMass = 0.1 * g * blurred * cut;
+      // The splat's own alpha after the compensation: what both reflect.
+      const own = 0.05 * c(RS * RS);
+      if (process.env.SHEET_LOG)
+        process.stderr.write(
+          `${name} fade ${JSON.stringify({ g, full, fullMass, faded, fadedMass, slant })}\n`,
+        );
+      expect(full.peak).toBeCloseTo(0.1, 2);
+      expect(faded.peak).toBeCloseTo(0.1 * g, 2);
+      expect(full.alpha / fullMass).toBeCloseTo(1, 1);
+      // The faded floor covers g of the unfaded one: the splat's own
+      // footprint at 0.1, over c(s0).
+      expect(g).toBeLessThan(0.5);
+      // (Within the sampling of a 0.6 px Gaussian cut at 1.4 px on a pixel
+      // centre: the ring at sqrt 2 px falls just outside.)
+      expect(Math.abs(faded.alpha / full.alpha / g - 1)).toBeLessThan(0.12);
+      expect(
+        (fadedMass * c(S0)) / (0.1 * 2 * Math.PI * RS * RS * cut),
+      ).toBeCloseTo(1, 5);
+      // A0 under the splat's own area: unfaded.
+      expect(off.alpha).toBe(full.alpha);
+      // The reflection is the same with or without the fade.
+      expect(full.red / (linear * (own / 0.1) * fullMass)).toBeCloseTo(1, 1);
+      expect(Math.abs(faded.red / full.red - 1)).toBeLessThan(0.12);
+      // The slanted sheet (2 x 0.08 px: 1 px^2 over A0 = 0.5): unfaded.
+      expect(slant.peak).toBeCloseTo(0.1, 2);
     });
   }
 });

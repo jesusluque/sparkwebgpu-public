@@ -78,6 +78,9 @@ const NOTHING = (rod: Rect): Rendered => ({
   pending: new Map(),
 });
 
+const sameRect = (a: Rect, b: Rect) =>
+  a.x1 === b.x1 && a.y1 === b.y1 && a.x2 === b.x2 && a.y2 === b.y2;
+
 export class FxGraph {
   private rods = new Map<FxInput, Rect>();
   private ctx: Required<FxContext> = {
@@ -88,17 +91,44 @@ export class FxGraph {
     projectHeight: 0,
   };
 
+  /**
+   * The pictures this render allocated (and the caller's it may consume):
+   * each goes back to the Gpu's pool as soon as the node reading it has
+   * been recorded, so a chain of N effects holds two pictures at a time,
+   * not N + 1 (a phone's frame: 6 MB each).
+   */
+  private owned = new Set<GPUBuffer>();
+
   constructor(readonly gpu: Gpu) {}
 
-  /** Renders `window` of `node`; records into the Gpu's frame, without flushing. */
-  render(node: FxInput, window: Rect, ctx: FxContext = {}): Rendered {
+  /**
+   * Renders `window` of `node`; records into the Gpu's frame, without
+   * flushing. `consumable`: source pictures the graph may hand back to the
+   * Gpu's pool once read (the caller does not read them again).
+   */
+  render(
+    node: FxInput,
+    window: Rect,
+    ctx: FxContext = {},
+    consumable: readonly FxBuffer[] = [],
+  ): Rendered {
     this.rods.clear();
+    this.owned.clear();
+    for (const p of consumable) this.owned.add(p.buffer);
     this.ctx = { ...this.ctx, ...ctx };
     try {
       return this.pull(node, window);
     } finally {
       this.rods.clear();
+      this.owned.clear();
     }
+  }
+
+  /** Hands an input's picture back once its reader is recorded (owned ones only). */
+  private consumed(p: FxBuffer | null | undefined, keep: FxBuffer) {
+    if (!p || p.buffer === keep.buffer || !this.owned.has(p.buffer)) return;
+    this.owned.delete(p.buffer);
+    this.gpu.release(p.buffer);
   }
 
   /** A node's region of definition, from its inputs'. */
@@ -184,6 +214,7 @@ export class FxGraph {
     const pass = passThroughClip(desc);
     let passed: Rendered | null = null;
     const pending = new Map<string, Promise<number[]>>();
+    const read: FxBuffer[] = [];
     desc.inputs.forEach((clip, i) => {
       const input = node.inputs?.[clip.name];
       if (!input) return;
@@ -202,8 +233,10 @@ export class FxGraph {
         values: got.values,
       };
       request.inputs.push(plane);
+      read.push(got.picture);
       for (const [id, buffer] of got.planes) {
         request.inputs.push({ ...plane, plane: id, buffer });
+        read.push(buffer);
       }
     });
     const upstream = passed as Rendered | null;
@@ -213,12 +246,32 @@ export class FxGraph {
     }
 
     const gpu = this.gpu;
-    const out = placed(gpu.scratch(rectWidth(area), rectHeight(area)), area);
+    // A pixelwise effect over a picture nothing else reads: written in place.
+    const before0 = upstream?.picture;
+    const mask0 = node.channels;
+    const reuse =
+      effect.inPlace &&
+      before0 &&
+      this.owned.has(before0.buffer) &&
+      read.filter((p) => p.buffer === before0.buffer).length === 1 &&
+      !node.planes?.length &&
+      (!mask0 || mask0.every(Boolean)) &&
+      sameRect(before0.rect, area) &&
+      before0.stride === rectWidth(area)
+        ? before0
+        : null;
+    // A new FxBuffer over the reused buffer: callers tell a rendered picture
+    // from the one they passed in (FxChain.apply writes it back only then).
+    const out = reuse
+      ? { ...reuse }
+      : placed(gpu.scratch(rectWidth(area), rectHeight(area)), area);
+    this.owned.add(out.buffer);
     request.outputs.push({ plane: "Color", buffer: out });
     const planes = new Map<string, FxBuffer>();
     for (const id of node.planes ?? []) {
       if (!desc.outputs.some((p) => p.id === id) || id === "Color") continue;
       const b = placed(gpu.scratch(out.width, out.height), area);
+      this.owned.add(b.buffer);
       planes.set(id, b);
       request.outputs.push({ plane: id, buffer: b });
     }
@@ -232,6 +285,8 @@ export class FxGraph {
     if (mask && !mask.every(Boolean) && before) {
       this.restoreChannels(out, before, mask);
     }
+    // Everything this node read is recorded: its inputs' pictures go back.
+    for (const p of read) this.consumed(p, out);
 
     const values = new Map(upstream?.values ?? []);
     for (const [k, v] of request.produced) {

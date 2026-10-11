@@ -101,6 +101,8 @@ export class TextureBridge {
       { texels, picture },
       u,
     );
+    // Unpacked: the texels' buffer serves the frame's write (same size).
+    gpu.release(texels);
     return picture;
   }
 

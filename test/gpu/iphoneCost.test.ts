@@ -489,7 +489,7 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
             splats.render(camera, target);
             await d.queue.onSubmittedWorkDone();
           }
-          // The relit colours of the first view (stride 5 uint4 a splat).
+          // The relit colours of the first view (relitStrideOf uint4 a splat).
           let colours: Float32Array | null = null;
           if (wantColours) {
             const relit = relight.relitBufferOf(mesh) as GPUBuffer;
@@ -498,9 +498,11 @@ describe.skipIf(!wideDevice || FILES.length === 0)(
             enc.copyBufferToBuffer(relit, 0, staging, 0, relit.size);
             d.queue.submit([enc.finish()]);
             const all = new Float32Array(await readAndDestroy(staging));
+            const stride = 4 * relight.relitStrideOf(mesh);
             colours = new Float32Array(leaves * 3);
             for (let i = 0; i < leaves; i++)
-              for (let c = 0; c < 3; c++) colours[3 * i + c] = all[i * 20 + c];
+              for (let c = 0; c < 3; c++)
+                colours[3 * i + c] = all[i * stride + c];
           }
           const relitBefore = relight.stats.relit;
           const moving = await frames(true);

@@ -189,20 +189,28 @@ export class AtheneaSky {
     };
   }
 
-  private uploadSource(image: SkyImage | null): GPUTexture {
-    if (this.source && this.sourceImage === image) return this.source;
+  /**
+   * The dome's image as an rgba32float lat-long with its mips, from level
+   * `base` down: the levels the preparation reads (the sun's and coarser).
+   * A finer base level is made only to build level `base` from it, on a
+   * submit of its own, and freed at once.
+   */
+  private uploadSource(image: SkyImage | null, base: number): GPUTexture {
+    if (this.source && this.sourceImage === image && this.sourceBase === base)
+      return this.source;
     this.source?.destroy();
     const w = image?.width ?? 1;
     const h = image?.height ?? 1;
+    const usage =
+      GPUTextureUsage.TEXTURE_BINDING |
+      GPUTextureUsage.STORAGE_BINDING |
+      GPUTextureUsage.COPY_DST;
     const texture = this.device.createTexture({
-      label: "env source",
+      label: base > 0 ? "env source (full, transient)" : "env source",
       size: [w, h],
       format: "rgba32float",
-      mipLevelCount: mipCount(w, h),
-      usage:
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.STORAGE_BINDING |
-        GPUTextureUsage.COPY_DST,
+      mipLevelCount: base > 0 ? base + 1 : mipCount(w, h),
+      usage: base > 0 ? usage | GPUTextureUsage.COPY_SRC : usage,
     });
     const rgba = new Float32Array(w * h * 4);
     if (image) {
@@ -228,11 +236,48 @@ export class AtheneaSky {
       { bytesPerRow: w * 16, rowsPerImage: h },
       [w, h],
     );
-    this.source = texture;
     this.sourceImage = image;
+    this.sourceBase = base;
     this.sourceMips = false;
-    return texture;
+    if (base === 0) {
+      this.source = texture;
+      return texture;
+    }
+    // Levels 1..base from level 0 (the same kernel the kept chain uses),
+    // level `base` copied out as the kept texture's level 0.
+    const bw = Math.max(w >> base, 1);
+    const bh = Math.max(h >> base, 1);
+    const kept = this.device.createTexture({
+      label: "env source",
+      size: [bw, bh],
+      format: "rgba32float",
+      mipLevelCount: mipCount(bw, bh),
+      usage,
+    });
+    const encoder = this.device.createCommandEncoder({
+      label: "athenea sky source",
+    });
+    const pass = encoder.beginComputePass({ label: "athenea sky source" });
+    this.encodeMips(pass, texture);
+    pass.end();
+    encoder.copyTextureToTexture(
+      { texture, mipLevel: base },
+      { texture: kept },
+      [bw, bh],
+    );
+    this.registry.submit(encoder.finish());
+    texture.destroy();
+    this.source = kept;
+    return kept;
   }
+
+  private sourceBase = 0;
+  /**
+   * Keep the source from the sun's level down only (default true): a 4k
+   * dome's rgba32float chain is 170 MB, its level 2 and coarser 11 MB, and
+   * the preparation reads nothing finer. False keeps every level (tests).
+   */
+  trimSource = true;
 
   private sourceMips = false;
 
@@ -273,9 +318,11 @@ export class AtheneaSky {
     this.dirty = false;
     const { device } = this;
     const image = this.options.image;
-    const source = this.uploadSource(image);
     const w = image?.width ?? 1;
     const h = image?.height ?? 1;
+    const projectLevel = image ? envProjectLevel(w) : 0;
+    const sunLevel = projectLevel >= 2 ? projectLevel - 2 : 0;
+    const source = this.uploadSource(image, this.trimSource ? sunLevel : 0);
     this.device.queue.writeBuffer(
       this.domeBuffer,
       0,
@@ -288,8 +335,6 @@ export class AtheneaSky {
       this.envTexels = createStorage(device, words * 4, "env texels");
     }
     this.baseSide = baseSide;
-    const projectLevel = image ? envProjectLevel(w) : 0;
-    const sunLevel = projectLevel >= 2 ? projectLevel - 2 : 0;
     const rw = Math.max(w >> sunLevel, 1);
     const rh = Math.max(h >> sunLevel, 1);
     if (
@@ -318,6 +363,7 @@ export class AtheneaSky {
       sourceHeight: h,
       residualLevels: residual.mipLevelCount,
       rowThreads: ROW_THREADS,
+      sourceBase: this.sourceBase,
     };
     const all = source.createView();
     const pass = encoder.beginComputePass({ label: "athenea sky" });

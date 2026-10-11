@@ -49,6 +49,8 @@ public struct AtheneaEnvParams {
     public uint  sourceMipWidth; ///< mips: the level read
     public uint  sourceMipHeight;
     public uint  rowThreads;     ///< prefilter: threads a grid row (a level past 65535 groups takes rows)
+    public uint  sourceBase;     ///< the level `skySource`'s level 0 is (AtheneaSky keeps no finer level
+                                 ///< than the sun's: a 4k dome's 170 MB of float mips down to 11)
 };
 
 StructuredBuffer<LightRecord>          envDome;
@@ -128,7 +130,7 @@ void atheneaEnvMip(uint3 tid: SV_DispatchThreadID) {
 // The dome's texels, as gTextures.textures[record.slot].Load reads them.
 
 float3 sourceLoad(uint x, uint y, uint level) {
-    return skySource.Load(int3(int(x), int(y), int(level))).rgb;
+    return skySource.Load(int3(int(x), int(y), int(level - envParams.sourceBase))).rgb;
 }
 
 uint sourceWidthAt(uint level) {

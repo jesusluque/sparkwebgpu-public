@@ -130,6 +130,28 @@ void atheneaDisplay(uint3 tid: SV_DispatchThreadID) {
     dst[tid.y * p.dstStride + tid.x] = float4(shown, 1.0);
 }
 
+/// atheneaDisplay over one picture, in place (AtheneaDisplay.inPlace: the
+/// host hands the input's picture back as the output when nothing else reads
+/// it). The same pixel, the same colour as atheneaDisplay's.
+RWStructuredBuffer<float4>            picture;
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void atheneaDisplayInPlace(uint3 tid: SV_DispatchThreadID) {
+    const AtheneaDisplayParams p = displayParams;
+    if (tid.x >= p.width || tid.y >= p.height) {
+        return;
+    }
+    const uint at = tid.y * p.dstStride + tid.x;
+    const float4 c = picture[at];
+    float3 shown = displayColourOf(c, float3(p.backgroundR, p.backgroundG, p.backgroundB), p.exposure, p.view,
+                                   p.display, p.peakScale, displayAces, displayAcesTables);
+    if (p.forSrgbOutput != 0 && p.display != 3) {
+        shown = float3(srgbDecodeOf(shown.r), srgbDecodeOf(shown.g), srgbDecodeOf(shown.b));
+    }
+    picture[at] = float4(shown, 1.0);
+}
+
 // --- ACES 2.0 tables: aces2_prepare.slang's three passes ---------------------
 
 ConstantBuffer<AcesPrepareParams> prepare;

@@ -97,7 +97,7 @@ export const reflection = {
       "group": 0,
       "binding": 10,
       "kind": "uniform",
-      "bytes": 288,
+      "bytes": 304,
       "fields": [
         {
           "name": "count",
@@ -268,85 +268,92 @@ export const reflection = {
           "components": 1
         },
         {
-          "name": "encoding",
+          "name": "stride",
           "offset": 96,
-          "size": 16,
-          "scalar": "float32",
-          "components": 4
+          "size": 4,
+          "scalar": "uint32",
+          "components": 1
         },
         {
-          "name": "row0",
+          "name": "encoding",
           "offset": 112,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "row1",
+          "name": "row0",
           "offset": 128,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "row2",
+          "name": "row1",
           "offset": 144,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "eyeObject",
+          "name": "row2",
           "offset": 160,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "eyeWorld",
+          "name": "eyeObject",
           "offset": 176,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "view0",
+          "name": "eyeWorld",
           "offset": 192,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "view1",
+          "name": "view0",
           "offset": 208,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "view2",
+          "name": "view1",
           "offset": 224,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "focal",
+          "name": "view2",
           "offset": 240,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "viewport",
+          "name": "focal",
           "offset": 256,
           "size": 16,
           "scalar": "float32",
           "components": 4
         },
         {
-          "name": "filter",
+          "name": "viewport",
           "offset": 272,
+          "size": 16,
+          "scalar": "float32",
+          "components": 4
+        },
+        {
+          "name": "filter",
+          "offset": 288,
           "size": 16,
           "scalar": "float32",
           "components": 4

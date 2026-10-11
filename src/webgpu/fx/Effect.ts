@@ -119,5 +119,16 @@ export abstract class Effect {
     return false;
   }
 
+  /**
+   * Pixel for pixel, each output pixel from the same pixel of the
+   * pass-through input alone: the host may then hand process() that input's
+   * own picture as the output (when nothing reads it after), and process()
+   * must write it in place (its output buffer is its input's). Saves a
+   * picture a frame (6 MB on a phone). Default false.
+   */
+  get inPlace(): boolean {
+    return false;
+  }
+
   abstract process(request: RenderRequest): boolean;
 }

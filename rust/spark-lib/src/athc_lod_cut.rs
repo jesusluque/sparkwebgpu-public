@@ -351,11 +351,21 @@ pub fn athenea_tree_errors(
         q.theta = q.theta.max(c.theta + angle(c.normal, q.normal));
         q.cull &= c.cull;
     }
-    // Each merge's own error with its bounds, then the climb.
+    // Each merge's own error with its bounds, then the climb. A merged thin
+    // sheet's error is SHEET_LOD_GAIN times its own, as the decoder's
+    // refine_sheets_first tells the size cut: floored at athenea's 0.1 one
+    // by one, a few large merges let the glass through in blotches where its
+    // leaves stack into a smooth tint (thread CM), so the error cut refines
+    // the glass first. The climb carries it up to every ancestor, and with
+    // it the page table's parent errors (athc_pages): the pages under the
+    // glass are needed as early as the cut wants them.
     for k in leaves..n {
         let s = scales_of(block, k);
         let rough = look_of(block, k).1;
         nb[k].eps = weights.own(size_of(s), cost[k], nb[k].spread, nb[k].theta, rough);
+        if crate::athc::is_sheet(block, k) {
+            nb[k].eps *= crate::athc::SHEET_LOD_GAIN;
+        }
     }
     for k in 0..n {
         let p = parent[k] as usize;
@@ -959,5 +969,17 @@ mod tests {
         assert!(nb[6].rho >= 2.0 + nb[5].rho - 1e-5 && nb[6].rho >= nb[4].rho + 2.0 - 1e-5);
         // No normals: never culled.
         assert!(nb.iter().all(|n| !n.cull));
+
+        // Merge 4 a thin sheet of glass (thread CM): its error times
+        // SHEET_LOD_GAIN, carried up to the root; merge 5 as it was.
+        let sheet = (255u32 << 16) | (1 << 24);
+        let size6 = size(6);
+        let mut b = b.clone();
+        b.pbr = vec![sheet, sheet, 0, 0, sheet, 0, 0];
+        let glass = athenea_tree_errors(&b, &parent, 4, &cost, &ErrorWeights::default(), false, None);
+        assert!((glass[4].eps - crate::athc::SHEET_LOD_GAIN * nb[4].eps).abs() < 1e-6);
+        assert_eq!(glass[5].eps, nb[5].eps);
+        assert_eq!(glass[6].eps, glass[4].eps.max(glass[5].eps).max(size6 * 0.1));
+        assert!((0..4).all(|k| glass[k].eps == 0.0), "leaves have none");
     }
 }

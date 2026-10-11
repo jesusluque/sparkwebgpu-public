@@ -378,9 +378,10 @@ export async function referenceRun(
     enc.copyBufferToBuffer(relit, 0, staging, 0, relit.size);
     d.queue.submit([enc.finish()]);
     const all = new Float32Array(await readAndDestroy(staging));
+    const stride = 4 * relight.relitStrideOf(mesh);
     colours = new Float32Array(n * 4);
     for (let i = 0; i < n; i++)
-      for (let c = 0; c < 4; c++) colours[4 * i + c] = all[i * 20 + c];
+      for (let c = 0; c < 4; c++) colours[4 * i + c] = all[i * stride + c];
   }
   let image: Float32Array | null = null;
   if (o.image) {

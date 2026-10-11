@@ -171,6 +171,11 @@ export class AtheneaDisplay extends Effect {
     };
   }
 
+  /** Pixel for pixel (atheneaDisplayInPlace when the host hands its input back). */
+  override get inPlace(): boolean {
+    return true;
+  }
+
   process(request: RenderRequest): boolean {
     const source = request.input("Source")?.buffer;
     const target = request.output("Color")?.buffer;
@@ -205,6 +210,24 @@ export class AtheneaDisplay extends Effect {
       backgroundB: request.number("background", 0, 2),
       forSrgbOutput: request.number("encoded", 0) < 0.5,
     });
+    if (source.buffer === target.buffer) {
+      if (
+        source.stride !== target.stride ||
+        source.rect.x1 !== target.rect.x1 ||
+        source.rect.y1 !== target.rect.y1
+      )
+        return false;
+      return gpu.run(
+        gpu.load(displayModule, "atheneaDisplayInPlace"),
+        [target.width, target.height, 1],
+        {
+          picture: target,
+          displayAces: aces.params,
+          displayAcesTables: aces.tables,
+        },
+        u,
+      );
+    }
     return gpu.run(
       gpu.load(displayModule, "atheneaDisplay"),
       [target.width, target.height, 1],

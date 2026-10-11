@@ -122,6 +122,34 @@ describe.skipIf(!device)("athenea sky (env prepare)", () => {
     sky.destroy();
   });
 
+  it("a wide dome keeps only its source from the sun's level, the same buffers", async () => {
+    // 2048 wide: env_project sums level 3, the sun is searched at level 1,
+    // so level 0 is made, used for level 1 and freed (sourceBase 1).
+    const w = 2048;
+    const h = 1024;
+    const image = skyImage(w, h, (x, y) =>
+      (x - 300) ** 2 + (y - 200) ** 2 < 40
+        ? 4000
+        : 0.2 + 0.6 * (x / w) * (y / h),
+    );
+    const read = async (trim: boolean) => {
+      const sky = new AtheneaSky(d, registry);
+      sky.trimSource = trim;
+      sky.set({ image });
+      sky.prepareNow();
+      const r = await sky.read();
+      sky.destroy();
+      return r;
+    };
+    const full = await read(false);
+    const kept = await read(true);
+    expect(Array.from(kept.sun)).toEqual(Array.from(full.sun));
+    expect(Array.from(kept.sh)).toEqual(Array.from(full.sh));
+    expect(Array.from(kept.texels as Uint32Array)).toEqual(
+      Array.from(full.texels as Uint32Array),
+    );
+  });
+
   it("a sky with no image is its colour, as the closed form", async () => {
     const { sky, axis } = await prepare(null, 3);
     const r = await check(sky, 64, PI * 3, 1e-4, 3, 3, 3);

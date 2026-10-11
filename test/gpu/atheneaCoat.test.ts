@@ -514,7 +514,7 @@ describe.skipIf(!wideDevice || !existsSync(ATHC))(
 
     it("hands the sharp coat to the draw with pixelDetail", async () => {
       expect(pool.id("curvature")).toBeGreaterThanOrEqual(0);
-      const detail = await plugin(car, true);
+      const detail = await plugin(car, true, 0, { unwiden: false });
       const words = new Uint32Array(detail.got.buffer);
       const half = (w: number) => {
         const e = (w >> 10) & 31;

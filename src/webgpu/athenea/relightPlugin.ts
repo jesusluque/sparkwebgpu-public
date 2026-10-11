@@ -213,7 +213,10 @@ export interface AtheneaRelightOptions {
    * by the surface's turn across the gaussian (Toksvig, mesh2splat's
    * m2sSpread: r'^4 = r^4 + 2 s^2, s = the largest principal curvature times
    * the wider size), with the pixel's own footprint term on top. Needs the
-   * cloud's curvature; nothing changes without pixelDetail.
+   * cloud's curvature; nothing changes without pixelDetail. Default true:
+   * thread CV, athenea's T65 cut of the whole Corvette at /World/Camera,
+   * 1920, against her mesh path trace (lamps masked): the car 19.68 ->
+   * 20.58 dB, the door 25.99 -> 26.96, the hood 14.58 -> 15.87.
    */
   unwiden?: boolean;
   /**
@@ -505,7 +508,7 @@ export function atheneaRelightPlugin(
     cullBacks: false,
     cullBacksFacing: CULL_BACKS_FACING,
     sheetFloor: "relight",
-    unwiden: false,
+    unwiden: true,
     coatFold: false,
     polishField: false,
     cpcaBatch: CPCA_BATCH,

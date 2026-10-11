@@ -62,7 +62,9 @@ function syntheticCloud(): Streams {
   // pbr: metallic, roughness, transmission bytes, flags (thin 1 << 24).
   const materials = [
     {
-      pbr: 0 | (128 << 8),
+      // The material's own roughness 0.34 (athenea 35ae3cb's mark, bits
+      // 26..31): the polish's field answers its closed part (polishField).
+      pbr: (0 | (128 << 8) | (1 << 26) | (11 << 27)) >>> 0,
       lobes: [0xffffffff, 0x3aa60000 | (20 << 8) | 255, 0],
     },
     {
@@ -73,7 +75,11 @@ function syntheticCloud(): Streams {
       pbr: (10 << 8) | (255 << 16) | (1 << 24),
       lobes: [0xffffffff, 0x3aa60000, 0],
     },
-    { pbr: 200 | (90 << 8), lobes: [0xc0ffffff, 0x3aa6ff00, 0x80000000] },
+    // Its own roughness 0 (a chrome under its coat): no field.
+    {
+      pbr: 200 | (90 << 8) | (1 << 26),
+      lobes: [0xc0ffffff, 0x3aa6ff00, 0x80000000],
+    },
   ];
   for (let i = 0; i < N; i++) {
     const z = 2 * r() - 1;
@@ -331,6 +337,49 @@ describe.skipIf(!wideDevice).each([8, 4])(
       expect(colours.relMSE).toBeLessThan(1e-5);
       expect(alphaDiff).toBeLessThan(1e-3);
       expect(image.relMSE).toBeLessThan(1e-3);
+    }, 120_000);
+
+    it("holds a fold's coat and reads the polish's field as today's path (athenea 35ae3cb)", async () => {
+      const W = 320;
+      const H = 240;
+      const { camera, place } = placeCamera(
+        W,
+        H,
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(1.2, -1.0, 0.6),
+        50,
+        1,
+      );
+      const source = compactToSource(cloud, s.q8);
+      const run = { W, H, sky: sky(), camera, place, colours: true };
+      const rules = { coatFold: true, polishField: true };
+      const ref = await referenceRun(d, { ...source }, N, basis, {
+        ...run,
+        relight: rules,
+      });
+      const got = await compactRun(d, cloud, {
+        ...run,
+        path: { sheetFade: -1, ...rules },
+      });
+      const plain = await compactRun(d, cloud, {
+        ...run,
+        path: { sheetFade: -1 },
+      });
+      const colours = compare(
+        got.colours as Float32Array,
+        ref.colours as Float32Array,
+      );
+      const moved = compare(
+        got.colours as Float32Array,
+        plain.colours as Float32Array,
+      );
+      process.stderr.write(
+        `COMPACT_RULES ${JSON.stringify({ colours, moved })}\n`,
+      );
+      // The rules change the light ...
+      expect(moved.relMSE).toBeGreaterThan(3e-7);
+      // ... the same way on both paths.
+      expect(colours.relMSE).toBeLessThan(1e-5);
     }, 120_000);
 
     it("floors thin sheets after the blur as the draw does (sheetFade)", async () => {

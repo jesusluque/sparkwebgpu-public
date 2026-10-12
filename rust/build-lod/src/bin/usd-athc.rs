@@ -143,7 +143,7 @@ use spark_lib::athc_build::{
 };
 use spark_lib::athc_lod_error::{with_lod_sizes, LodSizeOptions};
 use spark_lib::athc_merge::{levels_from_tree, ErrorOptions, ErrorView, MergeTree};
-use spark_lib::athc_pages::{check_paged, pack_pages, PageBox, PageInput};
+use spark_lib::athc_pages::{check_paged, PageBox, PageInput};
 use spark_lib::athc_v3::write_v3_paged;
 use spark_lib::athc_lod_cut::{athenea_tree_errors, with_lod_errors, ErrorWeights, Known, NO_CONE};
 use spark_lib::athl::SplatSources;
@@ -1642,7 +1642,11 @@ fn tree_main(args: &[String], tree_path: &str, paths: &[String]) -> Result<()> {
             sh_words: packed.sh_words as usize,
             page_box,
         };
-        let paged = pack_pages(&input)?;
+        // `--synthetic-fanout N` (thread CX): a forest past N roots (default
+        // 2048; 0: never) under a synthetic hierarchy of N a node, so page 0
+        // holds it whatever its roots (athenea's 5120 forests).
+        let fanout: usize = arg(args, "--synthetic-fanout").map(|v| v.parse()).transpose().context("--synthetic-fanout")?.unwrap_or(spark_lib::athc_pages::SYNTHETIC_FANOUT);
+        let paged = spark_lib::athc_pages::pack_pages_with(&input, fanout)?;
         check_paged(&paged.pages, &paged.rows)?;
         // Her table beside ours: how far apart (bands, error ranges, boxes).
         let her_info = prim.ints("athenea:splat:lodPageInfo")?;
@@ -1890,6 +1894,7 @@ fn main() -> Result<()> {
         "--compact-asset",
         "--split-roots",
         "--split-page-nodes",
+        "--synthetic-fanout",
     ];
     let mut paths = Vec::new();
     let mut skip = false;

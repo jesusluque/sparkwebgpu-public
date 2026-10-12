@@ -1620,6 +1620,15 @@ pub fn convert_runs(bytes: &[u8], run: usize) -> Result<(Vec<u8>, [u64; 2])> {
 /// over every node of every piece, `rounds`) and one material table (every
 /// piece's, in order). The pieces must share their basis.
 pub fn build_asset(pieces: &[&[u8]], entries: usize, rounds: usize, shared_materials: bool, threads: usize) -> Result<CompactAsset> {
+    build_asset_with(pieces, entries, rounds, shared_materials, threads, false)
+}
+
+/// `build_asset`, and with `rebasis` (thread CX: the basis comes from a fit
+/// and replaces the pieces', `athc-convert --table-only --compact-basis`)
+/// pieces that share an asset table already are read too: their shadow
+/// masks (the streams' raw bits) for the dictionary, nothing else (per-piece
+/// materials; the basis left to the caller).
+pub fn build_asset_with(pieces: &[&[u8]], entries: usize, rounds: usize, shared_materials: bool, threads: usize, rebasis: bool) -> Result<CompactAsset> {
     use crate::athc_v3::parse_v3;
     let mut asset = CompactAsset::default();
     let mut masks: Vec<Mask> = Vec::new();
@@ -1634,11 +1643,14 @@ pub fn build_asset(pieces: &[&[u8]], entries: usize, rounds: usize, shared_mater
         let w = words_of(blob);
         // v1 and v2 hold the basis and materials at the same words.
         let words = |at: u32, n: usize| -> Result<Vec<u32>> { (0..n).map(|k| w(at as usize + k)).collect() };
-        if w(1)? == 2 && w(10)? & (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS) != 0 {
+        let shares = w(1)? >= 2 && w(10)? & (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS) != 0;
+        if shares && !(rebasis && !shared_materials) {
             bail!("asset: piece {k} shares an asset table already");
         }
-        let basis = words(w(13)?, w(14)? as usize)?;
-        if k == 0 {
+        let basis = if shares { Vec::new() } else { words(w(13)?, w(14)? as usize)? };
+        if rebasis {
+            // The basis is the caller's.
+        } else if k == 0 {
             asset.basis = basis;
             asset.clusters = w(7)?;
         } else if basis != asset.basis || w(7)? != asset.clusters {
@@ -1942,6 +1954,15 @@ mod asset_tests {
             let d = |e: &Mask| (0..4).map(|j| (masks[k][j] ^ e[j]).count_ones()).sum::<u32>();
             assert_eq!(d(&mask_of(&y.cells)), entries.iter().map(d).min().unwrap());
         }
+        // A piece that shares a table (v3) is refused, unless the table is
+        // rebased (a fitted basis, per-piece materials): then its masks give
+        // the same dictionary as its alone twin's.
+        assert!(build_asset(&[&shared], 16, 4, false, 2).is_err());
+        assert!(build_asset_with(&[&shared], 16, 4, true, 2, true).is_err(), "shared materials need the pieces' tables");
+        let from_shared = build_asset_with(&[&shared, &shared], 16, 4, false, 2, true).unwrap();
+        let from_alone = build_asset_with(&[&alone, &alone], 16, 4, false, 2, true).unwrap();
+        assert!(from_shared.basis.is_empty());
+        assert_eq!(from_shared.codebook, from_alone.codebook);
     }
 
     /// CN's v1 fixture: rebased to v2, its traversal checked node by node

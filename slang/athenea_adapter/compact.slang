@@ -173,6 +173,7 @@ public struct CompactParams {
     public uint  nodeWords;    ///< node pool (thread CT): words a node record (0: planes); the plane uniforms are then bytes in the record
     public uint  headTable;    ///< node pool: the pages' heads, words (kCompactHeadWords a page)
     public float sharpMinPx;   ///< kCompactSharp: the smallest footprint (major deviation, px) shaded per pixel
+    public float sharpFlatTexels; ///< kCompactSharp: a lobe whose mirror turns less than this many sky texels over the footprint is read once
     public float reflectMinPx; ///< a footprint under it (major deviation, px) reads its reflected field band-limited
     public uint  reflectSubTerms; ///< ...to this many of its 16 coefficients (1: the mean, 4: degree 1, 9: degree 2)
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
@@ -777,8 +778,11 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
     const float3 irradiance = disc.w > 0.0 ? sunIrradiance() : float3(0.0);
     const bool cells = s.cellWords >= 8u;
     const bool hasField = cells && withIndirect;
-    float3 behind = transmittedBehindOf(s, wo, dome);
-    if (hasField && transmittedWeightOf(s) > 0.0 && s.ior > 1.0) {
+    // What a solid glass lets through (the body's transmitted share): read
+    // only where it is (transmittedWeightOf > 0), as it weighs nothing else.
+    const bool transmits = transmittedWeightOf(s) > 0.0;
+    float3 behind = transmits ? transmittedBehindOf(s, wo, dome) : float3(0.0);
+    if (hasField && transmits && s.ior > 1.0) {
         const float3 white = fieldThrough;
         const float open = smoothstep(0.5, 0.85, dot(white, float3(0.2126, 0.7152, 0.0722)));
         const float3 sharp =
@@ -788,7 +792,7 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
                       lensExitThrough(s, wo, lensCurvature)
                 : transmittedBehindOf(s, wo, dome);
         behind = open * sharp + (1.0 - open) * coupling * white * s.exitThrough;
-    } else if (hasField && transmittedWeightOf(s) > 0.0) {
+    } else if (hasField && transmits) {
         const float3 through = -wo;
         const float alpha = max(s.roughness * s.roughness, 1.0e-3);
         const float openBehind = splatConeOpen(s, compactData, through, min(1.4 * atan(alpha), 1.2), -s.normal);
@@ -797,7 +801,7 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
                   (1.0 - open) * coupling * fieldThrough) *
                  s.exitThrough;
     }
-    const float3 passes = transmittedShareOf(s, nDotV);
+    const float3 passes = transmits ? transmittedShareOf(s, nDotV) : float3(0.0);
     const float3 body2 = layers.under * s.albedo * (1.0 - s.metallic) *
                          ((1.0 - s.transmission) * front + transmittedWeightOf(s) * passes * behind);
     const float3 seen = compactEnvRadiance(envTexels, dome, mirror, s.roughness, side);
@@ -1214,10 +1218,30 @@ public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sh
         const float polishA = foldWidened(unwidened(cs.storedPolish, cs.spread), widen);
         const float coatR = sqrt(sqrt(min(coatA * coatA * coatA * coatA + pixelTurn2 / 6.0, 1.0)));
         const float polishR = sqrt(sqrt(min(polishA * polishA * polishA * polishA + pixelTurn2 / 6.0, 1.0)));
-        sharpA = uint4(packHalves(at.x, at.y), packHalves(stepX.x, stepX.y), packHalves(stepY.x, stepY.y),
-                       packHalves(sharp.coatWeight, coatR));
-        sharpB = uint4(packHalves(sharp.polishWeight.x, sharp.polishWeight.y),
-                       packHalves(sharp.polishWeight.z, polishR), 0u, 0u);
+        // A LOBE WHOSE MIRROR STAYS IN ONE TEXEL across the footprint (its
+        // turn over 3 sigma under sharpFlatTexels of the finer of the
+        // sky's two levels it reads) reads the same sky at every pixel: read
+        // once here, at the per-pixel roughness, and not drawn per pixel.
+        float coatW = sharp.coatWeight;
+        float3 polishW = sharp.polishWeight;
+        const float across = max(length(stepX), length(stepY)) * 3.0 * footprintPx;
+        const uint base = compactParams.envBaseSide;
+        const float3 mirror0 = reflect(-wo, surface.normal);
+        if (coatW > 0.0 &&
+            across * float(envSideOf(uint(sqrt(saturate(coatR)) * float(kEnvLevels - 1)), base)) < compactParams.sharpFlatTexels) {
+            light += coatW * compactEnvRadiance(envTexels, 0u, mirror0, coatR, base);
+            coatW = 0.0;
+        }
+        if (any(polishW > float3(0.0)) &&
+            across * float(envSideOf(uint(sqrt(saturate(polishR)) * float(kEnvLevels - 1)), base)) < compactParams.sharpFlatTexels) {
+            light += polishW * compactEnvRadiance(envTexels, 0u, mirror0, polishR, base);
+            polishW = float3(0.0);
+        }
+        if (coatW > 0.0 || any(polishW > float3(0.0))) {
+            sharpA = uint4(packHalves(at.x, at.y), packHalves(stepX.x, stepX.y), packHalves(stepY.x, stepY.y),
+                           packHalves(coatW, coatR));
+            sharpB = uint4(packHalves(polishW.x, polishW.y), packHalves(polishW.z, polishR), 0u, 0u);
+        }
     }
     float alpha = -1.0;
     if (surface.thinWalled && surface.transmission > 0.5) {
@@ -1611,16 +1635,27 @@ uint drawnClusterOf(uint slot) {
     return i == kCompactNone ? 0u : fieldAt(compactParams.cluster, 1u, i);
 }
 
+/// The workgroup's counts by cluster (the bin passes): one global atomic a
+/// cluster a workgroup instead of one a slot (thread CW).
+groupshared Atomic<uint> binLocal[kCompactBins];
+groupshared uint binBase[kCompactBins];
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaCompactBinCount(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
     const uint count = min(sortCount[1], compactParams.capacity);
+    binLocal[lid.x].store(0u);
+    GroupMemoryBarrierWithGroupSync();
     for (uint pass = 0u; pass < kCompactRounds; ++pass) {
         const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
-        if (slot >= count) {
-            return;
+        if (slot < count) {
+            binLocal[drawnClusterOf(slot)].add(1u);
         }
-        bins[drawnClusterOf(slot)].add(1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint n = binLocal[lid.x].load();
+    if (n != 0u) {
+        bins[lid.x].add(n);
     }
 }
 
@@ -1649,13 +1684,26 @@ void atheneaCompactBinScan(uint3 lid: SV_GroupThreadID) {
 [numthreads(256, 1, 1)]
 void atheneaCompactBinScatter(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
     const uint count = min(sortCount[1], compactParams.capacity);
-    for (uint pass = 0u; pass < kCompactRounds; ++pass) {
+    // Each slot's place among its workgroup's of the same cluster, then one
+    // range a cluster reserved for the workgroup, then the slots written.
+    binLocal[lid.x].store(0u);
+    GroupMemoryBarrierWithGroupSync();
+    uint clusterOf[kCompactRounds];
+    uint rank[kCompactRounds];
+    [unroll] for (uint pass = 0u; pass < kCompactRounds; ++pass) {
         const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
-        if (slot >= count) {
-            return;
+        clusterOf[pass] = slot < count ? drawnClusterOf(slot) : kCompactBins;
+        rank[pass] = clusterOf[pass] < kCompactBins ? binLocal[clusterOf[pass]].add(1u) : 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint n = binLocal[lid.x].load();
+    binBase[lid.x] = n != 0u ? bins[kCompactBins + lid.x].add(n) : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint pass = 0u; pass < kCompactRounds; ++pass) {
+        const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
+        if (clusterOf[pass] < kCompactBins) {
+            bins[2u * kCompactBins + binBase[clusterOf[pass]] + rank[pass]].store(slot);
         }
-        const uint at = bins[kCompactBins + drawnClusterOf(slot)].add(1u);
-        bins[2u * kCompactBins + at].store(slot);
     }
 }
 

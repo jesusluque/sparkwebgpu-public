@@ -43,7 +43,7 @@ function rng(seed: number) {
 }
 
 /** A synthetic TX cloud: a sphere shell of splats facing out, a few materials. */
-function syntheticCloud(): Streams {
+function syntheticCloud(N = COMPACT_PIECE + 3000, clusters = 256): Streams {
   const r = rng(3);
   const ext0 = new Uint32Array(4 * N);
   const ext1 = new Uint32Array(4 * N);
@@ -137,7 +137,7 @@ function syntheticCloud(): Streams {
     lobes,
     curvature,
     shadowBits,
-    q8: syntheticJointRecords(N, 256),
+    q8: syntheticJointRecords(N, clusters),
   };
 }
 
@@ -487,7 +487,16 @@ describe.skipIf(!wideDevice || !process.env.COMPACT_SINGLE)("one splat", () => {
       20,
       1,
     );
-    const run = { W, H, sky: sky(), camera, place, colours: true, image: true };
+    const run = {
+      W,
+      H,
+      sky: sky(),
+      camera,
+      place,
+      colours: true,
+      image: true,
+      path: { stableOrder: true },
+    };
     const ref = await referenceRun(d, compactToSource(cloud, s.q8), n, basis, {
       ...run,
       shapes: true,
@@ -759,4 +768,113 @@ describe.skipIf(!wideDevice)("the compact path's shading options", () => {
     path.dispose();
     color.destroy();
   });
+});
+
+// 512 clusters (thread CX: a 9-bit cluster id, its 9th bit in the shadow
+// index's bit 15, the bins 512): a basis of two copies of a 256-cluster one,
+// half the splats pointing at the second copy, draws exactly as the 256.
+describe.skipIf(!wideDevice)("512 clusters", () => {
+  const d = wideDevice as GPUDevice;
+  it("a doubled basis draws as the single one", async () => {
+    const s = syntheticCloud();
+    const basis = packJointBasis(syntheticJointBasis(256, 5));
+    const twice = new Float32Array(2 * basis.length);
+    twice.set(basis);
+    twice.set(basis, basis.length);
+    const q8 = s.q8.slice();
+    for (let i = 0; i < N; i += 2) q8[7 * i + 6] += 256;
+    const a = encodeCompact({ count: N, ...s, basis, clusters: 256 });
+    const b = encodeCompact({
+      count: N,
+      ...s,
+      q8,
+      basis: twice,
+      clusters: 512,
+    });
+    for (let i = 0; i < N; i += 101) {
+      expect([...decodeCompactSplat(b, i).cells]).toEqual([
+        ...s.shadowBits.subarray(8 * i, 8 * i + 8),
+      ]);
+    }
+    const W = 320;
+    const H = 240;
+    const { camera, place } = placeCamera(
+      W,
+      H,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(1.2, -1.0, 0.6),
+      50,
+      1,
+    );
+    const run = {
+      W,
+      H,
+      sky: sky(),
+      camera,
+      place,
+      colours: true,
+      image: true,
+      path: { stableOrder: true },
+    };
+    const ra = await compactRun(d, a, run);
+    const rb = await compactRun(d, b, run);
+    expect(rb.drawn).toBe(ra.drawn);
+    expect(ra.drawn).toBeGreaterThan(N / 4);
+    const ca = ra.colours as Float32Array;
+    const cb = rb.colours as Float32Array;
+    let worst = 0;
+    for (let k = 0; k < ca.length; k++)
+      worst = Math.max(worst, Math.abs(ca[k] - cb[k]));
+    expect(worst).toBe(0);
+    const ia = ra.image as Float32Array;
+    const ib = rb.image as Float32Array;
+    let worstPx = 0;
+    for (let k = 0; k < ia.length; k++)
+      worstPx = Math.max(worstPx, Math.abs(ia[k] - ib[k]));
+    expect(worstPx).toBe(0);
+  });
+
+  // Opt-in (COMPACT_CLUSTERS_TIMING=1, a short GPU hold): the shade's cost at
+  // 256 and 512 clusters, the phone's 393 x 852, a cloud of COMPACT_CLUSTERS_N.
+  it.skipIf(process.env.COMPACT_CLUSTERS_TIMING !== "1")(
+    "the shade's cost at 256 and 512 clusters",
+    async () => {
+      const n = Number(process.env.COMPACT_CLUSTERS_N ?? 400_000);
+      const W = 393;
+      const H = 852;
+      const { camera, place } = placeCamera(
+        W,
+        H,
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0.9, -0.75, 0.45),
+        50,
+        1,
+      );
+      const out: Record<string, unknown> = {};
+      for (const C of [256, 512, 256, 512]) {
+        const s = syntheticCloud(n, C);
+        const cloud = encodeCompact({
+          count: n,
+          ...s,
+          basis: packJointBasis(syntheticJointBasis(C, 5)),
+          clusters: C,
+        });
+        const r = await compactRun(d, cloud, {
+          W,
+          H,
+          sky: sky(),
+          camera,
+          place,
+          timing: true,
+          frames: 40,
+        });
+        out[`${C}${out[`${C}`] ? "b" : ""}`] = {
+          drawn: r.drawn,
+          timing: r.timing,
+        };
+      }
+      console.log(`COMPACT_CLUSTERS ${JSON.stringify(out)}`);
+    },
+    600_000,
+  );
 });

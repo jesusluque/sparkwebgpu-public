@@ -18,11 +18,14 @@
 //                            097's 8 + 8 shifts the coat's reflections)
 //   curvature          s8 x3 xx, xy, yy, a signed log in its chunk's range
 //   material           u16   into the material table (pbr, lobes: 4 words)
-//   cluster            u8    athenea's joint CPCA cluster (C = 256)
+//   cluster            u8    athenea's joint CPCA cluster, its low 8 bits (C <= 512:
+//                            the 9th is the shadow index's bit 15, thread CX)
 //   weights            3 planes of 8 int8 (direct, indirect, reflected), or of
 //                            8 int4 (weightBits 4, 097's mode 1)
 //   shadow             u16   into its piece's codebook (the open-direction
-//                            cells, 8 words; a piece is 16384 gaussians)
+//                            cells, 8 words; a piece is 16384 gaussians), bits
+//                            0-14 (a codebook of at most 32768); bit 15 the
+//                            cluster's 9th
 // and tables: the chunks' ranges (12 words a chunk), the pieces' codebook
 // offsets, the codebooks, the materials, and athenea's basis in f16 (504
 // words a cluster: per block its mean and its 8 directions times scale/127).
@@ -95,7 +98,8 @@ public static const uint kCompactPlain = 16u;      // debug: the albedo, no reli
 public static const uint kCompactCullBacks = 32u;  // opaque splats whose stored face looks away are not drawn
 public static const uint kCompactDrawList = 64u;   // the cull walks a list of gaussians (a LoD cut) in compactFrame
 public static const uint kCompactBinned = 128u;    // the shade walks the drawn slots by cluster (binsIn)
-public static const uint kCompactBins = 256u;      // clusters a cloud may have (u8 ids)
+public static const uint kCompactBins = 512u;      // clusters a cloud may have (9-bit ids, thread CX)
+public static const uint kCompactBinsPerThread = 2u; // the bin passes' 256 threads, 2 bins each
 public static const uint kCompactStableOrder = 256u; // each listed gaussian its own slot (culled: ~0), for repeatable images
 // athenea 35ae3cb, as relight.slang's kRelightCoatFold and kRelightPolishField:
 // a coat's bake widening held to kCoatFoldRoughness (0.3) where the surface
@@ -375,6 +379,13 @@ uint originOf(uint i) {
 
 /// `width` bytes (1..4) of element i of the plane at word `plane` (node
 /// pool: at byte `plane` of node i's record).
+/// Gaussian i's CPCA cluster: its cluster byte, the 9th bit from the shadow
+/// index's bit 15 (thread CX: 512 clusters with the record's size unchanged;
+/// a codebook of at most 32768 entries, so files of 256 clusters read as before).
+uint clusterAt(uint i) {
+    return fieldAt(compactParams.cluster, 1u, i) | ((fieldAt(compactParams.shadow, 2u, i) >> 15u) << 8u);
+}
+
 uint fieldAt(uint plane, uint width, uint i) {
     uint base;
     uint at;
@@ -508,7 +519,7 @@ uint cellBaseOf(uint i) {
     const uint book = compactParams.slotNodes == 0u && compactParams.nodeWords == 0u
                           ? compactData[compactParams.pieceTable + i / kCompactPiece]
                           : chunkWord(i, 9u);
-    return book + fieldAt(compactParams.shadow, 2u, i) * 8u;
+    return book + (fieldAt(compactParams.shadow, 2u, i) & 0x7fffu) * 8u;
 }
 
 // ------------------------------------------------------- the joint CPCA's terms
@@ -998,7 +1009,7 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
         o.surface.roughness = max(o.surface.roughness, compactParams.viewport.z);
         o.surface.lobes.coatRoughness = max(o.surface.lobes.coatRoughness, compactParams.viewport.z);
     }
-    o.cluster = fieldAt(compactParams.cluster, 1u, i);
+    o.cluster = clusterAt(i);
     o.index = i;
     return o;
 }
@@ -1632,7 +1643,7 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
 
 uint drawnClusterOf(uint slot) {
     const uint i = rec0[slot];
-    return i == kCompactNone ? 0u : fieldAt(compactParams.cluster, 1u, i);
+    return i == kCompactNone ? 0u : clusterAt(i);
 }
 
 /// The workgroup's counts by cluster (the bin passes): one global atomic a
@@ -1644,7 +1655,9 @@ groupshared uint binBase[kCompactBins];
 [numthreads(256, 1, 1)]
 void atheneaCompactBinCount(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
     const uint count = min(sortCount[1], compactParams.capacity);
-    binLocal[lid.x].store(0u);
+    for (uint j = 0u; j < kCompactBinsPerThread; ++j) {
+        binLocal[lid.x + 256u * j].store(0u);
+    }
     GroupMemoryBarrierWithGroupSync();
     for (uint pass = 0u; pass < kCompactRounds; ++pass) {
         const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
@@ -1653,31 +1666,45 @@ void atheneaCompactBinCount(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) 
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    const uint n = binLocal[lid.x].load();
-    if (n != 0u) {
-        bins[lid.x].add(n);
+    for (uint j = 0u; j < kCompactBinsPerThread; ++j) {
+        const uint b = lid.x + 256u * j;
+        const uint n = binLocal[b].load();
+        if (n != 0u) {
+            bins[b].add(n);
+        }
     }
 }
 
-groupshared uint binScan[kCompactBins];
+groupshared uint binScan[256];
 
 /// The clusters' starts (exclusive sums of the counts), the counts cleared
-/// for the next frame.
+/// for the next frame: one workgroup, a thread kCompactBinsPerThread
+/// consecutive bins (their sum scanned across the threads).
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaCompactBinScan(uint3 lid: SV_GroupThreadID) {
     const uint t = lid.x;
-    const uint n = bins[t].load();
-    binScan[t] = n;
+    uint n[kCompactBinsPerThread];
+    uint sum = 0u;
+    for (uint j = 0u; j < kCompactBinsPerThread; ++j) {
+        n[j] = bins[kCompactBinsPerThread * t + j].load();
+        sum += n[j];
+    }
+    binScan[t] = sum;
     GroupMemoryBarrierWithGroupSync();
-    for (uint step = 1u; step < kCompactBins; step <<= 1u) {
+    for (uint step = 1u; step < 256u; step <<= 1u) {
         const uint add = t >= step ? binScan[t - step] : 0u;
         GroupMemoryBarrierWithGroupSync();
         binScan[t] += add;
         GroupMemoryBarrierWithGroupSync();
     }
-    bins[kCompactBins + t].store(binScan[t] - n);
-    bins[t].store(0u);
+    uint start = binScan[t] - sum;
+    for (uint j = 0u; j < kCompactBinsPerThread; ++j) {
+        const uint b = kCompactBinsPerThread * t + j;
+        bins[kCompactBins + b].store(start);
+        bins[b].store(0u);
+        start += n[j];
+    }
 }
 
 [shader("compute")]
@@ -1686,7 +1713,9 @@ void atheneaCompactBinScatter(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID
     const uint count = min(sortCount[1], compactParams.capacity);
     // Each slot's place among its workgroup's of the same cluster, then one
     // range a cluster reserved for the workgroup, then the slots written.
-    binLocal[lid.x].store(0u);
+    for (uint j = 0u; j < kCompactBinsPerThread; ++j) {
+        binLocal[lid.x + 256u * j].store(0u);
+    }
     GroupMemoryBarrierWithGroupSync();
     uint clusterOf[kCompactRounds];
     uint rank[kCompactRounds];
@@ -1696,8 +1725,11 @@ void atheneaCompactBinScatter(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID
         rank[pass] = clusterOf[pass] < kCompactBins ? binLocal[clusterOf[pass]].add(1u) : 0u;
     }
     GroupMemoryBarrierWithGroupSync();
-    const uint n = binLocal[lid.x].load();
-    binBase[lid.x] = n != 0u ? bins[kCompactBins + lid.x].add(n) : 0u;
+    for (uint j = 0u; j < kCompactBinsPerThread; ++j) {
+        const uint b = lid.x + 256u * j;
+        const uint n = binLocal[b].load();
+        binBase[b] = n != 0u ? bins[kCompactBins + b].add(n) : 0u;
+    }
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (uint pass = 0u; pass < kCompactRounds; ++pass) {
         const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;

@@ -78,6 +78,11 @@ pub const P_MATERIAL: usize = 9;
 pub const P_CLUSTER: usize = 10;
 pub const P_WEIGHTS: usize = 11;
 pub const P_SHADOW: usize = 14;
+/// Clusters a basis may have (thread CX): the cluster byte, its 9th bit the
+/// shadow index's bit 15 (`SHADOW_INDEX_MASK`; a codebook of 32768 at most).
+pub const MAX_CLUSTERS: usize = 512;
+pub const SHADOW_INDEX_MASK: u32 = 0x7fff;
+pub const CLUSTER_HIGH_BIT: u32 = 0x8000;
 /// The traversal's planes (one byte each): centre correction x lo, x hi, y
 /// lo, y hi, z lo, z hi; the children's page lo, hi; the children word's
 /// four bytes; eps lo, hi; rho lo, hi.
@@ -157,8 +162,8 @@ impl JointBasis {
         if j["K"].as_u64() != Some(JOINT_K as u64) {
             bail!("cpca basis: K {:?}, the record holds {}", j["K"], JOINT_K);
         }
-        if c > 256 {
-            bail!("cpca basis: {} clusters, the compact cluster is a byte", c);
+        if c > MAX_CLUSTERS {
+            bail!("cpca basis: {} clusters, the compact cluster is 9 bits", c);
         }
         let arrays = j["arrays"].as_array().ok_or_else(|| anyhow!("cpca basis: no arrays"))?;
         let array = |name: &str| -> Result<Vec<f32>> {
@@ -1107,6 +1112,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
             let (cluster, qs) = basis.encode(&x, o.levels);
             used[cluster as usize] = true;
             raw[at(P_CLUSTER) + i] = cluster as u8;
+            let cluster_high = if cluster > 255 { CLUSTER_HIGH_BIT } else { 0 };
             for blk in 0..3 {
                 let mut packed = 0u32;
                 for k in 0..JOINT_K {
@@ -1124,7 +1130,10 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
                 }
                 first += JOINT_BLOCKS[blk];
             }
-            raw[at(P_SHADOW) + 2 * i..at(P_SHADOW) + 2 * i + 2].copy_from_slice(&(labels[node] as u16).to_le_bytes());
+            if labels[node] > SHADOW_INDEX_MASK && basis.clusters > 256 {
+                bail!("compact: {} clusters need a shadow dictionary of 32768 at most", basis.clusters);
+            }
+            raw[at(P_SHADOW) + 2 * i..at(P_SHADOW) + 2 * i + 2].copy_from_slice(&((labels[node] | cluster_high) as u16).to_le_bytes());
             let tree = lod_tree_words(b, i);
             let lode = (b.lod_error.len() == 2 * n).then(|| [b.lod_error[2 * i], b.lod_error[2 * i + 1]]);
             if let Some(e) = lode {
@@ -1224,7 +1233,7 @@ pub fn decode_node(raw: &[u8], n: usize, head: &[u32; HEAD_WORDS], tables: &Comp
         if c < 0 { -m } else { m }
     });
     let m = field(P_MATERIAL) as usize * 4;
-    let e = field(P_SHADOW) as usize * 8;
+    let e = (field(P_SHADOW) & SHADOW_INDEX_MASK) as usize * 8;
     let mut weights = [0i32; 24];
     for blk in 0..3 {
         let w = field(P_WEIGHTS + blk);
@@ -1241,7 +1250,7 @@ pub fn decode_node(raw: &[u8], n: usize, head: &[u32; HEAD_WORDS], tables: &Comp
         normal: decode_normal_bits(field(P_NORMAL), tables.normal_bits),
         curvature,
         material: [tables.materials[m], tables.materials[m + 1], tables.materials[m + 2], tables.materials[m + 3]],
-        cluster: field(P_CLUSTER),
+        cluster: field(P_CLUSTER) | (field(P_SHADOW) >> 15) << 8,
         weights,
         cells: tables.codebook[e..e + 8].try_into().unwrap(),
         traversal: traversal_node(raw, n, head, page, i),
@@ -1377,8 +1386,13 @@ pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &s
         }
         for i in 0..n {
             if !codebook.is_empty() {
+                // The cluster's 9th bit (bit 15) kept.
                 let at = plane_offset(P_SHADOW, n) + 2 * i;
-                raw[at..at + 2].copy_from_slice(&(labels[i] as u16).to_le_bytes());
+                let high = u16::from_le_bytes([raw[at], raw[at + 1]]) as u32 & CLUSTER_HIGH_BIT;
+                if high != 0 && labels[i] > SHADOW_INDEX_MASK {
+                    bail!("rebase: 512 clusters need a shadow dictionary of 32768 at most");
+                }
+                raw[at..at + 2].copy_from_slice(&((labels[i] | high) as u16).to_le_bytes());
             }
             let at = plane_offset(P_MATERIAL, n) + 2 * i;
             let m = u16::from_le_bytes([raw[at], raw[at + 1]]) as usize;
@@ -1868,6 +1882,40 @@ mod asset_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn a_basis_of_512_clusters_keeps_the_record_size() {
+        // Thread CX: the cluster's 9th bit in the shadow index's bit 15.
+        let o = CompactOptions { threads: 2, ..Default::default() };
+        let (paged, file) = crate::athc_pages::tests::sample_relit_paged(1500, 400);
+        let wide = sample_basis(512);
+        let c = build_compact(&file.chunks, false, &wide, &o).unwrap();
+        let (bytes, _) = write_v3_paged_compact(&file, &paged.rows, COMPRESSION_GZIP, &|_| 1, None, None, &c).unwrap();
+        let (narrow, _, _) = piece(1500, 400, &o);
+        let (a, b) = (nodes(&bytes, None), nodes(&narrow, None));
+        assert_eq!(a.len(), b.len());
+        let mut high = 0;
+        let mut x = [0f32; 112];
+        let mut k = 0;
+        for blk in &file.chunks {
+            for i in 0..blk.n {
+                for v in 0..112 {
+                    let w = blk.transfer[56 * i + v / 2];
+                    x[v] = if v % 2 == 0 { low_half(w) } else { high_half(w) };
+                }
+                let (want, _) = wide.encode(&x, o.levels);
+                assert_eq!(a[k].cluster, want, "node {k}");
+                high += (want > 255) as usize;
+                // The same open cells and everything else as with a small basis.
+                assert_eq!(a[k].cells, b[k].cells);
+                assert_eq!((a[k].center, a[k].material, a[k].traversal), (b[k].center, b[k].material, b[k].traversal));
+                k += 1;
+            }
+        }
+        assert_eq!(k, a.len());
+        assert!(high > 0, "no node in clusters 256..511");
+        assert!(JointBasis::parse("{\"C\": 513, \"K\": 8}", &[]).is_err());
     }
 
     #[test]

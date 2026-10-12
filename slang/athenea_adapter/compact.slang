@@ -69,6 +69,7 @@ import athenea.common.color;
 import athenea.common.octahedral;
 import athenea.light.environment;
 import athenea.scene.splat_encoding;
+import core.bindings;
 
 public static const uint kCompactChunk = 8192;
 public static const uint kCompactChunkWords = 12;
@@ -203,6 +204,15 @@ RWStructuredBuffer<float4>          debugOut;
 RWStructuredBuffer<Atomic<uint>>    bins;      ///< kCompactBinned: counts, starts (kCompactBins each), then the slots by cluster
 RWStructuredBuffer<uint>            shadeAux;  ///< the bins, read by the shade (kCompactBinned); then the sharp records it writes (kCompactSharp)
 StructuredBuffer<uint>              sharpIn;   ///< the same buffer, read by the draw (kCompactSharp)
+/// kCompactSharp: the dome's prefiltered levels (envTexels) as one filtered
+/// rgba16float atlas, so the draw reads a lobe with the hardware's trilinear
+/// in two samples instead of decoding eight texels (atheneaCompactEnvAtlas
+/// fills it when the dome changes): level 0 at the origin, the others down a
+/// column to its right.
+[format("rgba16f")] WTexture2D<float4> envAtlasOut;
+[Filterable] Texture2D<float4>         envAtlas;
+SamplerState                           envAtlasSampler;
+
 /// Where slot `slot`'s sharp records are in shadeAux / sharpIn (words).
 uint sharpAt(uint slot) { return 2u * kCompactBins + compactParams.capacity + 6u * slot; }
 void writeSharp(uint slot, uint4 a, uint4 b) {
@@ -219,6 +229,67 @@ ConstantBuffer<CompactParams>       compactParams;
 bool hasFlag(uint f) { return (compactParams.flags & f) != 0u; }
 
 float2 unpackHalves(uint w) { return float2(lowHalf(w), highHalf(w)); }
+
+/// Where level `level` starts in the atlas (texels).
+uint2 atlasOrigin(uint level, uint baseSide) {
+    if (level == 0u) {
+        return uint2(0u);
+    }
+    uint y = 0u;
+    for (uint l = 1u; l < level; ++l) {
+        y += envSideOf(l, baseSide);
+    }
+    return uint2(envSideOf(0u, baseSide), y);
+}
+
+/// The atlas' size: level 0 and the column of the others.
+uint2 atlasSize(uint baseSide) {
+    uint h = 0u;
+    for (uint l = 1u; l < kEnvLevels; ++l) {
+        h += envSideOf(l, baseSide);
+    }
+    return uint2(envSideOf(0u, baseSide) + envSideOf(1u, baseSide), max(envSideOf(0u, baseSide), h));
+}
+
+/// One level of the atlas along `dir`: the hardware's bilinear over the same
+/// texels environment.slang's envLevelAt reads (clamped inside the level).
+float3 atlasLevel(uint level, float3 dir, uint baseSide) {
+    const float side = float(envSideOf(level, baseSide));
+    const float2 at = clamp(octEncode(dir) * side - 0.5, 0.0, side - 1.0);
+    const float2 uv = (float2(atlasOrigin(level, baseSide)) + at + 0.5) / float2(atlasSize(baseSide));
+    return envAtlas.SampleLevel(envAtlasSampler, uv, 0.0).rgb;
+}
+
+/// environment.slang's envRadiance from the atlas: the two levels bracketing
+/// the roughness (its square root along the chain), blended.
+float3 atlasRadiance(float3 dir, float roughness, uint baseSide) {
+    const float level = sqrt(saturate(roughness)) * float(kEnvLevels - 1);
+    const uint lo = uint(floor(level));
+    const uint hi = min(lo + 1u, kEnvLevels - 1u);
+    return lerp(atlasLevel(lo, dir, baseSide), atlasLevel(hi, dir, baseSide), level - float(lo));
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void atheneaCompactEnvAtlas(uint3 tid: SV_DispatchThreadID) {
+    const uint baseSide = compactParams.envBaseSide;
+    const uint2 size = atlasSize(baseSide);
+    if (any(tid.xy >= size)) {
+        return;
+    }
+    float4 texel = float4(0.0, 0.0, 0.0, 1.0);
+    for (uint l = 0u; l < kEnvLevels; ++l) {
+        const uint2 o = atlasOrigin(l, baseSide);
+        const uint side = envSideOf(l, baseSide);
+        if (all(tid.xy >= o) && all(tid.xy < o + side)) {
+            texel = float4(envTexelAt(envTexels, 0u, l, tid.xy - o, baseSide), 1.0);
+            break;
+        }
+    }
+    envAtlasOut.Store(tid.xy, texel);
+}
+
+
 
 /// The dome's sun (envSun's disc and irradiance), copied after the
 /// projections by the project pass: the shade then binds no envSun.
@@ -1628,13 +1699,13 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
             const uint side = compactParams.envBaseSide;
             const float2 coat = unpackHalves(w.w);
             if (coat.x > 0.0) {
-                rgb += coat.x * envRadiance(envTexels, 0u, mirror, coat.y, side);
+                rgb += coat.x * atlasRadiance(mirror, coat.y, side);
             }
             const float2 p0 = unpackHalves(p.x);
             const float2 p1 = unpackHalves(p.y);
             const float3 polish = float3(p0.x, p0.y, p1.x);
             if (any(polish > float3(0.0))) {
-                rgb += polish * envRadiance(envTexels, 0u, mirror, p1.y, side);
+                rgb += polish * atlasRadiance(mirror, p1.y, side);
             }
         }
     }

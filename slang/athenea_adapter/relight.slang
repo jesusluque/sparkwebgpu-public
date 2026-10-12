@@ -697,7 +697,9 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
     // prefilter: the sharp lobes are unwidened from these.
     const float storedPolish = surface.roughness;
     const float storedCoat = surface.lobes.coatRoughness;
-    float sharpPixelVariance = 0.0;
+    // The pixel's own turn (athenea's splat_project pixelTurn2), with the
+    // fold's hold: what widens the sharp lobes per pixel.
+    float sharpPixelTurn2 = 0.0;
     // The footprint prefilter: the lobes widened by how the normal turns
     // over what the splat's one colour stands for. Without the per-pixel
     // slope that is its gaussian, or the pixel where the splat is smaller;
@@ -706,7 +708,6 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
         const float gain = relightParams.footprint;
         const float kappa = relightParams.filter.x;
         const float pixelVariance = turns ? relightParams.filter.z * (dot(dx, dx) + dot(dy, dy)) : 0.0;
-        sharpPixelVariance = hasFlag(kRelightSlope) ? pixelVariance : 0.0;
         const bool splatTerms = !hasFlag(kRelightSlope);
         const float3 shape = splatTerms ? shapeUV : float3(0.0);
         const float spread = splatTerms ? normalSpreadOf(i) : 0.0;
@@ -744,6 +745,7 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
             // smoothed across a fold the turn goes and the sharp lobes widen
             // by it (foldWidened, below).
             const float held = 1.0 - smoothstep(kFoldTurnLow, kFoldTurnHigh, 2.0 * spread);
+            sharpPixelTurn2 = held * held * (dot(dx, dx) + dot(dy, dy));
             const float most = 0.5;
             const float3 hx = held * dx * min(1.0, most / max(held * length(dx), 1.0e-9));
             const float3 hy = held * dy * min(1.0, most / max(held * length(dy), 1.0e-9));
@@ -776,31 +778,30 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
     // and not the stored roughness's widening unwidened (the same unless the
     // spread passes the stored roughness).
     if (kTransfer >= 2 && slope.sharpOn && hasFlag(kRelightUnwiden) && spread > 0.0) {
-        const float gain = relightParams.footprint;
-        const float kappa = relightParams.filter.x;
-        const bool pixelTerm = gain > 0.0 && sharpPixelVariance > 0.0;
         if (slope.sharpWeight > 0.0) {
-            const float own = unwidened(min(storedCoat, slope.sharpRoughness), spread);
-            slope.sharpRoughness =
-                pixelTerm ? footprintRoughness(own, float3(0.0), g.scales, gain, kappa, 0.0, sharpPixelVariance) : own;
+            slope.sharpRoughness = unwidened(min(storedCoat, slope.sharpRoughness), spread);
         }
         if (any(slope.sharpPolish > float3(0.0))) {
-            const float own = unwidened(min(storedPolish, slope.sharpPolishRoughness), spread);
-            slope.sharpPolishRoughness =
-                pixelTerm ? footprintRoughness(own, float3(0.0), g.scales, gain, kappa, 0.0, sharpPixelVariance) : own;
+            slope.sharpPolishRoughness = unwidened(min(storedPolish, slope.sharpPolishRoughness), spread);
         }
     }
     // A FOLD WIDENS the sharp lobes by the turn the pixels no longer take
     // (athenea f9c9a2b: alpha' = sqrt(alpha^2 + w (t/2)^2), held under
-    // kFoldRoughness), after the unwidening.
-    if (kTransfer >= 2 && slope.sharpOn && spread > 0.0) {
+    // kFoldRoughness), after the unwidening; then THE PIXEL'S OWN SPREAD, as
+    // athenea's splat_project: the read is at the pixel's centre and the
+    // normal turns by dx, dy across it, a box of slopes whose variance, twice
+    // for the mirror, widens the lobe: alpha^2 += 2 (|dx|^2 + |dy|^2) / 12
+    // (the compact path's, the same).
+    if (kTransfer >= 2 && slope.sharpOn) {
         const float turn = 2.0 * spread;
-        const float widen = smoothstep(kFoldTurnLow, kFoldTurnHigh, turn) * 0.25 * turn * turn;
+        const float widen = spread > 0.0 ? smoothstep(kFoldTurnLow, kFoldTurnHigh, turn) * 0.25 * turn * turn : 0.0;
         if (slope.sharpWeight > 0.0) {
-            slope.sharpRoughness = foldWidened(slope.sharpRoughness, widen);
+            const float a = foldWidened(slope.sharpRoughness, widen);
+            slope.sharpRoughness = sqrt(sqrt(min(a * a * a * a + sharpPixelTurn2 / 6.0, 1.0)));
         }
         if (any(slope.sharpPolish > float3(0.0))) {
-            slope.sharpPolishRoughness = foldWidened(slope.sharpPolishRoughness, widen);
+            const float a = foldWidened(slope.sharpPolishRoughness, widen);
+            slope.sharpPolishRoughness = sqrt(sqrt(min(a * a * a * a + sharpPixelTurn2 / 6.0, 1.0)));
         }
     }
     float alpha = -1.0;

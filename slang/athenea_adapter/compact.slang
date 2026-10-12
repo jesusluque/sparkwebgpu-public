@@ -173,6 +173,7 @@ public struct CompactParams {
     public uint  nodeWords;    ///< node pool (thread CT): words a node record (0: planes); the plane uniforms are then bytes in the record
     public uint  headTable;    ///< node pool: the pages' heads, words (kCompactHeadWords a page)
     public float sharpMinPx;   ///< kCompactSharp: the smallest footprint (major deviation, px) shaded per pixel
+    public float sharpFlatTexels; ///< kCompactSharp: a lobe whose mirror turns less than this many sky texels over the footprint is read once
     public float reflectMinPx; ///< a footprint under it (major deviation, px) reads its reflected field band-limited
     public uint  reflectSubTerms; ///< ...to this many of its 16 coefficients (1: the mean, 4: degree 1, 9: degree 2)
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
@@ -1217,10 +1218,30 @@ public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sh
         const float polishA = foldWidened(unwidened(cs.storedPolish, cs.spread), widen);
         const float coatR = sqrt(sqrt(min(coatA * coatA * coatA * coatA + pixelTurn2 / 6.0, 1.0)));
         const float polishR = sqrt(sqrt(min(polishA * polishA * polishA * polishA + pixelTurn2 / 6.0, 1.0)));
-        sharpA = uint4(packHalves(at.x, at.y), packHalves(stepX.x, stepX.y), packHalves(stepY.x, stepY.y),
-                       packHalves(sharp.coatWeight, coatR));
-        sharpB = uint4(packHalves(sharp.polishWeight.x, sharp.polishWeight.y),
-                       packHalves(sharp.polishWeight.z, polishR), 0u, 0u);
+        // A LOBE WHOSE MIRROR STAYS IN ONE TEXEL across the footprint (its
+        // turn over 3 sigma under sharpFlatTexels of the finer of the
+        // sky's two levels it reads) reads the same sky at every pixel: read
+        // once here, at the per-pixel roughness, and not drawn per pixel.
+        float coatW = sharp.coatWeight;
+        float3 polishW = sharp.polishWeight;
+        const float across = max(length(stepX), length(stepY)) * 3.0 * footprintPx;
+        const uint base = compactParams.envBaseSide;
+        const float3 mirror0 = reflect(-wo, surface.normal);
+        if (coatW > 0.0 &&
+            across * float(envSideOf(uint(sqrt(saturate(coatR)) * float(kEnvLevels - 1)), base)) < compactParams.sharpFlatTexels) {
+            light += coatW * compactEnvRadiance(envTexels, 0u, mirror0, coatR, base);
+            coatW = 0.0;
+        }
+        if (any(polishW > float3(0.0)) &&
+            across * float(envSideOf(uint(sqrt(saturate(polishR)) * float(kEnvLevels - 1)), base)) < compactParams.sharpFlatTexels) {
+            light += polishW * compactEnvRadiance(envTexels, 0u, mirror0, polishR, base);
+            polishW = float3(0.0);
+        }
+        if (coatW > 0.0 || any(polishW > float3(0.0))) {
+            sharpA = uint4(packHalves(at.x, at.y), packHalves(stepX.x, stepX.y), packHalves(stepY.x, stepY.y),
+                           packHalves(coatW, coatR));
+            sharpB = uint4(packHalves(polishW.x, polishW.y), packHalves(polishW.z, polishR), 0u, 0u);
+        }
     }
     float alpha = -1.0;
     if (surface.thinWalled && surface.transmission > 0.5) {

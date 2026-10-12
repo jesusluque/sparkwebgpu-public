@@ -707,6 +707,12 @@ export interface CompactPathOptions {
    */
   sharpMinPx?: number;
   /**
+   * kCompactSharp: a lobe whose mirror turns across its footprint (3 sigma)
+   * by less than this many texels of the sky level it reads is read once at
+   * the centre, at its per-pixel roughness, not per pixel. 0 off; default 2.
+   */
+  sharpFlatTexels?: number;
+  /**
    * A footprint whose major deviation is under this many px reads its
    * reflected field band-limited to `reflectSubTerms` of its 16
    * coefficients (1 the mean, 4 degree 1, 9 degree 2); 0 off. Default 3 px
@@ -875,6 +881,7 @@ export class CompactRelitPath {
       debugBits: 0,
       sharp: false,
       sharpMinPx: 1,
+      sharpFlatTexels: 2,
       reflectMinPx: 3,
       reflectSubTerms: 4,
       coatFold: true,
@@ -1121,6 +1128,7 @@ export class CompactRelitPath {
       keyScale: ((1 << K.kCompactKeyBits) - 1) / (far * 1.8),
       cullFacing: o.cullBacksFacing,
       sharpMinPx: o.sharpMinPx,
+      sharpFlatTexels: o.sharpFlatTexels,
       reflectMinPx: o.reflectMinPx,
       reflectSubTerms: o.reflectSubTerms,
       sheetFade: o.sheetFade,

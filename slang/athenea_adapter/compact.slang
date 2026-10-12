@@ -173,6 +173,8 @@ public struct CompactParams {
     public uint  nodeWords;    ///< node pool (thread CT): words a node record (0: planes); the plane uniforms are then bytes in the record
     public uint  headTable;    ///< node pool: the pages' heads, words (kCompactHeadWords a page)
     public float sharpMinPx;   ///< kCompactSharp: the smallest footprint (major deviation, px) shaded per pixel
+    public float reflectMinPx; ///< a footprint under it (major deviation, px) reads its reflected field band-limited
+    public uint  reflectSubTerms; ///< ...to this many of its 16 coefficients (1: the mean, 4: degree 1, 9: degree 2)
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
     public float4 row1;
     public float4 row2;
@@ -661,7 +663,7 @@ float3 fieldAlong(float field[48], float3 d, float roughness) {
 /// the same order as rebuilding the block then reading it, with a handful
 /// of registers instead of 48 (the rebuilt block spilled).
 void reflectedAlong(uint cluster, uint2 w, float3 m, float roughness, float coatRoughness, bool through, float3 t,
-                    out float3 polish, out float3 coat, out float3 along) {
+                    out float3 polish, out float3 coat, out float3 along, uint terms = 16u) {
     const float a = roughness * roughness;
     const float b = coatRoughness * coatRoughness;
     const float a2 = a * a, b2 = b * b;
@@ -681,6 +683,10 @@ void reflectedAlong(uint cluster, uint2 w, float3 m, float roughness, float coat
         gb[n] = exp(-band * b2);
     }
     [unroll] for (uint jp = 0; jp < 8u; ++jp) {
+        // Band-limited (a footprint under reflectMinPx): the first `terms`.
+        if (2u * jp >= terms) {
+            break;
+        }
         // Values 6 jp .. 6 jp + 5: coefficients 2 jp and 2 jp + 1, three words.
         float v[6];
         [unroll] for (uint h = 0; h < 3u; ++h) {
@@ -698,6 +704,9 @@ void reflectedAlong(uint cluster, uint2 w, float3 m, float roughness, float coat
         }
         [unroll] for (uint e = 0; e < 2u; ++e) {
             const uint j = 2u * jp + e;
+            if (j >= terms) {
+                break;
+            }
             const float3 f = float3(v[3u * e], v[3u * e + 1u], v[3u * e + 2u]);
             const uint n = j < 1u ? 0u : (j < 4u ? 1u : (j < 9u ? 2u : 3u));
             const float3 value = f * envBasisValue(j, m);
@@ -1049,7 +1058,8 @@ float3 eyeFrom(SplatSurface s) { return normalize(compactParams.eyeWorld.xyz - s
 
 /// The reflected field along the mirror (polish, coat) and, for a
 /// transmitting splat, along the way through: what relitCompact reads.
-void reflectedTerms(CompactSurface c, uint2 wr, out float3 polish, out float3 coat, out float3 through) {
+void reflectedTerms(CompactSurface c, uint2 wr, out float3 polish, out float3 coat, out float3 through,
+                    uint terms = 16u) {
     const SplatSurface s = c.surface;
     // eyeField.w (checks): 1 every splat reads eyeField; 2 or 3 the splats
     // of the other parity than (w - 2) read it, the rest the eye.
@@ -1059,7 +1069,7 @@ void reflectedTerms(CompactSurface c, uint2 wr, out float3 polish, out float3 co
     const float3 mirror = reflect(-wo, s.normal);
     const bool coated = s.lobes.coatWeight > 0.0;
     reflectedAlong(c.cluster, wr, mirror, s.roughness, coated ? s.lobes.coatRoughness : s.roughness,
-                   transmittedWeightOf(s) > 0.0, -wo, polish, coat, through);
+                   transmittedWeightOf(s) > 0.0, -wo, polish, coat, through, terms);
 }
 
 /// Splat i's relit colour (linear) and alpha (-1: its own), as relight.slang's
@@ -1120,7 +1130,8 @@ bool compactTurnPerPixel(CompactSplat g, float3x3 r, float3 shapeUV, float3 clou
 /// coat's weight and roughness; the polish's weight and roughness. The
 /// centre's readings of both lobes are out of the colour (the draw reads
 /// them per pixel). Zero records: nothing per pixel.
-public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sharpB, bool perPixel = true) {
+public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sharpB, bool perPixel = true,
+                          float footprintPx = 1.0e9) {
     sharpA = uint4(0u);
     sharpB = uint4(0u);
     if (hasFlag(kCompactPlain)) {
@@ -1176,7 +1187,10 @@ public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sh
     float3 coat = float3(0.0);
     float3 through = float3(0.0);
     if (indirect) {
-        reflectedTerms(cs, weightsOf(i, 2u), polish, coat, through);
+        // A footprint under reflectMinPx reads its reflected field
+        // band-limited (reflectSubTerms of its 16 coefficients).
+        const uint terms = footprintPx < compactParams.reflectMinPx ? compactParams.reflectSubTerms : 16u;
+        reflectedTerms(cs, weightsOf(i, 2u), polish, coat, through, terms);
     }
     const float openness = opennessValue(c, wd);
     float3 light = relitCompact(surface, eyeFrom(surface), 0u, indirect, front, coupling, sunShare, polish, coat,
@@ -1555,7 +1569,8 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         }
         uint4 sharpA, sharpB;
         // A footprint under sharpMinPx: its centre's reading is the pixel's.
-        const float4 lit = shadeColour(i, g, sharpA, sharpB, max(sigma.x, sigma.y) >= compactParams.sharpMinPx) *
+        const float4 lit = shadeColour(i, g, sharpA, sharpB, max(sigma.x, sigma.y) >= compactParams.sharpMinPx,
+                                       max(sigma.x, sigma.y)) *
                            float4(float3(sheetScale), 1.0);
         if (hasFlag(kCompactSharp)) {
             // The weights scaled with the colour (a sheet's floor).

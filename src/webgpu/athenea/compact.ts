@@ -706,6 +706,14 @@ export interface CompactPathOptions {
    * deviation in px (default 1: a splat under it keeps its centre's reading).
    */
   sharpMinPx?: number;
+  /**
+   * A footprint whose major deviation is under this many px reads its
+   * reflected field band-limited to `reflectSubTerms` of its 16
+   * coefficients (1 the mean, 4 degree 1, 9 degree 2); 0 off. Default 3 px
+   * and degree 1: within 0.01 dB of the full field against the path trace.
+   */
+  reflectMinPx?: number;
+  reflectSubTerms?: number;
   /** Check only (thread CW): the coat's and polish's roughness at least this. */
   coatFloor?: number;
   /**
@@ -857,7 +865,7 @@ export class CompactRelitPath {
       faint: true,
       releaseSky: true,
       plain: false,
-      binByCluster: false,
+      binByCluster: true,
       fieldEye: null,
       fieldFreshParity: null,
       stableOrder: false,
@@ -867,6 +875,8 @@ export class CompactRelitPath {
       debugBits: 0,
       sharp: false,
       sharpMinPx: 1,
+      reflectMinPx: 3,
+      reflectSubTerms: 4,
       coatFold: true,
       polishField: true,
       ...options,
@@ -1111,6 +1121,8 @@ export class CompactRelitPath {
       keyScale: ((1 << K.kCompactKeyBits) - 1) / (far * 1.8),
       cullFacing: o.cullBacksFacing,
       sharpMinPx: o.sharpMinPx,
+      reflectMinPx: o.reflectMinPx,
+      reflectSubTerms: o.reflectSubTerms,
       sheetFade: o.sheetFade,
       row0: row(0),
       row1: row(1),

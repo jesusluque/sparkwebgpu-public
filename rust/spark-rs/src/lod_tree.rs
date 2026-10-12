@@ -841,7 +841,7 @@ fn put_compact_page(state: &mut LodState, lod_id: u32, page_base: u32, chunk_bas
             let mut w = PackedWriter::new(n, *centre_bits);
             for (i, (t, c)) in page.iter().zip(&codes).enumerate() {
                 let key = (base + i) as u32;
-                let packed = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_node(t, c, chunk as u32, *centre_bits) };
+                let packed = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_node(t, c, &pq, *centre_bits) };
                 match packed {
                     Some((class, bits)) => {
                         w.push(i, class, bits);
@@ -1901,6 +1901,10 @@ struct PageQuant {
     dec: Vec<u16>,
     /// The page's distinct occlusion indices (a node keeps its place, 9 bits).
     palette: Vec<u16>,
+    /// The pages its merges' children are in, sorted (a merge keeps its
+    /// index, 9 bits; thread CU round 10: the 1280 car's children were
+    /// often 511+ pages on, 181k nodes kept whole in `full`).
+    kids: Vec<u16>,
     lo: [f32; 3],
     span: [f32; 3],
     ctop: f32,
@@ -2078,6 +2082,16 @@ impl CompactQuant {
                 pq.palette[k as usize] = v;
             }
         }
+        let mut kids: Vec<u16> = page
+            .iter()
+            .filter(|t| t.count == 2 && !t.size_mode)
+            .map(|t| (t.child_page & 0xffff) as u16)
+            .collect();
+        kids.sort_unstable();
+        kids.dedup();
+        kids.truncate(511);
+        kids.shrink_to_fit();
+        pq.kids = kids;
         pq.fill_tables();
         (pq, codes)
     }
@@ -2192,7 +2206,7 @@ fn take(r: u128, at: &mut u32, n: u32) -> u32 {
 
 /// Node `t`'s class and record (already quantized by `apply`, its codes
 /// `c`), or None: kept whole.
-fn pack_node(t: &spark_lib::athc_compact::TraversalNode, c: &NodeCodes, chunk: u32, cb: u32) -> Option<(u32, u128)> {
+fn pack_node(t: &spark_lib::athc_compact::TraversalNode, c: &NodeCodes, pq: &PageQuant, cb: u32) -> Option<(u32, u128)> {
     if t.size_mode || c.occl >= OCCL_FULL {
         return None;
     }
@@ -2216,10 +2230,13 @@ fn pack_node(t: &spark_lib::athc_compact::TraversalNode, c: &NodeCodes, chunk: u
             _ => None,
         };
     }
-    let delta = t.child_page.wrapping_sub(chunk) & 0xffff;
-    if t.count != 2 || delta >= 511 || c.eps == 0 || c.rho == 0 && t.rho != 0 {
+    if t.count != 2 || c.eps == 0 || c.rho == 0 && t.rho != 0 {
         return None;
     }
+    let Ok(kid) = pq.kids.binary_search(&((t.child_page & 0xffff) as u16)) else {
+        return None;
+    };
+    let delta = kid as u32;
     put(&mut r, &mut at, 8, c.eps);
     put(&mut r, &mut at, 7, c.rho);
     put(&mut r, &mut at, 12, t.place);
@@ -2260,8 +2277,8 @@ fn unpack_node(class: u32, r: u128, p: &PageQuant, cb: u32) -> LodSplat {
         let eps = take(r, &mut at, 8);
         let rho = take(r, &mut at, 7);
         let place = take(r, &mut at, 12);
-        let delta = take(r, &mut at, 9);
-        let child_page = (p.chunk + delta) & 0xffff;
+        let kid = take(r, &mut at, 9);
+        let child_page = p.kids[kid as usize] as u32;
         s = LodSplat::new_f16(centre.map(f16::from_bits), f16::ZERO, child_page << 16 | place, 2);
         s.eps = f16::from_bits(p.eps(eps));
         s.rho = f16::from_bits(if rho == 0 { 0 } else { p.rho(rho) });
@@ -2360,7 +2377,7 @@ mod quant_tests {
                     }
                     let d = Vec3A::from_array(t.centre.map(|v| f16::from_bits(v).to_f32())) - Vec3A::from_array(e.centre.map(|v| f16::from_bits(v).to_f32()));
                     assert!(d.length() <= pq.margin);
-                    let p = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_node(t, c, chunk, cb) };
+                    let p = if t.count == 0 && (t.eps != 0 || t.rho != 0) { None } else { pack_node(t, c, &pq, cb) };
                     match p {
                         Some((class, r)) => {
                             w.push(i, class, r);
@@ -2677,16 +2694,16 @@ mod quant_tests {
                 let input = traversal_input(&raw, n);
                 let head = layout.pages[p].compact;
                 let mut page: Vec<TraversalNode> = (0..n).map(|i| spark_lib::athc_compact::traversal_node_input(&input, n, &head, p as u32, i)).collect();
-                let (_, codes) = CompactQuant { centre_bits: 9, ..QUANT_RECORD_BITS }.apply(&mut page);
+                let (pq, codes) = CompactQuant { centre_bits: 9, ..QUANT_RECORD_BITS }.apply(&mut page);
                 for (t, c) in page.iter().zip(&codes) {
                     total += 1;
                     let why = if t.count == 0 && (t.eps != 0 || t.rho != 0) { "leaf with error" }
-                    else if pack_node(t, c, p as u32, 9).is_some() { continue }
+                    else if pack_node(t, c, &pq, 9).is_some() { continue }
                     else if c.occl >= OCCL_FULL { "occlusion palette" }
                     else if t.size_mode { "size mode" }
                     else if t.count == 0 { if c.theta_class == 2 { "leaf -0" } else { "leaf theta code" } }
                     else if t.count != 2 { "children" }
-                    else if t.child_page.wrapping_sub(p as u32) & 0xffff >= 511 { "page delta" }
+                    else if pq.kids.binary_search(&((t.child_page & 0xffff) as u16)).is_err() { "child page palette" }
                     else if c.eps == 0 { "eps code" }
                     else if c.rho == 0 { "rho code" }
                     else { "theta/cone" };
@@ -2736,4 +2753,88 @@ mod quant_tests {
         }
         eprintln!("pages {pages} leaves {leaves} merges {merges} (wide {wide}) children same page {same} next {d1} <16 {d16}; cones merges {cone_m} leaves {cone_l}; occluded {occl}; distinct occlusion a page max {distinct_max} hist(<16,<64,<256,<1k,<4k,more) {distinct_hist:?}");
     }
+}
+
+/// What the LoD trees hold, in bytes (thread CU round 10: the WASM heap's
+/// breakdown), as a JS object: each shared node store's records, page
+/// tables and maps, and the traversal's buffers. The heap itself (the
+/// memory's size) is the worker's `wasmMemory`.
+#[wasm_bindgen]
+pub fn lod_memory_report() -> JsValue {
+    let o = js_sys::Object::new();
+    let set = |k: &str, v: f64| {
+        js_sys::Reflect::set(&o, &JsValue::from_str(k), &JsValue::from_f64(v)).ok();
+    };
+    STATE.with_borrow(|state| {
+        let mut seen: Vec<*const RefCell<LodNodes>> = Vec::new();
+        let (mut records, mut index, mut tables, mut full, mut wide, mut quant_pages, mut slots_total) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut pages_alloc = 0usize;
+        let mut maps = 0usize;
+        for t in state.lod_trees.values() {
+            maps += 4 * (t.page_to_chunk.capacity() + t.chunk_to_page.capacity());
+            let ptr = Rc::as_ptr(&t.splats);
+            if seen.contains(&ptr) {
+                continue;
+            }
+            seen.push(ptr);
+            match &*t.splats.borrow() {
+                LodNodes::Full(v) => records += v.capacity() * std::mem::size_of::<LodSplat>(),
+                LodNodes::Compact { nodes, wide: w, margins, .. } => {
+                    records += nodes.capacity() * std::mem::size_of::<CompactLodNode>();
+                    wide += w.capacity() * 8;
+                    tables += margins.capacity() * 4;
+                }
+                LodNodes::Quant { nodes, pages, full: f, wide: w, slot, .. } => {
+                    slots_total += nodes.len() * *slot as usize;
+                    pages_alloc += nodes.capacity() * std::mem::size_of::<PackedPage>()
+                        + pages.capacity() * std::mem::size_of::<PageQuant>();
+                    for n in nodes {
+                        if !n.bytes.is_empty() {
+                            quant_pages += 1;
+                        }
+                        records += n.bytes.len();
+                        index += 4 * (n.lo.len() + n.hi.len() + n.pre.len());
+                    }
+                    for p in pages {
+                        tables += 2 * (p.dec.capacity() + p.palette.capacity() + p.kids.capacity());
+                    }
+                    full += f.capacity() * (4 + std::mem::size_of::<CompactLodNode>());
+                    wide += w.capacity() * 8;
+                }
+            }
+        }
+        let occl: usize = {
+            let mut s: Vec<*const (Vec<u32>, [f32; 6])> = Vec::new();
+            let mut b = 0;
+            for t in state.lod_trees.values() {
+                if let Some(oc) = &t.occlusion {
+                    let p = Rc::as_ptr(oc);
+                    if !s.contains(&p) {
+                        s.push(p);
+                        b += 4 * oc.0.capacity();
+                    }
+                }
+            }
+            b
+        };
+        set("trees", state.lod_trees.len() as f64);
+        set("stores", seen.len() as f64);
+        set("residentPages", quant_pages as f64);
+        set("slotsNodes", slots_total as f64);
+        set("records", records as f64);
+        set("recordIndex", index as f64);
+        set("pageTables", tables as f64);
+        set("pageStructs", pages_alloc as f64);
+        set("fullMap", full as f64);
+        set("wideMap", wide as f64);
+        set("chunkMaps", maps as f64);
+        set("occlusion", occl as f64);
+        set("frontier", ((state.frontier.heap.capacity() + state.frontier.stack.capacity()) * 16) as f64);
+        set("output", (state.output.capacity() * 12) as f64);
+        set("culled", (state.culled.capacity() * 8) as f64);
+        set("touched", (state.touched.capacity() * 8 + state.touched_set.capacity() * 8) as f64);
+        set("buffer", (state.buffer.capacity() * 4) as f64);
+    });
+    o.into()
 }

@@ -1991,7 +1991,11 @@ export class CompactBandStreamer {
   /** Pages posted to the worker, not landed back yet. */
   private unpacking = 0;
   private remoteBusy = false;
-  private remoteStats: Record<string, number | boolean> = {};
+  private remoteStats: Record<string, unknown> = {};
+  /** The node worker's last stats (debug). */
+  get cutterStats() {
+    return this.remoteStats;
+  }
   private keysWaiting = new Map<number, (k: Int32Array) => void>();
   private remoteKeys: Int32Array | null = null;
 

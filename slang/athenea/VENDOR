@@ -78,3 +78,5 @@ d8a8ee1c7d5969693623488e18ba08dcb7d7546cb17a87d5c4c0f941ae3ebce3  technique/disp
 # sha256  patch (slang/athenea_patches/), applied after the copy
 41886c9441f9c3f56c27f0adecdcd68a84ce8e453318a06005e75934e3b45842  0001-sharp-lobes-unwidened-polish-field.patch
 d612c4ea1ab841941ed2f878099de00f62d9f42c4dac6cd2f8cbdffb70c2b1ff  0002-fold-widens-sharp-lobes.patch
+d9f1f8e4716aa935a51c67b5e24d29d72c05d66dd70011d2e52f0986b4f9f33d  0003-far-face-reflection-third-point.patch
+d8f38fdeb296506c6501008fd87d5e06dfbc4c78b7fc09a1b482de21a36788a8  0004-lens-opens-against-fresnel.patch

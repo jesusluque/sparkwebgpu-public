@@ -34,6 +34,10 @@ use crate::splat_encode::{
     set_lod_tree_size,
 };
 
+/// `plainLobes()` packed (athc_build::pack_lobes(&SplatLobes::PLAIN)): the
+/// material of a cloud that carries no lobes.
+const PLAIN_LOBES: [u32; 3] = [0xffff_ffff, 0x4020_0000, 0];
+
 /// Bytes a node in a `CMPC` section (v2, thread CQ: the GPU's 40, then the
 /// traversal's 16).
 pub const NODE_BYTES: usize = 64;
@@ -935,7 +939,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
         if b.n == 0 {
             continue;
         }
-        // A cloud without lobes (no coat or specular layer) keeps zeros.
+        // A cloud without lobes (no coat or specular layer): plainLobes' words.
         if b.normals.len() != b.n || b.pbr.len() != b.n || !(b.lobes.is_empty() || b.lobes.len() == 3 * b.n) {
             bail!("compact: page {p} lacks normals, pbr or lobes (3 words): n {} normals {} pbr {} lobes {}", b.n, b.normals.len(), b.pbr.len(), b.lobes.len());
         }
@@ -1087,7 +1091,11 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
                     raw[at(P_CURVATURE) + 3 * i + k] = (if v < 0.0 { -m } else { m }) as u8;
                 }
             }
-            let lobes = if b.lobes.is_empty() { [0; 3] } else { [b.lobes[3 * i], b.lobes[3 * i + 1], b.lobes[3 * i + 2]] };
+            // A cloud without lobes reflects with `plainLobes()` (specular
+            // weight 1 at index 1.5), as the relight reads a missing array:
+            // zeros were a material with no polish at all and an index of
+            // 1, no lens (athenea's pawn, which carries no lobe primvars).
+            let lobes = if b.lobes.is_empty() { PLAIN_LOBES } else { [b.lobes[3 * i], b.lobes[3 * i + 1], b.lobes[3 * i + 2]] };
             let key = [b.pbr[i], lobes[0], lobes[1], lobes[2]];
             let m = match material_of.get(&key) {
                 Some(&m) => m,
@@ -1705,6 +1713,12 @@ pub fn build_asset_with(pieces: &[&[u8]], entries: usize, rounds: usize, shared_
 pub(crate) mod tests {
     use super::*;
     use crate::athc_v3::{parse_v3, read_v3, write_v3_paged, write_v3_paged_compact, SectionId, COMPRESSION_GZIP, ENCODING_BYTE_PLANES};
+
+    #[test]
+    fn plain_lobes_are_athenea_plain_lobes() {
+        // Thread CY: a lobe-less cloud (athenea's pawn) gets plainLobes(), not zeros.
+        assert_eq!(PLAIN_LOBES, crate::athc_build::pack_lobes(&crate::athc_build::SplatLobes::PLAIN));
+    }
 
     /// A joint basis of athenea's shape with `c` clusters of deterministic values.
     pub(crate) fn sample_basis(c: usize) -> JointBasis {

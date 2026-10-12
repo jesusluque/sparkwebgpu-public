@@ -738,9 +738,15 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
         const float4 w1 = relightParams.row1;
         const float4 w2 = relightParams.row2;
         {
+            // A TUBE TURNS, A FOLD WIDENS (athenea f9c9a2b, splat_project): t,
+            // the turn across +-2 sigma, is twice the bake's spread; on a
+            // surface's own curvature the pixels turn in full, on normals
+            // smoothed across a fold the turn goes and the sharp lobes widen
+            // by it (foldWidened, below).
+            const float held = 1.0 - smoothstep(kFoldTurnLow, kFoldTurnHigh, 2.0 * spread);
             const float most = 0.5;
-            const float3 hx = dx * min(1.0, most / max(length(dx), 1.0e-9));
-            const float3 hy = dy * min(1.0, most / max(length(dy), 1.0e-9));
+            const float3 hx = held * dx * min(1.0, most / max(held * length(dx), 1.0e-9));
+            const float3 hy = held * dy * min(1.0, most / max(held * length(dy), 1.0e-9));
             slope.on = true;
             slope.normalX = relightNormalToWorld(w0, w1, w2, normalize(cloudNormal + hx));
             slope.normalY = relightNormalToWorld(w0, w1, w2, normalize(cloudNormal + hy));
@@ -782,6 +788,19 @@ float4 relitColour<let kTransfer : int, let kCpca : int>(uint i, out RelightPixe
             const float own = unwidened(min(storedPolish, slope.sharpPolishRoughness), spread);
             slope.sharpPolishRoughness =
                 pixelTerm ? footprintRoughness(own, float3(0.0), g.scales, gain, kappa, 0.0, sharpPixelVariance) : own;
+        }
+    }
+    // A FOLD WIDENS the sharp lobes by the turn the pixels no longer take
+    // (athenea f9c9a2b: alpha' = sqrt(alpha^2 + w (t/2)^2), held under
+    // kFoldRoughness), after the unwidening.
+    if (kTransfer >= 2 && slope.sharpOn && spread > 0.0) {
+        const float turn = 2.0 * spread;
+        const float widen = smoothstep(kFoldTurnLow, kFoldTurnHigh, turn) * 0.25 * turn * turn;
+        if (slope.sharpWeight > 0.0) {
+            slope.sharpRoughness = foldWidened(slope.sharpRoughness, widen);
+        }
+        if (any(slope.sharpPolish > float3(0.0))) {
+            slope.sharpPolishRoughness = foldWidened(slope.sharpPolishRoughness, widen);
         }
     }
     float alpha = -1.0;

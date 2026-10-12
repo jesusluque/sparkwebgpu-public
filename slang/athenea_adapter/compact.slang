@@ -1135,15 +1135,23 @@ public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sh
     sharp.polishSeen = float3(0.0);
     float3 normalX = float3(0.0);
     float3 normalY = float3(0.0);
+    float pixelTurn2 = 0.0;
     if (perPixel && hasFlag(kCompactSharp) && cs.curved && hasFlag(kCompactIndirect)) {
         const float3x3 r = splatRotation(g.quaternion);
         const float3 cloudNormal = splatShadingNormal(r, g.scales, g.center, compactParams.eyeObject.xyz, false, 0u);
         float3 dx, dy;
         if (compactTurnPerPixel(g, r, cs.shapeUV, cloudNormal, dx, dy)) {
-            // splat_project's turn, held to half a radian a pixel.
+            // splat_project's turn, held to half a radian a pixel; a tube
+            // turns, a fold widens (athenea f9c9a2b): past kFoldTurnLow of
+            // turn across +-2 sigma (twice the bake's spread) the pixels'
+            // turn goes and the sharp lobes widen by it (foldWidened, below).
+            const float held = 1.0 - smoothstep(kFoldTurnLow, kFoldTurnHigh, 2.0 * cs.spread);
             const float most = 0.5;
-            const float3 hx = dx * min(1.0, most / max(length(dx), 1.0e-9));
-            const float3 hy = dy * min(1.0, most / max(length(dy), 1.0e-9));
+            const float3 hx = held * dx * min(1.0, most / max(held * length(dx), 1.0e-9));
+            const float3 hy = held * dy * min(1.0, most / max(held * length(dy), 1.0e-9));
+            // The pixel's own spread (athenea's splat_project): the normal
+            // turns by these across a pixel.
+            pixelTurn2 = held * held * (dot(dx, dx) + dot(dy, dy));
             const float3 stored = normalOf(i);
             const float3 n = dot(stored, cloudNormal) < 0.0 ? -stored : stored;
             const float4 w0 = compactParams.row0;
@@ -1182,8 +1190,16 @@ public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sh
         float2 stepY = octEncode(reflect(-wo, normalY)) - at;
         stepX = all(abs(stepX) < 0.25) ? stepX : float2(0.0);
         stepY = all(abs(stepY) < 0.25) ? stepY : float2(0.0);
-        const float coatR = unwidened(cs.storedCoat, cs.spread);
-        const float polishR = unwidened(cs.storedPolish, cs.spread);
+        const float turn = 2.0 * cs.spread;
+        const float widen = smoothstep(kFoldTurnLow, kFoldTurnHigh, turn) * 0.25 * turn * turn;
+        // THE PIXEL'S OWN SPREAD (athenea's splat_project): the read is at
+        // the pixel's centre and the normal turns by dx, dy across it, a box
+        // of slopes whose variance, twice for the mirror, widens the lobe:
+        // alpha^2 += 2 (|dx|^2 + |dy|^2) / 12.
+        const float coatA = foldWidened(unwidened(cs.storedCoat, cs.spread), widen);
+        const float polishA = foldWidened(unwidened(cs.storedPolish, cs.spread), widen);
+        const float coatR = sqrt(sqrt(min(coatA * coatA * coatA * coatA + pixelTurn2 / 6.0, 1.0)));
+        const float polishR = sqrt(sqrt(min(polishA * polishA * polishA * polishA + pixelTurn2 / 6.0, 1.0)));
         sharpA = uint4(packHalves(at.x, at.y), packHalves(stepX.x, stepX.y), packHalves(stepY.x, stepY.y),
                        packHalves(sharp.coatWeight, coatR));
         sharpB = uint4(packHalves(sharp.polishWeight.x, sharp.polishWeight.y),

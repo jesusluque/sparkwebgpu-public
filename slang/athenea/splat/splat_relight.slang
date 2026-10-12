@@ -1160,6 +1160,32 @@ public float unwidened(float roughness, float spread) {
 /// sky and drew the joint as a dark streak.
 public static const float kCoatFoldRoughness = 0.3;
 
+/// A TUBE OR A FOLD, by how far a gaussian's normal turns across its
+/// footprint, t = kMax 2 sigma_max (research, tubecrease): under kFoldTurnLow
+/// it is a surface's own curvature -- a chrome tube's body, coherent with its
+/// neighbours -- and its pixels turn with it in full, which draws the tube's
+/// thin line of light; past kFoldTurnHigh it is a mesh's normals smoothed
+/// across a fold within triangles narrower than the gaussian (a sill's 5 to 9
+/// radians), which no one gaussian can turn through, so its sharp lobes are
+/// widened by the turn instead -- alpha' = sqrt(alpha^2 + (t/2)^2), held under
+/// kFoldRoughness -- as the path traced frame integrates the fold in a pixel.
+/// Between, a smoothstep, so a moving camera does not see a step.
+public static const float kFoldTurnLow = 0.7;
+public static const float kFoldTurnHigh = 1.5;
+public static const float kFoldRoughness = 0.5;
+
+/// A sharp lobe's roughness widened by its fold (SplatSlope::foldWiden, the
+/// (t/2)^2 a fold adds to alpha^2); never narrower, never past kFoldRoughness
+/// unless it already was.
+public float foldWidened(float roughness, float widen) {
+    if (!(widen > 0.0)) {
+        return roughness;
+    }
+    const float alpha = roughness * roughness;
+    const float wide = sqrt(sqrt(alpha * alpha + widen));
+    return max(roughness, min(wide, kFoldRoughness));
+}
+
 public struct SplatSlope {
     public bool   on;
     public float3 normalX;
@@ -1181,6 +1207,9 @@ public struct SplatSlope {
     /// door's lacquer -- a mirror -- came out a matte 0.11 (research, the
     /// whole Corvette against the path trace). 0: not widened, or unknown.
     public float  bakeSpread;
+    /// What a fold adds to a sharp lobe's alpha^2 (kFoldTurnLow ..
+    /// kFoldTurnHigh): 0 on a surface's own curvature.
+    public float  foldWiden;
     public bool   cached;
     public uint   cachedDome;
     public float3 cachedFront;
@@ -1228,6 +1257,7 @@ public SplatSlope noSlope() {
     g.slopeY = float3(0.0);
     g.curvature = 0.0;
     g.bakeSpread = 0.0;
+    g.foldWiden = 0.0;
     g.cached = false;
     g.cachedDome = 0xFFFFFFFFu;
     g.cachedFront = float3(0.0);
@@ -1415,7 +1445,7 @@ float3 relitByDome<let kTransfer : int>(SplatSurface s, float3 wo, LightRecord l
             if (kTransfer >= 2 && slope.on && !s.hasReflection && dome == 0u &&
                 s.lobes.coatRoughness < kSharpRoughness) {
                 slope.sharpWeight = dot(layers.coat, float3(0.2126, 0.7152, 0.0722)) * coatNarrowed;
-                slope.sharpRoughness = unwidened(s.lobes.coatRoughness, slope.bakeSpread);
+                slope.sharpRoughness = foldWidened(unwidened(s.lobes.coatRoughness, slope.bakeSpread), slope.foldWiden);
                 slope.sharpSeen = coatSeen;
                 slope.sharpMirror = mirror;
                 slope.sharpMirrorX = reflect(-wo, slope.normalX);
@@ -1444,7 +1474,7 @@ float3 relitByDome<let kTransfer : int>(SplatSurface s, float3 wo, LightRecord l
                 // The polish goes to the blend per pixel (SplatSlope's sharp
                 // polish), along the same mirror and turn as the coat's.
                 slope.sharpPolish = polishWeight;
-                slope.sharpPolishRoughness = unwidened(s.roughness, slope.bakeSpread);
+                slope.sharpPolishRoughness = foldWidened(unwidened(s.roughness, slope.bakeSpread), slope.foldWiden);
                 slope.sharpPolishSeen = seen;
                 slope.sharpSunPolish = layers.under * thinWallGain(s) * splatPolish(s, nDotV) * sunShare;
                 slope.sharpSunCentre += layers.under * thinWallGain(s) * sunPolish;

@@ -742,7 +742,7 @@ export class CompactRelitPath {
   private bins: GPUBuffer | null = null;
   /**
    * The shade's aux buffer: the bins (kCompactBinned, 2 x kCompactBins +
-   * capacity words) then the sharp records (kCompactSharp, 6 words a slot);
+   * capacity words) then the sharp records (kCompactSharp, 5 words a slot);
    * a placeholder when neither is on.
    */
   private sharpRecords: GPUBuffer | null = null;
@@ -804,15 +804,15 @@ export class CompactRelitPath {
     // made again when the list grows past it or shrinks under 90 % of it.
     const drawn = Math.max(Math.min(this.listed, this.capacity), 1);
     const bytes = sharp
-      ? (binWords + 6 * Math.ceil(drawn * 1.02)) * 4
+      ? (binWords + 5 * Math.ceil(drawn * 1.02)) * 4
       : binned
         ? binWords * 4
         : 16;
-    const need = sharp ? (binWords + 6 * drawn) * 4 : bytes;
+    const need = sharp ? (binWords + 5 * drawn) * 4 : bytes;
     if (
       !this.sharpRecords ||
       this.sharpRecords.size < need ||
-      (sharp && this.sharpRecords.size > (binWords + (6 * drawn) / 0.9) * 4) ||
+      (sharp && this.sharpRecords.size > (binWords + (5 * drawn) / 0.9) * 4) ||
       (bytes === 16 && this.sharpRecords.size > 16)
     ) {
       this.sharpRecords?.destroy();

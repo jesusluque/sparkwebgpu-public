@@ -83,7 +83,9 @@ export function createReflectedRenderPipeline(
     .sort((a, b) => a.group - b.group || a.binding - b.binding);
 
   for (const b of bindings) {
-    if (b.kind === "unsupported" || b.kind === "external") {
+    // An external binding (a texture or a sampler, thread CW) carries its
+    // own layout; the caller binds it by name.
+    if (b.kind === "unsupported" || (b.kind === "external" && !b.layout)) {
       throw new Error(`${module.name}: unsupported binding '${b.name}'`);
     }
   }
@@ -113,11 +115,17 @@ export function createReflectedRenderPipeline(
   return { pipeline, layouts, bindings };
 }
 
-/** Bind groups for a reflected pipeline, buffers by binding name. */
+/**
+ * Bind groups for a reflected pipeline, buffers by binding name; an external
+ * binding (a texture view or a sampler) is bound as it is given.
+ */
 export function createBindGroups(
   device: GPUDevice,
   rp: ReflectedRenderPipeline,
-  buffers: Record<string, GPUBuffer | GPUBufferBinding>,
+  buffers: Record<
+    string,
+    GPUBuffer | GPUBufferBinding | GPUTextureView | GPUSampler
+  >,
 ): GPUBindGroup[] {
   return rp.layouts.map((layout, group) =>
     device.createBindGroup({
@@ -127,6 +135,9 @@ export function createBindGroups(
         .map((b) => {
           const r = buffers[b.name];
           if (!r) throw new Error(`missing buffer '${b.name}'`);
+          if (b.kind === "external") {
+            return { binding: b.binding, resource: r as GPUBindingResource };
+          }
           return {
             binding: b.binding,
             resource:

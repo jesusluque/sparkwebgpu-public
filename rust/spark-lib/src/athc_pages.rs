@@ -41,6 +41,39 @@ use serde::Serialize;
 use crate::athc::{merge_root, orient_merged, AthcBlock};
 use crate::athc_build::reorder;
 use crate::athc_lod_cut::{pack_error, unpack_error, NodeBounds, LOD_ERROR_WORDS, NO_CONE};
+
+/// Row `j` of `src` over row `i` of `dst` (every stream both carry).
+fn copy_row(dst: &mut AthcBlock, i: usize, src: &AthcBlock, j: usize) {
+    fn one(d: &mut [u32], dn: usize, i: usize, s: &[u32], sn: usize, j: usize) {
+        if d.is_empty() || s.is_empty() {
+            return;
+        }
+        let per = d.len() / dn;
+        if s.len() / sn != per {
+            return;
+        }
+        d[i * per..(i + 1) * per].copy_from_slice(&s[j * per..(j + 1) * per]);
+    }
+    let (dn, sn) = (dst.n, src.n);
+    dst.positions[i * 4..i * 4 + 4].copy_from_slice(&src.positions[j * 4..j * 4 + 4]);
+    one(&mut dst.shape, dn, i, &src.shape, sn, j);
+    one(&mut dst.sh, dn, i, &src.sh, sn, j);
+    one(&mut dst.normals, dn, i, &src.normals, sn, j);
+    one(&mut dst.emission, dn, i, &src.emission, sn, j);
+    one(&mut dst.pbr, dn, i, &src.pbr, sn, j);
+    one(&mut dst.lobes, dn, i, &src.lobes, sn, j);
+    one(&mut dst.transfer, dn, i, &src.transfer, sn, j);
+    one(&mut dst.shadow_bits, dn, i, &src.shadow_bits, sn, j);
+    one(&mut dst.curvature, dn, i, &src.curvature, sn, j);
+    one(&mut dst.skin, dn, i, &src.skin, sn, j);
+    // Never occluded, no second opacity.
+    if !dst.occlusion.is_empty() {
+        dst.occlusion[i] = 0;
+    }
+    if !dst.lod_mass.is_empty() {
+        dst.lod_mass[i] = 0;
+    }
+}
 use crate::athc_v3::{BlockEntry, Section};
 
 /// Words a node in the `TREE` section: its children's page, then their
@@ -233,6 +266,9 @@ pub struct PackReport {
     /// Sibling runs that crossed a page boundary in athenea's paging.
     pub split_runs: usize,
     pub merges_oriented: usize,
+    /// Synthetic nodes over the roots (`pack_pages_with`), and their pages.
+    pub synthetic_nodes: usize,
+    pub synthetic_pages: usize,
 }
 
 /// A paged tree: its pages (blocks with TREE words, LODE, tails), its page
@@ -276,15 +312,186 @@ pub fn children_of(block: &AthcBlock, name: impl Fn(u32, u32) -> u32) -> (Vec<u1
 /// the traversal reads them.
 const F16_SLACK: f32 = 1.0 / 1024.0;
 
-/// athenea's tree paged by error bands (see the module).
 /// Nodes a page may hold: a pager's slot (WgpuBandPager, CompactBandStreamer).
 pub const POOL_SLOT_NODES: usize = 3072;
 
+/// Roots a forest keeps flat under its synthetic root (`pack_pages`); past
+/// it they are grouped under a synthetic hierarchy, this many a node.
+pub const SYNTHETIC_FANOUT: usize = 2048;
+
+/// The parent error a synthetic node's children see: f16 infinity in LODE,
+/// so the error cut always refines it (never drawn, as a root's 3e38).
+pub const SYNTHETIC_ERROR: f32 = f32::INFINITY;
+
+/// athenea's tree paged by error bands (see the module), a forest past
+/// `SYNTHETIC_FANOUT` roots under a synthetic hierarchy.
 pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
+    pack_pages_with(input, SYNTHETIC_FANOUT)
+}
+
+/// The synthetic nodes over a forest's roots (thread CX): rows past the
+/// input block's, each `merge_root` of its children, never drawn.
+struct Synthetic {
+    /// Index of the first synthetic node (the input block's n).
+    first: usize,
+    rows: AthcBlock,
+    /// The original roots: the synthetic root is made from them, as a flat
+    /// forest's is (the same root, so the same cut).
+    roots: Vec<u32>,
+    /// Synthetic pages (the hierarchy's, after page 0).
+    pages: usize,
+}
+
+/// `pack_pages` with the roots past `fanout` (0: never) grouped under a
+/// synthetic hierarchy (thread CX: athenea's 5120 forests, 21 065 and 29 213
+/// lone roots, which a flat page 0 of 3072 nodes cannot hold).
+///
+/// The roots in Morton order of their centres, cut into runs of at most
+/// `fanout`, each run the children of a synthetic node; again over those
+/// nodes until at most `fanout` are left, the new forest's roots (page 0,
+/// under the synthetic root). Each run is a page of its own, the levels top
+/// down after page 0, then her pages. A synthetic node:
+/// - is never drawn: its error is infinite, so the error cut refines it;
+/// - has a sphere round its children's, so the page tests hold;
+/// - has no cone and no occlusion index (it never culls its children);
+/// - carries `merge_root` of its children's rows (the streams a node needs).
+///
+/// The synthetic root is the flat forest's (made from the original roots),
+/// so the cut is the flat forest's, node for node.
+pub fn pack_pages_with(input: &PageInput, fanout: usize) -> Result<PagedTree> {
     let n = input.block.n;
+    let roots: Vec<u32> = (0..n as u32).filter(|&k| {
+        let p = input.parent.get(k as usize).copied().unwrap_or(k) as usize;
+        p == k as usize || p >= n
+    }).collect();
+    if fanout < 2 || roots.len() <= fanout || input.parent.len() != n {
+        return pack_inner(input, None);
+    }
+    let PageInput { block, parent, page, bounds, ids, first_leaf, sh_words, page_box } = *input;
+    let mut parent_x = parent.to_vec();
+    let mut bounds_x = bounds.to_vec();
+    let mut ids_x = ids.to_vec();
+    let mut first_x = first_leaf.to_vec();
+    let mut rows = AthcBlock::default();
+    // Levels bottom up: each level's runs (children of one new node).
+    let mut level: Vec<u32> = roots.clone();
+    let mut runs_by_level: Vec<Vec<Vec<u32>>> = Vec::new();
+    while level.len() > fanout {
+        // Morton order of the centres within the level's box.
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for &k in &level {
+            let c = bounds_x[k as usize].centre;
+            for d in 0..3 {
+                lo[d] = lo[d].min(c[d]);
+                hi[d] = hi[d].max(c[d]);
+            }
+        }
+        let key = |k: u32| -> u64 {
+            let c = bounds_x[k as usize].centre;
+            let mut m = 0u64;
+            let q: [u64; 3] = [0, 1, 2].map(|d| {
+                let span = (hi[d] - lo[d]).max(1e-20);
+                (((c[d] - lo[d]) / span).clamp(0.0, 1.0) * 2_097_151.0) as u64
+            });
+            for b in (0..21).rev() {
+                for d in 0..3 {
+                    m = (m << 1) | ((q[d] >> b) & 1);
+                }
+            }
+            m
+        };
+        let mut sorted = level.clone();
+        sorted.sort_by_key(|&k| (key(k), k));
+        let groups = sorted.len().div_ceil(fanout);
+        let per = sorted.len().div_ceil(groups);
+        let mut next = Vec::with_capacity(groups);
+        let mut runs = Vec::with_capacity(groups);
+        for run in sorted.chunks(per) {
+            let id = (n + rows.n) as u32;
+            // Its rows: merge_root of its children's (originals or synthetic).
+            let kids_block = if (run[0] as usize) < n {
+                reorder(block, run)
+            } else {
+                let local: Vec<u32> = run.iter().map(|&k| k - n as u32).collect();
+                reorder(&rows, &local)
+            };
+            let mut row = reorder(&merge_root(&kids_block, sh_words), &[0]);
+            if !row.occlusion.is_empty() {
+                row.occlusion[0] = 0;
+            }
+            if !row.lod_mass.is_empty() {
+                row.lod_mass[0] = 0;
+            }
+            if rows.n == 0 {
+                rows = row;
+            } else {
+                rows.append(&row);
+            }
+            let c = [rows.positions[(rows.n - 1) * 4], rows.positions[(rows.n - 1) * 4 + 1], rows.positions[(rows.n - 1) * 4 + 2]];
+            let mut rho = 0.0f32;
+            for &k in run {
+                let b = &bounds_x[k as usize];
+                let d = ((b.centre[0] - c[0]).powi(2) + (b.centre[1] - c[1]).powi(2) + (b.centre[2] - c[2]).powi(2)).sqrt();
+                rho = rho.max(d + b.rho);
+                parent_x[k as usize] = id;
+            }
+            parent_x.push(id);
+            bounds_x.push(NodeBounds {
+                eps: SYNTHETIC_ERROR,
+                rho,
+                spread: 0.0,
+                theta: 0.0,
+                cull: false,
+                centre: c,
+                colour: [0.0; 3],
+                normal: [0.0, 0.0, 1.0],
+            });
+            ids_x.push(u32::MAX);
+            first_x.push(run.iter().map(|&k| first_x[k as usize]).min().unwrap());
+            next.push(id);
+            runs.push(run.to_vec());
+        }
+        runs_by_level.push(runs);
+        level = next;
+    }
+    // Pages: the new roots in page 0; each run a page, the levels top down;
+    // then her pages.
+    let mut page_x = vec![0u32; parent_x.len()];
+    let mut at = 1u32;
+    for runs in runs_by_level.iter().rev() {
+        for run in runs {
+            for &k in run {
+                page_x[k as usize] = at;
+            }
+            at += 1;
+        }
+    }
+    let original: std::collections::HashSet<u32> = roots.iter().copied().collect();
+    for k in 0..n {
+        if !original.contains(&(k as u32)) {
+            page_x[k] = page[k] + at;
+        }
+    }
+    let synth = Synthetic { first: n, rows, roots, pages: at as usize - 1 };
+    let x = PageInput {
+        block,
+        parent: &parent_x,
+        page: &page_x,
+        bounds: &bounds_x,
+        ids: &ids_x,
+        first_leaf: &first_x,
+        sh_words,
+        page_box,
+    };
+    pack_inner(&x, Some(&synth))
+}
+
+fn pack_inner(input: &PageInput, synth: Option<&Synthetic>) -> Result<PagedTree> {
+    let n = input.parent.len();
     let PageInput { parent, page, bounds, ids, first_leaf, .. } = *input;
-    if parent.len() != n || page.len() != n || bounds.len() != n || ids.len() != n || first_leaf.len() != n {
-        bail!("pack_pages: {} nodes, {} parents, {} pages, {} bounds, {} ids, {} first leaves", n, parent.len(), page.len(), bounds.len(), ids.len(), first_leaf.len());
+    let n_block = synth.map_or(n, |s| s.first);
+    if input.block.n != n_block || synth.is_some_and(|s| s.first + s.rows.n != n) || page.len() != n || bounds.len() != n || ids.len() != n || first_leaf.len() != n {
+        bail!("pack_pages: {} nodes, {} parents, {} pages, {} bounds, {} ids, {} first leaves", input.block.n, parent.len(), page.len(), bounds.len(), ids.len(), first_leaf.len());
     }
     // Children of each node, in tree order.
     let mut kids: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -490,8 +697,17 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         rows.push(PageRow { count: list.len() as u32, first, ..Default::default() });
     }
     // The rows of every node in page order, the synthetic root made from the roots.
-    let real: Vec<u32> = order.iter().map(|&k| if k == ROOT { roots[0] } else { k }).collect();
+    let real: Vec<u32> = order.iter().map(|&k| if k == ROOT { synth.map_or(roots[0], |s| s.roots[0]) } else if k as usize >= n_block { 0 } else { k }).collect();
     let mut all = reorder(input.block, &real);
+    // The synthetic hierarchy's rows (their own, `merge_root` of their children's).
+    if let Some(s) = synth {
+        for (i, &k) in order.iter().enumerate() {
+            if k == ROOT || (k as usize) < n_block {
+                continue;
+            }
+            copy_row(&mut all, i, &s.rows, k as usize - s.first);
+        }
+    }
     // athenea's merges: the third axis turned to the normal (the decoder's
     // orient_merged for a producer's coverage), the leaves as they are.
     let merges: Vec<u32> = (0..order.len() as u32).filter(|&i| {
@@ -506,7 +722,9 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
     }
     let mut root_bounds = None;
     if synthetic {
-        let rb = reorder(input.block, &roots);
+        // A synthetic hierarchy's root is the flat forest's: of the original roots.
+        let over: &[u32] = synth.map_or(&roots, |s| &s.roots);
+        let rb = reorder(input.block, over);
         let mut root = merge_root(&rb, input.sh_words);
         orient_merged(&mut root);
         let i = (root_place.1) as usize; // page 0
@@ -542,7 +760,7 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         let c = [all.positions[i * 4], all.positions[i * 4 + 1], all.positions[i * 4 + 2]];
         let mut eps = 0.0f32;
         let mut rho = 0.0f32;
-        for &r in &roots {
+        for &r in over {
             let b = &bounds[r as usize];
             eps = eps.max(b.eps);
             let d = ((b.centre[0] - c[0]).powi(2) + (b.centre[1] - c[1]).powi(2) + (b.centre[2] - c[2]).powi(2)).sqrt();
@@ -606,7 +824,7 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         let (mut eps_max, mut eps_min) = (0.0f32, f32::MAX);
         for i in row.first as usize..(row.first + row.count) as usize {
             let up = parent_at[i];
-            let e = if up == u32::MAX { ROOT_PARENT_ERROR } else { unpack_error(all.lod_error[up as usize * 2]).0 };
+            let e = if up == u32::MAX { ROOT_PARENT_ERROR } else { unpack_error(all.lod_error[up as usize * 2]).0.min(ROOT_PARENT_ERROR) };
             eps_max = eps_max.max(e);
             eps_min = eps_min.min(e);
             row.band = row.band.max(band_of(e));
@@ -650,6 +868,8 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         parents_after_children: late_parents,
         split_runs,
         merges_oriented: merges.len(),
+        synthetic_nodes: synth.map_or(0, |s| s.rows.n),
+        synthetic_pages: synth.map_or(0, |s| s.pages),
     };
     Ok(PagedTree { pages: blocks, rows, order, report })
 }
@@ -861,6 +1081,119 @@ pub(crate) mod tests {
         assert!(e >= nb.iter().map(|b| b.eps).fold(0.0, f32::max));
         assert!(r > 0.3, "{r}");
         assert_eq!(paged.rows[0].eps_max, ROOT_PARENT_ERROR);
+    }
+
+    /// A forest: `tree(leaves)` with its top `cut` merges removed (the last
+    /// indices), their children roots.
+    fn forest(leaves: usize, cut: usize) -> (AthcBlock, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let (b, mut parent, start, size) = tree(leaves);
+        let keep = parent.len() - cut;
+        for k in 0..keep {
+            if parent[k] as usize >= keep {
+                parent[k] = k as u32;
+            }
+        }
+        parent.truncate(keep);
+        (b.slice(0, keep), parent, start[..keep].to_vec(), size[..keep].to_vec())
+    }
+
+    /// The error cut over a paged tree as the traversal makes it (refine a
+    /// node with children while eps / max(d - rho, near) passes tau), each
+    /// cut node by its source index (`order`; the synthetic root u32::MAX),
+    /// sorted; and whether a synthetic node (source >= `n`) was ever cut.
+    fn cpu_cut(paged: &PagedTree, n: usize, eye: [f32; 3], tau: f32) -> (Vec<u32>, bool) {
+        let mut out = Vec::new();
+        let mut synthetic_drawn = false;
+        let mut stack = vec![0usize];
+        let node = |i: usize| -> (usize, usize) {
+            let p = paged.rows.iter().position(|r| (r.first..r.first + r.count).contains(&(i as u32))).unwrap();
+            (p, i - paged.rows[p].first as usize)
+        };
+        while let Some(i) = stack.pop() {
+            let (p, at) = node(i);
+            let b = &paged.pages[p];
+            let (cp, c0, count) = tree_children(&b.tree[at * 2..at * 2 + 2]);
+            let (eps, rho) = unpack_error(b.lod_error[at * 2]);
+            let c = &b.positions[at * 4..at * 4 + 3];
+            let d = ((c[0] - eye[0]).powi(2) + (c[1] - eye[1]).powi(2) + (c[2] - eye[2]).powi(2)).sqrt();
+            if count > 0 && eps / (d - rho).max(1e-3) > tau {
+                let first = paged.rows[cp as usize].first;
+                for j in 0..count {
+                    stack.push((first + c0 + j) as usize);
+                }
+            } else {
+                let k = paged.order[i];
+                if k != u32::MAX && k as usize >= n {
+                    synthetic_drawn = true;
+                }
+                out.push(k);
+            }
+        }
+        out.sort_unstable();
+        (out, synthetic_drawn)
+    }
+
+    #[test]
+    fn a_synthetic_hierarchy_over_the_roots_keeps_the_flat_cut() {
+        // ~400 roots (lone leaves and small trees), two levels at fanout 8.
+        let (b, parent, start, size) = forest(1024, 400);
+        let n = b.n;
+        let nb = bounds(&b, &parent, &size);
+        let page = her_pages(&parent, &nb, &start, 64);
+        let ids: Vec<u32> = (0..n as u32).collect();
+        let input = PageInput { block: &b, parent: &parent, page: &page, bounds: &nb, ids: &ids, first_leaf: &start, sh_words: 0, page_box: PageBox::Parents };
+        let flat = pack_pages_with(&input, 0).unwrap();
+        assert!(flat.report.roots > 200, "{:?}", flat.report);
+        assert_eq!(flat.report.synthetic_nodes, 0);
+        for fanout in [8usize, 32, 128] {
+            let hier = pack_pages_with(&input, fanout).unwrap();
+            assert!(hier.report.synthetic_nodes > 0);
+            assert!(hier.rows[0].count as usize <= fanout + 1, "page 0 of {}", hier.rows[0].count);
+            check_paged(&hier.pages, &hier.rows).unwrap();
+            // Every source node once.
+            let mut seen: Vec<u32> = hier.order.iter().copied().filter(|&k| k != u32::MAX && (k as usize) < n).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, ids);
+            // Synthetic nodes: no cone, never occluded, an infinite error,
+            // a sphere round their children.
+            for (p, blk) in hier.pages.iter().enumerate() {
+                for at in 0..blk.n {
+                    let k = hier.order[(hier.rows[p].first as usize) + at];
+                    if k == u32::MAX || (k as usize) < n {
+                        continue;
+                    }
+                    assert_eq!(blk.lod_error[at * 2 + 1], NO_CONE as u32);
+                    assert!(unpack_error(blk.lod_error[at * 2]).0.is_infinite());
+                    let (cp, c0, count) = tree_children(&blk.tree[at * 2..at * 2 + 2]);
+                    assert!(cp as usize > p && count > 0);
+                    let (_, rho) = unpack_error(blk.lod_error[at * 2]);
+                    let c = &blk.positions[at * 4..at * 4 + 3];
+                    let kids = &hier.pages[cp as usize];
+                    for j in (c0..c0 + count).map(|j| j as usize) {
+                        let kc = &kids.positions[j * 4..j * 4 + 3];
+                        let (_, kr) = unpack_error(kids.lod_error[j * 2]);
+                        let d = ((kc[0] - c[0]).powi(2) + (kc[1] - c[1]).powi(2) + (kc[2] - c[2]).powi(2)).sqrt();
+                        assert!(d <= rho * 1.001 + 1e-6 || kr == 0.0 && d <= rho * 1.001 + 1e-6, "child outside: {d} > {rho}");
+                    }
+                }
+            }
+            // The page table still has every needed node's page needed.
+            for row in &hier.rows {
+                assert!(row.eps_max.is_finite() && row.count > 0);
+            }
+            // The same cut as flat, everywhere (cuts from the root alone to every leaf).
+            let mut sizes = std::collections::BTreeSet::new();
+            for eye in [[-1.0f32, 0.3, 0.0], [5.0, 0.0, 0.2], [2.0, 0.01, 0.0], [40.0, 30.0, 0.0], [5.12, 0.0, 0.0]] {
+                for tau in [1e-4f32, 1e-3, 1e-2, 0.1, 10.0] {
+                    let (a, _) = cpu_cut(&flat, n, eye, tau);
+                    let (h, drawn) = cpu_cut(&hier, n, eye, tau);
+                    assert!(!drawn, "a synthetic node in the cut (fanout {fanout}, eye {eye:?}, tau {tau})");
+                    assert_eq!(a, h, "fanout {fanout}, eye {eye:?}, tau {tau}");
+                    sizes.insert(a.len());
+                }
+            }
+            assert!(sizes.len() >= 5 && sizes.contains(&1) && sizes.iter().any(|&s| s > 900), "{sizes:?}");
+        }
     }
 
     #[test]

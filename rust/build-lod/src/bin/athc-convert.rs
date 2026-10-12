@@ -99,6 +99,8 @@
 //!                         each page's traversal planes gzipped, the GPU's in deflate runs
 //!                         (the traversal's 24 bytes a node: v2's 16, the cone, occlusion), its own tables
 //!   athc-convert --compact-asset car.cmpa --out-dir D a.athc b.athc ...   one asset table
+//!     (--table-only [--compact-basis basis.json]: the table alone, with that basis; then
+//!     the pieces may share another table already, with --piece-materials: only their masks are read)
 //!                         for the pieces (D/car.cmpa: the basis once) and each piece written
 //!                         to D under its name, sharing it; tiers 1-3 byte for byte
 //!   --table-only          (thread CS) the asset table alone, for pieces in CPCA the rebase
@@ -517,9 +519,9 @@ fn cut_values_of(w: &[f32], lists: &[Vec<u32>], per_splat: &[f32], c: usize) -> 
 
 /// `--compact-rebase` and `--compact-asset` (thread CQ).
 fn compact_asset(args: &[String]) -> Result<()> {
-    use spark_lib::athc_compact::{build_asset, rebase_compact};
+    use spark_lib::athc_compact::{build_asset_with, rebase_compact};
     let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
-    let takes = ["--compact-asset", "--out-dir", "--asset-entries", "--asset-rounds"];
+    let takes = ["--compact-asset", "--out-dir", "--asset-entries", "--asset-rounds", "--compact-basis"];
     let paths: Vec<&String> =
         args.iter().enumerate().filter(|&(i, a)| !a.starts_with("--") && !(i > 0 && takes.contains(&args[i - 1].as_str()))).map(|(_, a)| a).collect();
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -541,7 +543,22 @@ fn compact_asset(args: &[String]) -> Result<()> {
     let inputs: Vec<Vec<u8>> = paths.iter().map(std::fs::read).collect::<std::io::Result<_>>()?;
     let refs: Vec<&[u8]> = inputs.iter().map(|b| b.as_slice()).collect();
     let t = std::time::Instant::now();
-    let mut asset = build_asset(&refs, entries, rounds, shared_materials, threads)?;
+    let rebasis = value("--compact-basis").is_some();
+    let mut asset = build_asset_with(&refs, entries, rounds, shared_materials, threads, rebasis)?;
+    // `--compact-basis basis.json` (its .bin beside it; thread CX): the table
+    // with this basis instead of the pieces' (a basis refitted on the pieces'
+    // full transfer, `fit-compact-basis`; with --table-only the pieces are then
+    // written over the table by `usd-athc --compact-basis` the same basis).
+    if let Some(json_path) = value("--compact-basis") {
+        let bin_path = json_path.strip_suffix(".json").map(|p| format!("{p}.bin")).unwrap_or_else(|| format!("{json_path}.bin"));
+        let basis = spark_lib::athc_compact::JointBasis::parse(&std::fs::read_to_string(&json_path)?, &std::fs::read(&bin_path)?)?;
+        if !args.iter().any(|a| a == "--table-only") {
+            bail!("--compact-basis: with --table-only (a rebase keeps each piece's CPCA codes, made with its own basis)");
+        }
+        asset.basis = basis.table_f16();
+        asset.clusters = basis.clusters as u32;
+        eprintln!("basis: {json_path} ({} clusters)", asset.clusters);
+    }
     // athenea's occlusion codebook, once per asset (thread CS): the same in
     // every piece, with the asset's box (the pieces' boxes' union).
     let layouts: Vec<_> = refs.iter().map(|b| spark_lib::athc_v3::parse_v3(b)).collect::<Result<_>>()?;

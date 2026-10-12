@@ -14,7 +14,9 @@
 //! `--held-out <piece.athc>` (repeatable): measured, not fitted on.
 //! `--sample S` (thread CS, the whole car): fit on every S-th node of each
 //! piece only (RAM: 448 bytes a fitted node), then measure every node, one
-//! piece in memory at a time.
+//! piece in memory at a time. `piece.athc@S` (thread CX): that piece's own
+//! stride, to weigh some pieces more (athenea's 5120 detail beside the
+//! 1280 panels).
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -92,9 +94,10 @@ fn main() -> Result<()> {
     // The fit's sample: every `sample`-th node of each fitted piece.
     let mut x: Vec<f32> = Vec::new();
     for f in &files {
+        let (path, stride) = split_stride(f, sample)?;
         let before = x.len() / 112;
-        x.extend(load(f, sample)?);
-        eprintln!("{}: {} nodes sampled (1 in {sample})", stem(f), x.len() / 112 - before);
+        x.extend(load(path, stride)?);
+        eprintln!("{}: {} nodes sampled (1 in {stride})", stem(path), x.len() / 112 - before);
     }
     let (basis, fit) = fit_joint_basis(&x, &o)?;
     eprintln!("fit: {}", serde_json::to_string(&fit)?);
@@ -115,6 +118,7 @@ fn main() -> Result<()> {
     let mut tot = [([0f64; 3], [0f64; 3]); 2];
     let mut tot_nodes = 0usize;
     for (k, f) in files.iter().chain(&held).enumerate() {
+        let f = split_stride(f, 1)?.0;
         let x = load(f, 1)?;
         let n = x.len() / 112;
         let mut row = json!({ "piece": stem(f), "heldOut": k >= files.len(), "nodes": n });
@@ -170,4 +174,12 @@ fn main() -> Result<()> {
     }
     eprintln!("wrote {out}.json and .bin");
     Ok(())
+}
+
+/// `piece.athc@S`: the path and its own stride (else `default`).
+fn split_stride(f: &str, default: usize) -> Result<(&str, usize)> {
+    match f.rsplit_once('@') {
+        Some((path, s)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) => Ok((path, s.parse::<usize>()?.max(1))),
+        _ => Ok((f, default)),
+    }
 }

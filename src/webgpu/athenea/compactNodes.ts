@@ -269,6 +269,13 @@ export class NodeSlotAllocator {
   /** The frame being built (`begin`); a slot stamped with it is in its cut. */
   frame = 1;
   private lastCut: Uint32Array = new Uint32Array(0);
+  /**
+   * Pinned slots (thread CU round 9): a cut the page keeps to draw at once
+   * (the fast cut while a still frame draws a finer one): never taken,
+   * idled nor moved until unpinned.
+   */
+  private pinned = new Uint8Array(0);
+  pinnedN = 0;
   readonly stats = { allocated: 0, reused: 0, evicted: 0, failed: 0 };
 
   constructor(
@@ -281,6 +288,46 @@ export class NodeSlotAllocator {
     this.stamp = new Uint16Array(capacity);
     this.idle = new SlotDeque(capacity);
     for (let s = 0; s < capacity; s++) this.idle.push(s);
+  }
+
+  /** Pins `slots` (those holding a node); replaces any earlier pin. */
+  pin(slots: ArrayLike<number>) {
+    this.unpin();
+    this.pinned = new Uint8Array(this.capacity);
+    let n = 0;
+    for (let k = 0; k < slots.length; k++) {
+      const s = slots[k];
+      if (s < this.capacity && this.keyOf[s] >= 0 && !this.pinned[s]) {
+        this.pinned[s] = 1;
+        n += 1;
+      }
+    }
+    this.pinnedN = n;
+  }
+
+  /** Lets the pinned slots go: those not in use go idle. */
+  unpin() {
+    if (!this.pinnedN) {
+      this.pinned = new Uint8Array(0);
+      return;
+    }
+    const p = this.pinned;
+    this.pinned = new Uint8Array(0);
+    this.pinnedN = 0;
+    for (let s = 0; s < p.length; s++) {
+      if (
+        p[s] &&
+        this.keyOf[s] >= 0 &&
+        this.stamp[s] !== this.frame &&
+        !this.isInLastCut(s)
+      ) {
+        this.idle.push(s);
+      }
+    }
+  }
+
+  private isPinned(s: number) {
+    return this.pinnedN > 0 && this.pinned[s] === 1;
   }
 
   /** Slots in use (a node in them, in the cut or idle). */
@@ -301,6 +348,11 @@ export class NodeSlotAllocator {
     const added = new Int32Array(capacity - this.capacity);
     for (let k = 0; k < added.length; k++) added[k] = this.capacity + k;
     this.idle.rebuild(capacity, () => true, added);
+    if (this.pinned.length) {
+      const pinned = new Uint8Array(capacity);
+      pinned.set(this.pinned);
+      this.pinned = pinned;
+    }
     this.capacity = capacity;
   }
 
@@ -366,8 +418,8 @@ export class NodeSlotAllocator {
         s = c;
         break;
       }
-      // Back in a cut since it went idle: skip it.
-      if (this.stamp[c] === this.frame) continue;
+      // Back in a cut since it went idle, or pinned: skip it.
+      if (this.stamp[c] === this.frame || this.isPinned(c)) continue;
       if (this.isInLastCut(c)) continue;
       this.slotOf.delete(this.keyOf[c]);
       this.stats.evicted += 1;
@@ -379,6 +431,7 @@ export class NodeSlotAllocator {
     while (s === undefined && this.lastCutAt < this.lastCut.length) {
       const c = this.lastCut[this.lastCutAt++];
       if (this.stamp[c] === this.frame || this.keyOf[c] < 0) continue;
+      if (this.isPinned(c)) continue;
       this.slotOf.delete(this.keyOf[c]);
       this.stats.evicted += 1;
       s = c;
@@ -417,7 +470,9 @@ export class NodeSlotAllocator {
     const frame = this.frame;
     for (let k = 0; k < last.length; k++) {
       const s = last[k];
-      if (stamp[s] !== frame && keyOf[s] >= 0) this.idle.push(s);
+      if (stamp[s] !== frame && keyOf[s] >= 0 && !this.isPinned(s)) {
+        this.idle.push(s);
+      }
     }
     this.lastCut = this.cur.slice(0, this.curN);
     this.curN = 0;
@@ -435,7 +490,12 @@ export class NodeSlotAllocator {
     let n = 0;
     for (let k = 0; k < p.length; k++) {
       const s = p[k];
-      if (s < 0 || this.stamp[s] === this.frame || this.isInLastCut(s)) {
+      if (
+        s < 0 ||
+        this.stamp[s] === this.frame ||
+        this.isInLastCut(s) ||
+        this.isPinned(s)
+      ) {
         continue;
       }
       this.release(s);
@@ -447,7 +507,7 @@ export class NodeSlotAllocator {
   /** Slot s back to the free list (a node that could not be written). */
   release(s: number) {
     const key = this.keyOf[s];
-    if (key < 0) return;
+    if (key < 0 || this.isPinned(s)) return;
     this.slotOf.delete(key);
     this.keyOf[s] = -1;
     this.idle.unshift(s);
@@ -461,6 +521,8 @@ export class NodeSlotAllocator {
    */
   shrink(capacity: number): Uint32Array | null {
     if (capacity >= this.capacity) return new Uint32Array(0);
+    // Pinned slots do not move (the page draws them by slot).
+    if (this.pinnedN > 0) return null;
     const keyOf = this.keyOf;
     const stamp = this.stamp;
     const live = (s: number) =>
@@ -537,6 +599,7 @@ export class NodeSlotAllocator {
     return (
       this.slotOf.bytes +
       this.capacity * 11 +
+      this.pinned.byteLength +
       this.cur.byteLength +
       this.lastCut.byteLength
     );

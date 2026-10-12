@@ -171,6 +171,25 @@ describe("NodeSlotAllocator", () => {
     expect(a.stats.evicted).toBe(0);
   });
 
+  it("keeps pinned slots out of reach until unpinned (thread CU round 9)", () => {
+    const a = new NodeSlotAllocator(4);
+    const f1 = frame(a, [1, 2]);
+    a.pin(Uint32Array.from(f1));
+    // A finer cut that wants every slot: the pinned ones are not taken.
+    const f2 = frame(a, [3, 4, 5, 6]);
+    expect(f2.filter((s) => s >= 0).some((s) => f1.includes(s))).toBe(false);
+    expect(f2.filter((s) => s < 0).length).toBe(2);
+    expect(a.use(1)).toBe(f1[0]);
+    expect(a.shrink(2)).toBeNull();
+    a.unpin();
+    const f3 = frame(a, [7]);
+    frame(a, [8]);
+    // Unpinned and out of use: idle, taken again.
+    const f5 = frame(a, [9, 10, 11]);
+    expect(new Set([...f5, ...f3]).size).toBeGreaterThan(0);
+    expect(f5.every((s) => s >= 0)).toBe(true);
+  });
+
   it("keeps its hysteresis across the u16 stamps' renumbering", () => {
     const a = new NodeSlotAllocator(4);
     const f1 = frame(a, [1, 2]);

@@ -76,6 +76,8 @@ export type ToCutter =
       asked?: number[];
     }
   | { t: "recycle"; buffer: ArrayBuffer }
+  /** Thread CU round 9: slots the page will draw again at once (or none). */
+  | { t: "pin"; slots: Uint32Array | null }
   | { t: "keys"; id: number };
 
 export interface CutterStats {
@@ -265,6 +267,10 @@ export class NodeCutter {
         this.runs.drop(m.g);
         this.alloc.releasePage(m.g);
         break;
+      case "pin":
+        if (m.slots) this.alloc.pin(m.slots);
+        else this.alloc.unpin();
+        break;
       case "recycle":
         if (this.spare.length < 1) this.spare.push(m.buffer);
         break;
@@ -336,9 +342,11 @@ export class NodeCutter {
     }
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => this.idleShrink(n), 1500);
-    if (n > alloc.capacity && alloc.capacity < this.o.maxCapacity) {
+    // Pinned slots hold another cut: room for this one beside them.
+    const want = n + alloc.pinnedN;
+    if (want > alloc.capacity && alloc.capacity < this.o.maxCapacity) {
       const next = Math.min(
-        Math.ceil(Math.max(n * 1.06, alloc.capacity * 1.1)),
+        Math.ceil(Math.max(want * 1.06, alloc.capacity * 1.1)),
         this.o.maxCapacity,
       );
       alloc.grow(next);

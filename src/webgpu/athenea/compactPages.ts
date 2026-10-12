@@ -1994,6 +1994,18 @@ export class CompactBandStreamer {
   private keysWaiting = new Map<number, (k: Int32Array) => void>();
   private remoteKeys: Int32Array | null = null;
 
+  /**
+   * The node pool keeps `slots` (a draw list of this pool) as they are
+   * until unpinned (null): the page draws them again at once (thread CU
+   * round 9: the fast cut kept while a still frame draws a finer one).
+   * Remote node pools only; returns whether it pinned.
+   */
+  pinSlots(slots: Uint32Array | null) {
+    if (!this.remote) return false;
+    this.post({ t: "pin", slots: slots ? slots.slice() : null });
+    return true;
+  }
+
   private post(m: ToCutter, transfer: Transferable[] = []) {
     this.remote?.postMessage(m, transfer);
   }

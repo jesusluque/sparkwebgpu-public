@@ -37,6 +37,53 @@ if (!localAssetsDirectoryExist) {
   );
 }
 
+/**
+ * SPARK_WASM=external (`npm run build:site`, the demo site's build): the
+ * WASM as a file beside the bundle (spark_rs_bg.wasm, fetched relative to
+ * it) instead of a base64 literal in it. A page then holds neither the
+ * ~2.4 MB literal in the bundle's source nor its decoded string (thread
+ * CU). The default build (the npm package's) keeps it inline.
+ */
+function sparkWasmExternal() {
+  const external = process.env.SPARK_WASM === "external";
+  const source = path.resolve(import.meta.dirname, "src/wasmSource.ts");
+  return {
+    name: "spark-wasm-external",
+    load(id: string) {
+      if (!external || path.resolve(id) !== source) return null;
+      return [
+        'const NAME = "spark_rs_bg.wasm";',
+        "export function wasmBytes() {",
+        "  return fetch(new URL(NAME, import.meta.url)).then((r) => {",
+        "    if (!r.ok) throw new Error(`${NAME}: ${r.status}`);",
+        "    return r.arrayBuffer();",
+        "  });",
+        "}",
+      ].join("\n");
+    },
+    generateBundle(this: {
+      emitFile: (f: {
+        type: "asset";
+        fileName: string;
+        source: Uint8Array;
+      }) => void;
+    }) {
+      if (!external) return;
+      this.emitFile({
+        type: "asset",
+        fileName: "spark_rs_bg.wasm",
+        source: fs.readFileSync(
+          path.resolve(
+            import.meta.dirname,
+            sparkRsDirectory,
+            "spark_rs_bg.wasm",
+          ),
+        ),
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const isMinify = mode === "production";
   const isFirstPass = mode === "production";
@@ -46,6 +93,7 @@ export default defineConfig(({ mode }) => {
 
     plugins: [
       arraybuffer(),
+      sparkWasmExternal(),
       glsl({
         include: ["**/*.glsl"],
       }),

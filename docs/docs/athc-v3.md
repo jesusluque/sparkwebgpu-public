@@ -929,6 +929,25 @@ says it is there and bits 27-31 hold round(v * 31); the materials are a
 piece's table, so it costs nothing a node (`usd-athc` reads
 `primvars:athenea:splat:materialRoughness`).
 
+The page around the car (thread CU, round 6): its own memory on a phone
+(the JS heap and buffers of the page, not the car's) from ~39 to ~25 MB in
+stage A, every frame byte for byte the same:
+
+- the relight sky's floats are not kept: `SkyImage.decode()` makes them
+  again from the RGBE file when the sky uploads (a 1k dome: 1.6 MB held
+  instead of 8 MB; a 4k one 25 instead of 128);
+- the visible dome's texels go once three has uploaded them;
+- one typed occlusion codebook for the pieces that share it (a JS array of
+  heap numbers in each layout was 4.3 MB for the car);
+- one draw list held, the asset tables let go after init.
+
+Stage B: `npm run build:site` builds Spark with its WASM as a file beside
+the bundle (`spark_rs_bg.wasm`, SPARK_WASM=external; the npm build keeps it
+inline), `readAthcLayout` parses in a loader worker and the page's own
+WASM instance is made on first use only, and the compact streamer keeps
+the pages' CMPC spans and heads in typed arrays (the layout's blocks and
+the rows' heads go).
+
 ### The curvature (`CURV`)
 
 athenea keeps a per-splat curvature in USD only

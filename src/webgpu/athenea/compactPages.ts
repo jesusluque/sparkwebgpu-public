@@ -559,6 +559,13 @@ export interface CompactBandOptions {
    * pieces written with one (thread CQ): its basis held once.
    */
   asset?: CompactAssetTables;
+  /**
+   * The pieces' layouts slimmed in place (thread CU): their blocks emptied
+   * and their page rows without heads (the streamer keeps the CMPC spans and
+   * the heads in typed arrays; ~3 MB of a car's page heap). For a page that
+   * reads the layouts only through the streamer.
+   */
+  slimLayout?: boolean;
   /** The WASM traversal. */
   lod: LodCall;
   /**
@@ -645,6 +652,12 @@ interface PieceState {
   /** CMPC v4: each page a container (runs). */
   runs: boolean;
   pageBytes: number[];
+  /** Each page's CMPC span in the file: its offset (thread CU: kept here, the layout's blocks let go). */
+  pageOffsets: Float64Array;
+  /** Each page's compact head (HEAD_WORDS a page; the rows' `compact`, let go). */
+  heads: Uint32Array;
+  /** Words a page in `heads`. */
+  headWords: number;
   lodId: number;
   /** page -> slot, slot -> page. */
   slotOf: Map<number, number>;
@@ -873,16 +886,49 @@ export class CompactBandStreamer {
       if (rows.some((r) => r.count > this.slotNodes)) {
         throw new Error(`${piece.name}: a page over ${this.slotNodes} nodes`);
       }
+      // The layout's per-page objects slimmed (thread CU: a car's blocks,
+      // twelve span objects a page, and the rows' heads, as arrays of heap
+      // numbers, were ~3 MB of the page's heap): the CMPC spans and the
+      // heads in typed arrays here, the rows without their heads.
+      const headWords = rows[0]?.compact.length ?? 0;
+      const heads = new Uint32Array(rows.length * headWords);
+      rows.forEach((r, page) => heads.set(r.compact, page * headWords));
+      const pageOffsets = Float64Array.from(
+        layout.blocks,
+        (b) => b.spans[section].offset,
+      );
+      const pageBytes = layout.blocks.map((b) => b.spans[section].stored);
+      const slim = !this.options.slimLayout
+        ? rows
+        : (rows.map((r) => ({
+            band: r.band,
+            count: r.count,
+            first: r.first,
+            lo: r.lo,
+            hi: r.hi,
+            epsMax: r.epsMax,
+            epsMin: r.epsMin,
+            offset: r.offset,
+            tierBytes: r.tierBytes,
+            tier4Bytes: r.tier4Bytes,
+          })) as unknown as Row[]);
+      if (this.options.slimLayout) {
+        (layout as { pages?: unknown }).pages = slim;
+        (layout as { blocks: unknown[] }).blocks = [];
+      }
       this.pieces.push({
         piece,
         index,
-        rows,
+        rows: slim,
+        pageOffsets,
+        heads,
+        headWords,
         section,
         compressed: layout.sections[section].compression === 1,
         runs:
           (layout.sections[section] as { encoding?: number }).encoding ===
           ENCODING_COMPACT_RUNS,
-        pageBytes: layout.blocks.map((b) => b.spans[section].stored),
+        pageBytes,
         lodId: -1,
         slotOf: new Map(),
         kids: new Map(),
@@ -995,7 +1041,10 @@ export class CompactBandStreamer {
               page,
               row.count,
               raw as Uint8Array,
-              row.compact,
+              piece.heads.subarray(
+                page * piece.headWords,
+                (page + 1) * piece.headWords,
+              ),
             )
           : this.landNodes(piece, page, l);
       piece.slotOf.set(page, slot);
@@ -1357,7 +1406,10 @@ export class CompactBandStreamer {
     return {
       input: l.input ?? compactTraversalInput(l.raw as Uint8Array, row.count),
       box: new Float32Array(
-        Uint32Array.from({ length: 6 }, (_, k) => row.compact[k] >>> 0).buffer,
+        Uint32Array.from(
+          { length: 6 },
+          (_, k) => piece.heads[page * piece.headWords + k] >>> 0,
+        ).buffer,
       ),
     };
   }
@@ -2309,21 +2361,16 @@ export class CompactBandStreamer {
     const s = this.stats;
     s.pagesRequested += pages.length;
     s.ranges += 1;
-    const blocks = p.piece.layout.blocks;
-    const first = blocks[pages[0]].spans[p.section];
-    const last = blocks[pages[pages.length - 1]].spans[p.section];
-    const start = first.offset;
-    const bytes = last.offset + last.stored - start;
+    const lastPage = pages[pages.length - 1];
+    const start = p.pageOffsets[pages[0]];
+    const bytes = p.pageOffsets[lastPage] + p.pageBytes[lastPage] - start;
     s.bytesRead += bytes;
     p.piece
       .read(start, bytes)
       .then(async (data) => {
         for (const page of pages) {
-          const span = blocks[page].spans[p.section];
-          const stored = data.subarray(
-            span.offset - start,
-            span.offset - start + span.stored,
-          );
+          const at = p.pageOffsets[page] - start;
+          const stored = data.subarray(at, at + p.pageBytes[page]);
           if (p.runs && this.remote) {
             // The worker unpacks it (its runs kept there) and sends the
             // traversal's input back ("landed").
@@ -2334,7 +2381,7 @@ export class CompactBandStreamer {
                 t: "page",
                 g: this.pageBase[p.index] + page,
                 container: c,
-                fileAt: span.offset,
+                fileAt: p.pageOffsets[page],
               },
               [c.buffer],
             );
@@ -2357,7 +2404,7 @@ export class CompactBandStreamer {
               stored: null,
               input: u.input,
               container: nodePool ? c : undefined,
-              fileAt: span.offset,
+              fileAt: p.pageOffsets[page],
               planes: u.planes,
             });
             continue;

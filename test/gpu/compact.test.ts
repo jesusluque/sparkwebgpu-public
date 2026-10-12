@@ -642,6 +642,76 @@ describe.skipIf(!wideDevice)("the compact path's shading options", () => {
     color.destroy();
   });
 
+  it("toggles sharp and plain after the env went into the atlas, the same images", async () => {
+    // a98d9d2 freed the env buffer once the atlas held it: turning the sharp
+    // lobes off (or plain on) and back read a missing buffer (CW).
+    const s = syntheticCloud();
+    const cloud = encodeCompact({
+      count: N,
+      ...s,
+      basis: packJointBasis(syntheticJointBasis(256, 5)),
+      clusters: 256,
+    });
+    const W = 96;
+    const H = 72;
+    const { camera } = placeCamera(
+      W,
+      H,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(3, -2, 1),
+      40,
+      1,
+    );
+    const color = d.createTexture({
+      size: [W, H],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const view = color.createView();
+    const draw = async (path: CompactRelitPath) => {
+      const enc = d.createCommandEncoder();
+      path.render(enc, camera, view, "rgba16float", W, H, {
+        clear: { r: 0, g: 0, b: 0, a: 0 },
+      });
+      path.registry.submit(enc.finish());
+      return readImage(d, color);
+    };
+    const fresh = async (o: { sharp?: boolean; plain?: boolean }) => {
+      const p = new CompactRelitPath(d, {
+        hdri: sky(),
+        stableOrder: true,
+        ...o,
+      });
+      p.setCloud(cloud);
+      const image = await draw(p);
+      p.dispose();
+      return image;
+    };
+    const sharpOn = await fresh({ sharp: true });
+    const sharpOff = await fresh({ sharp: false });
+    const plainOn = await fresh({ sharp: true, plain: true });
+    const path = new CompactRelitPath(d, {
+      hdri: sky(),
+      stableOrder: true,
+      sharp: true,
+    });
+    path.setCloud(cloud);
+    expect(await draw(path)).toEqual(sharpOn);
+    // The env buffer is in the atlas now.
+    expect(path.sky.envTexels).toBeNull();
+    path.options.sharp = false;
+    expect(await draw(path)).toEqual(sharpOff);
+    path.options.sharp = true;
+    expect(await draw(path)).toEqual(sharpOn);
+    path.options.plain = true;
+    expect(await draw(path)).toEqual(plainOn);
+    path.options.plain = false;
+    expect(await draw(path)).toEqual(sharpOn);
+    expect(sharpOn.some((v) => v > 0)).toBe(true);
+    path.dispose();
+    color.destroy();
+  });
+
   it("keeps a still frame still when the same draw list comes again", async () => {
     const s = syntheticCloud();
     const cloud = encodeCompact({

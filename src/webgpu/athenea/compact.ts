@@ -1204,6 +1204,19 @@ export class CompactRelitPath {
 
   /** The dome prepared when changed, on a submit of its own (its source images can go right after). */
   private prepareSky() {
+    // The env buffer was freed into the atlas (shareEnv): a frame that
+    // needs it again (the sharp lobes turned off, or an atlas to rebuild)
+    // prepares the dome again, which makes it (the same texels: the image
+    // is the same as before the toggle).
+    if (!this.sky.envTexels && !this.sky.dirty) {
+      const sharp = this.options.sharp && !this.options.plain;
+      if (
+        !sharp ||
+        this.atlasKey !== `${this.sky.version}|${this.sky.baseSide}`
+      ) {
+        this.sky.dirty = true;
+      }
+    }
     if (!this.sky.dirty) return;
     this.sky.prepareNow();
     if (this.options.releaseSky) this.sky.releaseSources();

@@ -222,7 +222,10 @@ export interface AtheneaRelightOptions {
   /**
    * athenea-pieces 35ae3cb: a coat's widening held to 0.3
    * (kCoatFoldRoughness) where the bake's spread is large -- a joint's
-   * lacquer widened to near 1 drew a dark streak. Needs the curvature.
+   * lacquer widened to near 1 drew a dark streak. Needs the curvature, and
+   * only where the material's own roughness (pbr bits 26..31) is at least
+   * 0.3, a paint's: off on chrome, glass and the rough metals, and on any
+   * cloud without the mark. Default true.
    */
   coatFold?: boolean;
   /**
@@ -230,7 +233,9 @@ export interface AtheneaRelightOptions {
    * usd-athc from primvars:athenea:splat:materialRoughness) is read, and a
    * polish whose material is at least 0.3 rough asks its own lobe's cells
    * and the reflected field answers what they close. Clouds without the
-   * mark are unchanged.
+   * mark are unchanged (bit for bit). Default true (athenea: the door's
+   * classes against the path trace, whole door 0.91 -> 1.01, its near floor
+   * 0.90 -> 1.02).
    */
   polishField?: boolean;
   /** For investigations: the lighting's parts left out, or a debug view. */
@@ -509,8 +514,8 @@ export function atheneaRelightPlugin(
     cullBacksFacing: CULL_BACKS_FACING,
     sheetFloor: "relight",
     unwiden: true,
-    coatFold: false,
-    polishField: false,
+    coatFold: true,
+    polishField: true,
     cpcaBatch: CPCA_BATCH,
     releaseSky: false,
     frame: null,

@@ -104,6 +104,18 @@ public static const uint kCompactStableOrder = 256u; // each listed gaussian its
 // per-pixel lobes, so athenea's unwidened lobes, b26d276, do not apply.)
 public static const uint kCompactCoatFold = 512u;
 public static const uint kCompactPolishField = 1024u;
+// THE SHARP LOBES PER PIXEL (thread CW; relight.slang's kRelightSlope with
+// the sharp coat and polish, athenea's SplatSlope / splat_blend kSharpMark):
+// a coat under kSharpRoughness and a polish under kSharpPolishRoughness are
+// not answered once at the centre. The shade takes the centre's reading of
+// the sky out of the colour and hands the draw the lobe's weight, its
+// roughness unwidened (athenea's `unwidened`, the bake's Toksvig spread taken
+// back), and the mirror at the centre and its step a pixel right and down
+// (from the curvature); the fragment reads the sky again along the mirror
+// its pixel turns to. Six words a drawn slot, after the bins (2 x
+// kCompactBins + capacity words) in the shade's aux buffer (shadeAux: the
+// shade's tenth storage buffer, a phone's limit, shared with the bins).
+public static const uint kCompactSharp = 2048u;
 public static const uint kCompactNone = 0xFFFFFFFFu;
 
 public struct CompactParams {
@@ -155,6 +167,7 @@ public struct CompactParams {
     public uint  drawList;     ///< kCompactDrawList: the list's start in compactFrame, words (count entries)
     public uint  nodeWords;    ///< node pool (thread CT): words a node record (0: planes); the plane uniforms are then bytes in the record
     public uint  headTable;    ///< node pool: the pages' heads, words (kCompactHeadWords a page)
+    public float sharpMinPx;   ///< kCompactSharp: the smallest footprint (major deviation, px) shaded per pixel
     public float4 row0;        ///< the cloud to athenea's stage, rows of a 3x4
     public float4 row1;
     public float4 row2;
@@ -188,10 +201,24 @@ StructuredBuffer<uint>              draw2;
 StructuredBuffer<uint>              draw3;
 RWStructuredBuffer<float4>          debugOut;
 RWStructuredBuffer<Atomic<uint>>    bins;      ///< kCompactBinned: counts, starts (kCompactBins each), then the slots by cluster
-StructuredBuffer<uint>              binsIn;    ///< the same, read by the shade
+RWStructuredBuffer<uint>            shadeAux;  ///< the bins, read by the shade (kCompactBinned); then the sharp records it writes (kCompactSharp)
+StructuredBuffer<uint>              sharpIn;   ///< the same buffer, read by the draw (kCompactSharp)
+/// Where slot `slot`'s sharp records are in shadeAux / sharpIn (words).
+uint sharpAt(uint slot) { return 2u * kCompactBins + compactParams.capacity + 6u * slot; }
+void writeSharp(uint slot, uint4 a, uint4 b) {
+    const uint at = sharpAt(slot);
+    shadeAux[at] = a.x;
+    shadeAux[at + 1u] = a.y;
+    shadeAux[at + 2u] = a.z;
+    shadeAux[at + 3u] = a.w;
+    shadeAux[at + 4u] = b.x;
+    shadeAux[at + 5u] = b.y;
+}
 ConstantBuffer<CompactParams>       compactParams;
 
 bool hasFlag(uint f) { return (compactParams.flags & f) != 0u; }
+
+float2 unpackHalves(uint w) { return float2(lowHalf(w), highHalf(w)); }
 
 /// The dome's sun (envSun's disc and irradiance), copied after the
 /// projections by the project pass: the shade then binds no envSun.
@@ -605,9 +632,18 @@ float3 transmittedShareOf(SplatSurface s, float nDotV) {
 
 /// relitByDome<2> for a TX cloud (cells and field) with the kept terms in
 /// hand, nothing traced, no slope (pixelDetail off): a gaussian's light.
+/// kCompactSharp: what relitCompact hands the draw (see kCompactSharp).
+struct CompactSharp {
+    bool want;          ///< in: the slope is known (curved, projected)
+    float coatWeight;   ///< out: the coat's weight (luma, narrowed), 0 none
+    float3 coatSeen;
+    float3 polishWeight;
+    float3 polishSeen;
+};
+
 float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, float3 front, float3 coupling,
                     float sunShare, float3 fieldPolish, float3 fieldCoat, float3 fieldThrough, float openness,
-                    float lensCurvature) {
+                    float lensCurvature, inout CompactSharp sharp) {
     const uint side = compactParams.envBaseSide;
     const float nDotV = max(dot(s.normal, wo), 1.0e-4);
     const float3 mirror = reflect(-wo, s.normal);
@@ -650,11 +686,23 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
     const float3 sunPolish = !(disc.w > 0.0) ? float3(0.0)
                                              : splatPolish(s, nDotV) * irradiance *
                                                    (sunShare * sunReflectPdf(mirror, disc.xyz, s.roughness, disc.w));
+    if (sharp.want && dome == 0u && s.roughness < kSharpPolishRoughness &&
+        (uint(compactParams.viewport.w) & 2u) == 0u) {
+        const float3 polishWeight = layers.under * thinWallGainOf(s) * splatPolish(s, nDotV) * narrowed;
+        if (any(polishWeight > float3(0.0))) {
+            sharp.polishWeight = polishWeight;
+            sharp.polishSeen = seen;
+        }
+    }
     float3 coat = float3(0.0);
     if (coated) {
         const float3 coatSeen = envRadiance(envTexels, dome, mirror, s.lobes.coatRoughness, side);
         const float coatNarrowed = cells ? splatLobeOpen(s, compactData, mirror, s.lobes.coatRoughness, s.normal)
                                          : specularOpenness(nDotV, openAll, s.lobes.coatRoughness);
+        if (sharp.want && dome == 0u && s.lobes.coatRoughness < kSharpRoughness) {
+            sharp.coatWeight = dot(layers.coat, float3(0.2126, 0.7152, 0.0722)) * coatNarrowed;
+            sharp.coatSeen = coatSeen;
+        }
         const float3 coatSun = !(disc.w > 0.0)
                                    ? float3(0.0)
                                    : layers.coat * irradiance *
@@ -712,6 +760,13 @@ float coveredGlass(float a, float n) {
 struct CompactSurface {
     SplatSurface surface;
     float lensCurvature;
+    /// kCompactSharp: the curvature and the roughnesses as stored (before
+    /// the footprint prefilter), and the bake's spread.
+    bool curved;
+    float3 shapeUV;
+    float storedCoat;
+    float storedPolish;
+    float spread;
     uint cluster;
     uint index;
 };
@@ -769,12 +824,27 @@ CompactSurface surfaceOf(uint i, CompactSplat g) {
     surface.cellBase = cellBaseOf(i);
     // The curvature: the lens of a solid glass, and the footprint prefilter.
     o.lensCurvature = 0.0;
+    o.curved = false;
+    o.shapeUV = float3(0.0);
+    o.storedCoat = surface.lobes.coatRoughness;
+    o.storedPolish = surface.roughness;
+    o.spread = 0.0;
     if (hasFlag(kCompactCurvature)) {
         const float3 shapeUV = curvatureOf(i);
+        o.curved = true;
+        o.shapeUV = shapeUV;
+        {
+            const float a = shapeUV.x, b = shapeUV.y, c = shapeUV.z;
+            const float kMax = abs(0.5 * (a + c)) + sqrt(0.25 * (a - c) * (a - c) + b * b);
+            const float sp = kMax * max(g.scales.x, g.scales.y);
+            o.spread = isfinite(sp) ? sp : 0.0;
+        }
         const float3 axisN = float3(r[0][2], r[1][2], r[2][2]);
         const float faces = dot(n, axisN) >= 0.0 ? 1.0 : -1.0;
         o.lensCurvature = faces * 0.5 * (shapeUV.x + shapeUV.z);
-        if (compactParams.footprint > 0.0) {
+        // With the sharp lobes per pixel (kCompactSharp) the mirror turns
+        // per pixel: no splat footprint term (relight.slang with kRelightSlope).
+        if (compactParams.footprint > 0.0 && !hasFlag(kCompactSharp)) {
             surface.roughness = footprintOf(surface.roughness, shapeUV, g.scales, compactParams.footprint,
                                             compactParams.footprintClamp);
             surface.lobes.coatRoughness = footprintOf(surface.lobes.coatRoughness, shapeUV, g.scales,
@@ -880,10 +950,95 @@ void reflectedTerms(CompactSurface c, uint2 wr, out float3 polish, out float3 co
 /// Splat i's relit colour (linear) and alpha (-1: its own), as relight.slang's
 /// relitColour<2, 2> (the joint CPCA under one dome, no slope).
 public float4 shadeColour(uint i, CompactSplat g) {
+    uint4 a, b;
+    return shadeColour(i, g, a, b);
+}
+
+/// kCompactSharp: how the normal turns a pixel right and down (relight.slang
+/// projectForSlope + normalTurnPerPixel, in the cloud's space), from the
+/// curvature; false where unknown or edge-on.
+bool compactTurnPerPixel(CompactSplat g, float3x3 r, float3 shapeUV, float3 cloudNormal, out float3 dx,
+                         out float3 dy) {
+    dx = float3(0.0);
+    dy = float3(0.0);
+    const float3x3 wv = float3x3(compactParams.view0.xyz, compactParams.view1.xyz, compactParams.view2.xyz);
+    const float3 t = toView(g.center);
+    if (!(t.z > 1.0e-6)) {
+        return false;
+    }
+    const float fx = compactParams.focal.x;
+    const float fy = compactParams.focal.y;
+    const float cx = compactParams.focal.z;
+    const float cy = compactParams.focal.w;
+    const float width = compactParams.viewport.x;
+    const float height = compactParams.viewport.y;
+    const float invZ = 1.0 / t.z;
+    const float2 lo = (float2(-0.15 * width, -0.15 * height) - float2(cx, cy)) / float2(fx, fy);
+    const float2 hi = (float2(1.15 * width, 1.15 * height) - float2(cx, cy)) / float2(fx, fy);
+    const float tx = clamp(t.x * invZ, min(lo.x, hi.x), max(lo.x, hi.x)) * t.z;
+    const float ty = clamp(t.y * invZ, min(lo.y, hi.y), max(lo.y, hi.y)) * t.z;
+    const float3 jx = float3(fx * invZ, 0.0, -fx * tx * invZ * invZ);
+    const float3 jy = float3(0.0, fy * invZ, -fy * ty * invZ * invZ);
+    const float3 tx3 = mul(jx, wv);
+    const float3 ty3 = mul(jy, wv);
+    const float3 u = float3(r[0][0], r[1][0], r[2][0]);
+    const float3 v = float3(r[0][1], r[1][1], r[2][1]);
+    const float2x2 toPixels = float2x2(dot(tx3, u), dot(tx3, v), dot(ty3, u), dot(ty3, v));
+    const float det = toPixels[0][0] * toPixels[1][1] - toPixels[0][1] * toPixels[1][0];
+    if (!(abs(det) > 1.0e-12)) {
+        return false;
+    }
+    const float2 stepX = float2(toPixels[1][1], -toPixels[1][0]) / det;
+    const float2 stepY = float2(-toPixels[0][1], toPixels[0][0]) / det;
+    const float2x2 shapeOf = float2x2(shapeUV.x, shapeUV.y, shapeUV.y, shapeUV.z);
+    const float3 axis = float3(r[0][2], r[1][2], r[2][2]);
+    const float side = dot(cloudNormal, axis) >= 0.0 ? 1.0 : -1.0;
+    const float2 turnX = mul(shapeOf, stepX) * side;
+    const float2 turnY = mul(shapeOf, stepY) * side;
+    dx = u * turnX.x + v * turnX.y;
+    dy = u * turnY.x + v * turnY.y;
+    return true;
+}
+
+/// The same, and (kCompactSharp) the draw's two sharp records: the mirror at
+/// the centre and its steps a pixel right and down (octahedral, f16), the
+/// coat's weight and roughness; the polish's weight and roughness. The
+/// centre's readings of both lobes are out of the colour (the draw reads
+/// them per pixel). Zero records: nothing per pixel.
+public float4 shadeColour(uint i, CompactSplat g, out uint4 sharpA, out uint4 sharpB, bool perPixel = true) {
+    sharpA = uint4(0u);
+    sharpB = uint4(0u);
     if (hasFlag(kCompactPlain)) {
         return float4(cloudLight(g.rgba.rgb, hasFlag(kCompactLinear)), -1.0);
     }
     const CompactSurface cs = surfaceOf(i, g);
+    CompactSharp sharp;
+    sharp.want = false;
+    sharp.coatWeight = 0.0;
+    sharp.coatSeen = float3(0.0);
+    sharp.polishWeight = float3(0.0);
+    sharp.polishSeen = float3(0.0);
+    float3 normalX = float3(0.0);
+    float3 normalY = float3(0.0);
+    if (perPixel && hasFlag(kCompactSharp) && cs.curved && hasFlag(kCompactIndirect)) {
+        const float3x3 r = splatRotation(g.quaternion);
+        const float3 cloudNormal = splatShadingNormal(r, g.scales, g.center, compactParams.eyeObject.xyz, false, 0u);
+        float3 dx, dy;
+        if (compactTurnPerPixel(g, r, cs.shapeUV, cloudNormal, dx, dy)) {
+            // splat_project's turn, held to half a radian a pixel.
+            const float most = 0.5;
+            const float3 hx = dx * min(1.0, most / max(length(dx), 1.0e-9));
+            const float3 hy = dy * min(1.0, most / max(length(dy), 1.0e-9));
+            const float3 stored = normalOf(i);
+            const float3 n = dot(stored, cloudNormal) < 0.0 ? -stored : stored;
+            const float4 w0 = compactParams.row0;
+            const float4 w1 = compactParams.row1;
+            const float4 w2 = compactParams.row2;
+            normalX = relightNormalToWorld(w0, w1, w2, normalize(n + hx));
+            normalY = relightNormalToWorld(w0, w1, w2, normalize(n + hy));
+            sharp.want = true;
+        }
+    }
     SplatSurface surface = cs.surface;
     const uint c = cs.cluster;
     // The kept terms, from the clusters' projections.
@@ -902,7 +1057,23 @@ public float4 shadeColour(uint i, CompactSplat g) {
     }
     const float openness = opennessValue(c, wd);
     float3 light = relitCompact(surface, eyeFrom(surface), 0u, indirect, front, coupling, sunShare, polish, coat,
-                                through, openness, cs.lensCurvature);
+                                through, openness, cs.lensCurvature, sharp);
+    if (sharp.coatWeight > 0.0 || any(sharp.polishWeight > float3(0.0))) {
+        // The centre's readings out; the draw reads the sky per pixel.
+        light = max(light - sharp.coatWeight * sharp.coatSeen - sharp.polishWeight * sharp.polishSeen, float3(0.0));
+        const float3 wo = eyeFrom(surface);
+        const float2 at = octEncode(reflect(-wo, surface.normal));
+        float2 stepX = octEncode(reflect(-wo, normalX)) - at;
+        float2 stepY = octEncode(reflect(-wo, normalY)) - at;
+        stepX = all(abs(stepX) < 0.25) ? stepX : float2(0.0);
+        stepY = all(abs(stepY) < 0.25) ? stepY : float2(0.0);
+        const float coatR = unwidened(cs.storedCoat, cs.spread);
+        const float polishR = unwidened(cs.storedPolish, cs.spread);
+        sharpA = uint4(packHalves(at.x, at.y), packHalves(stepX.x, stepX.y), packHalves(stepY.x, stepY.y),
+                       packHalves(sharp.coatWeight, coatR));
+        sharpB = uint4(packHalves(sharp.polishWeight.x, sharp.polishWeight.y),
+                       packHalves(sharp.polishWeight.z, polishR), 0u, 0u);
+    }
     float alpha = -1.0;
     if (surface.thinWalled && surface.transmission > 0.5) {
         const float alphaOwn = max(min(g.rgba.a, 1.0) - 1.0 / 255.0, 0.0);
@@ -1218,7 +1389,7 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         }
         const uint t = slot;
         if (hasFlag(kCompactBinned)) {
-            slot = binsIn[2u * kCompactBins + t];
+            slot = shadeAux[2u * kCompactBins + t];
         }
         const uint i = rec0[slot];
         if (i == kCompactNone) {
@@ -1242,13 +1413,29 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         const bool sheet = sheetAfterBlur() && isSheet(i);
         const bool drawn = (alpha > 0.0 || sheet) && projectCompact(g, v, i, sheet, alpha, centre, sigma, angle, lod, sheetScale);
         if (!drawn || max(sigma.x, sigma.y) * compactParams.maxStdDev < compactParams.minPixelRadius) {
+            if (hasFlag(kCompactSharp)) {
+                writeSharp(slot, uint4(0u), uint4(0u));
+            }
             rec0[slot] = 0u;
             rec1[slot] = 0u;
             rec2[slot] = 0u;
             rec3[slot] = 0u;
             continue;
         }
-        const float4 lit = shadeColour(i, g) * float4(float3(sheetScale), 1.0);
+        uint4 sharpA, sharpB;
+        // A footprint under sharpMinPx: its centre's reading is the pixel's.
+        const float4 lit = shadeColour(i, g, sharpA, sharpB, max(sigma.x, sigma.y) >= compactParams.sharpMinPx) *
+                           float4(float3(sheetScale), 1.0);
+        if (hasFlag(kCompactSharp)) {
+            // The weights scaled with the colour (a sheet's floor).
+            const float2 cw = unpackHalves(sharpA.w);
+            sharpA.w = packHalves(cw.x * sheetScale, cw.y);
+            const float2 p0 = unpackHalves(sharpB.x);
+            const float2 p1 = unpackHalves(sharpB.y);
+            sharpB.x = packHalves(p0.x * sheetScale, p0.y * sheetScale);
+            sharpB.y = packHalves(p1.x * sheetScale, p1.y);
+            writeSharp(slot, sharpA, sharpB);
+        }
         rec0[slot] = packCentre(centre);
         rec1[slot] = (f32tof16(sigma.x) & 0xFFFFu) | (uint(round(angle / 3.14159265358979 * 65535.0)) << 16u);
         rec2[slot] = (f32tof16(sigma.y) & 0xFFFFu) | ((f32tof16(lod ? -alpha : alpha) & 0xFFFFu) << 16u);
@@ -1358,6 +1545,10 @@ struct CompactVertexOut {
     nointerpolation float4 rgba : COLOR0;
     float2 uv : TEXCOORD0;
     nointerpolation float adjusted : TEXCOORD1;
+    /// kCompactSharp: the pixel's step from the centre (px, the shade's
+    /// rows down) and the slot.
+    float2 offset : TEXCOORD2;
+    nointerpolation uint slot : TEXCOORD3;
 };
 
 static const float2 kCorners[4] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0), float2(1.0, 1.0) };
@@ -1369,6 +1560,8 @@ CompactVertexOut atheneaCompactVertex(uint vertexId: SV_VertexID, uint instanceI
     o.rgba = float4(0.0);
     o.uv = float2(0.0);
     o.adjusted = 0.0;
+    o.offset = float2(0.0);
+    o.slot = instanceId;
     const uint w1 = draw1[instanceId];
     const uint w2 = draw2[instanceId];
     if (w1 == 0u && w2 == 0u) {
@@ -1402,6 +1595,7 @@ CompactVertexOut atheneaCompactVertex(uint vertexId: SV_VertexID, uint instanceI
     o.rgba = float4(unpackRgb9e5(draw3[instanceId]), alpha);
     o.uv = corner * adjusted;
     o.adjusted = adjusted;
+    o.offset = corner.x * v1 * s1 + corner.y * v2 * s2;
     return o;
 }
 
@@ -1424,5 +1618,27 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
     if (a < compactParams.minAlpha) {
         discard;
     }
-    return float4(v.rgba.rgb * a, a);
+    float3 rgb = v.rgba.rgb;
+    if (hasFlag(kCompactSharp)) {
+        const uint at = sharpAt(v.slot);
+        const uint4 w = uint4(sharpIn[at], sharpIn[at + 1u], sharpIn[at + 2u], sharpIn[at + 3u]);
+        const uint2 p = uint2(sharpIn[at + 4u], sharpIn[at + 5u]);
+        if (w.w != 0u || p.x != 0u || p.y != 0u) {
+            const float2 d = v.offset;
+            const float2 at = unpackHalves(w.x) + unpackHalves(w.y) * d.x + unpackHalves(w.z) * d.y;
+            const float3 mirror = octDecode(saturate(at));
+            const uint side = compactParams.envBaseSide;
+            const float2 coat = unpackHalves(w.w);
+            if (coat.x > 0.0) {
+                rgb += coat.x * envRadiance(envTexels, 0u, mirror, coat.y, side);
+            }
+            const float2 p0 = unpackHalves(p.x);
+            const float2 p1 = unpackHalves(p.y);
+            const float3 polish = float3(p0.x, p0.y, p1.x);
+            if (any(polish > float3(0.0))) {
+                rgb += polish * envRadiance(envTexels, 0u, mirror, p1.y, side);
+            }
+        }
+    }
+    return float4(rgb * a, a);
 }

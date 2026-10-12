@@ -1635,16 +1635,27 @@ uint drawnClusterOf(uint slot) {
     return i == kCompactNone ? 0u : fieldAt(compactParams.cluster, 1u, i);
 }
 
+/// The workgroup's counts by cluster (the bin passes): one global atomic a
+/// cluster a workgroup instead of one a slot (thread CW).
+groupshared Atomic<uint> binLocal[kCompactBins];
+groupshared uint binBase[kCompactBins];
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void atheneaCompactBinCount(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
     const uint count = min(sortCount[1], compactParams.capacity);
+    binLocal[lid.x].store(0u);
+    GroupMemoryBarrierWithGroupSync();
     for (uint pass = 0u; pass < kCompactRounds; ++pass) {
         const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
-        if (slot >= count) {
-            return;
+        if (slot < count) {
+            binLocal[drawnClusterOf(slot)].add(1u);
         }
-        bins[drawnClusterOf(slot)].add(1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint n = binLocal[lid.x].load();
+    if (n != 0u) {
+        bins[lid.x].add(n);
     }
 }
 
@@ -1673,13 +1684,26 @@ void atheneaCompactBinScan(uint3 lid: SV_GroupThreadID) {
 [numthreads(256, 1, 1)]
 void atheneaCompactBinScatter(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
     const uint count = min(sortCount[1], compactParams.capacity);
-    for (uint pass = 0u; pass < kCompactRounds; ++pass) {
+    // Each slot's place among its workgroup's of the same cluster, then one
+    // range a cluster reserved for the workgroup, then the slots written.
+    binLocal[lid.x].store(0u);
+    GroupMemoryBarrierWithGroupSync();
+    uint clusterOf[kCompactRounds];
+    uint rank[kCompactRounds];
+    [unroll] for (uint pass = 0u; pass < kCompactRounds; ++pass) {
         const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
-        if (slot >= count) {
-            return;
+        clusterOf[pass] = slot < count ? drawnClusterOf(slot) : kCompactBins;
+        rank[pass] = clusterOf[pass] < kCompactBins ? binLocal[clusterOf[pass]].add(1u) : 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint n = binLocal[lid.x].load();
+    binBase[lid.x] = n != 0u ? bins[kCompactBins + lid.x].add(n) : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint pass = 0u; pass < kCompactRounds; ++pass) {
+        const uint slot = (gid.x * kCompactRounds + pass) * kCompactWorkgroup + lid.x;
+        if (clusterOf[pass] < kCompactBins) {
+            bins[2u * kCompactBins + binBase[clusterOf[pass]] + rank[pass]].store(slot);
         }
-        const uint at = bins[kCompactBins + drawnClusterOf(slot)].add(1u);
-        bins[2u * kCompactBins + at].store(slot);
     }
 }
 

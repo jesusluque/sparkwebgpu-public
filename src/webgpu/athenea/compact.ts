@@ -742,7 +742,7 @@ export class CompactRelitPath {
   private bins: GPUBuffer | null = null;
   /**
    * The shade's aux buffer: the bins (kCompactBinned, 2 x kCompactBins +
-   * capacity words) then the sharp records (kCompactSharp, 6 words a slot);
+   * capacity words) then the sharp records (kCompactSharp, 5 words a slot);
    * a placeholder when neither is on.
    */
   private sharpRecords: GPUBuffer | null = null;
@@ -799,14 +799,20 @@ export class CompactRelitPath {
   private auxFor(binned: boolean): GPUBuffer {
     const sharp = this.options.sharp && !this.options.plain;
     const binWords = 2 * K.kCompactBins + this.capacity;
+    // The sharp records for the slots drawn (thread CU): at most the listed
+    // gaussians (the sort's count), not the sort's capacity; 2 % over it,
+    // made again when the list grows past it or shrinks under 90 % of it.
+    const drawn = Math.max(Math.min(this.listed, this.capacity), 1);
     const bytes = sharp
-      ? (binWords + 6 * Math.max(this.capacity, 1)) * 4
+      ? (binWords + 5 * Math.ceil(drawn * 1.02)) * 4
       : binned
         ? binWords * 4
         : 16;
+    const need = sharp ? (binWords + 5 * drawn) * 4 : bytes;
     if (
       !this.sharpRecords ||
-      this.sharpRecords.size < bytes ||
+      this.sharpRecords.size < need ||
+      (sharp && this.sharpRecords.size > (binWords + (5 * drawn) / 0.9) * 4) ||
       (bytes === 16 && this.sharpRecords.size > 16)
     ) {
       this.sharpRecords?.destroy();
@@ -1020,7 +1026,7 @@ export class CompactRelitPath {
       (o.stableOrder ? K.kCompactStableOrder : 0) |
       (o.coatFold ? K.kCompactCoatFold : 0) |
       (o.polishField ? K.kCompactPolishField : 0) |
-      (o.sharp && !o.plain ? K.kCompactSharp : 0) |
+      (o.sharp && !o.plain ? K.kCompactSharp | K.kCompactEnvAtlas : 0) |
       (this.listCount >= 0 ? K.kCompactDrawList : 0)
     );
   }
@@ -1138,8 +1144,38 @@ export class CompactRelitPath {
       compactFrameOut: this.frame,
       envSh: sky.envSh,
       envSun: sky.envSun,
-      envTexels: sky.envTexels as GPUBuffer,
+      // Freed once the atlas holds its texels (shareEnv): a placeholder.
+      envTexels: sky.envTexels ?? this.noTexels,
     };
+  }
+
+  private noTexelsBuffer: GPUBuffer | null = null;
+  private get noTexels() {
+    this.noTexelsBuffer ??= createStorage(
+      this.device,
+      16,
+      "env texels (in the atlas)",
+    );
+    return this.noTexelsBuffer;
+  }
+
+  /**
+   * kCompactEnvAtlas (thread CU): the atlas built (on a submit of its own)
+   * as soon as the dome is prepared, then the env buffer freed: the shade
+   * reads the same f16 texels from the atlas. A dome prepared again makes
+   * the buffer again (AtheneaSky.prepare) and this runs again.
+   */
+  private shareEnv(params: UniformWriter) {
+    if (!(this.options.sharp && !this.options.plain)) return;
+    const sky = this.sky;
+    if (!sky.envTexels) return;
+    const encoder = this.device.createCommandEncoder({
+      label: "compact env atlas",
+    });
+    this.envAtlasFor(encoder, params);
+    this.registry.submit(encoder.finish());
+    sky.envTexels.destroy();
+    sky.envTexels = null;
   }
 
   /** The dome prepared (when changed) and the clusters projected on it. */
@@ -1159,6 +1195,7 @@ export class CompactRelitPath {
     this.registry.get(compactModule, "atheneaCompactProject").dispatch(pass, {
       grid: [(this.cloud as CompactCloud).layout.clusters],
       buffers: this.buffers(),
+      bindings: { envAtlas: this.envAtlasFor(encoder, params).view },
       uniforms: params.data,
     });
     pass.end();
@@ -1199,6 +1236,7 @@ export class CompactRelitPath {
     // and keep (thread CN: a fresh path's highlights came out ~10-20 % off).
     this.prepareSky();
     const params = this.params(camera, width, height);
+    this.shareEnv(params);
     // Nothing moved and the light is the same: the records in the sort's
     // buffers are this frame's, and only the draw runs.
     const key = `${new Uint32Array(params.data).join()}|${this.sky.version}|${this.projectedKey}|${this.capacity}|${this.listVersion}`;
@@ -1328,6 +1366,7 @@ export class CompactRelitPath {
             // Off, the shade reads none of it: any read-only buffer binds.
             shadeAux: this.auxFor(binned),
           },
+          bindings: { envAtlas: this.envAtlasFor(encoder, params).view },
           uniforms: params.data,
         },
         this.sorter.dispatchArgs,
@@ -1413,12 +1452,14 @@ export class CompactRelitPath {
     const encoder = this.device.createCommandEncoder();
     this.prepareSky();
     const params = this.params(camera, width, height);
+    this.shareEnv(params);
     this.prepareLight(encoder, params, null);
     const pass = encoder.beginComputePass({ label: "compact.colours" });
     const row = K.kCompactDispatchRow;
     this.registry.get(compactModule, "atheneaCompactColours").dispatch(pass, {
       grid: [Math.min(n, row), Math.ceil(n / row)],
       buffers: { ...this.buffers(), debugOut: out },
+      bindings: { envAtlas: this.envAtlasFor(encoder, params).view },
       uniforms: params.data,
     });
     pass.end();
@@ -1463,6 +1504,7 @@ export class CompactRelitPath {
   dispose() {
     if (this.ownsData) this.data?.destroy();
     this.atlas?.destroy();
+    this.noTexelsBuffer?.destroy();
     this.sharpRecords?.destroy();
     this.bins?.destroy();
     this.frame.destroy();

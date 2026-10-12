@@ -113,10 +113,14 @@ public static const uint kCompactPolishField = 1024u;
 // roughness unwidened (athenea's `unwidened`, the bake's Toksvig spread taken
 // back), and the mirror at the centre and its step a pixel right and down
 // (from the curvature); the fragment reads the sky again along the mirror
-// its pixel turns to. Six words a drawn slot, after the bins (2 x
+// its pixel turns to. Five words a drawn slot (packSharp), after the bins (2 x
 // kCompactBins + capacity words) in the shade's aux buffer (shadeAux: the
 // shade's tenth storage buffer, a phone's limit, shared with the bins).
 public static const uint kCompactSharp = 2048u;
+// The env's texels read from the atlas (thread CU): with kCompactSharp the
+// atlas holds every level's texels as the same f16 values, so the shade reads
+// them there (compactEnvRadiance) and the env buffer is freed once it exists.
+public static const uint kCompactEnvAtlas = 4096u;
 public static const uint kCompactNone = 0xFFFFFFFFu;
 
 public struct CompactParams {
@@ -214,7 +218,7 @@ StructuredBuffer<uint>              sharpIn;   ///< the same buffer, read by the
 SamplerState                           envAtlasSampler;
 
 /// Where slot `slot`'s sharp records are in shadeAux / sharpIn (words).
-uint sharpAt(uint slot) { return 2u * kCompactBins + compactParams.capacity + 6u * slot; }
+uint sharpAt(uint slot) { return 2u * kCompactBins + compactParams.capacity + 5u * slot; }
 void writeSharp(uint slot, uint4 a, uint4 b) {
     const uint at = sharpAt(slot);
     shadeAux[at] = a.x;
@@ -222,7 +226,18 @@ void writeSharp(uint slot, uint4 a, uint4 b) {
     shadeAux[at + 2u] = a.z;
     shadeAux[at + 3u] = a.w;
     shadeAux[at + 4u] = b.x;
-    shadeAux[at + 5u] = b.y;
+}
+// Five words a slot (thread CU, athenea's pick: the same image to 60 dB):
+// the mirror at the centre unorm16 x2, its steps a pixel right and down as
+// f16 pairs, coat weight u10 | coat roughness u11 | polish roughness u11
+// (the roughnesses as their square roots, any up to 1: a fold widens them,
+// athenea f9c9a2b), and in the fifth the polish weights in RGB9E5 (b.x).
+uint4 packSharp(float2 at, float2 sx, float2 sy, float coatW, float coatR, float3 polishW, float polishR, out uint polish) {
+    const uint2 a = uint2(round(saturate(at) * 65535.0));
+    const uint w = uint(round(saturate(coatW) * 1023.0)) | (uint(round(sqrt(saturate(coatR)) * 2047.0)) << 10u) |
+                   (uint(round(sqrt(saturate(polishR)) * 2047.0)) << 21u);
+    polish = packRgb9e5(max(polishW, float3(0.0)));
+    return uint4(a.x | (a.y << 16u), packHalves(sx.x, sx.y), packHalves(sy.x, sy.y), w);
 }
 ConstantBuffer<CompactParams>       compactParams;
 
@@ -267,6 +282,35 @@ float3 atlasRadiance(float3 dir, float roughness, uint baseSide) {
     const uint lo = uint(floor(level));
     const uint hi = min(lo + 1u, kEnvLevels - 1u);
     return lerp(atlasLevel(lo, dir, baseSide), atlasLevel(hi, dir, baseSide), level - float(lo));
+}
+
+/// environment.slang's envLevelAt and envRadiance with their texels read
+/// from the atlas (kCompactEnvAtlas; the same values and arithmetic).
+float3 atlasTexelAt(uint level, uint2 uv, uint baseSide) {
+    return envAtlas.Load(int3(int2(atlasOrigin(level, baseSide) + uv), 0)).rgb;
+}
+float3 atlasLevelAt(uint level, float3 dir, uint baseSide) {
+    const float side = float(envSideOf(level, baseSide));
+    const float2 at = clamp(octEncode(dir) * side - 0.5, 0.0, side - 1.0);
+    const uint2 lo = uint2(floor(at));
+    const uint2 hi = min(lo + 1, uint2(uint(side) - 1, uint(side) - 1));
+    const float2 f = at - float2(lo);
+    const float3 v00 = atlasTexelAt(level, lo, baseSide);
+    const float3 v10 = atlasTexelAt(level, uint2(hi.x, lo.y), baseSide);
+    const float3 v01 = atlasTexelAt(level, uint2(lo.x, hi.y), baseSide);
+    const float3 v11 = atlasTexelAt(level, hi, baseSide);
+    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);
+}
+float3 compactEnvRadiance(StructuredBuffer<uint> texels, uint dome, float3 dir, float roughness,
+                          uint baseSide) {
+    if (!hasFlag(kCompactEnvAtlas) || dome != 0u) {
+        return envRadiance(texels, dome, dir, roughness, baseSide);
+    }
+    const float level = sqrt(saturate(roughness)) * float(kEnvLevels - 1);
+    const uint lo = uint(floor(level));
+    const uint hi = min(lo + 1, kEnvLevels - 1);
+    const float f = level - float(lo);
+    return lerp(atlasLevelAt(lo, dir, baseSide), atlasLevelAt(hi, dir, baseSide), f);
 }
 
 [shader("compute")]
@@ -688,7 +732,7 @@ float transmittedWeightOf(SplatSurface s) {
 }
 
 float3 transmittedBehindOf(SplatSurface s, float3 wo, uint dome) {
-    const float3 seen = s.ior > 1.0 ? envRadiance(envTexels, dome, bentThrough(s, wo), s.roughness,
+    const float3 seen = s.ior > 1.0 ? compactEnvRadiance(envTexels, dome, bentThrough(s, wo), s.roughness,
                                                   compactParams.envBaseSide)
                                     : envIrradiance(envSh, dome, -s.normal) * (1.0 / 3.14159265358979);
     return seen * s.exitThrough;
@@ -730,7 +774,7 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
         const float open = smoothstep(0.5, 0.85, dot(white, float3(0.2126, 0.7152, 0.0722)));
         const float3 sharp =
             lensCurvature > 0.0
-                ? envRadiance(envTexels, dome, lensExit(s, wo, lensCurvature),
+                ? compactEnvRadiance(envTexels, dome, lensExit(s, wo, lensCurvature),
                               transmittedRoughness(s.roughness, s.ior), side) *
                       lensExitThrough(s, wo, lensCurvature)
                 : transmittedBehindOf(s, wo, dome);
@@ -740,14 +784,14 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
         const float alpha = max(s.roughness * s.roughness, 1.0e-3);
         const float openBehind = splatConeOpen(s, compactData, through, min(1.4 * atan(alpha), 1.2), -s.normal);
         const float open = openBehind >= 0.0 ? openBehind : 0.0;
-        behind = (open * envRadiance(envTexels, dome, through, s.roughness, side) +
+        behind = (open * compactEnvRadiance(envTexels, dome, through, s.roughness, side) +
                   (1.0 - open) * coupling * fieldThrough) *
                  s.exitThrough;
     }
     const float3 passes = transmittedShareOf(s, nDotV);
     const float3 body2 = layers.under * s.albedo * (1.0 - s.metallic) *
                          ((1.0 - s.transmission) * front + transmittedWeightOf(s) * passes * behind);
-    const float3 seen = envRadiance(envTexels, dome, mirror, s.roughness, side);
+    const float3 seen = compactEnvRadiance(envTexels, dome, mirror, s.roughness, side);
     const float openAll = saturate(openness / 0.28209479177387814);
     // athenea 35ae3cb: a polish as wide as the field asks its own lobe's
     // cells, and the field answers what they close.
@@ -767,7 +811,7 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
     }
     float3 coat = float3(0.0);
     if (coated) {
-        const float3 coatSeen = envRadiance(envTexels, dome, mirror, s.lobes.coatRoughness, side);
+        const float3 coatSeen = compactEnvRadiance(envTexels, dome, mirror, s.lobes.coatRoughness, side);
         const float coatNarrowed = cells ? splatLobeOpen(s, compactData, mirror, s.lobes.coatRoughness, s.normal)
                                          : specularOpenness(nDotV, openAll, s.lobes.coatRoughness);
         if (sharp.want && dome == 0u && s.lobes.coatRoughness < kSharpRoughness) {
@@ -1511,7 +1555,18 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
             const float2 p1 = unpackHalves(sharpB.y);
             sharpB.x = packHalves(p0.x * sheetScale, p0.y * sheetScale);
             sharpB.y = packHalves(p1.x * sheetScale, p1.y);
-            writeSharp(slot, sharpA, sharpB);
+            {
+                const float2 a0 = unpackHalves(sharpA.x);
+                const float2 sx = unpackHalves(sharpA.y);
+                const float2 sy = unpackHalves(sharpA.z);
+                const float2 c = unpackHalves(sharpA.w);
+                const float2 q0 = unpackHalves(sharpB.x);
+                const float2 q1 = unpackHalves(sharpB.y);
+                const bool any0 = sharpA.w != 0u || sharpB.x != 0u || sharpB.y != 0u;
+                uint pw = 0u;
+                const uint4 r4 = any0 ? packSharp(a0, sx, sy, c.x, c.y, float3(q0.x, q0.y, q1.x), q1.y, pw) : uint4(0u);
+                writeSharp(slot, r4, uint4(pw, 0u, 0u, 0u));
+            }
         }
         rec0[slot] = packCentre(centre);
         rec1[slot] = (f32tof16(sigma.x) & 0xFFFFu) | (uint(round(angle / 3.14159265358979 * 65535.0)) << 16u);
@@ -1698,22 +1753,25 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
     float3 rgb = v.rgba.rgb;
     if (hasFlag(kCompactSharp)) {
         const uint at = sharpAt(v.slot);
-        const uint4 w = uint4(sharpIn[at], sharpIn[at + 1u], sharpIn[at + 2u], sharpIn[at + 3u]);
-        const uint2 p = uint2(sharpIn[at + 4u], sharpIn[at + 5u]);
-        if (w.w != 0u || p.x != 0u || p.y != 0u) {
+        const uint4 r0 = uint4(sharpIn[at], sharpIn[at + 1u], sharpIn[at + 2u], sharpIn[at + 3u]);
+        const uint4 r = uint4(r0.x, r0.y, r0.w, sharpIn[at + 4u]);
+        if (r.z != 0u || r.w != 0u) {
             const float2 d = v.offset;
-            const float2 at = unpackHalves(w.x) + unpackHalves(w.y) * d.x + unpackHalves(w.z) * d.y;
+            const float2 a0 = float2(float(r.x & 0xFFFFu), float(r.x >> 16u)) / 65535.0;
+            const float2 sx = unpackHalves(r0.y);
+            const float2 sy = unpackHalves(r0.z);
+            const float2 at = a0 + sx * d.x + sy * d.y;
             const float3 mirror = octDecode(saturate(at));
             const uint side = compactParams.envBaseSide;
-            const float2 coat = unpackHalves(w.w);
+            const float cr = float((r.z >> 10u) & 0x7FFu) / 2047.0;
+            const float2 coat = float2(float(r.z & 0x3FFu) / 1023.0, cr * cr);
             if (coat.x > 0.0) {
                 rgb += coat.x * atlasRadiance(mirror, coat.y, side);
             }
-            const float2 p0 = unpackHalves(p.x);
-            const float2 p1 = unpackHalves(p.y);
-            const float3 polish = float3(p0.x, p0.y, p1.x);
+            const float3 polish = unpackRgb9e5(r.w);
             if (any(polish > float3(0.0))) {
-                rgb += polish * atlasRadiance(mirror, p1.y, side);
+                const float pr = float(r.z >> 21u) / 2047.0;
+                rgb += polish * atlasRadiance(mirror, pr * pr, side);
             }
         }
     }

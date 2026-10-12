@@ -694,9 +694,24 @@ export interface CompactPathOptions {
    */
   cullBacks?: boolean;
   cullBacksFacing?: number;
+  /**
+   * The sharp lobes per pixel (thread CW, relight.slang's pixelDetail): a
+   * coat under 0.2 and a polish under 0.5 read the sky again in the draw,
+   * along the mirror each pixel turns to (the curvature), at their unwidened
+   * roughness. 24 B a drawn splat; default false.
+   */
+  sharp?: boolean;
+  /**
+   * kCompactSharp: the smallest footprint shaded per pixel, its major
+   * deviation in px (default 1: a splat under it keeps its centre's reading).
+   */
+  sharpMinPx?: number;
   /** Check only (thread CW): the coat's and polish's roughness at least this. */
   coatFloor?: number;
-  /** Check only (thread CW): 1 merged nodes' LoD opacity held to 1. */
+  /**
+   * Check only (thread CW): 1 merged nodes' LoD opacity held to 1; 2 no
+   * polish per pixel (kCompactSharp: the coat alone).
+   */
   debugBits?: number;
   /** The relight plugin's coatFold (athenea 35ae3cb): needs the curvature. */
   coatFold?: boolean;
@@ -725,6 +740,30 @@ export class CompactRelitPath {
   private drawUniform: GPUBuffer;
   /** binByCluster: counts, starts, then the drawn slots by cluster. */
   private bins: GPUBuffer | null = null;
+  /**
+   * The shade's aux buffer: the bins (kCompactBinned, 2 x kCompactBins +
+   * capacity words) then the sharp records (kCompactSharp, 6 words a slot);
+   * a placeholder when neither is on.
+   */
+  private sharpRecords: GPUBuffer | null = null;
+  private auxFor(binned: boolean): GPUBuffer {
+    const sharp = this.options.sharp && !this.options.plain;
+    const binWords = 2 * K.kCompactBins + this.capacity;
+    const bytes = sharp
+      ? (binWords + 6 * Math.max(this.capacity, 1)) * 4
+      : binned
+        ? binWords * 4
+        : 16;
+    if (
+      !this.sharpRecords ||
+      this.sharpRecords.size < bytes ||
+      (bytes === 16 && this.sharpRecords.size > 16)
+    ) {
+      this.sharpRecords?.destroy();
+      this.sharpRecords = createStorage(this.device, bytes, "compact aux");
+    }
+    return this.sharpRecords;
+  }
   private pipeline: ReflectedRenderPipeline | null = null;
   private pipelineFormat = "";
   private projectedKey = "";
@@ -770,6 +809,8 @@ export class CompactRelitPath {
       cullBacksFacing: -0.2,
       coatFloor: 0,
       debugBits: 0,
+      sharp: false,
+      sharpMinPx: 1,
       coatFold: false,
       polishField: true,
       ...options,
@@ -924,6 +965,7 @@ export class CompactRelitPath {
       (o.stableOrder ? K.kCompactStableOrder : 0) |
       (o.coatFold ? K.kCompactCoatFold : 0) |
       (o.polishField ? K.kCompactPolishField : 0) |
+      (o.sharp && !o.plain ? K.kCompactSharp : 0) |
       (this.listCount >= 0 ? K.kCompactDrawList : 0)
     );
   }
@@ -1007,6 +1049,7 @@ export class CompactRelitPath {
       falloff: 1,
       keyScale: ((1 << K.kCompactKeyBits) - 1) / (far * 1.8),
       cullFacing: o.cullBacksFacing,
+      sharpMinPx: o.sharpMinPx,
       sheetFade: o.sheetFade,
       row0: row(0),
       row1: row(1),
@@ -1182,12 +1225,7 @@ export class CompactRelitPath {
     this.records = rec;
     const binned = this.options.binByCluster && !this.options.plain;
     if (binned) {
-      const bytes = (2 * K.kCompactBins + this.capacity) * 4;
-      if (!this.bins || this.bins.size < bytes) {
-        this.bins?.destroy();
-        this.bins = createStorage(this.device, bytes, "compact bins");
-      }
-      const bins = this.bins;
+      const bins = this.auxFor(true);
       const pass = encoder.beginComputePass({
         label: "compact.bin",
         timestampWrites: profiler?.timestampWrites("compact.bin"),
@@ -1233,7 +1271,7 @@ export class CompactRelitPath {
             rec2: rec[2],
             rec3: rec[3],
             // Off, the shade reads none of it: any read-only buffer binds.
-            binsIn: binned && this.bins ? this.bins : buffers.compactData,
+            shadeAux: this.auxFor(binned),
           },
           uniforms: params.data,
         },
@@ -1285,6 +1323,8 @@ export class CompactRelitPath {
       draw2: rec[2],
       draw3: rec[3],
       compactParams: this.drawUniform,
+      sharpIn: this.sharpRecords ?? this.auxFor(false),
+      envTexels: this.sky.envTexels as GPUBuffer,
     });
     const pass = encoder.beginRenderPass({
       label: "compact.draw",
@@ -1358,11 +1398,14 @@ export class CompactRelitPath {
     (this.sorter as unknown as { destroyBuffers(): void }).destroyBuffers();
     this.bins?.destroy();
     this.bins = null;
+    this.sharpRecords?.destroy();
+    this.sharpRecords = null;
     this.frameKey = "";
   }
 
   dispose() {
     if (this.ownsData) this.data?.destroy();
+    this.sharpRecords?.destroy();
     this.bins?.destroy();
     this.frame.destroy();
     this.drawUniform.destroy();

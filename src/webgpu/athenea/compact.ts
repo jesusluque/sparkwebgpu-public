@@ -488,9 +488,19 @@ export function encodeCompact(input: CompactInput): CompactCloud {
       }
       weights[b][i] = packed >>> 0;
     }
-    cluster[i] = input.q8[7 * i + 6];
-    if (input.q8[7 * i + 6] > 255)
-      throw new Error("compact: over 256 clusters");
+    // A 9-bit cluster (thread CX): its low byte in the cluster plane, the
+    // 9th bit in the shadow index's bit 15 (a codebook of 32768 at most).
+    const c = input.q8[7 * i + 6];
+    if (c >= 512 || c >= input.clusters)
+      throw new Error(`compact: cluster ${c} (512 at most)`);
+    cluster[i] = c & 0xff;
+    if (c > 255) {
+      if (shadow[i] > 0x7fff)
+        throw new Error(
+          "compact: 512 clusters need a codebook of 32768 at most",
+        );
+      shadow[i] |= 0x8000;
+    }
   }
   // athenea's basis in f16.
   const basisHalves = new Uint16Array(input.clusters * CLUSTER_WORDS * 2);
@@ -611,8 +621,8 @@ export function decodeCompactSplat(cloud: CompactCloud, i: number) {
   const m = W.materials + field(W.material, 2) * 4;
   const piece = data[W.pieceTable + Math.floor(i / COMPACT_PIECE)];
   const cells = data.subarray(
-    piece + field(W.shadow, 2) * 8,
-    piece + field(W.shadow, 2) * 8 + 8,
+    piece + (field(W.shadow, 2) & 0x7fff) * 8,
+    piece + (field(W.shadow, 2) & 0x7fff) * 8 + 8,
   );
   return {
     center,
@@ -1371,7 +1381,7 @@ export class CompactRelitPath {
         );
       this.registry
         .get(compactModule, "atheneaCompactBinScan")
-        .dispatch(pass, { grid: [K.kCompactBins], buffers: { bins } });
+        .dispatch(pass, { grid: [256], buffers: { bins } });
       this.registry
         .get(compactModule, "atheneaCompactBinScatter")
         .dispatchIndirect(

@@ -146,12 +146,12 @@ fn main() -> Result<()> {
     println!("{}", serde_json::to_string(&all)?);
     rows.push(all);
 
-    if basis.clusters > 256 {
+    if basis.clusters > spark_lib::athc_compact::MAX_CLUSTERS {
         // A measurement only: the compact tier's cluster is a byte.
         if let Some(r) = arg("--report") {
             std::fs::write(r, serde_json::to_string_pretty(&json!({ "fit": fit, "pieces": rows }))?)?;
         }
-        eprintln!("{} clusters: measured only (the compact tier stores 256 at most); no basis written", basis.clusters);
+        eprintln!("{} clusters: measured only (the compact tier stores 512 at most); no basis written", basis.clusters);
         return Ok(());
     }
     let names: Vec<String> = files.iter().map(|f| stem(f)).collect();

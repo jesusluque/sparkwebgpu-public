@@ -191,6 +191,31 @@ describe.skipIf(!wideDevice)("the node pool", () => {
     }
   });
 
+  it("moves records on the GPU (a pool given back): the same image", async () => {
+    const cam = camera(W, H);
+    const nodes = await streamer(8, true, false);
+    await settle(nodes, cam);
+    const a = await draw(nodes.path, cam);
+    const pool = nodes.s.pool as CompactNodePool;
+    // Every slot drawn to a new place past the old capacity (a thread a
+    // word, thread CU round 10), the list renamed to match.
+    const list = nodes.s.drawList.slice();
+    const slotsOf = [...new Set(list)];
+    expect(slotsOf.length).toBeGreaterThan(64);
+    const old = pool.capacity;
+    const to = new Map(slotsOf.map((v, k) => [v, old + k]));
+    const moves = new Uint32Array(
+      slotsOf.flatMap((v) => [v, to.get(v) as number]),
+    );
+    pool.resize(old + slotsOf.length, moves);
+    nodes.path.setPagedCloud(pool);
+    nodes.path.setDrawList(list.map((v) => to.get(v) as number));
+    const b = await draw(nodes.path, cam);
+    expect(same(a, b)).toBe(0);
+    nodes.path.dispose();
+    nodes.s.dispose();
+  });
+
   it("reads CMPC v4 runs: the same cut and image, in both pools", async () => {
     const cam = camera(W, H);
     const pages = await streamer(8, false, false);

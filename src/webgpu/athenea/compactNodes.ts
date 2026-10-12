@@ -883,6 +883,87 @@ export class CompactNodePool {
    * capacities copied, then `moves` (from, to slot pairs: records past a
    * smaller capacity kept in a slot below it).
    */
+  private movePipeline: GPUComputePipeline | null = null;
+
+  /** Records `moves` (from, to slot pairs) from this buffer into `dst`. */
+  private moveRecords(
+    enc: GPUCommandEncoder,
+    dst: GPUBuffer,
+    moves: Uint32Array,
+  ) {
+    const d = this.device;
+    this.movePipeline ??= d.createComputePipeline({
+      label: "node pool moves",
+      layout: "auto",
+      compute: {
+        module: d.createShaderModule({
+          label: "node pool moves",
+          code: /* wgsl */ `
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<storage, read> moves: array<u32>;
+@group(0) @binding(3) var<uniform> p: vec4<u32>; // moves, records base (words), words a record, threads a row
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let t = g.y * p.w + g.x;
+  let m = t / p.z;
+  if (m >= p.x) { return; }
+  let w = t % p.z;
+  dst[p.y + moves[2u * m + 1u] * p.z + w] = src[p.y + moves[2u * m] * p.z + w];
+}`,
+        }),
+        entryPoint: "main",
+      },
+    });
+    const n = moves.length >> 1;
+    const threads = n * NODE_RECORD_WORDS;
+    const groups = Math.ceil(threads / 64);
+    const gx = Math.min(groups, 65535);
+    const gy = Math.ceil(groups / gx);
+    const mb = d.createBuffer({
+      label: "node pool moves",
+      size: moves.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    d.queue.writeBuffer(
+      mb,
+      0,
+      moves.buffer,
+      moves.byteOffset,
+      moves.byteLength,
+    );
+    const ub = d.createBuffer({
+      label: "node pool moves params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    d.queue.writeBuffer(
+      ub,
+      0,
+      new Uint32Array([n, this.recordsBase, NODE_RECORD_WORDS, gx * 64]),
+    );
+    const pass = enc.beginComputePass({ label: "node pool moves" });
+    pass.setPipeline(this.movePipeline);
+    pass.setBindGroup(
+      0,
+      d.createBindGroup({
+        layout: this.movePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.buffer } },
+          { binding: 1, resource: { buffer: dst } },
+          { binding: 2, resource: { buffer: mb } },
+          { binding: 3, resource: { buffer: ub } },
+        ],
+      }),
+    );
+    pass.dispatchWorkgroups(gx, gy);
+    pass.end();
+    // The params buffer is small: let it go with the moves.
+    const both = mb;
+    queueMicrotask(() => ub.destroy());
+    return both;
+  }
+
   resize(capacity: number, moves?: Uint32Array) {
     const next = Math.min(Math.max(capacity, 1024), this.maxCapacity);
     if (next === this.capacity && !moves?.length) return false;
@@ -893,16 +974,25 @@ export class CompactNodePool {
       4;
     enc.copyBufferToBuffer(this.buffer, 0, buffer, 0, keep);
     const R = NODE_RECORD_WORDS * 4;
-    for (let k = 0; moves && k < moves.length; k += 2) {
-      enc.copyBufferToBuffer(
-        this.buffer,
-        this.recordsBase * 4 + moves[k] * R,
-        buffer,
-        this.recordsBase * 4 + moves[k + 1] * R,
-        R,
-      );
+    let movesBuffer: GPUBuffer | null = null;
+    if (moves && moves.length > 2 * 64) {
+      // Many moves (a still frame's pool given back): one dispatch, a
+      // thread a word, instead of a copy command a record (thread CU
+      // round 10: ~100k copies stalled the first moving frame ~90 ms).
+      movesBuffer = this.moveRecords(enc, buffer, moves);
+    } else {
+      for (let k = 0; moves && k < moves.length; k += 2) {
+        enc.copyBufferToBuffer(
+          this.buffer,
+          this.recordsBase * 4 + moves[k] * R,
+          buffer,
+          this.recordsBase * 4 + moves[k + 1] * R,
+          R,
+        );
+      }
     }
     this.device.queue.submit([enc.finish()]);
+    movesBuffer?.destroy();
     this.buffer.destroy();
     this.buffer = buffer;
     this.capacity = next;

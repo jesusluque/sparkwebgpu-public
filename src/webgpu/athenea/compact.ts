@@ -857,7 +857,7 @@ export class CompactRelitPath {
       faint: true,
       releaseSky: true,
       plain: false,
-      binByCluster: false,
+      binByCluster: true,
       fieldEye: null,
       fieldFreshParity: null,
       stableOrder: false,

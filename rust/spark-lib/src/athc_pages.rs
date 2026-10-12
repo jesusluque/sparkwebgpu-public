@@ -277,6 +277,9 @@ pub fn children_of(block: &AthcBlock, name: impl Fn(u32, u32) -> u32) -> (Vec<u1
 const F16_SLACK: f32 = 1.0 / 1024.0;
 
 /// athenea's tree paged by error bands (see the module).
+/// Nodes a page may hold: a pager's slot (WgpuBandPager, CompactBandStreamer).
+pub const POOL_SLOT_NODES: usize = 3072;
+
 pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
     let n = input.block.n;
     let PageInput { parent, page, bounds, ids, first_leaf, .. } = *input;
@@ -364,6 +367,27 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         }
     }
     let moved = (0..n).filter(|&k| at_page[k] != page[k]).count();
+    // Pages the moves emptied (her coarse pages of lone roots, all gone to
+    // page 0 under the synthetic root) are dropped, the rest renumbered in
+    // order: a page is never empty.
+    let pages = {
+        let mut used = vec![false; pages];
+        for &p in &at_page {
+            used[p as usize] = true;
+        }
+        let mut new_of = vec![0u32; pages];
+        let mut next = 0u32;
+        for (p, &u) in used.iter().enumerate() {
+            new_of[p] = next;
+            if u {
+                next += 1;
+            }
+        }
+        for p in at_page.iter_mut() {
+            *p = new_of[*p as usize];
+        }
+        next as usize
+    };
     // Nodes of each page.
     let mut members: Vec<Vec<u32>> = vec![Vec::new(); pages];
     for k in 0..n {
@@ -449,8 +473,11 @@ pub fn pack_pages(input: &PageInput) -> Result<PagedTree> {
         if list.len() != nodes.len() + (p == 0 && synthetic) as usize {
             bail!("pack_pages: page {p} lays out {} of its {} nodes", list.len(), nodes.len());
         }
-        if list.len() > 0xffff {
-            bail!("pack_pages: page {p} of {} nodes (at most 65 535)", list.len());
+        if list.len() > POOL_SLOT_NODES {
+            // The pagers' slots (WgpuBandPager, CompactBandStreamer) hold
+            // 3072 nodes: a larger page (a forest's roots past ~3070, all
+            // in page 0) would not load. usd-athc --split-roots.
+            bail!("pack_pages: page {p} of {} nodes (a pool slot holds {POOL_SLOT_NODES}; --split-roots)", list.len());
         }
         for (i, &k) in list.iter().enumerate() {
             if k == ROOT {
@@ -834,6 +861,34 @@ pub(crate) mod tests {
         assert!(e >= nb.iter().map(|b| b.eps).fold(0.0, f32::max));
         assert!(r > 0.3, "{r}");
         assert_eq!(paged.rows[0].eps_max, ROOT_PARENT_ERROR);
+    }
+
+    #[test]
+    fn a_page_of_only_roots_is_dropped_not_left_empty() {
+        // athenea's 5120 forests (thousands of lone roots): a coarse page
+        // of hers holds nothing but roots, which all go to page 0.
+        let (b, mut parent, start, size) = tree(64);
+        let top = parent.len() - 1;
+        let kids: Vec<usize> = (0..top).filter(|&k| parent[k] as usize == top).collect();
+        for &k in &kids {
+            parent[k] = k as u32;
+        }
+        let b = b.slice(0, top);
+        parent.truncate(top);
+        let nb = bounds(&b, &parent, &size[..top]);
+        let her = her_pages(&parent, &nb, &start[..top], 16);
+        // Her page 1: the roots alone; the rest one page later.
+        let page: Vec<u32> = (0..top).map(|k| if kids.contains(&k) { 1 } else if her[k] == 0 { 0 } else { her[k] + 1 }).collect();
+        let ids: Vec<u32> = (0..b.n as u32).collect();
+        let input = PageInput { block: &b, parent: &parent, page: &page, bounds: &nb, ids: &ids, first_leaf: &start[..top], sh_words: 0, page_box: PageBox::Parents };
+        let paged = pack_pages(&input).unwrap();
+        assert!(paged.rows.iter().all(|r| r.count > 0));
+        assert_eq!(paged.report.pages, paged.rows.len());
+        check_paged(&paged.pages, &paged.rows).unwrap();
+        let mut seen = paged.order.clone();
+        seen.retain(|&k| k != u32::MAX);
+        seen.sort();
+        assert_eq!(seen, ids);
     }
 
     /// A paged tree of `leaves` leaves (pages of `per`) whose nodes carry

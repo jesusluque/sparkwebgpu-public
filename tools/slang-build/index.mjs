@@ -149,7 +149,21 @@ export function reflect(json) {
                 format: STORAGE_FORMATS[p.format] ?? p.format,
               },
             }
-          : { texture: { sampleType: "unfilterable-float" } };
+          : {
+              texture: {
+                // [Filterable] (core.bindings): sampled with a filtering
+                // sampler (thread CW); else read with Load, unfilterable.
+                sampleType: (p.userAttribs ?? []).some(
+                  (a) => a.name === "Filterable",
+                )
+                  ? "float"
+                  : "unfilterable-float",
+              },
+            };
+    } else if (t.kind === "samplerState") {
+      // A SamplerState, bound by the caller: a filtering sampler.
+      entry.kind = "external";
+      entry.layout = { sampler: { type: "filtering" } };
     } else {
       entry.kind = "unsupported";
       entry.type = t.kind;

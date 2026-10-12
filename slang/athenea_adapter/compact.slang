@@ -71,6 +71,7 @@ import athenea.common.packing;
 import athenea.common.color;
 import athenea.common.octahedral;
 import athenea.light.environment;
+import athenea.material.microfacet;
 import athenea.scene.splat_encoding;
 import core.bindings;
 
@@ -795,7 +796,13 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
     float3 behind = transmits ? transmittedBehindOf(s, wo, dome) : float3(0.0);
     if (hasField && transmits && s.ior > 1.0) {
         const float3 white = fieldThrough;
-        const float open = smoothstep(0.5, 0.85, dot(white, float3(0.2126, 0.7152, 0.0722)));
+        // athenea 798184d: the way through reads open against what the two
+        // faces' Fresnel and the tint let through at all.
+        const float3 lumW = float3(0.2126, 0.7152, 0.0722);
+        const float fresnelIn = fresnelDielectric(saturate(nDotV), max(s.ior, 1.0));
+        const float3 tintIn = lerp(float3(1.0), saturate(s.albedo), s.transmission);
+        const float expected = max(dot((1.0 - fresnelIn) * (1.0 - fresnelIn) * tintIn * tintIn, lumW), 1.0e-3);
+        const float open = smoothstep(0.5, 0.85, saturate(dot(white, lumW) / expected));
         const float3 sharp =
             lensCurvature > 0.0
                 ? compactEnvRadiance(envTexels, dome, lensExit(s, wo, lensCurvature),
@@ -813,9 +820,23 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
                  s.exitThrough;
     }
     const float3 passes = transmits ? transmittedShareOf(s, nDotV) : float3(0.0);
-    const float3 body2 = layers.under * s.albedo * (1.0 - s.metallic) *
-                         ((1.0 - s.transmission) * front + transmittedWeightOf(s) * passes * behind);
     const float3 seen = compactEnvRadiance(envTexels, dome, mirror, s.roughness, side);
+    // athenea a112076: a solid's far face reflects back out through the near
+    // one (farFaceReflected), the light it sends read through the lens's third
+    // point where the cloud keeps its curvature (lensFarReflection).
+    float3 farBack = float3(0.0);
+    if (transmits) {
+        float3 farSeen = seen;
+        if (lensCurvature > 0.0) {
+            const float3 farOut = lensFarReflection(s, wo, lensCurvature);
+            if (dot(farOut, farOut) > 0.5) {
+                farSeen = compactEnvRadiance(envTexels, dome, farOut, transmittedRoughness(s.roughness, s.ior), side);
+            }
+        }
+        farBack = farFaceReflected(s, nDotV, farSeen);
+    }
+    const float3 body2 = layers.under * s.albedo * (1.0 - s.metallic) *
+                         ((1.0 - s.transmission) * front + transmittedWeightOf(s) * (passes * behind + farBack));
     const float openAll = saturate(openness / 0.28209479177387814);
     // athenea 35ae3cb: a polish as wide as the field asks its own lobe's
     // cells, and the field answers what they close.

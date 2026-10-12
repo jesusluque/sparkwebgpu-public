@@ -942,6 +942,30 @@ public float3 lensExitThrough(SplatSurface s, float3 wo, float curvature) {
     return (1.0 - reflectedBack) * tint;
 }
 
+/// WHERE THE LIGHT THE FAR FACE REFLECTS LEAVES: the ray `lensExit` bends
+/// in, reflected at the far face of the same sphere, crosses again and is
+/// bent out at a third point -- the primary rainbow's path -- not along the
+/// near face's mirror. Read along the mirror, a clear ball's head looked up
+/// at the bright ceiling and came out 7 % over the path traced one, its rim
+/// 28 % (research, proto/pawn). Zero where there is no such path: no
+/// curvature, no way in, or the third point holds it by total reflection.
+public float3 lensFarReflection(SplatSurface s, float3 wo, float curvature) {
+    const float index = max(s.ior, 1.0);
+    const float3 n = s.normal;
+    const float3 inside = refract(-wo, n, 1.0 / index);
+    if (!(curvature > 1.0e-6) || !(dot(inside, inside) > 1.0e-8)) {
+        return float3(0.0);
+    }
+    const float3 t1 = normalize(inside);
+    const float radius = 1.0 / curvature;
+    const float chord = 2.0 * radius * max(dot(t1, -n), 0.0);
+    const float3 farNormal = normalize(t1 * (chord / radius) + n);
+    const float3 r1 = reflect(t1, farNormal);
+    const float3 thirdNormal = normalize(r1 * (2.0 * max(dot(r1, -farNormal), 0.0)) + farNormal);
+    const float3 out = refract(r1, -thirdNormal, index);
+    return dot(out, out) > 1.0e-8 ? normalize(out) : float3(0.0);
+}
+
 public float3 bentThrough(SplatSurface s, float3 wo) {
     const float3 bent = refract(-wo, s.normal, 1.0 / max(s.ior, 1.0));
     return dot(bent, bent) > 1.0e-8 ? normalize(bent) : -wo;
@@ -1058,6 +1082,27 @@ float3 transmittedShare(SplatSurface s, float nDotV) {
                ? float3(0.0)
                : saturate(float3(1.0) - ggxEnvDielectricAt(s.roughness, nDotV, s.lobes.specularIor) *
                                             s.lobes.specularWeight);
+}
+
+/// WHAT THE FAR FACE OF A SOLID SENDS BACK OUT THROUGH THE NEAR ONE: light
+/// that came in along the mirror direction, crossed the glass, met the far
+/// face and was reflected back to the eye -- in at the near face (1 - R),
+/// the tint, the far face's R, the tint again, out at the near face (1 - R);
+/// the gaussian's colour carries the first tint, as it does for the light
+/// let through (`lensExitThrough`). For a ball the far face meets the ray at
+/// the angle the near one bent it to, which reflects as much as the near
+/// face does from outside (reciprocity). Left out, a clear ball under a
+/// uniform sky read 0.952 where the mesh path traced, once its transmission
+/// paid one Fresnel a face, reads 0.9998: what passes both faces (0.92),
+/// the near face's polish (0.04), and this (0.037). Nothing for a thin wall
+/// (the blend is its whole transmission) or a far face seen from behind.
+public float3 farFaceReflected(SplatSurface s, float nDotV, float3 alongMirror) {
+    if (s.thinWalled || s.backFacing || !(s.ior > 1.0)) {
+        return float3(0.0);
+    }
+    const float r = fresnelDielectric(saturate(nDotV), s.ior);
+    const float3 tint = lerp(float3(1.0), saturate(s.albedo), s.transmission);
+    return (1.0 - r) * r * tint * (1.0 - r) * alongMirror;
 }
 
 /// WHAT A TX TRANSFER GIVES A GAUSSIAN WHATEVER THE EYE: the body's light
@@ -1359,7 +1404,17 @@ float3 relitByDome<let kTransfer : int>(SplatSurface s, float3 wo, LightRecord l
             // 0.58 against the mesh path traced, where the first transfer
             // drew it sharp.
             const float3 white = splatFieldAlong(s, transfer, -wo, s.roughness);
-            const float open = smoothstep(0.5, 0.85, dot(white, float3(0.2126, 0.7152, 0.0722)));
+            // How open the way through reads, against what the two faces'
+            // Fresnel and the tint let through at all: at grazing the field
+            // along the way (`white`) falls with the Fresnel though nothing
+            // blocks it, and the lens filled with the degree-3 field drew the
+            // rim of a clear ball a quarter over the path traced one
+            // (research, proto/pawn: rim relMSE 0.083 -> 0.062).
+            const float3 lumW = float3(0.2126, 0.7152, 0.0722);
+            const float fresnelIn = fresnelDielectric(saturate(nDotV), max(s.ior, 1.0));
+            const float3 tintIn = lerp(float3(1.0), saturate(s.albedo), s.transmission);
+            const float expected = max(dot((1.0 - fresnelIn) * (1.0 - fresnelIn) * tintIn * tintIn, lumW), 1.0e-3);
+            const float open = smoothstep(0.5, 0.85, saturate(dot(white, lumW) / expected));
             // Through both faces where the cloud keeps its curvature (a ball
             // shows the room inverted, a pawn's head did not), one bend
             // otherwise.
@@ -1388,14 +1443,24 @@ float3 relitByDome<let kTransfer : int>(SplatSurface s, float3 wo, LightRecord l
         // The far face of a solid transmits nothing of its own: its share of
         // the light is what the near face already sent on.
         const float3 passes = transmittedShare(s, nDotV);
-        const float3 body2 = layers.under * s.albedo * (1.0 - s.metallic) *
-                             ((1.0 - s.transmission) * front + transmittedWeight(s) * passes * behind);
         // What the reflection sees: the cloud itself where a ray found it,
         // and the sky narrowed by how much of it this gaussian can see where
         // nothing was traced.
         const float3 seen = s.hasReflection
                                 ? s.reflectionColour
                                 : envRadiance(envTexels, dome, mirror, s.roughness, envBaseSide);
+        // The far face's reflection leaves through a third point of the
+        // lens (lensFarReflection), where the cloud keeps its curvature.
+        float3 farSeen = seen;
+        if (kTransfer >= 2 && slope.curvature > 0.0 && !s.hasReflection) {
+            const float3 farOut = lensFarReflection(s, wo, slope.curvature);
+            if (dot(farOut, farOut) > 0.5) {
+                farSeen = envRadiance(envTexels, dome, farOut, transmittedRoughness(s.roughness, s.ior), envBaseSide);
+            }
+        }
+        const float3 body2 = layers.under * s.albedo * (1.0 - s.metallic) *
+                             ((1.0 - s.transmission) * front +
+                              transmittedWeight(s) * (passes * behind + farFaceReflected(s, nDotV, farSeen)));
         // A TX transfer asks its lobe which of its directions are open; the
         // first transfer had one number for the whole hemisphere.
         // THE BASE'S POLISH IS OPEN BY THE HARMONICS, as the first transfer

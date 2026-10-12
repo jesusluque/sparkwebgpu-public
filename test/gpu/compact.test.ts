@@ -43,7 +43,11 @@ function rng(seed: number) {
 }
 
 /** A synthetic TX cloud: a sphere shell of splats facing out, a few materials. */
-function syntheticCloud(N = COMPACT_PIECE + 3000, clusters = 256): Streams {
+function syntheticCloud(
+  N = COMPACT_PIECE + 3000,
+  clusters = 256,
+  glass = false,
+): Streams {
   const r = rng(3);
   const ext0 = new Uint32Array(4 * N);
   const ext1 = new Uint32Array(4 * N);
@@ -81,6 +85,13 @@ function syntheticCloud(N = COMPACT_PIECE + 3000, clusters = 256): Streams {
       lobes: [0xc0ffffff, 0x3aa6ff00, 0x80000000],
     },
   ];
+  // A solid glass (transmission 1, not thin, its index 1.5 in the lobes'
+  // top byte as material 2's): the lens (athenea a112076, 798184d).
+  if (glass)
+    materials.splice(1, 3, {
+      pbr: (5 << 8) | (255 << 16),
+      lobes: [0xffffffff, 0x3aa60000, 0],
+    });
   for (let i = 0; i < N; i++) {
     const z = 2 * r() - 1;
     const phi = 2 * Math.PI * r();
@@ -428,6 +439,72 @@ describe.skipIf(!wideDevice).each([8, 4])(
     }, 120_000);
   },
 );
+
+describe.skipIf(!wideDevice)("a solid glass lens", () => {
+  // Half the shell a solid glass with an index (ior 1.5 on both paths, as a
+  // set's corvette.json `ior`): the lens, its far face's reflection through
+  // the third point and its openness against Fresnel (athenea a112076,
+  // 798184d), the same on the compact path as in today's relight.
+  it("relights as today's path does", async () => {
+    const d = wideDevice as GPUDevice;
+    const s = syntheticCloud(N, 256, true);
+    const basis = syntheticJointBasis(256, 5);
+    const cloud = encodeCompact({
+      count: N,
+      ...s,
+      basis: packJointBasis(basis),
+      clusters: 256,
+      weightBits: 8,
+    });
+    const W = 320;
+    const H = 240;
+    const { camera, place } = placeCamera(
+      W,
+      H,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(1.2, -1.0, 0.6),
+      50,
+      1,
+    );
+    const run = { W, H, sky: sky(), camera, place, colours: true, image: true };
+    const ref = await referenceRun(
+      d,
+      { ...compactToSource(cloud, s.q8) },
+      N,
+      basis,
+      {
+        ...run,
+        ior: 1.5,
+      },
+    );
+    const got = await compactRun(d, cloud, {
+      ...run,
+      path: { faint: true, sheetFade: -1, ior: 1.5 },
+    });
+    const plain = await compactRun(d, cloud, {
+      ...run,
+      path: { faint: true, sheetFade: -1 },
+    });
+    const colours = compare(
+      got.colours as Float32Array,
+      ref.colours as Float32Array,
+    );
+    const image = compare(got.image as Float32Array, ref.image as Float32Array);
+    const lens = compare(
+      got.image as Float32Array,
+      plain.image as Float32Array,
+    );
+    process.stderr.write(
+      `COMPACT_GLASS ${JSON.stringify({ colours, image, againstNoLens: lens })}\n`,
+    );
+    expect(cloud.layout.materials).toBe(2);
+    // The index matters (the lens is drawn at all) ...
+    expect(lens.relMSE).toBeGreaterThan(1e-4);
+    // ... and the same on both paths.
+    expect(colours.relMSE).toBeLessThan(1e-5);
+    expect(image.relMSE).toBeLessThan(1e-3);
+  }, 120_000);
+});
 
 describe.skipIf(!wideDevice || !process.env.COMPACT_SINGLE)("one splat", () => {
   const d = wideDevice as GPUDevice;

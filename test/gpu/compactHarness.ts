@@ -278,6 +278,8 @@ export interface RunOptions {
   transferResident?: "cpca8" | "words";
   /** Reference only: more atheneaRelightPlugin options (sheetFloor). */
   relight?: Record<string, unknown>;
+  /** Reference only: the cloud's glass index (the plugin's setIor). */
+  ior?: number;
 }
 
 function median(v: number[]) {
@@ -367,6 +369,7 @@ export async function referenceRun(
   });
   host.register(relight).attach(splats);
   const mesh = splats.add(source);
+  if (o.ior) relight.setIor(mesh, o.ior);
   await host.ready();
   o.place(0);
   for (let k = 0; k < 4; k++) {

@@ -777,8 +777,11 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
     const float3 irradiance = disc.w > 0.0 ? sunIrradiance() : float3(0.0);
     const bool cells = s.cellWords >= 8u;
     const bool hasField = cells && withIndirect;
-    float3 behind = transmittedBehindOf(s, wo, dome);
-    if (hasField && transmittedWeightOf(s) > 0.0 && s.ior > 1.0) {
+    // What a solid glass lets through (the body's transmitted share): read
+    // only where it is (transmittedWeightOf > 0), as it weighs nothing else.
+    const bool transmits = transmittedWeightOf(s) > 0.0;
+    float3 behind = transmits ? transmittedBehindOf(s, wo, dome) : float3(0.0);
+    if (hasField && transmits && s.ior > 1.0) {
         const float3 white = fieldThrough;
         const float open = smoothstep(0.5, 0.85, dot(white, float3(0.2126, 0.7152, 0.0722)));
         const float3 sharp =
@@ -788,7 +791,7 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
                       lensExitThrough(s, wo, lensCurvature)
                 : transmittedBehindOf(s, wo, dome);
         behind = open * sharp + (1.0 - open) * coupling * white * s.exitThrough;
-    } else if (hasField && transmittedWeightOf(s) > 0.0) {
+    } else if (hasField && transmits) {
         const float3 through = -wo;
         const float alpha = max(s.roughness * s.roughness, 1.0e-3);
         const float openBehind = splatConeOpen(s, compactData, through, min(1.4 * atan(alpha), 1.2), -s.normal);
@@ -797,7 +800,7 @@ float3 relitCompact(SplatSurface s, float3 wo, uint dome, bool withIndirect, flo
                   (1.0 - open) * coupling * fieldThrough) *
                  s.exitThrough;
     }
-    const float3 passes = transmittedShareOf(s, nDotV);
+    const float3 passes = transmits ? transmittedShareOf(s, nDotV) : float3(0.0);
     const float3 body2 = layers.under * s.albedo * (1.0 - s.metallic) *
                          ((1.0 - s.transmission) * front + transmittedWeightOf(s) * passes * behind);
     const float3 seen = compactEnvRadiance(envTexels, dome, mirror, s.roughness, side);

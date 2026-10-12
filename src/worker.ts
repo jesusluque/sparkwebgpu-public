@@ -23,6 +23,8 @@ import init_wasm, {
   get_lod_tree_level,
   athc_merged_pages,
   athc3_merged_pages,
+  athc_layout,
+  athc_prefix_bytes,
 } from "spark-rs";
 import type {
   AttribValues,
@@ -32,6 +34,7 @@ import type {
 } from "./defines";
 
 const rpcHandlers = {
+  athcLayout,
   athcMergedPages,
   athc3MergedPages,
   sortSplats16,
@@ -1007,6 +1010,20 @@ function getLodTreeLevel({
   level: number;
 }) {
   return get_lod_tree_level(lodId, level) as { indices: Uint32Array };
+}
+
+// A .athc's headers and tables (src/athc.ts readAthcLayout): `need`, the
+// bytes they take, and the layout once the prefix holds them (else null).
+async function athcLayout({
+  prefix,
+  fileBytes,
+}: {
+  prefix: Uint8Array;
+  fileBytes: number;
+}): Promise<{ need: number; layout: unknown }> {
+  const need = athc_prefix_bytes(prefix.subarray(0, 4096));
+  if (need > prefix.length) return { need, layout: null };
+  return { need, layout: athc_layout(prefix, fileBytes) };
 }
 
 // A .athc's merged pages (src/athc.ts), from its bytes through its levels.

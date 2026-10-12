@@ -26,6 +26,7 @@
     "build": "npm run build:production && npm run build:dev && npm run build:types",
     "build:dev": "vite build --mode dev",
     "build:production": "vite build --mode production",
+    "build:site": "SPARK_WASM=external vite build --mode production",
     "build:types": "tsc",
     "build:wasm": "node rust/build_wasm.js",
     "build:slang": "node tools/slang-build/index.mjs",

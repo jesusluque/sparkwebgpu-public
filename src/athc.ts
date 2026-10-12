@@ -18,12 +18,7 @@
 // the pager's (WgpuSplatPager.streamsToFetch); a page that did not fetch a
 // stream group fetches it later on its own (fetchAthcStreams), one Range.
 
-import {
-  athc_decode_cpca,
-  athc_layout,
-  athc_prefix_bytes,
-  athc_skeleton,
-} from "spark-rs";
+import { athc_decode_cpca, athc_skeleton } from "spark-rs";
 import { workerPool } from "./SplatWorker";
 import * as wasm from "./wasm";
 import {
@@ -525,23 +520,34 @@ export async function readRange(
   return { data: body.subarray(offset, offset + bytes), total: body.length };
 }
 
-/** The headers and tables of a .athc, from its first bytes. */
+/**
+ * The headers and tables of a .athc, from its first bytes. Parsed in a
+ * loader worker (thread CU: the page's own WASM instance is then never
+ * made for it; its memory grew with every prefix and never shrinks).
+ */
 export async function readAthcLayout(
   options: FetchOptions,
 ): Promise<{ layout: AnyAthcLayout; prefix: Uint8Array }> {
-  await wasm.initialization;
   const first = await readRange(options, 0, 65536);
   let prefix = first.data;
   const total = first.total;
   if (!Number.isFinite(total)) {
     throw new Error(".athc: the server did not say how long the file is");
   }
-  const need = athc_prefix_bytes(prefix.slice(0, 4096));
-  if (need > prefix.length) {
-    prefix = (await readRange(options, 0, need)).data;
+  // Copies: the call transfers its buffers.
+  const parse = (bytes: Uint8Array) =>
+    workerPool.withWorker((worker) =>
+      worker.call("athcLayout", { prefix: bytes.slice(), fileBytes: total }),
+    );
+  let parsed = await parse(prefix);
+  if (!parsed.layout) {
+    prefix = (await readRange(options, 0, parsed.need)).data;
+    parsed = await parse(prefix);
   }
-  const layout = athc_layout(prefix, total) as AnyAthcLayout;
-  return { layout, prefix: prefix.subarray(0, Math.max(need, 136)) };
+  return {
+    layout: parsed.layout as AnyAthcLayout,
+    prefix: prefix.subarray(0, Math.max(parsed.need, 136)),
+  };
 }
 
 /** One animation of a skinned .athc (athc_skin.rs SkinClip). */
@@ -575,6 +581,7 @@ export async function readAthcSkeleton(
   options: FetchOptions,
 ): Promise<AthcSkeleton | null> {
   const { prefix } = await readAthcLayout(options);
+  await wasm.initialization;
   return athc_skeleton(prefix) as AthcSkeleton | null;
 }
 

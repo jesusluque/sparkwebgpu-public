@@ -1040,6 +1040,9 @@ export class SplatMesh extends SplatGenerator {
       object: THREE.Object3D;
     }[],
   ) {
+    // The WASM instance is made on first use: the first raycasts start it
+    // (and miss, as before it was ready).
+    if (this.raycastable && !wasm.isInitialized()) void wasm.startWasm();
     if (
       !wasm.isInitialized() ||
       !this.raycastable ||

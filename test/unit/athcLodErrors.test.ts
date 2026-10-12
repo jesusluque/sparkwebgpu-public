@@ -26,6 +26,13 @@ vi.mock("../../src/SplatWorker", async () => {
     (...args: any[]) => any
   >;
   const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
+    // src/worker.ts athcLayout (readAthcLayout parses in a worker).
+    athcLayout: ({ prefix, fileBytes }) => {
+      const bytes = prefix as Uint8Array;
+      const need = wasm.athc_prefix_bytes(bytes.subarray(0, 4096));
+      if (need > bytes.length) return { need, layout: null };
+      return { need, layout: wasm.athc_layout(bytes, fileBytes) };
+    },
     athc3MergedPages: ({ tables, levels }) => {
       const { pages, headers, ...tree } = wasm.athc3_merged_pages(
         tables,

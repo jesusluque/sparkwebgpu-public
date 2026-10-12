@@ -33,7 +33,7 @@ import {
   createReflectedRenderPipeline,
 } from "../renderPipeline";
 import { UniformWriter } from "../uniforms";
-import { AtheneaSky, type SkyImage } from "./AtheneaSky";
+import { AtheneaSky, type SkyImage, envSideOf } from "./AtheneaSky";
 
 /** Gaussians a chunk (positions, scales and curvature are ranged per chunk). */
 export const COMPACT_CHUNK = K.kCompactChunk;
@@ -746,6 +746,56 @@ export class CompactRelitPath {
    * a placeholder when neither is on.
    */
   private sharpRecords: GPUBuffer | null = null;
+  /** kCompactSharp: the dome's levels as one filtered atlas (or 1 x 1). */
+  private atlas: GPUTexture | null = null;
+  private atlasKey = "";
+  private atlasSampler: GPUSampler | null = null;
+  /** The atlas for this dome (compact.slang atlasSize/atlasOrigin). */
+  private envAtlasFor(encoder: GPUCommandEncoder, params: UniformWriter) {
+    const sharp = this.options.sharp && !this.options.plain;
+    const base = this.sky.baseSide;
+    const key = sharp ? `${this.sky.version}|${base}` : "none";
+    if (!this.atlas || this.atlasKey !== key) {
+      this.atlas?.destroy();
+      let w = 1;
+      let h = 1;
+      if (sharp) {
+        let column = 0;
+        for (let l = 1; l < 8; l++) column += envSideOf(l, base);
+        w = envSideOf(0, base) + envSideOf(1, base);
+        h = Math.max(envSideOf(0, base), column);
+      }
+      this.atlas = this.device.createTexture({
+        label: "compact env atlas",
+        size: [w, h],
+        format: "rgba16float",
+        usage:
+          GPUTextureUsage.TEXTURE_BINDING |
+          (sharp ? GPUTextureUsage.STORAGE_BINDING : 0),
+      });
+      this.atlasKey = key;
+      if (sharp) {
+        const pass = encoder.beginComputePass({ label: "compact.envAtlas" });
+        this.registry
+          .get(compactModule, "atheneaCompactEnvAtlas")
+          .dispatch(pass, {
+            grid: [w, h],
+            buffers: { envTexels: this.sky.envTexels as GPUBuffer },
+            bindings: { envAtlasOut: this.atlas.createView() },
+            uniforms: params.data,
+          });
+        pass.end();
+      }
+    }
+    this.atlasSampler ??= this.device.createSampler({
+      label: "compact env atlas",
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+    });
+    return { view: this.atlas.createView(), sampler: this.atlasSampler };
+  }
   private auxFor(binned: boolean): GPUBuffer {
     const sharp = this.options.sharp && !this.options.plain;
     const binWords = 2 * K.kCompactBins + this.capacity;
@@ -1299,6 +1349,7 @@ export class CompactRelitPath {
     profiler: GpuProfiler | null,
   ) {
     const rec = this.records;
+    const atlas = this.envAtlasFor(encoder, params);
     if (!this.pipeline || this.pipelineFormat !== format) {
       this.pipeline = createReflectedRenderPipeline(
         this.device,
@@ -1329,7 +1380,8 @@ export class CompactRelitPath {
       draw3: rec[3],
       compactParams: this.drawUniform,
       sharpIn: this.sharpRecords ?? this.auxFor(false),
-      envTexels: this.sky.envTexels as GPUBuffer,
+      envAtlas: atlas.view,
+      envAtlasSampler: atlas.sampler,
     });
     const pass = encoder.beginRenderPass({
       label: "compact.draw",
@@ -1410,6 +1462,7 @@ export class CompactRelitPath {
 
   dispose() {
     if (this.ownsData) this.data?.destroy();
+    this.atlas?.destroy();
     this.sharpRecords?.destroy();
     this.bins?.destroy();
     this.frame.destroy();

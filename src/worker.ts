@@ -25,6 +25,7 @@ import init_wasm, {
   athc3_merged_pages,
   athc_layout,
   athc_prefix_bytes,
+  lod_memory_report,
 } from "spark-rs";
 import type {
   AttribValues,
@@ -56,6 +57,7 @@ const rpcHandlers = {
   getLodTreeLevel,
   nextChunk,
   wasmMemory,
+  lodMemory,
   setCompactQuant,
 };
 export type rpcHandlers = typeof rpcHandlers;
@@ -66,6 +68,13 @@ function setCompactQuant({ bits }: { bits: number[] }) {
   const b = [0, 1, 2, 3, 4].map((k) => bits[k] ?? 0);
   set_compact_quant(b[0], b[1], b[2], b[3], b[4]);
   return {};
+}
+/** What the LoD trees hold, bytes (lod_tree.rs lod_memory_report). */
+function lodMemory() {
+  return {
+    ...(lod_memory_report() as Record<string, number>),
+    heap: wasmExports?.memory.buffer.byteLength ?? 0,
+  };
 }
 /** The worker's WASM heap, bytes (it never shrinks). */
 function wasmMemory() {

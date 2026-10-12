@@ -81,6 +81,7 @@ export type ToCutter =
   | { t: "keys"; id: number };
 
 export interface CutterStats {
+  mem?: Record<string, number>;
   cut: number;
   missing: number;
   missDropped: number;
@@ -731,6 +732,34 @@ export class NodeCutter {
     s.indexBytes = this.alloc.bytes;
     s.runBytesHeld = this.runs.bytes;
     s.inflatedBytes = this.runs.inflatedBytes;
+    // Where the worker's buffers go (thread CU round 10), bytes.
+    const b = (a: { byteLength: number } | null | undefined) =>
+      a?.byteLength ?? 0;
+    s.mem = {
+      alloc: this.alloc.bytes,
+      runs: this.runs.bytes + this.runs.inflatedBytes,
+      runPages: this.runs.pageCount * 96,
+      cut:
+        b(this.keys) +
+        b(this.out) +
+        b(this.failed) +
+        b(this.failedList) +
+        b(this.base) +
+        b(this.miss) +
+        b(this.kb) +
+        b(this.near?.parents) +
+        b(this.near?.firstKids) +
+        b(this.near?.kidCounts),
+      groups:
+        b(this.gA) +
+        b(this.gB) +
+        b(this.gG) +
+        b(this.gR) +
+        b(this.gW) +
+        b(this.queue),
+      seen: b(this.seen) + b(this.kidScratch),
+      spare: this.spare.reduce((n, x) => n + x.byteLength, 0),
+    };
     s.fetches = this.fetches;
     s.waitingRuns = this.waiting.size;
     s.busy =

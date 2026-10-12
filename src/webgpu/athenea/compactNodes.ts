@@ -124,7 +124,7 @@ export class NodeIndex {
     }
     if (p.n === p.slots.length) {
       const grown = new Int32Array(
-        Math.min(this.places, Math.ceil(p.slots.length * 1.5) + 8),
+        Math.min(this.places, Math.ceil(p.slots.length * 1.25) + 8),
       );
       grown.set(p.slots);
       this.slotBytes += (grown.length - p.slots.length) * 4;
@@ -201,24 +201,25 @@ function popcount(v: number) {
  */
 class SlotDeque {
   q: Int32Array;
-  inQ: Uint8Array;
+  /** One bit a slot: in the ring (thread CU round 10: was a byte). */
+  inQ: Uint32Array;
   head = 0;
   len = 0;
   constructor(capacity: number) {
     this.q = new Int32Array(Math.max(capacity, 1));
-    this.inQ = new Uint8Array(Math.max(capacity, 1));
+    this.inQ = new Uint32Array((Math.max(capacity, 1) + 31) >>> 5);
   }
   /** An idle slot, behind the others. */
   push(s: number) {
-    if (this.inQ[s]) return;
-    this.inQ[s] = 1;
+    if (this.inQ[s >>> 5] & (1 << (s & 31))) return;
+    this.inQ[s >>> 5] |= 1 << (s & 31);
     this.q[(this.head + this.len) % this.q.length] = s;
     this.len += 1;
   }
   /** A free slot, in front (taken next). */
   unshift(s: number) {
-    if (this.inQ[s]) return;
-    this.inQ[s] = 1;
+    if (this.inQ[s >>> 5] & (1 << (s & 31))) return;
+    this.inQ[s >>> 5] |= 1 << (s & 31);
     this.head = (this.head + this.q.length - 1) % this.q.length;
     this.q[this.head] = s;
     this.len += 1;
@@ -228,7 +229,7 @@ class SlotDeque {
     const s = this.q[this.head];
     this.head = (this.head + 1) % this.q.length;
     this.len -= 1;
-    this.inQ[s] = 0;
+    this.inQ[s >>> 5] &= ~(1 << (s & 31));
     return s;
   }
   /** Its slots, front first (a copy). */
@@ -249,7 +250,7 @@ class SlotDeque {
   ) {
     const old = this.toArray();
     this.q = new Int32Array(Math.max(capacity, 1));
-    this.inQ = new Uint8Array(Math.max(capacity, 1));
+    this.inQ = new Uint32Array((Math.max(capacity, 1) + 31) >>> 5);
     this.head = 0;
     this.len = 0;
     for (let k = 0; k < front.length; k++) this.push(front[k]);
@@ -274,7 +275,7 @@ export class NodeSlotAllocator {
    * (the fast cut while a still frame draws a finer one): never taken,
    * idled nor moved until unpinned.
    */
-  private pinned = new Uint8Array(0);
+  private pinned = new Uint32Array(0);
   pinnedN = 0;
   readonly stats = { allocated: 0, reused: 0, evicted: 0, failed: 0 };
 
@@ -293,12 +294,12 @@ export class NodeSlotAllocator {
   /** Pins `slots` (those holding a node); replaces any earlier pin. */
   pin(slots: ArrayLike<number>) {
     this.unpin();
-    this.pinned = new Uint8Array(this.capacity);
+    this.pinned = new Uint32Array((this.capacity + 31) >>> 5);
     let n = 0;
     for (let k = 0; k < slots.length; k++) {
       const s = slots[k];
-      if (s < this.capacity && this.keyOf[s] >= 0 && !this.pinned[s]) {
-        this.pinned[s] = 1;
+      if (s < this.capacity && this.keyOf[s] >= 0 && !this.isPinnedBit(s)) {
+        this.pinned[s >>> 5] |= 1 << (s & 31);
         n += 1;
       }
     }
@@ -308,15 +309,15 @@ export class NodeSlotAllocator {
   /** Lets the pinned slots go: those not in use go idle. */
   unpin() {
     if (!this.pinnedN) {
-      this.pinned = new Uint8Array(0);
+      this.pinned = new Uint32Array(0);
       return;
     }
     const p = this.pinned;
-    this.pinned = new Uint8Array(0);
+    this.pinned = new Uint32Array(0);
     this.pinnedN = 0;
-    for (let s = 0; s < p.length; s++) {
+    for (let s = 0; s < this.capacity; s++) {
       if (
-        p[s] &&
+        p[s >>> 5] & (1 << (s & 31)) &&
         this.keyOf[s] >= 0 &&
         this.stamp[s] !== this.frame &&
         !this.isInLastCut(s)
@@ -327,7 +328,11 @@ export class NodeSlotAllocator {
   }
 
   private isPinned(s: number) {
-    return this.pinnedN > 0 && this.pinned[s] === 1;
+    return this.pinnedN > 0 && this.isPinnedBit(s);
+  }
+
+  private isPinnedBit(s: number) {
+    return (this.pinned[s >>> 5] & (1 << (s & 31))) !== 0;
   }
 
   /** Slots in use (a node in them, in the cut or idle). */
@@ -349,7 +354,7 @@ export class NodeSlotAllocator {
     for (let k = 0; k < added.length; k++) added[k] = this.capacity + k;
     this.idle.rebuild(capacity, () => true, added);
     if (this.pinned.length) {
-      const pinned = new Uint8Array(capacity);
+      const pinned = new Uint32Array((capacity + 31) >>> 5);
       pinned.set(this.pinned);
       this.pinned = pinned;
     }
@@ -598,7 +603,7 @@ export class NodeSlotAllocator {
   get bytes() {
     return (
       this.slotOf.bytes +
-      this.capacity * 11 +
+      this.capacity * 10.125 +
       this.pinned.byteLength +
       this.cur.byteLength +
       this.lastCut.byteLength
@@ -883,6 +888,87 @@ export class CompactNodePool {
    * capacities copied, then `moves` (from, to slot pairs: records past a
    * smaller capacity kept in a slot below it).
    */
+  private movePipeline: GPUComputePipeline | null = null;
+
+  /** Records `moves` (from, to slot pairs) from this buffer into `dst`. */
+  private moveRecords(
+    enc: GPUCommandEncoder,
+    dst: GPUBuffer,
+    moves: Uint32Array,
+  ) {
+    const d = this.device;
+    this.movePipeline ??= d.createComputePipeline({
+      label: "node pool moves",
+      layout: "auto",
+      compute: {
+        module: d.createShaderModule({
+          label: "node pool moves",
+          code: /* wgsl */ `
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<storage, read> moves: array<u32>;
+@group(0) @binding(3) var<uniform> p: vec4<u32>; // moves, records base (words), words a record, threads a row
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let t = g.y * p.w + g.x;
+  let m = t / p.z;
+  if (m >= p.x) { return; }
+  let w = t % p.z;
+  dst[p.y + moves[2u * m + 1u] * p.z + w] = src[p.y + moves[2u * m] * p.z + w];
+}`,
+        }),
+        entryPoint: "main",
+      },
+    });
+    const n = moves.length >> 1;
+    const threads = n * NODE_RECORD_WORDS;
+    const groups = Math.ceil(threads / 64);
+    const gx = Math.min(groups, 65535);
+    const gy = Math.ceil(groups / gx);
+    const mb = d.createBuffer({
+      label: "node pool moves",
+      size: moves.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    d.queue.writeBuffer(
+      mb,
+      0,
+      moves.buffer,
+      moves.byteOffset,
+      moves.byteLength,
+    );
+    const ub = d.createBuffer({
+      label: "node pool moves params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    d.queue.writeBuffer(
+      ub,
+      0,
+      new Uint32Array([n, this.recordsBase, NODE_RECORD_WORDS, gx * 64]),
+    );
+    const pass = enc.beginComputePass({ label: "node pool moves" });
+    pass.setPipeline(this.movePipeline);
+    pass.setBindGroup(
+      0,
+      d.createBindGroup({
+        layout: this.movePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.buffer } },
+          { binding: 1, resource: { buffer: dst } },
+          { binding: 2, resource: { buffer: mb } },
+          { binding: 3, resource: { buffer: ub } },
+        ],
+      }),
+    );
+    pass.dispatchWorkgroups(gx, gy);
+    pass.end();
+    // The params buffer is small: let it go with the moves.
+    const both = mb;
+    queueMicrotask(() => ub.destroy());
+    return both;
+  }
+
   resize(capacity: number, moves?: Uint32Array) {
     const next = Math.min(Math.max(capacity, 1024), this.maxCapacity);
     if (next === this.capacity && !moves?.length) return false;
@@ -893,16 +979,25 @@ export class CompactNodePool {
       4;
     enc.copyBufferToBuffer(this.buffer, 0, buffer, 0, keep);
     const R = NODE_RECORD_WORDS * 4;
-    for (let k = 0; moves && k < moves.length; k += 2) {
-      enc.copyBufferToBuffer(
-        this.buffer,
-        this.recordsBase * 4 + moves[k] * R,
-        buffer,
-        this.recordsBase * 4 + moves[k + 1] * R,
-        R,
-      );
+    let movesBuffer: GPUBuffer | null = null;
+    if (moves && moves.length > 2 * 64) {
+      // Many moves (a still frame's pool given back): one dispatch, a
+      // thread a word, instead of a copy command a record (thread CU
+      // round 10: ~100k copies stalled the first moving frame ~90 ms).
+      movesBuffer = this.moveRecords(enc, buffer, moves);
+    } else {
+      for (let k = 0; moves && k < moves.length; k += 2) {
+        enc.copyBufferToBuffer(
+          this.buffer,
+          this.recordsBase * 4 + moves[k] * R,
+          buffer,
+          this.recordsBase * 4 + moves[k + 1] * R,
+          R,
+        );
+      }
     }
     this.device.queue.submit([enc.finish()]);
+    movesBuffer?.destroy();
     this.buffer.destroy();
     this.buffer = buffer;
     this.capacity = next;
@@ -1100,6 +1195,10 @@ export class RunPayloadStore {
   bytes = 0;
   inflatedBytes = 0;
   frame = 0;
+  /** Pages held (thread CU: the memory census). */
+  get pageCount() {
+    return this.pages.size;
+  }
   readonly stats = {
     inflates: 0,
     inflateMs: 0,

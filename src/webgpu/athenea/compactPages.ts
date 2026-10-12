@@ -1345,11 +1345,12 @@ export class CompactBandStreamer {
     for (const p of this.pieces) pendingPages += p.inFlight.size;
     const plan = planBand(
       meshes,
-      this.options.slots,
+      this.limit,
       this.options.maxRangeBytes ?? 8 << 20,
-      { free: this.freeSlots.length, pending: pendingPages },
+      { free: Math.max(0, this.limit - this.slotsHeld), pending: pendingPages },
     );
     this.lastPlan = plan;
+    this.trimToLimit();
     const s = this.stats;
     s.neededPages = plan.neededPages;
     s.neededNodes = plan.neededNodes;
@@ -1990,7 +1991,11 @@ export class CompactBandStreamer {
   /** Pages posted to the worker, not landed back yet. */
   private unpacking = 0;
   private remoteBusy = false;
-  private remoteStats: Record<string, number | boolean> = {};
+  private remoteStats: Record<string, unknown> = {};
+  /** The node worker's last stats (debug). */
+  get cutterStats() {
+    return this.remoteStats;
+  }
   private keysWaiting = new Map<number, (k: Int32Array) => void>();
   private remoteKeys: Int32Array | null = null;
 
@@ -2247,10 +2252,45 @@ export class CompactBandStreamer {
   private evictedRanges: Record<string, unknown>[] = [];
   private evictedSlots = new Set<number>();
 
-  /** A free slot, else one evicted from the last plan's order. */
+  /**
+   * The slots the plan may fill (thread CU round 10): up to options.slots,
+   * lower to hold fewer pages (a phone: the moving budget; all of them for
+   * a still frame). Lowering it evicts pages past it at the next update.
+   */
+  slotLimit = Number.POSITIVE_INFINITY;
+
+  private get limit() {
+    return Math.min(this.slotLimit, this.options.slots);
+  }
+
+  /** Pages resident or landing (slots not free). */
+  private get slotsHeld() {
+    return this.options.slots - this.freeSlots.length;
+  }
+
+  /** A free slot (under the limit), else one evicted from the last plan's order. */
   private takeSlot(): number | undefined {
-    const free = this.freeSlots.pop();
-    if (free !== undefined) return free;
+    if (this.slotsHeld < this.limit) {
+      const free = this.freeSlots.pop();
+      if (free !== undefined) return free;
+    }
+    return this.evictOne();
+  }
+
+  /**
+   * Pages past a lowered limit go (the last plan's eviction order), 32 an
+   * update: a still frame's ~1000 extra pages at once were a 90 ms task on
+   * the first moving frame.
+   */
+  private trimToLimit() {
+    for (let k = 0; k < 32 && this.slotsHeld > this.limit; k++) {
+      const slot = this.evictOne();
+      if (slot === undefined) break;
+      this.freeSlots.push(slot);
+    }
+  }
+
+  private evictOne(): number | undefined {
     const order = this.lastPlan?.evictable ?? [];
     while (order.length) {
       const { key, page } = order.shift() as { key: PieceState; page: number };
@@ -2359,7 +2399,7 @@ export class CompactBandStreamer {
         t.push((f * row.epsMax) / Math.max(Math.sqrt(d2), BAND_NEAR) / pixel);
       });
     }
-    const room = this.options.slots - this.pieces.length;
+    const room = this.limit - this.pieces.length;
     this.lastTauPages = t;
     this.lastTauRoom = room;
     if (t.length <= room) return 0;

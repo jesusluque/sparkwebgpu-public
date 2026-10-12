@@ -31,6 +31,7 @@ export const atheneaAdapterCompact = {
   kCompactCoatFold: 512,
   kCompactPolishField: 1024,
   kCompactSharp: 2048,
+  kCompactEnvAtlas: 4096,
   kCompactNone: 4294967295,
   kCompactSheetAlpha: 0.1,
 } as const;

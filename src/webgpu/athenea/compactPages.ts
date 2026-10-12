@@ -714,6 +714,9 @@ export class CompactBandStreamer {
     culled: 0,
     occluded: 0,
     tau: 0,
+    tauTooLow: 0,
+    tauNeededPages: 0,
+    tauRoom: 0,
     traverseMs: 0,
     /** The WASM traversal alone (the rest: the worker's round trip). */
     traverseWasmMs: 0,
@@ -1060,11 +1063,34 @@ export class CompactBandStreamer {
       );
       // Pruned (wanted pages): the set grows as tau falls, so tau comes
       // down by at most 1/1.25 a traversal (up at once: never past the pool).
-      const next =
+      // Thread CU: for an eye that stays, a tau whose wanted pages did not
+      // fit (the fit came back above it) is remembered, and tau comes down
+      // no lower than halfway to it, so it settles on the lowest tau that
+      // fits (to 2 %) instead of swinging between a step that fits and one
+      // that does not (the close-up: 4.61 <-> 5.76 forever).
+      const eyeKey = `${eyeArr}|${fwdArr}|${pixel}`;
+      if (eyeKey !== this.tauEyeKey) {
+        this.tauEyeKey = eyeKey;
+        this.tauTooLow = 0;
+      }
+      if (this.wanted && fit > this.tau * 1.000001 && this.tauFell) {
+        this.tauTooLow = Math.max(this.tauTooLow, this.tau);
+      }
+      let next =
         this.wanted && fit < this.tau ? Math.max(fit, this.tau / 1.25) : fit;
+      if (this.wanted && next < this.tau && this.tauTooLow > 0) {
+        next = Math.max(next, 0.5 * (this.tau + this.tauTooLow));
+        if (this.tau - this.tauTooLow <= 0.02 * this.tau) next = this.tau;
+      }
+      this.tauFell = next < this.tau * 0.999;
       // Still coming down: the caller keeps traversing a still view.
-      this.converging = next < this.tau * 0.999;
+      this.converging = this.tauFell;
       this.tau = next;
+      this.stats.tauTooLow = this.tauTooLow;
+      this.stats.tauNeededPages = this.lastTauPages.filter(
+        (t) => t > next,
+      ).length;
+      this.stats.tauRoom = this.lastTauRoom;
     }
     this.stats.tau = this.tau;
     const errorLimit = pixel * this.tau;
@@ -2227,6 +2253,15 @@ export class CompactBandStreamer {
 
   /** tau fell at the last update (pruned planning): not settled yet. */
   converging = false;
+  /** The eye tauTooLow belongs to (any move forgets it). */
+  private tauEyeKey = "";
+  /** For that eye, the largest tau whose wanted pages did not fit (0: none). */
+  private tauTooLow = 0;
+  /** tau came down at the last update. */
+  private tauFell = false;
+  /** The last tauToFitNow's page thresholds and the pool's room. */
+  private lastTauPages: number[] = [];
+  private lastTauRoom = 0;
 
   /** The pages of each tree the last traversal asked for (null: no pruning). */
   private wanted: Map<number, Set<number>> | null = null;
@@ -2261,6 +2296,8 @@ export class CompactBandStreamer {
       });
     }
     const room = this.options.slots - this.pieces.length;
+    this.lastTauPages = t;
+    this.lastTauRoom = room;
     if (t.length <= room) return 0;
     t.sort((a, b) => b - a);
     return t[Math.max(0, room)] * (1 + 1e-6);

@@ -1205,8 +1205,11 @@ fn is_disc(s: [f32; 3]) -> bool {
 }
 
 /// `lod_leaf_moments.slang`, over the Morton-sorted splats.
-fn leaf_moments(s: &AthcBlock, level: &Level, l: &MomentLayout, sh_words: usize) -> Vec<f32> {
-    let mut m = vec![0.0f32; level.groups * l.stride];
+fn leaf_moments(s: &AthcBlock, level: &Level, l: &MomentLayout, sh_words: usize) -> Vec<f64> {
+    // f64: the second moments are about the world origin, and in f32 at ~2 m
+    // they lose ~5e-7 m², far more than a thin splat's variance (athenea
+    // b1d6959; her fix takes them about a local centre instead).
+    let mut m = vec![0.0f64; level.groups * l.stride];
     for g in 0..level.groups {
         let first = level.starts[g] as usize;
         let end = if g + 1 < level.groups {
@@ -1245,20 +1248,22 @@ fn leaf_moments(s: &AthcBlock, level: &Level, l: &MomentLayout, sh_words: usize)
             let mm: M3 =
                 [0, 1, 2].map(|row| [r[row][0] * sc[0], r[row][1] * sc[1], r[row][2] * sc[2]]);
             let cov = mul(&mm, &transpose(&mm));
-            let wt = p[3] * disc_area(sc);
+            let wt = (p[3] * disc_area(sc)) as f64;
+            let (x, y, z) = (p[0] as f64, p[1] as f64, p[2] as f64);
+            let c = cov.map(|row| row.map(|v| v as f64));
             m[at] += wt;
-            m[at + 1] += wt * p[0];
-            m[at + 2] += wt * p[1];
-            m[at + 3] += wt * p[2];
-            m[at + 4] += wt * (cov[0][0] + p[0] * p[0]);
-            m[at + 5] += wt * (cov[0][1] + p[0] * p[1]);
-            m[at + 6] += wt * (cov[0][2] + p[0] * p[2]);
-            m[at + 7] += wt * (cov[1][1] + p[1] * p[1]);
-            m[at + 8] += wt * (cov[1][2] + p[1] * p[2]);
-            m[at + 9] += wt * (cov[2][2] + p[2] * p[2]);
-            m[at + 10] += wt * f16_of(sh[2] >> 16);
-            m[at + 11] += wt * f16_of(sh[3] & 0xffff);
-            m[at + 12] += wt * f16_of(sh[3] >> 16);
+            m[at + 1] += wt * x;
+            m[at + 2] += wt * y;
+            m[at + 3] += wt * z;
+            m[at + 4] += wt * (c[0][0] + x * x);
+            m[at + 5] += wt * (c[0][1] + x * y);
+            m[at + 6] += wt * (c[0][2] + x * z);
+            m[at + 7] += wt * (c[1][1] + y * y);
+            m[at + 8] += wt * (c[1][2] + y * z);
+            m[at + 9] += wt * (c[2][2] + z * z);
+            m[at + 10] += wt * f16_of(sh[2] >> 16) as f64;
+            m[at + 11] += wt * f16_of(sh[3] & 0xffff) as f64;
+            m[at + 12] += wt * f16_of(sh[3] >> 16) as f64;
             if !is_disc(sc) {
                 m[at + l.not_discs()] += 1.0;
             }
@@ -1269,14 +1274,14 @@ fn leaf_moments(s: &AthcBlock, level: &Level, l: &MomentLayout, sh_words: usize)
                 } else {
                     f16_of(word >> 16)
                 };
-                m[at + MOMENTS_HEAD + h] += wt * v;
+                m[at + MOMENTS_HEAD + h] += wt * v as f64;
             }
             if l.normals {
                 let nv = crate::athc::unpack_normal(s.normals[i]);
                 let nb = at + MOMENTS_HEAD + l.keep * 3;
-                m[nb] += wt * nv[0];
-                m[nb + 1] += wt * nv[1];
-                m[nb + 2] += wt * nv[2];
+                m[nb] += wt * nv[0] as f64;
+                m[nb + 1] += wt * nv[1] as f64;
+                m[nb + 2] += wt * nv[2] as f64;
             }
         }
     }
@@ -1284,8 +1289,8 @@ fn leaf_moments(s: &AthcBlock, level: &Level, l: &MomentLayout, sh_words: usize)
 }
 
 /// `lod_merge_moments.slang`
-fn merge_moments(level: &Level, fine: &Level, fine_moments: &[f32], stride: usize) -> Vec<f32> {
-    let mut m = vec![0.0f32; level.groups * stride];
+fn merge_moments(level: &Level, fine: &Level, fine_moments: &[f64], stride: usize) -> Vec<f64> {
+    let mut m = vec![0.0f64; level.groups * stride];
     for g in 0..level.groups {
         let first = fine.group[level.starts[g] as usize] as usize;
         let end = if g + 1 < level.groups {
@@ -1294,7 +1299,7 @@ fn merge_moments(level: &Level, fine: &Level, fine_moments: &[f32], stride: usiz
             fine.groups
         };
         for k in 0..stride {
-            let mut sum = 0.0f32;
+            let mut sum = 0.0f64;
             for h in first..end {
                 sum += fine_moments[h * stride + k];
             }
@@ -1305,7 +1310,8 @@ fn merge_moments(level: &Level, fine: &Level, fine_moments: &[f32], stride: usiz
 }
 
 /// `lod_finalize.slang`: one packed Gaussian per group.
-fn finalize(m: &[f32], groups: usize, l: &MomentLayout, sh_words: usize) -> AthcBlock {
+fn finalize(m64: &[f64], groups: usize, l: &MomentLayout, sh_words: usize) -> AthcBlock {
+    let m: Vec<f32> = m64.iter().map(|&v| v as f32).collect();
     let mut b = AthcBlock {
         n: groups,
         ..Default::default()
@@ -1313,18 +1319,16 @@ fn finalize(m: &[f32], groups: usize, l: &MomentLayout, sh_words: usize) -> Athc
     for g in 0..groups {
         let at = g * l.stride;
         let weight = m[at].max(1e-30);
-        let mu = [m[at + 1] / weight, m[at + 2] / weight, m[at + 3] / weight];
-        let mut cov: M3 = [
-            [m[at + 4], m[at + 5], m[at + 6]],
-            [m[at + 5], m[at + 7], m[at + 8]],
-            [m[at + 6], m[at + 8], m[at + 9]],
-        ]
-        .map(|row| row.map(|v| v / weight));
-        for r in 0..3 {
-            for c in 0..3 {
-                cov[r][c] -= mu[r] * mu[c];
-            }
-        }
+        // The mean and covariance in f64 (see `leaf_moments`).
+        let w64 = m64[at].max(1e-30);
+        let mu64 = [m64[at + 1] / w64, m64[at + 2] / w64, m64[at + 3] / w64];
+        let s2 = [
+            [m64[at + 4], m64[at + 5], m64[at + 6]],
+            [m64[at + 5], m64[at + 7], m64[at + 8]],
+            [m64[at + 6], m64[at + 8], m64[at + 9]],
+        ];
+        let mu = mu64.map(|v| v as f32);
+        let mut cov: M3 = [0, 1, 2].map(|r| [0, 1, 2].map(|c| (s2[r][c] / w64 - mu64[r] * mu64[c]) as f32));
         let mut axes = jacobi(&mut cov);
         if determinant(&axes) < 0.0 {
             for row in axes.iter_mut() {
@@ -1714,7 +1718,7 @@ pub fn build_lod_from_codes(cloud: &PackedCloud, o: &BuildOptions, codes: &[u32]
     );
     let sh_words = cloud.sh_words as usize;
     let mut stored: Vec<(u32, AthcBlock)> = Vec::new();
-    let mut fine_moments = Vec::new();
+    let mut fine_moments: Vec<f64> = Vec::new();
     for r in (coarsest..=finest).rev() {
         let level = levels[r as usize].as_ref().unwrap();
         let moments = if r == finest {
@@ -1977,7 +1981,7 @@ pub fn reduce_cells_runs(cloud: &PackedCloud, cell: f32, fill: f32) -> Result<(P
             sh[2] = (f16_bits(half_safe(grown[2])) & 0xffff) | (base0 << 16);
             // finalize clamped at 0.99 before the area grew: the weight
             // over the widened area.
-            let weight = moments[g * l.stride];
+            let weight = moments[g * l.stride] as f32;
             let area = disc_area(grown.map(f32::exp));
             block.positions[g * 4 + 3] = (weight / area.max(1e-30)).min(0.99);
         }

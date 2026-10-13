@@ -99,7 +99,8 @@
 //!                         each page's traversal planes gzipped, the GPU's in deflate runs
 //!                         (the traversal's 24 bytes a node: v2's 16, the cone, occlusion), its own tables
 //!   athc-convert --compact-asset car.cmpa --out-dir D a.athc b.athc ...   one asset table
-//!     (--table-only [--compact-basis basis.json]: the table alone, with that basis; then
+//!     (--table-only [--compact-basis basis.json]...: the table alone, with that basis (several:
+//!     basis 0, 1, ...; a piece written over it names its own); then
 //!     the pieces may share another table already, with --piece-materials: only their masks are read)
 //!                         for the pieces (D/car.cmpa: the basis once) and each piece written
 //!                         to D under its name, sharing it; tiers 1-3 byte for byte
@@ -549,15 +550,23 @@ fn compact_asset(args: &[String]) -> Result<()> {
     // with this basis instead of the pieces' (a basis refitted on the pieces'
     // full transfer, `fit-compact-basis`; with --table-only the pieces are then
     // written over the table by `usd-athc --compact-basis` the same basis).
-    if let Some(json_path) = value("--compact-basis") {
+    // More than one `--compact-basis` (thread CX): the asset holds them all,
+    // the first as basis 0; each piece written over it names its own.
+    let bases: Vec<String> =
+        args.iter().enumerate().filter(|(_, a)| *a == "--compact-basis").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
+    for (k, json_path) in bases.iter().enumerate() {
         let bin_path = json_path.strip_suffix(".json").map(|p| format!("{p}.bin")).unwrap_or_else(|| format!("{json_path}.bin"));
-        let basis = spark_lib::athc_compact::JointBasis::parse(&std::fs::read_to_string(&json_path)?, &std::fs::read(&bin_path)?)?;
+        let basis = spark_lib::athc_compact::JointBasis::parse(&std::fs::read_to_string(json_path)?, &std::fs::read(&bin_path)?)?;
         if !args.iter().any(|a| a == "--table-only") {
             bail!("--compact-basis: with --table-only (a rebase keeps each piece's CPCA codes, made with its own basis)");
         }
-        asset.basis = basis.table_f16();
-        asset.clusters = basis.clusters as u32;
-        eprintln!("basis: {json_path} ({} clusters)", asset.clusters);
+        if k == 0 {
+            asset.basis = basis.table_f16();
+            asset.clusters = basis.clusters as u32;
+        } else {
+            asset.extra_bases.push((basis.clusters as u32, basis.table_f16()));
+        }
+        eprintln!("basis {k}: {json_path} ({} clusters)", basis.clusters);
     }
     // athenea's occlusion codebook, once per asset (thread CS): the same in
     // every piece, with the asset's box (the pieces' boxes' union).

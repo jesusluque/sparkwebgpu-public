@@ -99,8 +99,8 @@ public static const uint kCompactPlain = 16u;      // debug: the albedo, no reli
 public static const uint kCompactCullBacks = 32u;  // opaque splats whose stored face looks away are not drawn
 public static const uint kCompactDrawList = 64u;   // the cull walks a list of gaussians (a LoD cut) in compactFrame
 public static const uint kCompactBinned = 128u;    // the shade walks the drawn slots by cluster (binsIn)
-public static const uint kCompactBins = 512u;      // clusters a cloud may have (9-bit ids, thread CX)
-public static const uint kCompactBinsPerThread = 2u; // the bin passes' 256 threads, 2 bins each
+public static const uint kCompactBins = 1024u;     // clusters a cloud may have: its bases' together (thread CX)
+public static const uint kCompactBinsPerThread = 4u; // the bin passes' 256 threads, 4 bins each
 public static const uint kCompactStableOrder = 256u; // each listed gaussian its own slot (culled: ~0), for repeatable images
 // athenea 35ae3cb, as relight.slang's kRelightCoatFold and kRelightPolishField:
 // a coat's bake widening held to kCoatFoldRoughness (0.3) where the surface
@@ -384,7 +384,13 @@ uint originOf(uint i) {
 /// index's bit 15 (thread CX: 512 clusters with the record's size unchanged;
 /// a codebook of at most 32768 entries, so files of 256 clusters read as before).
 uint clusterAt(uint i) {
-    return fieldAt(compactParams.cluster, 1u, i) | ((fieldAt(compactParams.shadow, 2u, i) >> 15u) << 8u);
+    const uint own = fieldAt(compactParams.cluster, 1u, i) | ((fieldAt(compactParams.shadow, 2u, i) >> 15u) << 8u);
+    // Paged (thread CX): its piece's basis's first cluster among the pool's
+    // bases, x 256, in the top byte of its head's word 10 (0 with one basis).
+    if (compactParams.slotNodes == 0u && compactParams.nodeWords == 0u) {
+        return own;
+    }
+    return own + (chunkWord(i, 10u) >> 24u) * 256u;
 }
 
 uint fieldAt(uint plane, uint width, uint i) {
@@ -510,7 +516,7 @@ float3 curvatureOf(uint i) {
 
 uint4 materialOf(uint i) {
     const uint table = compactParams.slotNodes == 0u && compactParams.nodeWords == 0u ? compactParams.materials
-                                                                                      : chunkWord(i, 10u);
+                                                                                      : chunkWord(i, 10u) & 0xFFFFFFu;
     const uint at = table + fieldAt(compactParams.material, 2u, i) * kCompactMaterialWords;
     return uint4(compactData[at], compactData[at + 1u], compactData[at + 2u], compactData[at + 3u]);
 }

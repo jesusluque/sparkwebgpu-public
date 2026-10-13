@@ -536,12 +536,14 @@ export interface CompactBandOptions {
   foveation?: Partial<Foveation> | null;
   /**
    * The view's frustum (thread CU round 11): a node or page wholly outside
-   * the camera's field widened by `marginDeg` a side (or behind the eye)
-   * is cut no finer than `tau` px (and its pages are not asked for below
-   * it), whatever the cut's tau. Default margin 8 degrees, tau 8; null:
+   * the camera's field widened a side by `margin` of its half angle (at
+   * least `minDeg`), or behind the eye, is cut no finer than `tau` px (and
+   * its pages are not asked for below it), whatever the cut's tau. A
+   * margin in proportion to the field: a telephoto's 3 degrees would be
+   * swamped by a fixed 8. Default margin 0.25, minDeg 0.5, tau 8; null:
    * none (the cone's foveation only).
    */
-  frustum?: { marginDeg?: number; tau?: number } | null;
+  frustum?: { margin?: number; minDeg?: number; tau?: number } | null;
   /**
    * The trees' object-to-world (the car's frame: athenea's Z-up stage
    * turned to three's Y-up). The traversal and the planner take the eye in
@@ -2366,13 +2368,16 @@ export class CompactBandStreamer {
   ): PageFrustum | null {
     const o = this.options.frustum;
     if (o === null) return null;
-    const margin = ((o?.marginDeg ?? 8) * Math.PI) / 180;
+    const frac = o?.margin ?? 0.25;
+    const minRad = ((o?.minDeg ?? 0.5) * Math.PI) / 180;
     const tau = o?.tau ?? 8;
     const halfY = (camera.fov * Math.PI) / 360;
     const halfX = Math.atan(Math.tan(halfY) * camera.aspect);
     const lim = (89 * Math.PI) / 180;
-    const tanX = Math.tan(Math.min(halfX + margin, lim));
-    const tanY = Math.tan(Math.min(halfY + margin, lim));
+    const widen = (h: number) =>
+      Math.tan(Math.min(h + Math.max(frac * h, minRad), lim));
+    const tanX = widen(halfX);
+    const tanY = widen(halfY);
     const e = view.elements;
     const unit = (a: number) => {
       const v = new THREE.Vector3(e[a], e[a + 1], e[a + 2]).normalize();

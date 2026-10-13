@@ -54,6 +54,13 @@ import {
   parseRunsContainer,
   unpackRunsContainer,
 } from "./compactNodes";
+import {
+  COMPACT_MAX_CLUSTERS,
+  compactBases,
+  headWord10,
+} from "./compactRecords";
+
+export { COMPACT_MAX_CLUSTERS, compactBases, headWord10 };
 import type { CutMsg, CutPart, FromCutter, ToCutter } from "./nodeWorker";
 import NodeWorker from "./nodeWorker?worker&inline";
 
@@ -125,12 +132,16 @@ export interface CompactPieceTables {
   assetFlags: number;
   assetId: bigint;
   assetName: string;
+  /** Which of the asset's bases (thread CX; 0 the first, word 20, 0 before). */
+  basisIndex: number;
 }
 
 /** An asset's shared compact tables (rust athc_compact CompactAsset, `.cmpa`). */
 export interface CompactAssetTables {
   basis: Uint32Array;
   clusters: number;
+  /** More bases (thread CX, CMPA v2): basis k >= 1 is extraBases[k - 1]. */
+  extraBases: { clusters: number; basis: Uint32Array }[];
   codebook: Uint32Array;
   materials: Uint32Array;
   /**
@@ -198,14 +209,16 @@ export function parseCompactTables(bytes: Uint8Array): CompactPieceTables {
         TABLE_ASSET_OCCLUSION),
     assetId: BigInt(w[16]) | (BigInt(w[17]) << 32n),
     assetName: new TextDecoder().decode(name),
+    basisIndex: w.length > 20 ? w[20] : 0,
   };
 }
 
 /** An asset table (`.cmpa`, CompactAsset::to_bytes), its id checked. */
 export function parseCompactAsset(bytes: Uint8Array): CompactAssetTables {
   const w = wordsOf(bytes);
-  if (w[0] !== ASSET_MAGIC || w[1] !== 1) {
-    throw new Error("compact asset table: not CMPA v1");
+  // v2 (thread CX): more than one basis, word 15 their directory.
+  if (w[0] !== ASSET_MAGIC || (w[1] !== 1 && w[1] !== 2)) {
+    throw new Error("compact asset table: not CMPA v1 or v2");
   }
   const total = w[2];
   if (w.length < total) throw new Error("compact asset table: too short");
@@ -228,6 +241,16 @@ export function parseCompactAsset(bytes: Uint8Array): CompactAssetTables {
             w.slice(w[13] + 8 * w[14], w[13] + 8 * w[14] + 6).buffer,
           )
         : new Float32Array(6),
+    extraBases:
+      w[1] === 2 && w[15]
+        ? Array.from({ length: w[w[15]] }, (_, k) => {
+            const e = w[15] + 1 + 3 * k;
+            return {
+              clusters: w[e],
+              basis: w.slice(w[e + 1], w[e + 1] + w[e + 2]),
+            };
+          })
+        : [],
     id,
     bytes: 4 * total,
   };
@@ -252,9 +275,22 @@ export function resolveCompactTables(
       `compact tables: asset table ${asset.id.toString(16)}, the piece wants ${t.assetId.toString(16)}`,
     );
   }
+  let basis = t.basis;
+  if (t.assetFlags & TABLE_ASSET_BASIS) {
+    const b =
+      t.basisIndex === 0
+        ? { clusters: asset.clusters, basis: asset.basis }
+        : asset.extraBases[t.basisIndex - 1];
+    if (!b || b.clusters !== t.clusters) {
+      throw new Error(
+        `compact tables: the asset has no basis ${t.basisIndex} of ${t.clusters} clusters`,
+      );
+    }
+    basis = b.basis;
+  }
   return {
     ...t,
-    basis: t.assetFlags & TABLE_ASSET_BASIS ? asset.basis : t.basis,
+    basis,
     codebook: t.assetFlags & TABLE_ASSET_CODEBOOK ? asset.codebook : t.codebook,
     materials:
       t.assetFlags & TABLE_ASSET_MATERIALS ? asset.materials : t.materials,
@@ -327,7 +363,11 @@ export class CompactPagePool {
   readonly slotsBase: number;
   readonly cloud: CompactCloud;
   /** Each piece's codebook and materials (words in the buffer). */
-  readonly pieceBase: { codebook: number; materials: number }[] = [];
+  readonly pieceBase: {
+    codebook: number;
+    materials: number;
+    clusterBase: number;
+  }[] = [];
   readonly tableWords: number;
   private staging: Uint8Array;
 
@@ -346,14 +386,11 @@ export class CompactPagePool {
         );
       }
       if (
-        p.clusters !== first.clusters ||
         p.normalBits !== first.normalBits ||
         p.weightBits !== first.weightBits ||
-        p.linear !== first.linear ||
-        !sameWords(p.basis, first.basis)
+        p.linear !== first.linear
       ) {
-        // One projection table a frame: the pieces share one basis.
-        throw new Error("CompactPagePool: the pieces' bases or codes differ");
+        throw new Error("CompactPagePool: the pieces' codes differ");
       }
     }
     // Tables: the basis once, then each piece's codebook and materials --
@@ -369,11 +406,15 @@ export class CompactPagePool {
       placed.set(w, at);
       return at;
     };
-    const basis = push(first.basis);
-    for (const p of pieces) {
+    // The pieces' bases, one table (thread CX: several, each piece's
+    // clusters from its own base; one, as before).
+    const bases = compactBases(pieces);
+    const basis = push(bases.table);
+    for (const [k, p] of pieces.entries()) {
       this.pieceBase.push({
         codebook: push(p.codebook),
         materials: push(p.materials),
+        clusterBase: bases.clusterBase[k],
       });
     }
     this.tableWords = Math.ceil(tables.length / 16) * 16;
@@ -405,7 +446,7 @@ export class CompactPagePool {
         (n, c) => n + c.length / 8,
         0,
       ),
-      clusters: first.clusters,
+      clusters: bases.clusters,
       linear: first.linear,
       curvature: pieces.every((p) => p.curvature),
       normalBits: first.normalBits,
@@ -457,7 +498,7 @@ export class CompactPagePool {
     const w = new Uint32Array(out.buffer);
     for (let k = 0; k < HEAD_WORDS; k++) w[k] = head[k] >>> 0;
     w[9] = this.pieceBase[piece].codebook;
-    w[10] = this.pieceBase[piece].materials;
+    w[10] = headWord10(this.pieceBase[piece]);
     // The faint dither's seed: the node's place in its piece, not its slot.
     w[11] = ((piece << 26) + page * 4096) >>> 0;
     const words = (this.cloud.layout as CompactLayout).words;

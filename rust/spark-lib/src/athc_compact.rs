@@ -126,6 +126,8 @@ pub const TABLE_ASSET_OCCLUSION: u32 = 32;
 /// The asset table (`CompactAsset::to_bytes`, a sidecar `.cmpa`).
 pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"CMPA");
 pub const ASSET_VERSION: u32 = 1;
+/// v2 (thread CX): more than one basis (`CompactAsset::extra_bases`).
+pub const ASSET_VERSION_BASES: u32 = 2;
 const ASSET_FIXED_WORDS: usize = 16;
 /// Bytes of the asset's name a piece keeps (UTF-8, zero padded).
 pub const ASSET_NAME_BYTES: usize = 64;
@@ -402,9 +404,32 @@ pub struct CompactAsset {
     /// the eye against; empty: none.
     pub occlusion: Vec<u32>,
     pub occlusion_box: [f32; 6],
+    /// More bases (thread CX): basis k (k >= 1) is `extra_bases[k - 1]`, its
+    /// clusters and its f16 table; a piece names its own (`CompactTables::
+    /// basis_index`). Empty: one basis, the blob v1 as before.
+    pub extra_bases: Vec<(u32, Vec<u32>)>,
 }
 
 impl CompactAsset {
+    /// Basis `k`: its clusters and f16 table (0 the first).
+    pub fn basis_at(&self, k: u32) -> Option<(u32, &[u32])> {
+        if k == 0 {
+            (!self.basis.is_empty()).then_some((self.clusters, &self.basis[..]))
+        } else {
+            self.extra_bases.get(k as usize - 1).map(|(c, t)| (*c, &t[..]))
+        }
+    }
+
+    /// The index of the basis with this table, if the asset holds it.
+    pub fn basis_index(&self, table: &[u32], clusters: u32) -> Option<u32> {
+        (0..=self.extra_bases.len() as u32).find(|&k| self.basis_at(k).is_some_and(|(c, t)| c == clusters && t == table))
+    }
+
+    /// Every basis's clusters, in order.
+    pub fn basis_clusters(&self) -> Vec<u32> {
+        (0..=self.extra_bases.len() as u32).filter_map(|k| self.basis_at(k).map(|b| b.0)).collect()
+    }
+
     pub fn flags(&self) -> u32 {
         (!self.basis.is_empty() as u32)
             | (!self.codebook.is_empty() as u32) << 1
@@ -422,8 +447,25 @@ impl CompactAsset {
         let materials_at = (codebook_at + self.codebook.len()).div_ceil(16) * 16;
         let occlusion_at = (materials_at + self.materials.len()).div_ceil(16) * 16;
         let occlusion_words = if self.occlusion.is_empty() { 0 } else { self.occlusion.len() + 6 };
-        let total = (occlusion_at + occlusion_words).div_ceil(16) * 16;
+        // v2 (thread CX): word 15 the more bases' directory (count, then
+        // clusters, at, words each), the tables after it.
+        let dir_at = (occlusion_at + occlusion_words).div_ceil(16) * 16;
+        let mut extra_at = Vec::new();
+        let mut end = if self.extra_bases.is_empty() { dir_at } else { (dir_at + 1 + 3 * self.extra_bases.len()).div_ceil(16) * 16 };
+        for (_, t) in &self.extra_bases {
+            extra_at.push(end);
+            end = (end + t.len()).div_ceil(16) * 16;
+        }
+        let total = end;
         let mut w = vec![0u32; total];
+        if !self.extra_bases.is_empty() {
+            w[15] = dir_at as u32;
+            w[dir_at] = self.extra_bases.len() as u32;
+            for (k, (c, t)) in self.extra_bases.iter().enumerate() {
+                w[dir_at + 1 + 3 * k..dir_at + 4 + 3 * k].copy_from_slice(&[*c, extra_at[k] as u32, t.len() as u32]);
+                w[extra_at[k]..extra_at[k] + t.len()].copy_from_slice(t);
+            }
+        }
         if !self.occlusion.is_empty() {
             // Words 13, 14: the occlusion codebook's offset and entries, the
             // box's 6 floats after it (v1 kept them 0: no occlusion).
@@ -436,7 +478,7 @@ impl CompactAsset {
         }
         w[..13].copy_from_slice(&[
             ASSET_MAGIC,
-            ASSET_VERSION,
+            if self.extra_bases.is_empty() { ASSET_VERSION } else { ASSET_VERSION_BASES },
             total as u32,
             self.flags(),
             self.clusters,
@@ -467,8 +509,8 @@ impl CompactAsset {
 
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let w = words_of(b);
-        if w(0)? != ASSET_MAGIC || w(1)? != ASSET_VERSION {
-            bail!("not a compact asset table (CMPA v{ASSET_VERSION})");
+        if w(0)? != ASSET_MAGIC || !(w(1)? == ASSET_VERSION || w(1)? == ASSET_VERSION_BASES) {
+            bail!("not a compact asset table (CMPA v{ASSET_VERSION} or v{ASSET_VERSION_BASES})");
         }
         let total = w(2)? as usize;
         if b.len() < 4 * total {
@@ -497,6 +539,17 @@ impl CompactAsset {
             } else {
                 [0.0; 6]
             },
+            extra_bases: if w(1)? == ASSET_VERSION_BASES && w(15)? != 0 {
+                let dir = w(15)?;
+                (0..w(dir as usize)? as usize)
+                    .map(|k| -> Result<(u32, Vec<u32>)> {
+                        let e = dir as usize + 1 + 3 * k;
+                        Ok((w(e)?, words(w(e + 1)?, w(e + 2)? as usize)?))
+                    })
+                    .collect::<Result<_>>()?
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -521,6 +574,9 @@ pub struct CompactTables {
     pub asset_flags: u32,
     pub asset_id: u64,
     pub asset_name: String,
+    /// Which of the asset's bases (thread CX; 0 the first, word 20 of the
+    /// blob, 0 in every file before).
+    pub basis_index: u32,
 }
 
 impl CompactTables {
@@ -540,10 +596,10 @@ impl CompactTables {
             bail!("compact tables: asset table {:016x}, the piece wants {:016x}", a.id(), self.asset_id);
         }
         if self.asset_flags & TABLE_ASSET_BASIS != 0 {
-            if a.basis.is_empty() || a.clusters != self.clusters {
-                bail!("compact tables: the asset has no basis of {} clusters", self.clusters);
+            match a.basis_at(self.basis_index) {
+                Some((c, table)) if c == self.clusters => t.basis = table.to_vec(),
+                _ => bail!("compact tables: the asset has no basis {} of {} clusters", self.basis_index, self.clusters),
             }
-            t.basis = a.basis.clone();
         }
         if self.asset_flags & TABLE_ASSET_CODEBOOK != 0 {
             t.codebook = a.codebook.clone();
@@ -593,6 +649,7 @@ impl CompactTables {
             name_at as u32,
             if name_words > 0 { name.len().min(ASSET_NAME_BYTES) as u32 } else { 0 },
         ]);
+        w[20] = self.basis_index;
         w[TABLE_FIXED_WORDS..head].copy_from_slice(&PLANE_WIDTHS);
         w[codebook_at..codebook_at + self.codebook.len()].copy_from_slice(&self.codebook);
         w[materials_at..materials_at + self.materials.len()].copy_from_slice(&self.materials);
@@ -630,6 +687,7 @@ impl CompactTables {
             asset_flags: flags & (TABLE_ASSET_BASIS | TABLE_ASSET_CODEBOOK | TABLE_ASSET_MATERIALS | TABLE_ASSET_OCCLUSION),
             asset_id: w(16)? as u64 | (w(17)? as u64) << 32,
             asset_name: String::from_utf8_lossy(name).into_owned(),
+            basis_index: w(20)?,
         })
     }
 }
@@ -928,11 +986,13 @@ pub fn lod_tree_words(block: &AthcBlock, i: usize) -> [u32; 4] {
 pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &CompactOptions) -> Result<CompactPages> {
     let asset = o.asset.as_ref();
     let basis_f16 = basis.table_f16();
-    if let Some(a) = asset {
-        if !a.basis.is_empty() && (a.basis != basis_f16 || a.clusters as usize != basis.clusters) {
-            bail!("compact: the asset table's basis is not this basis");
+    // The asset's basis this piece uses (thread CX: an asset may hold several).
+    let basis_index = match asset {
+        Some(a) if !a.basis.is_empty() => {
+            a.basis_index(&basis_f16, basis.clusters as u32).ok_or_else(|| anyhow!("compact: the asset table holds no basis equal to this basis"))?
         }
-    }
+        _ => 0,
+    };
     let t = std::time::Instant::now();
     let total: usize = pages.iter().map(|b| b.n).sum();
     for (p, b) in pages.iter().enumerate() {
@@ -1177,6 +1237,7 @@ pub fn build_compact(pages: &[AthcBlock], linear: bool, basis: &JointBasis, o: &
         asset_flags,
         asset_id: if asset_flags != 0 { asset.unwrap().id() } else { 0 },
         asset_name: if asset_flags != 0 { o.asset_name.clone() } else { String::new() },
+        basis_index: if asset_flags & TABLE_ASSET_BASIS != 0 { basis_index } else { 0 },
     };
     let stats = CompactStats {
         nodes: total,
@@ -1355,10 +1416,11 @@ pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &s
     }
     let file = read_v3(bytes)?;
     let skeleton = crate::athc_v3::read_v3_skeleton(bytes)?;
-    if let Some(a) = asset {
-        if !a.basis.is_empty() && (a.basis != old.basis || a.clusters != old.clusters) {
-            bail!("rebase: the asset table's basis is not the piece's");
-        }
+    let basis_index = match asset {
+        Some(a) if !a.basis.is_empty() => a.basis_index(&old.basis, old.clusters).ok_or_else(|| anyhow!("rebase: the asset table holds no basis equal to the piece's"))?,
+        _ => 0,
+    };
+    if let Some(_a) = asset {
     }
     let codebook: Vec<Mask> = asset.map(|a| a.codebook.chunks_exact(8).map(mask_of).collect()).unwrap_or_default();
     let mut material_of: std::collections::HashMap<[u32; 4], u32> = std::collections::HashMap::new();
@@ -1445,6 +1507,7 @@ pub fn rebase_compact(bytes: &[u8], asset: Option<&CompactAsset>, asset_name: &s
         asset_flags: flags,
         asset_id: if flags != 0 { asset.unwrap().id() } else { 0 },
         asset_name: if flags != 0 { asset_name.to_string() } else { String::new() },
+        basis_index: if flags & TABLE_ASSET_BASIS != 0 { basis_index } else { 0 },
         ..old.clone()
     };
     stats.materials = used_materials.len();
@@ -1896,6 +1959,56 @@ mod asset_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn an_asset_holds_several_bases_and_a_piece_names_its_own() {
+        // Thread CX: Part_2 and Infinite_Black on bases of their own.
+        let o = CompactOptions { threads: 2, ..Default::default() };
+        let (a0, b1) = (sample_basis(6), sample_basis(5));
+        let one = CompactAsset { basis: a0.table_f16(), clusters: 6, ..Default::default() };
+        // One basis: the v1 blob as before (no directory, word 15 zero).
+        let blob1 = one.to_bytes();
+        assert_eq!(u32::from_le_bytes(blob1[4..8].try_into().unwrap()), ASSET_VERSION);
+        assert_eq!(u32::from_le_bytes(blob1[60..64].try_into().unwrap()), 0);
+        let two = CompactAsset { extra_bases: vec![(5, b1.table_f16())], ..one.clone() };
+        let blob2 = two.to_bytes();
+        assert_eq!(u32::from_le_bytes(blob2[4..8].try_into().unwrap()), ASSET_VERSION_BASES);
+        assert_eq!(CompactAsset::from_bytes(&blob2).unwrap(), two);
+        assert_eq!(CompactAsset::from_bytes(&blob1).unwrap(), one);
+        assert_eq!(two.basis_index(&b1.table_f16(), 5), Some(1));
+        assert_eq!(two.basis_index(&a0.table_f16(), 6), Some(0));
+        assert_eq!(two.basis_clusters(), vec![6, 5]);
+        // A piece written with basis 1 over the asset: index 1, its nodes as alone.
+        let (paged, file) = crate::athc_pages::tests::sample_relit_paged(1500, 400);
+        let shared = CompactOptions { asset: Some(two.clone()), asset_name: "car.cmpa".into(), ..o.clone() };
+        let c = build_compact(&file.chunks, false, &b1, &shared).unwrap();
+        assert_eq!(c.tables.basis_index, 1);
+        assert!(c.tables.basis.is_empty());
+        let (bytes, _) = write_v3_paged_compact(&file, &paged.rows, COMPRESSION_GZIP, &|_| 1, None, None, &c).unwrap();
+        let alone = build_compact(&file.chunks, false, &b1, &o).unwrap();
+        let (abytes, _) = write_v3_paged_compact(&file, &paged.rows, COMPRESSION_GZIP, &|_| 1, None, None, &alone).unwrap();
+        let (x, y) = (nodes(&bytes, Some(&two)), nodes(&abytes, None));
+        assert_eq!(x.len(), y.len());
+        for (p, q) in x.iter().zip(&y) {
+            assert_eq!((p.cluster, p.weights, p.center, p.cells), (q.cluster, q.weights, q.center, q.cells));
+        }
+        let layout = parse_v3(&bytes).unwrap();
+        let [at, n] = layout.compact_table;
+        let t = CompactTables::from_bytes(&bytes[at as usize..(at + n) as usize]).unwrap();
+        assert_eq!(t.resolve(Some(&two)).unwrap().basis, b1.table_f16());
+        // Its index is the asset's: against a single-basis asset it is refused.
+        let one_only = CompactAsset { basis: b1.table_f16(), clusters: 5, ..Default::default() };
+        assert!(CompactTables { asset_id: one_only.id(), ..t.clone() }.resolve(Some(&one_only)).is_err());
+        // A piece of basis 0: index 0, the table words as before.
+        let c0 = build_compact(&file.chunks, false, &a0, &shared).unwrap();
+        assert_eq!(c0.tables.basis_index, 0);
+        let c0_one = build_compact(&file.chunks, false, &a0, &CompactOptions { asset: Some(one.clone()), asset_name: "car.cmpa".into(), ..o.clone() }).unwrap();
+        let (tb, tb1) = (c0.tables.to_bytes(), c0_one.tables.to_bytes());
+        assert_eq!(tb.len(), tb1.len());
+        // The same bytes but the asset id (words 16, 17).
+        assert_eq!(tb[..64], tb1[..64]);
+        assert_eq!(tb[72..], tb1[72..]);
     }
 
     #[test]

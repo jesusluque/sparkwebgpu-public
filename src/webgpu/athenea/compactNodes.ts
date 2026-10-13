@@ -22,7 +22,9 @@ import {
   COMPACT_PLANE_WIDTHS,
   NODE_RECORD_WORDS,
   RECORD_FIELDS,
+  compactBases,
   compactPlaneOffset,
+  headWord10,
   packRunRecords,
   runPlaneOffsets,
 } from "./compactRecords";
@@ -740,7 +742,11 @@ export class CompactNodePool {
   cloud: CompactCloud;
   capacity: number;
   /** Each piece's codebook and materials (words in the buffer). */
-  readonly pieceBase: { codebook: number; materials: number }[] = [];
+  readonly pieceBase: {
+    codebook: number;
+    materials: number;
+    clusterBase: number;
+  }[] = [];
   private headBytes: number;
 
   constructor(
@@ -765,11 +771,14 @@ export class CompactNodePool {
       placed.set(w, at);
       return at;
     };
-    const basis = push(first.basis);
-    for (const p of pieces) {
+    // The pieces' bases, one table (thread CX: several; one, as before).
+    const bases = compactBases(pieces);
+    const basis = push(bases.table);
+    for (const [k, p] of pieces.entries()) {
       this.pieceBase.push({
         codebook: push(p.codebook),
         materials: push(p.materials),
+        clusterBase: bases.clusterBase[k],
       });
     }
     this.headTable = Math.ceil(tables.length / 16) * 16;
@@ -782,7 +791,7 @@ export class CompactNodePool {
         const at = g * NODE_HEAD_WORDS;
         for (let k = 0; k < 12; k++) heads[at + k] = head[k] >>> 0;
         heads[at + 9] = this.pieceBase[piece].codebook;
-        heads[at + 10] = this.pieceBase[piece].materials;
+        heads[at + 10] = headWord10(this.pieceBase[piece]);
         // The faint dither's seed: as CompactPagePool's (the node's place in its piece).
         heads[at + 11] = ((piece << 26) + page * 4096) >>> 0;
         g += 1;
@@ -809,7 +818,7 @@ export class CompactNodePool {
         (n, c) => n + c.length / 8,
         0,
       ),
-      clusters: first.clusters,
+      clusters: bases.clusters,
       linear: first.linear,
       curvature: pieces.every((p) => p.curvature),
       normalBits: first.normalBits,

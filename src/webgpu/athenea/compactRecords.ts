@@ -1,3 +1,4 @@
+import type { CompactPieceTables } from "./compactPages";
 // A node record of the node pool (thread CT) packed from a CMPC v4 run's
 // inflated planes: no three.js, no WebGPU, so the run decoder's worker
 // (runWorker.ts, thread CU) imports it too.
@@ -107,4 +108,75 @@ export function packRunRecords(
     out[at + 42] = (origin >>> 16) & 0xff;
     out[at + 43] = (origin >>> 24) & 0xff;
   }
+}
+
+/**
+ * The pieces' bases in one table (thread CX): each distinct basis once, in
+ * the order the pieces name them, and each piece's first cluster in it (the
+ * shader adds it to the node's cluster; the projections and the bins are by
+ * that global cluster). One basis: its own table, every base 0 (as before).
+ */
+export function compactBases(pieces: CompactPieceTables[]) {
+  const distinct: { basis: Uint32Array; clusters: number; base: number }[] = [];
+  let clusters = 0;
+  const clusterBase = pieces.map((p) => {
+    let d = distinct.find(
+      (x) =>
+        x.clusters === p.clusters &&
+        (x.basis === p.basis || sameBasisWords(x.basis, p.basis)),
+    );
+    if (!d) {
+      d = { basis: p.basis, clusters: p.clusters, base: clusters };
+      distinct.push(d);
+      clusters += p.clusters;
+    }
+    return d.base;
+  });
+  if (distinct.length > 1) {
+    if (distinct.some((d) => d.clusters % 256 !== 0)) {
+      throw new Error(
+        "compact bases: several, each of a multiple of 256 clusters",
+      );
+    }
+    if (clusters > COMPACT_MAX_CLUSTERS) {
+      throw new Error(
+        `compact bases: ${clusters} clusters (${COMPACT_MAX_CLUSTERS} at most)`,
+      );
+    }
+  }
+  const table =
+    distinct.length === 1
+      ? distinct[0].basis
+      : (() => {
+          const t = new Uint32Array(
+            distinct.reduce((n, d) => n + d.basis.length, 0),
+          );
+          let at = 0;
+          for (const d of distinct) {
+            t.set(d.basis, at);
+            at += d.basis.length;
+          }
+          return t;
+        })();
+  return { table, clusters, clusterBase, bases: distinct.length };
+}
+
+/**
+ * A page head's word 10: its piece's materials (words) and, in the top 8
+ * bits, its basis's first cluster / 256 (thread CX; 0 with one basis).
+ */
+export function headWord10(b: { materials: number; clusterBase: number }) {
+  if (b.materials >= 1 << 24) {
+    throw new Error("compact: materials past 2^24 words");
+  }
+  return (b.materials | ((b.clusterBase / 256) << 24)) >>> 0;
+}
+
+/** Clusters a pool's bases may hold together (compact.slang kCompactBins). */
+export const COMPACT_MAX_CLUSTERS = 1024;
+
+function sameBasisWords(a: Uint32Array, b: Uint32Array) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

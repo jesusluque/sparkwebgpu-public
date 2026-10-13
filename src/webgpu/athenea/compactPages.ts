@@ -551,6 +551,15 @@ export interface CompactPiece {
   url?: string;
 }
 
+/** The view's frustum for the planner (CompactBandStreamer.frustumFor). */
+interface PageFrustum {
+  tanX: number;
+  tanY: number;
+  /** The coarsest tau a node outside is cut at. */
+  tau: number;
+  outside(row: AthcPageRow): boolean;
+}
+
 export interface CompactBandOptions {
   /** Pool slots (the residency budget, in pages). */
   slots: number;
@@ -566,6 +575,16 @@ export interface CompactBandOptions {
    * at 30 degrees more, behindFoveate 0.2 (WgpuLod's). null: none (CN's).
    */
   foveation?: Partial<Foveation> | null;
+  /**
+   * The view's frustum (thread CU round 11): a node or page wholly outside
+   * the camera's field widened a side by `margin` of its half angle (at
+   * least `minDeg`), or behind the eye, is cut no finer than `tau` px (and
+   * its pages are not asked for below it), whatever the cut's tau. A
+   * margin in proportion to the field: a telephoto's 3 degrees would be
+   * swamped by a fixed 8. Default margin 0.25, minDeg 0.5, tau 8; null:
+   * none (the cone's foveation only).
+   */
+  frustum?: { margin?: number; minDeg?: number; tau?: number } | null;
   /**
    * The trees' object-to-world (the car's frame: athenea's Z-up stage
    * turned to three's Y-up). The traversal and the planner take the eye in
@@ -771,6 +790,7 @@ export class CompactBandStreamer {
     tauTooLow: 0,
     tauNeededPages: 0,
     tauRoom: 0,
+    outTau: 0,
     traverseMs: 0,
     /** The WASM traversal alone (the rest: the worker's round trip). */
     traverseWasmMs: 0,
@@ -1142,14 +1162,26 @@ export class CompactBandStreamer {
       .normalize();
     const eyeArr = [eye.x, eye.y, eye.z];
     const fwdArr = [forward.x, forward.y, forward.z];
-    const foveateFor = (p: PieceState) =>
-      fov
-        ? (page: number) => pageFoveate(p.rows[page], eyeArr, fwdArr, fov)
-        : undefined;
+    const frustum = this.frustumFor(camera, view);
+    this.stats.outTau = frustum ? frustum.tau : 0;
+    // A page wholly outside the frustum (its box's sphere).
+    const outsideFor = (p: PieceState) =>
+      frustum ? (page: number) => frustum.outside(p.rows[page]) : undefined;
+    const foveateFor = (p: PieceState) => {
+      const out = outsideFor(p);
+      if (!fov && !out) return undefined;
+      return (page: number) =>
+        out?.(page)
+          ? // The traversal's weight of a node outside: tau / outTau.
+            Math.min(1, this.tau / (frustum as PageFrustum).tau)
+          : fov
+            ? pageFoveate(p.rows[page], eyeArr, fwdArr, fov)
+            : 1;
+    };
     if (this.options.tauToFit) {
       const fit = Math.max(
         this.options.tau ?? 1,
-        this.tauToFitNow(eye, pixel, foveateFor),
+        this.tauToFitNow(eye, pixel, foveateFor, outsideFor, frustum?.tau),
       );
       // Pruned (wanted pages): the set grows as tau falls, so tau comes
       // down by at most 1/1.25 a traversal (up at once: never past the pool).
@@ -1158,7 +1190,10 @@ export class CompactBandStreamer {
       // no lower than halfway to it, so it settles on the lowest tau that
       // fits (to 2 %) instead of swinging between a step that fits and one
       // that does not (the close-up: 4.61 <-> 5.76 forever).
-      const eyeKey = `${eyeArr}|${fwdArr}|${pixel}`;
+      // The pool's limit too (thread CU round 11): a still frame lifts it,
+      // and a tau too low for the moving pool is no bound on the still one
+      // (v8's first still frame stayed at the moving pool's tau, 7.4).
+      const eyeKey = `${eyeArr}|${fwdArr}|${pixel}|${this.limit}`;
       if (eyeKey !== this.tauEyeKey) {
         this.tauEyeKey = eyeKey;
         this.tauTooLow = 0;
@@ -1198,6 +1233,10 @@ export class CompactBandStreamer {
         coneFov0: fov ? fov.coneFov0 : 0,
         coneFov: fov ? fov.coneFov : 0,
         coneFoveate: fov ? fov.coneFoveate : 1,
+        // [tanX, tanY, the weight of a node wholly outside]: tau / outTau.
+        frustum: frustum
+          ? [frustum.tanX, frustum.tanY, Math.min(1, this.tau / frustum.tau)]
+          : undefined,
       };
     }
     let list: Uint32Array = new Uint32Array(0);
@@ -2359,6 +2398,65 @@ export class CompactBandStreamer {
     return undefined;
   }
 
+  /**
+   * The view's frustum in the trees' space (options.frustum), or null: its
+   * tangents widened by the margin, and a page's outside test (its box's
+   * sphere wholly beyond a side plane or behind the eye).
+   */
+  private frustumFor(
+    camera: THREE.PerspectiveCamera,
+    view: THREE.Matrix4,
+  ): PageFrustum | null {
+    const o = this.options.frustum;
+    if (o === null) return null;
+    const frac = o?.margin ?? 0.25;
+    const minRad = ((o?.minDeg ?? 0.5) * Math.PI) / 180;
+    const tau = o?.tau ?? 8;
+    const halfY = (camera.fov * Math.PI) / 360;
+    const halfX = Math.atan(Math.tan(halfY) * camera.aspect);
+    const lim = (89 * Math.PI) / 180;
+    const widen = (h: number) =>
+      Math.tan(Math.min(h + Math.max(frac * h, minRad), lim));
+    const tanX = widen(halfX);
+    const tanY = widen(halfY);
+    const e = view.elements;
+    const unit = (a: number) => {
+      const v = new THREE.Vector3(e[a], e[a + 1], e[a + 2]).normalize();
+      return [v.x, v.y, v.z];
+    };
+    const right = unit(0);
+    const up = unit(4);
+    const back = unit(8);
+    const eye = [e[12], e[13], e[14]];
+    const nx = Math.sqrt(1 + tanX * tanX);
+    const ny = Math.sqrt(1 + tanY * tanY);
+    return {
+      tanX,
+      tanY,
+      tau,
+      outside(row: AthcPageRow) {
+        let x = 0;
+        let y = 0;
+        let z = 0;
+        let r2 = 0;
+        for (let k = 0; k < 3; k++) {
+          const c = 0.5 * (row.lo[k] + row.hi[k]) - eye[k];
+          const h = 0.5 * (row.hi[k] - row.lo[k]);
+          r2 += h * h;
+          x += c * right[k];
+          y += c * up[k];
+          z -= c * back[k];
+        }
+        const r = Math.sqrt(r2);
+        return (
+          z < -r ||
+          Math.abs(x) - tanX * z > r * nx ||
+          Math.abs(y) - tanY * z > r * ny
+        );
+      },
+    };
+  }
+
   /** The foveation for this camera (options.foveation), or null. */
   private foveationFor(camera: THREE.PerspectiveCamera): Foveation | null {
     const o = this.options.foveation;
@@ -2422,10 +2520,13 @@ export class CompactBandStreamer {
     eye: THREE.Vector3,
     pixel: number,
     foveateFor: (p: PieceState) => ((page: number) => number) | undefined,
+    outsideFor?: (p: PieceState) => ((page: number) => boolean) | undefined,
+    outTau = 0,
   ) {
     const t: number[] = [];
     for (const p of this.pieces) {
       const fv = foveateFor(p);
+      const out = outsideFor?.(p);
       const wanted = this.wantedOf(p);
       p.rows.forEach((row, page) => {
         if (wanted && !wanted(page)) return;
@@ -2435,6 +2536,13 @@ export class CompactBandStreamer {
           const e = [eye.x, eye.y, eye.z][k];
           const v = Math.max(row.lo[k] - e, 0, e - row.hi[k]);
           d2 += v * v;
+        }
+        if (out?.(page)) {
+          // Outside the frustum: needed at any tau below its own P when P
+          // passes outTau (the weight tau / outTau), never otherwise.
+          const P = row.epsMax / Math.max(Math.sqrt(d2), BAND_NEAR) / pixel;
+          t.push(P > outTau ? P : 0);
+          return;
         }
         const f = fv ? fv(page) : 1;
         t.push((f * row.epsMax) / Math.max(Math.sqrt(d2), BAND_NEAR) / pixel);

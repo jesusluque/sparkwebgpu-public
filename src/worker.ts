@@ -909,6 +909,8 @@ function traverseLodTrees({
       coneFov0: number;
       coneFov: number;
       coneFoveate: number;
+      /** [tanX, tanY, outside weight] (thread CU round 11; spark-rs Frustum). */
+      frustum?: number[];
     }
   >;
   traverseMode: "dynamic" | "standard";
@@ -944,6 +946,13 @@ function traverseLodTrees({
     keyInstances.map(([_key, instance]) => instance.coneFoveate),
   );
 
+  // The view's frustum by instance (none: the cone's foveation only).
+  const frustums = keyInstances.some(([_key, i]) => i.frustum)
+    ? new Float32Array(
+        keyInstances.flatMap(([_key, i]) => i.frustum ?? [0, 0, 1]),
+      )
+    : undefined;
+
   const lodFunction =
     traverseMode === "dynamic"
       ? dynamic_traverse_lod_trees
@@ -968,6 +977,7 @@ function traverseLodTrees({
     neighbours,
     unordered,
     stream,
+    frustums,
   ) as {
     culledCount?: number;
     occludedCount?: number;

@@ -968,15 +968,15 @@ fn traverse_core(
     lod_ids: &[u32], root_pages: &[u32],
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
-    cone_fov0s: &[f32], cone_fovs: &[f32],
+    cone_fov0s: &[f32], cone_fovs: &[f32], frustums: &[f32],
     error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
     error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink, stream: bool,
 ) -> Result<TraverseOut, String> {
     // Unordered (a stack): the same cut unless the budget binds, then again in order.
-    let (out, budget_hit) = traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered, sink, stream)?;
+    let (out, budget_hit) = traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, frustums, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered, sink, stream)?;
     if unordered && budget_hit {
         sink.reset();
-        return traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, false, sink, stream).map(|r| r.0);
+        return traverse_once(state, max_splats, pixel_scale_limit, last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, frustums, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, false, sink, stream).map(|r| r.0);
     }
     Ok(out)
 }
@@ -988,7 +988,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
     lod_ids: &[u32], root_pages: &[u32],
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
-    cone_fov0s: &[f32], cone_fovs: &[f32],
+    cone_fov0s: &[f32], cone_fovs: &[f32], frustums: &[f32],
     error_limit: Option<f32>, back_cull_min: Option<f32>, occlusion_cull: Option<bool>,
     error_size_k: Option<f32>, neighbours: Option<bool>, unordered: bool, sink: &mut dyn CutSink, stream: bool,
 ) -> Result<(TraverseOut, bool), String> {
@@ -1047,7 +1047,8 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
             let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
             let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
             let cone_dot = cone_dot.min(cone_dot0);
-            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard)
+            let frustum = frustums.get(index * 3..index * 3 + 3).and_then(|f| Frustum::of(&view_to_objects[i16..i16 + 16], f));
+            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard, frustum)
         }).collect();
         // Each instance's occlusion codebook, when culling by it.
         let occlusions: Vec<Option<&(Vec<u32>, [f32; 6])>> = lod_ids
@@ -1301,7 +1302,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
                         };
                         let delta = node.center() - instance.4;
                         let d = delta.length().max(1.0e-6);
-                        bufs[5].push((r / d * foveate_of(delta, 1.0 / d, instance)).to_bits());
+                        bufs[5].push((r / d * foveate_of(delta, 1.0 / d, bound_of(&node), instance)).to_bits());
                     }
                     if bufs[0].len() == CHUNK {
                         flush(sink, inst, &mut bufs, at);
@@ -1371,7 +1372,7 @@ fn stream_out(output: &mut Vec<(u32, u32, u32)>, instances: &[Inst<'_>], slots: 
             let r = if node.child_count > 0 || parent == u32::MAX { node.rho.to_f32() } else { 0.5 * instance.1.get(parent as usize).rho.to_f32() };
             let delta = node.center() - instance.4;
             let d = delta.length().max(1.0e-6);
-            f[5].push((r / d * foveate_of(delta, 1.0 / d, instance)).to_bits());
+            f[5].push((r / d * foveate_of(delta, 1.0 / d, bound_of(&node), instance)).to_bits());
         }
     }
     for (k, b) in f.iter().enumerate() {
@@ -1462,14 +1463,19 @@ pub fn traverse_lod_trees(
     unordered: Option<bool>,
     // The node pool's worker (thread CU): the cut in chunks (`parts`), any instance, never whole in the heap.
     stream: Option<bool>,
+    // The view's frustum by instance (thread CU round 11): [tanX, tanY,
+    // outside] each, the tangents with their margin; outside < 1 weighs a
+    // node wholly outside it. None: no frustum.
+    frustums: Option<Box<[f32]>>,
 ) -> anyhow::Result<Object, JsValue> {
+    let frustums: &[f32] = frustums.as_deref().unwrap_or(&[]);
     let neighbours_on = neighbours.unwrap_or(false);
     let stream = stream.unwrap_or(false);
     let mut sink = JsSink { neighbours: neighbours_on, arrays: vec![], counts: vec![] };
     let mut ssink = JsStreamSink { parts: Array::new(), culled: Array::new() };
     let out = STATE.with_borrow_mut(|state| {
         let s: &mut dyn CutSink = if stream { &mut ssink } else { &mut sink };
-        traverse_core(state, max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered.unwrap_or(false), s, stream)
+        traverse_core(state, max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects, lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, frustums, error_limit, back_cull_min, occlusion_cull, error_size_k, neighbours, unordered.unwrap_or(false), s, stream)
     }).map_err(|e| JsValue::from_str(&e))?;
     let TraverseOut { lod_ids: out_ids, touched, min_pixel_scale, output_size, frontier_size, leaf_count, culled_count, occluded_count } = out;
     let instance_indices = Array::new();
@@ -1545,10 +1551,59 @@ impl CutSink for JsStreamSink {
     }
 }
 
-type Inst<'a> = (u32, Ref<'a, LodNodes>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32, f32);
+type Inst<'a> = (u32, Ref<'a, LodNodes>, &'a Vec<u32>, &'a Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32, f32, f32, Option<Frustum>);
+
+/// The view's frustum in an instance's object space (thread CU round 11):
+/// a node whose bounding sphere lies wholly outside it (its sides widened by
+/// a margin, or behind the eye) is weighed by `outside` instead of the
+/// cone's foveation, so the cut refines it no finer than a coarse tau and
+/// asks for no pages under it.
+#[derive(Clone, Copy, Debug)]
+struct Frustum {
+    right: Vec3A,
+    up: Vec3A,
+    forward: Vec3A,
+    tx: f32,
+    ty: f32,
+    /// sqrt(1 + t^2): a side plane's distance from (x, z) is (|x| - t z) / it.
+    nx: f32,
+    ny: f32,
+    outside: f32,
+}
+
+impl Frustum {
+    /// From the view-to-object matrix (column major) and [tanX, tanY,
+    /// outside] (tanX <= 0 or outside >= 1: none).
+    fn of(view: &[f32], f: &[f32]) -> Option<Self> {
+        let (tx, ty, outside) = (f[0], f[1], f[2]);
+        if tx.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || ty.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || outside.partial_cmp(&1.0) != Some(std::cmp::Ordering::Less) {
+            return None;
+        }
+        let right = Vec3A::from_slice(&view[0..3]).normalize();
+        let up = Vec3A::from_slice(&view[4..7]).normalize();
+        let forward = Vec3A::from_slice(&view[8..11]).normalize().map(|x| -x);
+        Some(Self { right, up, forward, tx, ty, nx: (1.0 + tx * tx).sqrt(), ny: (1.0 + ty * ty).sqrt(), outside: outside.max(0.0) })
+    }
+
+    /// The sphere at `delta` from the eye, radius `r`, is wholly outside.
+    fn outside(&self, delta: Vec3A, r: f32) -> bool {
+        let z = delta.dot(self.forward);
+        if z < -r {
+            return true;
+        }
+        let x = delta.dot(self.right);
+        let y = delta.dot(self.up);
+        (x.abs() - self.tx * z) > r * self.nx || (y.abs() - self.ty * z) > r * self.ny
+    }
+}
+
+/// A node's bounding sphere (its subtree's): rho with the error bounds, else its size.
+fn bound_of(splat: &LodSplat) -> f32 {
+    (if splat.has_error() { splat.rho.to_f32() } else { splat.size() }) + splat.margin
+}
 
 fn compute_pixel_scale<'a>(splat: &LodSplat, instance: &Inst<'a>) -> f32 {
-    let &(_, _, _, _, origin, _, lod_scale, _, _, _, _, err_ratio, size_guard) = instance;
+    let &(_, _, _, _, origin, _, lod_scale, _, _, _, _, err_ratio, size_guard, _) = instance;
     let center = splat.center();
     let delta = center - origin;
     // A quantized node's distance less its page's centre error (thread CT).
@@ -1562,12 +1617,17 @@ fn compute_pixel_scale<'a>(splat: &LodSplat, instance: &Inst<'a>) -> f32 {
         splat.size() * inv_distance
     };
     let pixel_scale = pixel_scale * lod_scale;
-    foveate_of(delta, inv_distance, instance) * pixel_scale
+    foveate_of(delta, inv_distance, bound_of(splat), instance) * pixel_scale
 }
 
 /// The foveation weight of a node at `delta` from the eye (1 in the view's cone).
-fn foveate_of(delta: Vec3A, inv_distance: f32, instance: &Inst<'_>) -> f32 {
-    let &(_, _, _, _, _, forward, _, behind_foveate, cone_foveate, cone_dot0, cone_dot, _, _) = instance;
+fn foveate_of(delta: Vec3A, inv_distance: f32, radius: f32, instance: &Inst<'_>) -> f32 {
+    let &(_, _, _, _, _, forward, _, behind_foveate, cone_foveate, cone_dot0, cone_dot, _, _, frustum) = instance;
+    if let Some(f) = frustum {
+        if f.outside(delta, radius) {
+            return f.outside;
+        }
+    }
     let forward_dot = delta.dot(forward);
     let foveate = if forward_dot <= 0.0 {
         behind_foveate
@@ -1640,7 +1700,7 @@ pub fn dynamic_traverse_lod_trees(
             let cone_foveate = cone_foveates[index];
             let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index]).to_radians().cos() } else { 1.0 };
             let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index]).to_radians().cos() } else { 1.0 };
-            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard)
+            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot, err_ratio, size_guard, None)
         }).collect();
 
         let mut lod_chunk_max: AHashMap<u32, Vec<f32>> = AHashMap::new();
@@ -2329,6 +2389,28 @@ mod counting {
 #[cfg(test)]
 mod quant_tests {
     use super::*;
+
+    #[test]
+    fn frustum_outside_is_the_sphere_wholly_beyond_a_side() {
+        // The identity view: the eye at the origin looking down -z, 45
+        // degrees a side (tan 1), the outside weight 0.25.
+        let view = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let f = Frustum::of(&view, &[1.0, 0.5, 0.25]).unwrap();
+        assert!(!f.outside(Vec3A::new(0.0, 0.0, -10.0), 0.1));
+        assert!(!f.outside(Vec3A::new(9.9, 0.0, -10.0), 0.1));
+        assert!(f.outside(Vec3A::new(12.0, 0.0, -10.0), 0.1));
+        // Its sphere reaches back in.
+        assert!(!f.outside(Vec3A::new(12.0, 0.0, -10.0), 2.0));
+        // tanY 0.5: y 6 at z -10 is out, 4 in.
+        assert!(f.outside(Vec3A::new(0.0, 6.0, -10.0), 0.1));
+        assert!(!f.outside(Vec3A::new(0.0, -4.0, -10.0), 0.1));
+        // Behind the eye, unless the sphere holds it.
+        assert!(f.outside(Vec3A::new(0.0, 0.0, 3.0), 1.0));
+        assert!(!f.outside(Vec3A::new(0.0, 0.0, 0.5), 1.0));
+        // No frustum: a tangent 0, or a weight of 1.
+        assert!(Frustum::of(&view, &[0.0, 0.5, 0.25]).is_none());
+        assert!(Frustum::of(&view, &[1.0, 0.5, 1.0]).is_none());
+    }
     use spark_lib::athc_compact::{traversal_input, TraversalNode};
     use spark_lib::athc_v3::{gunzip, parse_v3, SectionId};
 
@@ -2619,7 +2701,7 @@ mod quant_tests {
                         let t0 = std::time::Instant::now();
                         sink = VecSink::default();
                         out = STATE.with_borrow_mut(|state| {
-                            traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), unordered, &mut sink, false)
+                            traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], &[], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), unordered, &mut sink, false)
                         })
                         .unwrap();
                         times.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -2644,7 +2726,7 @@ mod quant_tests {
                 {
                     let mut vs = VecSink::default();
                     STATE.with_borrow_mut(|state| {
-                        traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), true, &mut vs, true)
+                        traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], &[], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), true, &mut vs, true)
                     })
                     .unwrap();
                     let f = &vs.fields[0];
@@ -2666,7 +2748,7 @@ mod quant_tests {
                 let before = super::counting::NOW.load(Relaxed);
                 super::counting::PEAK.store(before, Relaxed);
                 STATE.with_borrow_mut(|state| {
-                    traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), true, &mut Null, true)
+                    traverse_core(state, 1 << 24, pixel, None, &ids, &roots, &views, &ones, &vec![0.2; n], &vec![0.4; n], &vec![89.3; n], &vec![119.3; n], &[], Some(pixel * tau), Some(-1.0), Some(true), None, Some(true), true, &mut Null, true)
                 })
                 .unwrap();
                 eprintln!("  traversal: kept {:.1} MB over the tree, peak {:.1} MB over its start", mb(super::counting::NOW.load(Relaxed) - landed), mb(super::counting::PEAK.load(Relaxed) - before));

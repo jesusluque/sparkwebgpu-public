@@ -1961,6 +1961,19 @@ mod asset_tests {
         out
     }
 
+    /// Opt-in (CMPA_FILES=a.cmpa,b.cmpa): published one-basis tables read and
+    /// write back byte for byte (thread CX).
+    #[test]
+    fn published_asset_tables_round_trip() {
+        let Ok(files) = std::env::var("CMPA_FILES") else { return };
+        for f in files.split(',') {
+            let b = std::fs::read(f).unwrap();
+            let a = CompactAsset::from_bytes(&b).unwrap();
+            assert!(a.extra_bases.is_empty());
+            assert_eq!(a.to_bytes(), b, "{f}");
+        }
+    }
+
     #[test]
     fn an_asset_holds_several_bases_and_a_piece_names_its_own() {
         // Thread CX: Part_2 and Infinite_Black on bases of their own.

@@ -4,9 +4,9 @@
 // (compactBases, headWord10); the projections and the bins are by that
 // global cluster. Here the fixture's pages drawn two ways must be the same,
 // bit for bit:
-//   one piece on a basis of 512 clusters U ++ V, its pages 4..7 pointing at
-//   the second half (the cluster's 9th bit);
-//   two pieces (pages 0..3 and 4..7) on bases U and V of 256 each.
+//   two pieces (pages 0..3 and 4..7) on one basis of 512 clusters U ++ V,
+//   the second's nodes pointing at its second half (the cluster's 9th bit);
+//   the same two pieces on bases U and V of 256 each.
 
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
@@ -165,11 +165,13 @@ describe.skipIf(!wideDevice)("several bases in one pool", () => {
       tex.destroy();
       path.dispose();
       pool.buffer.destroy();
-      return { image, colours };
+      return { image, colours, list };
     };
+    // The same two pieces both ways (a page's faint and sheet dither seeds are
+    // its place in its piece): one basis UV for both, or U and V.
     const a = await render(
-      [one],
-      () => 0,
+      [one, { ...one }],
+      (p) => (p < split ? 0 : 1),
       (p) => rawsOne[p],
     );
     const b = await render(
@@ -185,9 +187,15 @@ describe.skipIf(!wideDevice)("several bases in one pool", () => {
     }
     expect(lit).toBeGreaterThan(200);
     expect(worst).toBe(0);
+    // The listed (written) nodes: a slot past its page's count reads zeros
+    // under its page's head, a cluster of no one.
     let worstC = 0;
-    for (let k = 0; k < a.colours.length; k++)
-      worstC = Math.max(worstC, Math.abs(a.colours[k] - b.colours[k]));
+    for (const i of a.list)
+      for (let c = 0; c < 4; c++)
+        worstC = Math.max(
+          worstC,
+          Math.abs(a.colours[4 * i + c] - b.colours[4 * i + c]),
+        );
     expect(worstC).toBe(0);
   });
 });

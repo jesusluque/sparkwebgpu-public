@@ -560,6 +560,60 @@ interface PageFrustum {
   outside(row: AthcPageRow): boolean;
 }
 
+/** tauToFit's state between updates (CompactBandStreamer). */
+export interface FitTauState {
+  /** The current tau. */
+  tau: number;
+  /** For this eye, the largest tau whose wanted pages did not fit (0: none). */
+  tooLow: number;
+  /** tau came down at the last step. */
+  fell: boolean;
+  /** A still view: tau only refines and settles once (thread DB). */
+  hold: boolean;
+  /** Still: the tau settled on (0: still coming down). */
+  held: number;
+}
+
+/**
+ * One update's tau from the pool's fit (`fit`: the lowest tau whose needed
+ * pages fit, at least the floor). `pruned`: the needed set is the last
+ * traversal's wanted pages (it grows as tau falls). Updates `st` and
+ * returns the next tau (st.tau is left to the caller).
+ */
+export function fitTauStep(st: FitTauState, fit: number, pruned: boolean) {
+  const tau = st.tau;
+  // Pruned (wanted pages): the set grows as tau falls, so tau comes down by
+  // at most 1/1.25 a step (up at once: never past the pool). Thread CU: for
+  // an eye that stays, a tau whose wanted pages did not fit (the fit came
+  // back above it) is remembered, and tau comes down no lower than halfway
+  // to it, so it settles on the lowest tau that fits (to 2 %) instead of
+  // swinging between a step that fits and one that does not.
+  if (pruned && fit > tau * 1.000001 && st.fell) {
+    st.tooLow = Math.max(st.tooLow, tau);
+  }
+  let next = pruned && fit < tau ? Math.max(fit, tau / 1.25) : fit;
+  if (pruned && next < tau && st.tooLow > 0) {
+    next = Math.max(next, 0.5 * (tau + st.tooLow));
+    if (tau - st.tooLow <= 0.02 * tau) next = tau;
+  }
+  if (st.hold) {
+    // A still view (thread DB, the user's rule): tau stays or refines,
+    // never coarser. A step down that did not fit (the fit came back above
+    // it) stays where it is: the planner never evicts a needed page, so a
+    // pool short of the cut keeps what it holds and stops asking (no swap,
+    // the cut only gains pages). Within 2 % of the bound below: held.
+    if (st.held > 0) next = st.held;
+    else if (next > tau) {
+      next = tau;
+      if (st.fell || st.tooLow > 0) st.held = tau;
+    } else if (st.tooLow > 0 && next - st.tooLow <= 0.02 * next) {
+      st.held = next;
+    }
+  }
+  st.fell = next < tau * 0.999;
+  return next;
+}
+
 export interface CompactBandOptions {
   /** Pool slots (the residency budget, in pages). */
   slots: number;
@@ -788,6 +842,8 @@ export class CompactBandStreamer {
     occluded: 0,
     tau: 0,
     tauTooLow: 0,
+    /** Still (holdTau): the tau settled on, 0 still coming down. */
+    tauHeld: 0,
     tauNeededPages: 0,
     tauRoom: 0,
     outTau: 0,
@@ -1039,6 +1095,11 @@ export class CompactBandStreamer {
   /** The asset table had an occlusion codebook (kept past init). */
   private assetOcclusion = false;
 
+  /** Page Ranges being fetched, and pages landed not yet in the pool. */
+  get pagesInFlight() {
+    return this.fetching + this.landed.length;
+  }
+
   /** Fetching or landed pages not yet in the pool. */
   get busy() {
     return (
@@ -1183,35 +1244,37 @@ export class CompactBandStreamer {
         this.options.tau ?? 1,
         this.tauToFitNow(eye, pixel, foveateFor, outsideFor, frustum?.tau),
       );
-      // Pruned (wanted pages): the set grows as tau falls, so tau comes
-      // down by at most 1/1.25 a traversal (up at once: never past the pool).
-      // Thread CU: for an eye that stays, a tau whose wanted pages did not
-      // fit (the fit came back above it) is remembered, and tau comes down
-      // no lower than halfway to it, so it settles on the lowest tau that
-      // fits (to 2 %) instead of swinging between a step that fits and one
-      // that does not (the close-up: 4.61 <-> 5.76 forever).
-      // The pool's limit too (thread CU round 11): a still frame lifts it,
+      // tauTooLow is the eye's (fitTauStep): the key is the eye, the view,
+      // the pixel and the pool's limit (thread CU round 11: a still frame
+      // lifts it,
       // and a tau too low for the moving pool is no bound on the still one
       // (v8's first still frame stayed at the moving pool's tau, 7.4).
-      const eyeKey = `${eyeArr}|${fwdArr}|${pixel}|${this.limit}`;
+      // The eye to 0.1 mm and the view to 1e-5 (thread DB: a damped orbit's
+      // sub-ulp tail, or a float round trip, is no new eye; at full
+      // precision every frame forgot tauTooLow and tau swung for ever).
+      const q = (v: number, s: number) => Math.round(v * s);
+      const eyeKey = `${eyeArr.map((v) => q(v, 1e4))}|${fwdArr.map((v) => q(v, 1e5))}|${pixel.toPrecision(6)}|${this.limit}`;
       if (eyeKey !== this.tauEyeKey) {
         this.tauEyeKey = eyeKey;
         this.tauTooLow = 0;
+        this.tauHeld = 0;
       }
-      if (this.wanted && fit > this.tau * 1.000001 && this.tauFell) {
-        this.tauTooLow = Math.max(this.tauTooLow, this.tau);
-      }
-      let next =
-        this.wanted && fit < this.tau ? Math.max(fit, this.tau / 1.25) : fit;
-      if (this.wanted && next < this.tau && this.tauTooLow > 0) {
-        next = Math.max(next, 0.5 * (this.tau + this.tauTooLow));
-        if (this.tau - this.tauTooLow <= 0.02 * this.tau) next = this.tau;
-      }
-      this.tauFell = next < this.tau * 0.999;
+      const st: FitTauState = {
+        tau: this.tau,
+        tooLow: this.tauTooLow,
+        fell: this.tauFell,
+        hold: this.holdTau,
+        held: this.tauHeld,
+      };
+      const next = fitTauStep(st, fit, !!this.wanted);
+      this.tauTooLow = st.tooLow;
+      this.tauFell = st.fell;
+      this.tauHeld = st.held;
       // Still coming down: the caller keeps traversing a still view.
       this.converging = this.tauFell;
       this.tau = next;
       this.stats.tauTooLow = this.tauTooLow;
+      this.stats.tauHeld = this.tauHeld;
       this.stats.tauNeededPages = this.lastTauPages.filter(
         (t) => t > next,
       ).length;
@@ -2502,6 +2565,23 @@ export class CompactBandStreamer {
   private tauTooLow = 0;
   /** tau came down at the last update. */
   private tauFell = false;
+  /**
+   * A still view (thread DB): tau may only come down, and settles once on
+   * the lowest tau that fits (tauToFit). Set by the caller while still;
+   * clearing it (a move) lets tau follow the pool again.
+   */
+  get holdTau() {
+    return this.holdTauOn;
+  }
+  set holdTau(on: boolean) {
+    if (on === this.holdTauOn) return;
+    this.holdTauOn = on;
+    this.tauHeld = 0;
+  }
+  private holdTauOn = false;
+  /** Still: the tau settled on (0: still coming down). */
+  private tauHeld = 0;
+
   /** The last tauToFitNow's page thresholds and the pool's room. */
   private lastTauPages: number[] = [];
   private lastTauRoom = 0;

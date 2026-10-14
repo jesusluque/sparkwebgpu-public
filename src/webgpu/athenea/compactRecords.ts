@@ -173,7 +173,7 @@ export function headWord10(b: { materials: number; clusterBase: number }) {
 }
 
 /** Clusters a pool's bases may hold together (compact.slang kCompactBins). */
-export const COMPACT_MAX_CLUSTERS = 1024;
+export const COMPACT_MAX_CLUSTERS = 2048;
 
 function sameBasisWords(a: Uint32Array, b: Uint32Array) {
   if (a.length !== b.length) return false;

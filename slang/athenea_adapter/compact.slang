@@ -99,8 +99,8 @@ public static const uint kCompactPlain = 16u;      // debug: the albedo, no reli
 public static const uint kCompactCullBacks = 32u;  // opaque splats whose stored face looks away are not drawn
 public static const uint kCompactDrawList = 64u;   // the cull walks a list of gaussians (a LoD cut) in compactFrame
 public static const uint kCompactBinned = 128u;    // the shade walks the drawn slots by cluster (binsIn)
-public static const uint kCompactBins = 1024u;     // clusters a cloud may have: its bases' together (thread CX)
-public static const uint kCompactBinsPerThread = 4u; // the bin passes' 256 threads, 4 bins each
+public static const uint kCompactBins = 2048u;     // clusters a cloud may have: its bases' together (thread CX; 2048 for v82b, thread DA)
+public static const uint kCompactBinsPerThread = 8u; // the bin passes' 256 threads, 8 bins each (binLocal + binBase: 16 KiB of workgroup storage)
 public static const uint kCompactStableOrder = 256u; // each listed gaussian its own slot (culled: ~0), for repeatable images
 // athenea 35ae3cb, as relight.slang's kRelightCoatFold and kRelightPolishField:
 // a coat's bake widening held to kCoatFoldRoughness (0.3) where the surface

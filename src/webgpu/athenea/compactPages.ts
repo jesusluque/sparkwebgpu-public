@@ -1095,6 +1095,11 @@ export class CompactBandStreamer {
   /** The asset table had an occlusion codebook (kept past init). */
   private assetOcclusion = false;
 
+  /** Page Ranges being fetched, and pages landed not yet in the pool. */
+  get pagesInFlight() {
+    return this.fetching + this.landed.length;
+  }
+
   /** Fetching or landed pages not yet in the pool. */
   get busy() {
     return (

@@ -60,6 +60,8 @@ export interface CutMsg {
   /** Each pool slot's key base (a node key is its pool index plus it). */
   kb: Int32Array;
   parts: CutPart[];
+  /** Pages are on their way (the load grid's pending nodes wait for them). */
+  loading?: boolean;
 }
 
 export interface AheadMsg {
@@ -316,6 +318,7 @@ export class NodeCutter {
   private baseParent: Int32Array<ArrayBufferLike> = new Int32Array(0);
   private basePend: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private grid = new LoadGridMarks();
+  private gridLoading = true;
   private gridTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
@@ -393,6 +396,7 @@ export class NodeCutter {
 
   private cut(m: CutMsg) {
     const t0 = performance.now();
+    this.gridLoading = m.loading !== false;
     this.gen += 1;
     const alloc = this.alloc;
     const runs = this.runs;
@@ -1038,7 +1042,12 @@ export class NodeCutter {
       list,
       (x) => (x < nb ? this.baseKey[x] : subKey[x - nb]),
       (x) => (x < nb ? this.baseParent[x] : -1),
-      (x) => (x < nb ? this.basePend[x] : subPend[x - nb]) !== 0,
+      // A traversal node waits only while pages come; a parent standing in
+      // for a child's record, until it is decoded.
+      (x) =>
+        x < nb
+          ? this.gridLoading && this.basePend[x] !== 0
+          : subPend[x - nb] !== 0,
       now,
     );
     if (this.gridTimer) clearTimeout(this.gridTimer);

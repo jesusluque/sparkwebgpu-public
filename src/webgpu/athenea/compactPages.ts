@@ -2321,7 +2321,14 @@ export class CompactBandStreamer {
         if (a && !transfer.includes(a.buffer)) transfer.push(a.buffer);
       }
     }
-    const msg: CutMsg = { t: "cut", kb: this.slotKeyBases(), parts };
+    const msg: CutMsg = {
+      t: "cut",
+      kb: this.slotKeyBases(),
+      parts,
+      // The load grid: a node waits for its children only while pages come
+      // (a full pool's coarser parts are not loading: no grid on them).
+      loading: this.pagesInFlight > 0,
+    };
     this.post(msg, transfer);
   }
 

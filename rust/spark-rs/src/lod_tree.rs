@@ -1182,7 +1182,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
                         culled_out.push((inst_index, paged_index));
                     }
                 } else {
-                    output.push((inst_index, paged_index, parent));
+                    output.push((inst_index | PENDING, paged_index, parent));
                 }
                 continue;
             }

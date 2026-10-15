@@ -64,6 +64,7 @@ export { COMPACT_MAX_CLUSTERS, compactBases, headWord10 };
 import type { CutMsg, CutPart, FromCutter, ToCutter } from "./nodeWorker";
 import NodeWorker from "./nodeWorker?worker&inline";
 
+import { atheneaAdapterCompact as K } from "../generated/constants";
 import { COMPACT_PLANE_WIDTHS, compactPlaneOffset } from "./compactRecords";
 
 export { COMPACT_PLANE_WIDTHS };
@@ -695,6 +696,12 @@ export interface CompactBandOptions {
    * Absent: whole pages in GPU slots (CompactPagePool).
    */
   nodePool?: {
+    /**
+     * The load pixelate's marks (thread DC; the worker's node pool only): the draw
+     * lists mark the coarse nodes waiting for their children and the ones
+     * just in (their top byte, CompactRelitPath's loadFx). Default false.
+     */
+    loadMarks?: boolean;
     capacity?: number;
     maxCapacity?: number;
     decodedPages?: number;
@@ -961,6 +968,7 @@ export class CompactBandStreamer {
           // Runs fetched by the main thread (a worker's fetches waited behind its slices).
           urls: pieces.map(() => ""),
           runFetchers: np.runFetchers ?? 12,
+          loadMarks: np.loadMarks === true,
         });
       } else if (
         pieces.some((p) => {
@@ -2150,7 +2158,11 @@ export class CompactBandStreamer {
    */
   pinSlots(slots: Uint32Array | null) {
     if (!this.remote) return false;
-    this.post({ t: "pin", slots: slots ? slots.slice() : null });
+    // Slots without the load marks's marks (an entry's top byte).
+    this.post({
+      t: "pin",
+      slots: slots ? slots.map((s) => s & K.kCompactLoadIndex) : null,
+    });
     return true;
   }
 
@@ -2309,7 +2321,14 @@ export class CompactBandStreamer {
         if (a && !transfer.includes(a.buffer)) transfer.push(a.buffer);
       }
     }
-    const msg: CutMsg = { t: "cut", kb: this.slotKeyBases(), parts };
+    const msg: CutMsg = {
+      t: "cut",
+      kb: this.slotKeyBases(),
+      parts,
+      // The load marks: a node waits for its children only while pages come
+      // (a full pool's coarser parts are not loading: not pixelated).
+      loading: this.pagesInFlight > 0,
+    };
     this.post(msg, transfer);
   }
 

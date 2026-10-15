@@ -126,20 +126,23 @@ public static const uint kCompactSharp = 2048u;
 // atlas holds every level's texels as the same f16 values, so the shade reads
 // them there (compactEnvRadiance) and the env buffer is freed once it exists.
 public static const uint kCompactEnvAtlas = 4096u;
-// THE LOAD GRID (thread DC): a draw list entry's top byte (the node pool's
-// slots are under 2^24) marks a splat drawn coarse because the cut wanted it
-// finer and its children are not here yet (pending: a screen-space grid on
-// it), or one that just replaced such a splat (fading: its arrival's 6-bit
-// stamp, kCompactGridTicks a second, the grid fading out over
-// kCompactGridFadeTicks). The shade carries them into the record: pending
-// in sigma2's sign bit, fading in sigma1's with the stamp in the angle's
-// low 6 bits (a fading splat's angle to 10 bits, for half a second).
-public static const uint kCompactLoadGrid = 8192u;
-public static const uint kCompactGridIndex = 0x00FFFFFFu;
-public static const uint kCompactGridPending = 0x80000000u;
-public static const uint kCompactGridFading = 0x40000000u;
-public static const uint kCompactGridTicks = 32u;
-public static const uint kCompactGridFadeTicks = 16u;
+// THE LOAD PIXELATE (thread DC): a draw list entry's top byte (the node
+// pool's slots are under 2^24) marks a splat drawn coarse because the cut
+// wanted it finer and its children are not here yet (pending), or one that
+// just replaced such a splat (fading: its arrival's 6-bit stamp,
+// kCompactLoadTicks a second, over kCompactLoadFadeTicks). The shade
+// carries them into the record: pending in sigma2's sign bit, fading in
+// sigma1's with the stamp in the angle's low 6 bits (a fading splat's angle
+// to 10 bits, for half a second). The fragment of a marked splat evaluates
+// its gaussian at its screen block's centre, not at the pixel: where every
+// splat is marked the picture is constant a block (pixelated), and the
+// block shrinks to a pixel as the splat's weight fades.
+public static const uint kCompactLoadFx = 8192u;
+public static const uint kCompactLoadIndex = 0x00FFFFFFu;
+public static const uint kCompactLoadPending = 0x80000000u;
+public static const uint kCompactLoadFading = 0x40000000u;
+public static const uint kCompactLoadTicks = 32u;
+public static const uint kCompactLoadFadeTicks = 16u;
 public static const uint kCompactNone = 0xFFFFFFFFu;
 
 public struct CompactParams {
@@ -206,7 +209,7 @@ public struct CompactParams {
     public float4 view2;
     public float4 focal;       ///< pixels: focal x, focal y (negative: rows go down), centre x, centre y
     public float4 viewport;    ///< width, height; checks: z coatFloor, w debugBits
-    public float4 loadGrid;    ///< kCompactLoadGrid: the cell and the line (px), the grid's strength, now (ticks, mod 64)
+    public float4 loadFx;      ///< kCompactLoadFx: the largest block (px), its scale (0..1), -, now (ticks, mod 64)
 };
 
 StructuredBuffer<uint>              compactData;
@@ -1387,10 +1390,10 @@ bool inFrustum(float3 v) {
 
 uint gaussianIndex(uint3 tid) { return tid.x + tid.y * kCompactDispatchRow; }
 
-/// A draw list entry's (or a sorted value's) gaussian, its load grid bits
-/// apart (kCompactLoadGrid).
-uint gridIndexOf(uint entry) { return hasFlag(kCompactLoadGrid) ? entry & kCompactGridIndex : entry; }
-uint gridBitsOf(uint entry) { return hasFlag(kCompactLoadGrid) ? entry & ~kCompactGridIndex : 0u; }
+/// A draw list entry's (or a sorted value's) gaussian, its load marks
+/// apart (kCompactLoadFx).
+uint loadIndexOf(uint entry) { return hasFlag(kCompactLoadFx) ? entry & kCompactLoadIndex : entry; }
+uint loadBitsOf(uint entry) { return hasFlag(kCompactLoadFx) ? entry & ~kCompactLoadIndex : 0u; }
 
 /// A gaussian's sort key (24 bits, far first), or kCompactNone where it is
 /// not drawn: transparent, outside the frustum, or a culled back.
@@ -1439,12 +1442,12 @@ void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
     // With a draw list (a LoD cut chosen on the host), thread t culls its
     // t-th entry; else gaussian t.
     const uint entry = hasFlag(kCompactDrawList) ? compactFrame[compactParams.drawList + t] : t;
-    const uint i = gridIndexOf(entry);
+    const uint i = loadIndexOf(entry);
     const uint key = cullKeyOf(i);
     if (stable) {
         // The radix sort is stable: equal keys keep the list's order.
         sortKeys[t] = key == kCompactNone ? 0u : key;
-        sortVals[t] = key == kCompactNone ? kCompactNone : i | gridBitsOf(entry);
+        sortVals[t] = key == kCompactNone ? kCompactNone : i | loadBitsOf(entry);
         return;
     }
     if (key == kCompactNone) {
@@ -1453,7 +1456,7 @@ void atheneaCompactCull(uint3 tid: SV_DispatchThreadID) {
     const uint slot = sortArgs[1].add(1u);
     if (slot < compactParams.capacity) {
         sortKeys[slot] = key;
-        sortVals[slot] = i | gridBitsOf(entry);
+        sortVals[slot] = i | loadBitsOf(entry);
     }
 }
 
@@ -1628,7 +1631,7 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
             rec3[slot] = 0u;
             continue;
         }
-        const uint i = gridIndexOf(entry);
+        const uint i = loadIndexOf(entry);
         CompactSplat g = readCompact(i);
         const float3 v = toView(g.center);
         // The footprint first: a splat it drops (under minAlpha, a faint
@@ -1680,10 +1683,10 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
         rec0[slot] = packCentre(centre);
         uint w1 = (f32tof16(sigma.x) & 0xFFFFu) | (uint(round(angle / 3.14159265358979 * 65535.0)) << 16u);
         uint w2 = (f32tof16(sigma.y) & 0xFFFFu) | ((f32tof16(lod ? -alpha : alpha) & 0xFFFFu) << 16u);
-        const uint grid = gridBitsOf(entry);
-        if ((grid & kCompactGridPending) != 0u) {
+        const uint marks = loadBitsOf(entry);
+        if ((marks & kCompactLoadPending) != 0u) {
             w2 |= 0x8000u;
-        } else if ((grid & kCompactGridFading) != 0u) {
+        } else if ((marks & kCompactLoadFading) != 0u) {
             w1 = (w1 & ~0x003F0000u) | (((entry >> 24u) & 63u) << 16u) | 0x8000u;
         }
         rec1[slot] = w1;
@@ -1700,7 +1703,7 @@ void atheneaCompactShade(uint3 lid: SV_GroupThreadID, uint3 gid: SV_GroupID) {
 
 uint drawnClusterOf(uint slot) {
     const uint i = rec0[slot];
-    return i == kCompactNone ? 0u : clusterAt(gridIndexOf(i));
+    return i == kCompactNone ? 0u : clusterAt(loadIndexOf(i));
 }
 
 /// The workgroup's counts by cluster (the bin passes): one global atomic a
@@ -1843,8 +1846,8 @@ struct CompactVertexOut {
     /// rows down) and the slot.
     float2 offset : TEXCOORD2;
     nointerpolation uint slot : TEXCOORD3;
-    /// kCompactLoadGrid: the grid's weight (1 pending, fading to 0).
-    nointerpolation float grid : TEXCOORD4;
+    /// kCompactLoadFx: the load weight (1 pending, fading to 0).
+    nointerpolation float load : TEXCOORD4;
 };
 
 static const float2 kCorners[4] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0), float2(1.0, 1.0) };
@@ -1858,21 +1861,21 @@ CompactVertexOut atheneaCompactVertex(uint vertexId: SV_VertexID, uint instanceI
     o.adjusted = 0.0;
     o.offset = float2(0.0);
     o.slot = instanceId;
-    o.grid = 0.0;
+    o.load = 0.0;
     uint w1 = draw1[instanceId];
     uint w2 = draw2[instanceId];
     if (w1 == 0u && w2 == 0u) {
         return o;
     }
-    if (hasFlag(kCompactLoadGrid)) {
+    if (hasFlag(kCompactLoadFx)) {
         if ((w2 & 0x8000u) != 0u) {
-            o.grid = 1.0;
+            o.load = 1.0;
         } else if ((w1 & 0x8000u) != 0u) {
-            float age = compactParams.loadGrid.w - float((w1 >> 16u) & 63u);
+            float age = compactParams.loadFx.w - float((w1 >> 16u) & 63u);
             if (age < 0.0) {
                 age += 64.0;
             }
-            o.grid = saturate(1.0 - age / float(kCompactGridFadeTicks));
+            o.load = saturate(1.0 - age / float(kCompactLoadFadeTicks));
         }
         w1 &= 0xFFFF7FFFu;
         w2 &= 0xFFFF7FFFu;
@@ -1920,7 +1923,21 @@ float splatAlphaOf(float a, float z2) {
 
 [shader("fragment")]
 float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
-    const float z2 = dot(v.uv, v.uv);
+    float z2 = dot(v.uv, v.uv);
+    float2 shift = float2(0.0);
+    if (hasFlag(kCompactLoadFx)) {
+        // The splat's own coordinates are affine on screen: at the centre
+        // of the pixel's block they are its own plus the screen steps.
+        const float2 ux = ddx(v.uv);
+        const float2 uy = ddy(v.uv);
+        const float block = floor(1.0 + (compactParams.loadFx.x - 1.0) * compactParams.loadFx.y * v.load);
+        if (block >= 2.0) {
+            const float2 p = v.position.xy;
+            shift = (floor(p / block) + 0.5) * block - p;
+            const float2 uvb = v.uv + ux * shift.x + uy * shift.y;
+            z2 = dot(uvb, uvb);
+        }
+    }
     if (z2 > v.adjusted * v.adjusted) {
         discard;
     }
@@ -1934,7 +1951,8 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
         const uint4 r0 = uint4(sharpIn[at], sharpIn[at + 1u], sharpIn[at + 2u], sharpIn[at + 3u]);
         const uint4 r = uint4(r0.x, r0.y, r0.w, sharpIn[at + 4u]);
         if (r.z != 0u || r.w != 0u) {
-            const float2 d = v.offset;
+            // (The block's centre too, pixelated: kCompactLoadFx.)
+            const float2 d = v.offset + shift;
             const float2 a0 = float2(float(r.x & 0xFFFFu), float(r.x >> 16u)) / 65535.0;
             const float2 sx = unpackHalves(r0.y);
             const float2 sy = unpackHalves(r0.z);
@@ -1951,16 +1969,6 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
                 const float pr = float(r.z >> 21u) / 2047.0;
                 rgb += polish * atlasRadiance(mirror, pr * pr, side);
             }
-        }
-    }
-    if (hasFlag(kCompactLoadGrid) && v.grid > 0.0) {
-        // A line every cell px on screen (the splat's pixel, not its
-        // surface): the car's coarse parts under a fine grid.
-        const float2 p = floor(v.position.xy);
-        const float cell = compactParams.loadGrid.x;
-        const float2 m = p - cell * floor(p / cell);
-        if (any(m < compactParams.loadGrid.yy)) {
-            rgb = lerp(rgb, float3(1.0), compactParams.loadGrid.z * v.grid);
         }
     }
     return float4(rgb * a, a);

@@ -182,12 +182,12 @@ function sameBasisWords(a: Uint32Array, b: Uint32Array) {
   return true;
 }
 
-/** Wall-clock ms (the same in a worker and the page: the load grid's stamps). */
-export function gridClockMs() {
+/** Wall-clock ms (the same in a worker and the page: the load marks's stamps). */
+export function loadClockMs() {
   return performance.timeOrigin + performance.now();
 }
 
-/** A load grid stamp (6 bits, kCompactGridTicks a second) for wall-clock ms `t`. */
-export function gridTick(t: number) {
-  return Math.floor((t * K.kCompactGridTicks) / 1000) & 63;
+/** A load marks stamp (6 bits, kCompactLoadTicks a second) for wall-clock ms `t`. */
+export function loadTick(t: number) {
+  return Math.floor((t * K.kCompactLoadTicks) / 1000) & 63;
 }

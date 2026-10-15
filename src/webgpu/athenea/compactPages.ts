@@ -697,11 +697,11 @@ export interface CompactBandOptions {
    */
   nodePool?: {
     /**
-     * The load grid (thread DC; the worker's node pool only): the draw
+     * The load pixelate's marks (thread DC; the worker's node pool only): the draw
      * lists mark the coarse nodes waiting for their children and the ones
-     * just in (their top byte, CompactRelitPath's loadGrid). Default false.
+     * just in (their top byte, CompactRelitPath's loadFx). Default false.
      */
-    loadGrid?: boolean;
+    loadMarks?: boolean;
     capacity?: number;
     maxCapacity?: number;
     decodedPages?: number;
@@ -968,7 +968,7 @@ export class CompactBandStreamer {
           // Runs fetched by the main thread (a worker's fetches waited behind its slices).
           urls: pieces.map(() => ""),
           runFetchers: np.runFetchers ?? 12,
-          loadGrid: np.loadGrid === true,
+          loadMarks: np.loadMarks === true,
         });
       } else if (
         pieces.some((p) => {
@@ -2158,10 +2158,10 @@ export class CompactBandStreamer {
    */
   pinSlots(slots: Uint32Array | null) {
     if (!this.remote) return false;
-    // Slots without the load grid's marks (an entry's top byte).
+    // Slots without the load marks's marks (an entry's top byte).
     this.post({
       t: "pin",
-      slots: slots ? slots.map((s) => s & K.kCompactGridIndex) : null,
+      slots: slots ? slots.map((s) => s & K.kCompactLoadIndex) : null,
     });
     return true;
   }
@@ -2325,8 +2325,8 @@ export class CompactBandStreamer {
       t: "cut",
       kb: this.slotKeyBases(),
       parts,
-      // The load grid: a node waits for its children only while pages come
-      // (a full pool's coarser parts are not loading: no grid on them).
+      // The load marks: a node waits for its children only while pages come
+      // (a full pool's coarser parts are not loading: not pixelated).
       loading: this.pagesInFlight > 0,
     };
     this.post(msg, transfer);

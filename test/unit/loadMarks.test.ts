@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { gridTick } from "../../src/webgpu/athenea/compactRecords";
-import { LoadGridMarks } from "../../src/webgpu/athenea/nodeWorker";
+import { loadTick } from "../../src/webgpu/athenea/compactRecords";
+import { LoadMarks } from "../../src/webgpu/athenea/nodeWorker";
 import { atheneaAdapterCompact as K } from "../../src/webgpu/generated/constants";
 
 /** A list of slots `slots` for nodes `keys` (parents, pending) marked at `now`. */
 function marked(
-  g: LoadGridMarks,
+  g: LoadMarks,
   slots: number[],
   keys: number[],
   parents: number[],
@@ -24,15 +24,15 @@ function marked(
 }
 
 const fading = (s: number, t: number) =>
-  (s | K.kCompactGridFading | (gridTick(t) << 24)) >>> 0;
+  (s | K.kCompactLoadFading | (loadTick(t) << 24)) >>> 0;
 
-describe("LoadGridMarks", () => {
+describe("LoadMarks", () => {
   it("marks the waiting nodes, fades their children in, then lets them be", () => {
-    const g = new LoadGridMarks();
+    const g = new LoadMarks();
     const t0 = 1_000_000;
     // Node 7 (slot 3) waits for its children; node 8 (slot 4) does not.
     let r = marked(g, [3, 4], [7, 8], [-1, -1], [true, false], t0);
-    expect(Array.from(r.list)).toEqual([(3 | K.kCompactGridPending) >>> 0, 4]);
+    expect(Array.from(r.list)).toEqual([(3 | K.kCompactLoadPending) >>> 0, 4]);
     expect(r.until).toBe(0);
     // Its children 70 and 71 arrive (slots 5, 6) at t1: they fade from t1.
     const t1 = t0 + 2000;
@@ -70,11 +70,11 @@ describe("LoadGridMarks", () => {
   });
 
   it("fades a node that stops waiting, and marks nothing in a loaded cut", () => {
-    const g = new LoadGridMarks();
+    const g = new LoadMarks();
     marked(g, [1], [10], [-1], [true], 0);
     const r = marked(g, [1], [10], [-1], [false], 100);
     expect(r.list[0]).toBe(fading(1, 100));
-    const h = new LoadGridMarks();
+    const h = new LoadMarks();
     const q = marked(h, [1, 2], [10, 11], [-1, 10], [false, false], 0);
     expect(Array.from(q.list)).toEqual([1, 2]);
   });

@@ -209,7 +209,7 @@ public struct CompactParams {
     public float4 view2;
     public float4 focal;       ///< pixels: focal x, focal y (negative: rows go down), centre x, centre y
     public float4 viewport;    ///< width, height; checks: z coatFloor, w debugBits
-    public float4 loadFx;      ///< kCompactLoadFx: the largest block (px), its scale (0..1), the tint (0..1), now (ticks, mod 64)
+    public float4 loadFx;      ///< kCompactLoadFx: the largest block (px), its scale (0..1), the tint (0..1, its progress in), now (ticks, mod 64)
 };
 
 StructuredBuffer<uint>              compactData;
@@ -1978,13 +1978,19 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
         // The tint (loadFx.z): a pixelated part, still loading, in a cool
         // steel blue at its own luminance, its tiles rimmed, both fading
         // with the blocks as the detail lands.
-        const float w = compactParams.loadFx.z * compactParams.loadFx.y * v.load;
+        const float w = compactParams.loadFx.z * v.load;
         const float lum = dot(rgb, float3(0.2126, 0.7152, 0.0722));
         const float3 steel = float3(0.55, 0.78, 1.15);
         // A thin light rim on each tile (read on the dark paint too).
         const float rim = smoothstep(0.8, 0.97, tile);
         const float3 tinted = (lum * 1.1 + 0.015) * steel * (1.0 - 0.25 * rim) + 0.035 * rim * steel;
         rgb = lerp(rgb, tinted, w);
+        // A glint as a fading tile lets go: a short flash of its own light
+        // (and the rim's blue) peaking near the fade's end (load ~0.2).
+        if (v.load < 1.0) {
+            const float glint = smoothstep(0.0, 0.2, v.load) * (1.0 - smoothstep(0.2, 0.55, v.load));
+            rgb += glint * (0.9 * rgb + 0.03 * steel);
+        }
     }
     return float4(rgb * a, a);
 }

@@ -1926,12 +1926,15 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
     float z2 = dot(v.uv, v.uv);
     float2 shift = float2(0.0);
     float tile = 0.0;
+    // A fading splat's blocks and tint are done by its fade's last fifth
+    // (100 ms): that is the blink's (pending: 1, as it was).
+    const float held = v.load < 1.0 ? saturate((v.load - 0.2) / 0.8) : v.load;
     if (hasFlag(kCompactLoadFx)) {
         // The splat's own coordinates are affine on screen: at the centre
         // of the pixel's block they are its own plus the screen steps.
         const float2 ux = ddx(v.uv);
         const float2 uy = ddy(v.uv);
-        const float block = floor(1.0 + (compactParams.loadFx.x - 1.0) * compactParams.loadFx.y * v.load);
+        const float block = floor(1.0 + (compactParams.loadFx.x - 1.0) * compactParams.loadFx.y * held);
         if (block >= 2.0) {
             const float2 p = v.position.xy;
             shift = (floor(p / block) + 0.5) * block - p;
@@ -1978,18 +1981,20 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
         // The tint (loadFx.z): a pixelated part, still loading, in a cool
         // steel blue at its own luminance, its tiles rimmed, both fading
         // with the blocks as the detail lands.
-        const float w = compactParams.loadFx.z * v.load;
+        const float w = compactParams.loadFx.z * held;
         const float lum = dot(rgb, float3(0.2126, 0.7152, 0.0722));
         const float3 steel = float3(0.55, 0.78, 1.15);
         // A thin light rim on each tile (read on the dark paint too).
         const float rim = smoothstep(0.8, 0.97, tile);
         const float3 tinted = (lum * 1.1 + 0.015) * steel * (1.0 - 0.25 * rim) + 0.035 * rim * steel;
         rgb = lerp(rgb, tinted, w);
-        // A glint as a fading tile lets go: a short flash of its own light
-        // (and the rim's blue) peaking near the fade's end (load ~0.2).
-        if (v.load < 1.0) {
-            const float glint = smoothstep(0.0, 0.2, v.load) * (1.0 - smoothstep(0.2, 0.55, v.load));
-            rgb += glint * (0.9 * rgb + 0.03 * steel);
+        // The blink as the blocks die: the fade's last 100 ms, a strong
+        // tinted flash held ~2 frames (33 ms), then gone over ~4 (67 ms).
+        if (v.load < 0.2) {
+            const float t = (0.2 - v.load) / 0.2;
+            const float b = t < 0.33 ? 1.0 : saturate((1.0 - t) / 0.67);
+            const float3 flash = (2.5 * lum + 0.18) * float3(0.75, 0.9, 1.15);
+            rgb = lerp(rgb, flash, 0.8 * b) + 0.06 * b * steel;
         }
     }
     return float4(rgb * a, a);

@@ -45,7 +45,7 @@ describe("LoadMarks", () => {
       t1,
     );
     expect(Array.from(r.list)).toEqual([fading(5, t1), fading(6, t1), 4]);
-    expect(r.until).toBe(t1 + 1000);
+    expect(r.until).toBe(t1 + 500);
     // A grandchild 700 in 0.2 s later inherits its parent's arrival.
     r = marked(
       g,
@@ -63,7 +63,7 @@ describe("LoadMarks", () => {
       [700, 71, 8],
       [70, 7, -1],
       [false, false, false],
-      t1 + 1000,
+      t1 + 500,
     );
     expect(Array.from(r.list)).toEqual([9, 6, 4]);
     expect(r.until).toBe(0);

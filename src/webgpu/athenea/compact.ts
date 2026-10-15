@@ -1032,7 +1032,12 @@ export class CompactRelitPath {
         else if (v & K.kCompactLoadFading) fading++;
       }
       this.loadMarked = indices.length ? pending / indices.length : 0;
-      if (fading) this.loadFadeUntil = performance.now() + 550;
+      if (fading) {
+        this.loadFadeUntil =
+          performance.now() +
+          (1000 * K.kCompactLoadFadeTicks) / K.kCompactLoadTicks +
+          50;
+      }
     }
     const need = (this.projWords + indices.length) * 4;
     if (this.frame.size < need) {

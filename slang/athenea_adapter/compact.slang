@@ -142,7 +142,7 @@ public static const uint kCompactLoadIndex = 0x00FFFFFFu;
 public static const uint kCompactLoadPending = 0x80000000u;
 public static const uint kCompactLoadFading = 0x40000000u;
 public static const uint kCompactLoadTicks = 32u;
-public static const uint kCompactLoadFadeTicks = 16u;
+public static const uint kCompactLoadFadeTicks = 32u;
 public static const uint kCompactNone = 0xFFFFFFFFu;
 
 public struct CompactParams {
@@ -1926,9 +1926,9 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
     float z2 = dot(v.uv, v.uv);
     float2 shift = float2(0.0);
     float tile = 0.0;
-    // A fading splat's blocks and tint are done by its fade's last fifth
-    // (100 ms): that is the blink's (pending: 1, as it was).
-    const float held = v.load < 1.0 ? saturate((v.load - 0.2) / 0.8) : v.load;
+    // A fading splat's blocks and tint are done in its fade's first half
+    // (0.5 s of 1 s): the second is the blink's (pending: 1, as it was).
+    const float held = v.load < 1.0 ? saturate((v.load - 0.5) / 0.5) : v.load;
     if (hasFlag(kCompactLoadFx)) {
         // The splat's own coordinates are affine on screen: at the centre
         // of the pixel's block they are its own plus the screen steps.
@@ -1988,11 +1988,12 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
         const float rim = smoothstep(0.8, 0.97, tile);
         const float3 tinted = (lum * 1.1 + 0.015) * steel * (1.0 - 0.25 * rim) + 0.035 * rim * steel;
         rgb = lerp(rgb, tinted, w);
-        // The blink as the blocks die: the fade's last 100 ms, a strong
-        // tinted flash held ~2 frames (33 ms), then gone over ~4 (67 ms).
-        if (v.load < 0.2) {
-            const float t = (0.2 - v.load) / 0.2;
-            const float b = t < 0.33 ? 1.0 : saturate((1.0 - t) / 0.67);
+        // The blink as the blocks die: the fade's last 0.5 s, a strong
+        // tinted flash held ~0.1 s, then easing out over ~0.4 s.
+        if (v.load < 0.5) {
+            const float t = (0.5 - v.load) / 0.5;
+            const float u = saturate((1.0 - t) / 0.8);
+            const float b = t < 0.2 ? 1.0 : u * u * (3.0 - 2.0 * u);
             const float3 flash = (2.5 * lum + 0.18) * float3(0.75, 0.9, 1.15);
             rgb = lerp(rgb, flash, 0.8 * b) + 0.06 * b * steel;
         }

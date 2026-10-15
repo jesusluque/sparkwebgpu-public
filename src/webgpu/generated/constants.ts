@@ -38,7 +38,7 @@ export const atheneaAdapterCompact = {
   kCompactLoadPending: 2147483648,
   kCompactLoadFading: 1073741824,
   kCompactLoadTicks: 32,
-  kCompactLoadFadeTicks: 16,
+  kCompactLoadFadeTicks: 32,
   kCompactNone: 4294967295,
   kCompactSheetAlpha: 0.1,
 } as const;

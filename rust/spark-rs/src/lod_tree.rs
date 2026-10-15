@@ -520,12 +520,17 @@ pub fn set_lod_occlusion_codebook(lod_id: u32, codebook: Uint32Array, bounds: &[
     })
 }
 
+/// An output node waiting for its children's page (the load grid, thread
+/// DC): the top bit of its instance; with `neighbours` its kidCounts' top bit.
+const PENDING: u32 = 0x8000_0000;
+
 struct LodState {
     next_id: u32,
     lod_trees: AHashMap<u32, LodTree>,
     /// (pixel scale, instance, node, its parent: u32::MAX a root).
     frontier: Frontier<(OrderedFloat<f32>, u32, u32, u32)>,
-    /// (instance, node, its parent).
+    /// (instance, node, its parent); the instance's top bit (PENDING) a node
+    /// the cut wanted finer whose children's page is not resident.
     output: Vec<(u32, u32, u32)>,
     /// The nodes culled (instance, node): pruned subtrees' roots and cut nodes left out.
     culled: Vec<(u32, u32)>,
@@ -1191,7 +1196,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
                         culled_out.push((inst_index, paged_index));
                     }
                 } else {
-                    output.push((inst_index, paged_index, parent));
+                    output.push((inst_index | PENDING, paged_index, parent));
                 }
                 continue;
             }
@@ -1267,12 +1272,12 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
                 }
             };
             for (inst, instance) in instances.iter().enumerate() {
-                let cut = output.iter().filter(|o| o.0 as usize == inst).count();
+                let cut = output.iter().filter(|o| (o.0 & !PENDING) as usize == inst).count();
                 let culled = if neighbours { culled_out.iter().filter(|o| o.0 as usize == inst).count() } else { 0 };
                 sink.start(inst, cut, culled);
                 let mut at = 0;
-                for &(inst_index, paged_index, parent) in output.iter() {
-                    if inst_index as usize != inst {
+                for &(inst_flags, paged_index, parent) in output.iter() {
+                    if (inst_flags & !PENDING) as usize != inst {
                         continue;
                     }
                     bufs[0].push(paged_index);
@@ -1291,7 +1296,7 @@ max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
                             (u32::MAX, 0)
                         };
                         bufs[2].push(first);
-                        bufs[3].push(count);
+                        bufs[3].push(count | (inst_flags & PENDING));
                         // Its size on screen (thread CU: the order its payload is
                         // decoded in): its sphere's angle (a leaf: half its parent's),
                         // foveated as the cut is; f32 bits.
@@ -1352,7 +1357,8 @@ fn stream_out(output: &mut Vec<(u32, u32, u32)>, instances: &[Inst<'_>], slots: 
     let n = output.len();
     let mut f: [Vec<u32>; 6] = Default::default();
     f[0].reserve(n);
-    for &(inst, paged_index, parent) in output.iter() {
+    for &(inst_flags, paged_index, parent) in output.iter() {
+        let inst = inst_flags & !PENDING;
         f[0].push(paged_index);
         if neighbours {
             let instance = &instances[inst as usize];
@@ -1368,7 +1374,7 @@ fn stream_out(output: &mut Vec<(u32, u32, u32)>, instances: &[Inst<'_>], slots: 
                 (u32::MAX, 0)
             };
             f[2].push(first);
-            f[3].push(count);
+            f[3].push(count | (inst_flags & PENDING));
             let r = if node.child_count > 0 || parent == u32::MAX { node.rho.to_f32() } else { 0.5 * instance.1.get(parent as usize).rho.to_f32() };
             let delta = node.center() - instance.4;
             let d = delta.length().max(1.0e-6);

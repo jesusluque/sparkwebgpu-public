@@ -33,6 +33,12 @@ export const atheneaAdapterCompact = {
   kCompactPolishField: 1024,
   kCompactSharp: 2048,
   kCompactEnvAtlas: 4096,
+  kCompactLoadGrid: 8192,
+  kCompactGridIndex: 16777215,
+  kCompactGridPending: 2147483648,
+  kCompactGridFading: 1073741824,
+  kCompactGridTicks: 32,
+  kCompactGridFadeTicks: 16,
   kCompactNone: 4294967295,
   kCompactSheetAlpha: 0.1,
 } as const;

@@ -1,3 +1,4 @@
+import { atheneaAdapterCompact as K } from "../generated/constants";
 import type { CompactPieceTables } from "./compactPages";
 // A node record of the node pool (thread CT) packed from a CMPC v4 run's
 // inflated planes: no three.js, no WebGPU, so the run decoder's worker
@@ -179,4 +180,14 @@ function sameBasisWords(a: Uint32Array, b: Uint32Array) {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+/** Wall-clock ms (the same in a worker and the page: the load grid's stamps). */
+export function gridClockMs() {
+  return performance.timeOrigin + performance.now();
+}
+
+/** A load grid stamp (6 bits, kCompactGridTicks a second) for wall-clock ms `t`. */
+export function gridTick(t: number) {
+  return Math.floor((t * K.kCompactGridTicks) / 1000) & 63;
 }

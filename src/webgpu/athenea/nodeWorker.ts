@@ -9,6 +9,7 @@
 // module's tail is the worker's glue.
 
 import { gunzipSync } from "fflate";
+import { atheneaAdapterCompact as K } from "../generated/constants";
 import {
   NodeSlotAllocator,
   PAGE_PLACES,
@@ -18,7 +19,12 @@ import {
   parseRunsContainer,
   unpackRunsContainer,
 } from "./compactNodes";
-import { NODE_RECORD_WORDS, packRunRecords } from "./compactRecords";
+import {
+  NODE_RECORD_WORDS,
+  gridClockMs,
+  gridTick,
+  packRunRecords,
+} from "./compactRecords";
 
 export interface CutterInit {
   t: "init";
@@ -35,6 +41,8 @@ export interface CutterInit {
   pagePiece: Uint16Array;
   urls: string[];
   runFetchers: number;
+  /** The load grid (thread DC): the draw list's entries carry its marks. */
+  loadGrid?: boolean;
 }
 
 export interface CutPart {
@@ -142,6 +150,10 @@ export type FromCutter =
   | { t: "keys"; id: number; keys: Int32Array };
 
 const SH = 8388608;
+/** A traversal node waiting for its children's page (spark-rs PENDING, kidCounts' top bit). */
+const KID_PENDING = 0x80000000;
+/** The load grid's fade, ms (kCompactGridFadeTicks). */
+const GRID_FADE_MS = (1000 * K.kCompactGridFadeTicks) / K.kCompactGridTicks;
 
 /**
  * `f` in a new task without setTimeout's 4 ms clamp on nested timers (a
@@ -158,6 +170,62 @@ const laterTask: (f: () => void) => void = (() => {
     ch.port2.postMessage(0);
   };
 })();
+
+/**
+ * The load grid's marks on the draw lists (thread DC): a node waiting for
+ * its children is pending (kCompactGridPending); one that replaced a
+ * pending node (its parent's children, or the node itself no longer
+ * waiting) fades from now, and its own children from its arrival, so a
+ * level coming in fades rather than pops (kCompactGridFading with the
+ * arrival's stamp in the top byte).
+ */
+export class LoadGridMarks {
+  /** The last list's pending keys, and its fading ones (key -> arrival, wall-clock ms). */
+  private pend = new Set<number>();
+  private stamp = new Map<number, number>();
+
+  /**
+   * Marks `list` (entry x: node key `key(x)`, its parent's `parent(x)`, -1
+   * none, waiting for its children `pending(x)`) at wall-clock `now`;
+   * returns when its last fade ends (0: none fades).
+   */
+  mark(
+    list: Uint32Array,
+    key: (x: number) => number,
+    parent: (x: number) => number,
+    pending: (x: number) => boolean,
+    now: number,
+  ) {
+    const prevPend = this.pend;
+    const prevStamp = this.stamp;
+    const pend = new Set<number>();
+    const stamp = new Map<number, number>();
+    const look = prevPend.size > 0 || prevStamp.size > 0;
+    let first = Number.POSITIVE_INFINITY;
+    for (let x = 0; x < list.length; x++) {
+      const k = key(x);
+      if (pending(x)) {
+        pend.add(k);
+        list[x] = (list[x] | K.kCompactGridPending) >>> 0;
+        continue;
+      }
+      if (!look) continue;
+      let t = prevStamp.get(k);
+      if (t === undefined) {
+        const p = parent(x);
+        if (prevPend.has(k) || (p >= 0 && prevPend.has(p))) t = now;
+        else if (p >= 0) t = prevStamp.get(p);
+      }
+      if (t === undefined || now - t >= GRID_FADE_MS) continue;
+      stamp.set(k, t);
+      list[x] = (list[x] | K.kCompactGridFading | (gridTick(t) << 24)) >>> 0;
+      first = Math.min(first, t);
+    }
+    this.pend = pend;
+    this.stamp = stamp;
+    return first < Number.POSITIVE_INFINITY ? first + GRID_FADE_MS : 0;
+  }
+}
 
 /** The node pool's CPU side (the worker's logic, driven by messages). */
 export class NodeCutter {
@@ -240,6 +308,15 @@ export class NodeCutter {
   private seen = new Uint8Array(0);
   private seenEpoch = 0;
   private kidScratch = new Int32Array(64);
+  /**
+   * The load grid (thread DC): each base entry's node key, its parent's
+   * (-1 none) and whether it waits for its children.
+   */
+  private baseKey: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private baseParent: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private basePend: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  private grid = new LoadGridMarks();
+  private gridTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     init: CutterInit,
@@ -358,6 +435,10 @@ export class NodeCutter {
     // nodes' slots go straight into the drawn base; the parts (transferred)
     // are let go with the message.
     const base = new Uint32Array(n);
+    const grid = !!this.o.loadGrid;
+    const baseKey = new Int32Array(grid ? n : 0);
+    const baseParent = new Int32Array(grid ? n : 0);
+    const basePend = new Uint8Array(grid ? n : 0);
     let b0 = 0;
     const missAt = new Int32Array(n);
     const missKeyAll = new Int32Array(n);
@@ -384,7 +465,14 @@ export class NodeCutter {
         if (s < 0) {
           missAt[missN] = pi * SH + j;
           missKeyAll[missN++] = key;
-        } else base[b0++] = s;
+        } else {
+          if (grid) {
+            baseKey[b0] = key;
+            baseParent[b0] = this.keyOfIndex(p.parents?.[j] ?? 0xffffffff, kb);
+            basePend[b0] = (p.kidCounts?.[j] ?? 0) >>> 31;
+          }
+          base[b0++] = s;
+        }
         if (protect) {
           runs.mark(key >>> 12, key & 4095, RUN_CUT);
           if (p.parents) markI(p.parents[j]);
@@ -500,6 +588,11 @@ export class NodeCutter {
     for (let x = 0; x < missN; x++) fl[x] = x;
     this.failedList = fl;
     this.base = base.slice(0, b0);
+    if (grid) {
+      this.baseKey = baseKey.slice(0, b0);
+      this.baseParent = baseParent.slice(0, b0);
+      this.basePend = basePend.slice(0, b0);
+    }
     this.stats.missDropped = dropped;
     this.stats.cut = n;
     this.fetchRuns();
@@ -795,17 +888,37 @@ export class NodeCutter {
     const fl = this.failedList;
     let resolved = 0;
     for (let x = 0; x < fl.length; x++) if (!this.failed[fl[x]]) resolved++;
+    const grid = !!this.o.loadGrid;
     if (resolved) {
       const base = new Uint32Array(this.base.length + resolved);
       base.set(this.base);
       let b0 = this.base.length;
+      const gk = new Int32Array(grid ? base.length : 0);
+      const gp = new Int32Array(grid ? base.length : 0);
+      const gd = new Uint8Array(grid ? base.length : 0);
+      if (grid) {
+        gk.set(this.baseKey);
+        gp.set(this.baseParent);
+        gd.set(this.basePend);
+      }
       let f0 = 0;
       for (let x = 0; x < fl.length; x++) {
         const k = fl[x];
-        if (!this.failed[k]) base[b0++] = this.out[k];
-        else fl[f0++] = k;
+        if (!this.failed[k]) {
+          if (grid && near) {
+            gk[b0] = this.keys[k];
+            gp[b0] = this.keyOfIndex(near.parents[k], kb);
+            gd[b0] = near.kidCounts[k] >>> 31;
+          }
+          base[b0++] = this.out[k];
+        } else fl[f0++] = k;
       }
       this.base = base;
+      if (grid) {
+        this.baseKey = gk;
+        this.baseParent = gp;
+        this.basePend = gd;
+      }
       this.failedList = fl.subarray(0, f0);
     }
     const misses = this.failedList;
@@ -825,13 +938,29 @@ export class NodeCutter {
       const epoch = this.seenEpoch;
       let subs = new Uint32Array(Math.max(64, misses.length * 2));
       let sn = 0;
-      const push = (s: number) => {
+      // The load grid: each substitute's key, and whether it is a parent
+      // standing in for its missing child (drawn coarse: pending).
+      let subKey = new Int32Array(grid ? subs.length : 0);
+      let subPend = new Uint8Array(grid ? subs.length : 0);
+      const push = (s: number, key = -1, pend = 0) => {
         if (seen[s] === epoch) return;
         seen[s] = epoch;
         if (sn === subs.length) {
           const g2 = new Uint32Array(subs.length * 2);
           g2.set(subs);
           subs = g2;
+          if (grid) {
+            const k2 = new Int32Array(subs.length);
+            k2.set(subKey);
+            subKey = k2;
+            const p2 = new Uint8Array(subs.length);
+            p2.set(subPend);
+            subPend = p2;
+          }
+        }
+        if (grid) {
+          subKey[sn] = key;
+          subPend[sn] = pend;
         }
         subs[sn++] = s;
       };
@@ -843,7 +972,7 @@ export class NodeCutter {
         const parent = near.parents[k];
         const ps = parent !== 0xffffffff ? held(parent) : -1;
         if (ps >= 0) {
-          push(ps);
+          push(ps, grid ? this.keyOfIndex(parent, kb) : -1, 1);
           substituted += 1;
           continue;
         }
@@ -860,7 +989,8 @@ export class NodeCutter {
             ks[c] = s;
           }
           if (c === count) {
-            for (let y = 0; y < count; y++) push(ks[y]);
+            for (let y = 0; y < count; y++)
+              push(ks[y], grid ? this.keyOfIndex(first + y, kb) : -1);
             substituted += 1;
             continue;
           }
@@ -871,10 +1001,12 @@ export class NodeCutter {
       result = this.listBuffer(this.base.length + sn);
       result.set(this.base);
       result.set(subs.subarray(0, sn), this.base.length);
+      if (grid) this.markGrid(result, subKey, subPend);
     } else {
       result = this.listBuffer(this.base.length);
       result.set(this.base);
       holes = misses.length;
+      if (grid) this.markGrid(result, new Int32Array(0), new Uint8Array(0));
     }
     const s = this.stats;
     s.missingArea = this.allArea > 0 ? missedArea / this.allArea : 0;
@@ -883,6 +1015,53 @@ export class NodeCutter {
     s.missing = misses.length;
     s.substituted = substituted;
     return result;
+  }
+
+  /** A traversal index's node key (-1: none). */
+  private keyOfIndex(i: number, kb: Int32Array<ArrayBufferLike>) {
+    if (i === 0xffffffff) return -1;
+    const key = i + kb[(i / this.o.slotNodes) | 0];
+    return key >= 0 ? key : -1;
+  }
+
+  /**
+   * The load grid's marks on a list (its base, then substitutes with their
+   * keys): a node waiting for its children is pending; one that replaced a
+   * pending node (its parent, or itself no longer waiting) fades from now,
+   * and its children from its own arrival, so a level coming in fades
+   * rather than pops. A timer sends the list again as the last fade ends.
+   */
+  private markGrid(list: Uint32Array, subKey: Int32Array, subPend: Uint8Array) {
+    const nb = this.base.length;
+    const now = gridClockMs();
+    const until = this.grid.mark(
+      list,
+      (x) => (x < nb ? this.baseKey[x] : subKey[x - nb]),
+      (x) => (x < nb ? this.baseParent[x] : -1),
+      (x) => (x < nb ? this.basePend[x] : subPend[x - nb]) !== 0,
+      now,
+    );
+    if (this.gridTimer) clearTimeout(this.gridTimer);
+    this.gridTimer = null;
+    if (!until) return;
+    this.gridTimer = setTimeout(
+      () => {
+        this.gridTimer = null;
+        const drawList = this.buildDrawList();
+        this.lastListAt = performance.now();
+        this.fillStats();
+        this.post({
+          t: "frame",
+          grow: 0,
+          moves: null,
+          slots: new Uint32Array(0),
+          records: new Uint8Array(0),
+          drawList,
+          stats: { ...this.stats },
+        });
+      },
+      Math.max(0, until - now) + 10,
+    );
   }
 
   /** Draw lists the main thread gave back, for the next ones. */

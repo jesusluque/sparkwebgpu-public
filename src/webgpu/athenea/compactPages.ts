@@ -64,6 +64,7 @@ export { COMPACT_MAX_CLUSTERS, compactBases, headWord10 };
 import type { CutMsg, CutPart, FromCutter, ToCutter } from "./nodeWorker";
 import NodeWorker from "./nodeWorker?worker&inline";
 
+import { atheneaAdapterCompact as K } from "../generated/constants";
 import { COMPACT_PLANE_WIDTHS, compactPlaneOffset } from "./compactRecords";
 
 export { COMPACT_PLANE_WIDTHS };
@@ -695,6 +696,12 @@ export interface CompactBandOptions {
    * Absent: whole pages in GPU slots (CompactPagePool).
    */
   nodePool?: {
+    /**
+     * The load grid (thread DC; the worker's node pool only): the draw
+     * lists mark the coarse nodes waiting for their children and the ones
+     * just in (their top byte, CompactRelitPath's loadGrid). Default false.
+     */
+    loadGrid?: boolean;
     capacity?: number;
     maxCapacity?: number;
     decodedPages?: number;
@@ -961,6 +968,7 @@ export class CompactBandStreamer {
           // Runs fetched by the main thread (a worker's fetches waited behind its slices).
           urls: pieces.map(() => ""),
           runFetchers: np.runFetchers ?? 12,
+          loadGrid: np.loadGrid === true,
         });
       } else if (
         pieces.some((p) => {
@@ -2150,7 +2158,11 @@ export class CompactBandStreamer {
    */
   pinSlots(slots: Uint32Array | null) {
     if (!this.remote) return false;
-    this.post({ t: "pin", slots: slots ? slots.slice() : null });
+    // Slots without the load grid's marks (an entry's top byte).
+    this.post({
+      t: "pin",
+      slots: slots ? slots.map((s) => s & K.kCompactGridIndex) : null,
+    });
     return true;
   }
 

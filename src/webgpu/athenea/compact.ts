@@ -34,6 +34,7 @@ import {
 } from "../renderPipeline";
 import { UniformWriter } from "../uniforms";
 import { AtheneaSky, type SkyImage, envSideOf } from "./AtheneaSky";
+import { gridClockMs } from "./compactRecords";
 
 /** Gaussians a chunk (positions, scales and curvature are ranged per chunk). */
 export const COMPACT_CHUNK = K.kCompactChunk;
@@ -741,6 +742,15 @@ export interface CompactPathOptions {
   coatFold?: boolean;
   /** The relight plugin's polishField (athenea 35ae3cb): pbr bits 26..31; default true. */
   polishField?: boolean;
+  /**
+   * The load grid (thread DC, kCompactLoadGrid): splats the draw list marks
+   * as standing in for detail not yet here are drawn under a screen-space
+   * grid, a line `line` px wide every `cell` px, mixed `strength` towards
+   * white, fading out over half a second once the detail lands. The list's
+   * entries then carry the marks in their top byte (nodeWorker.ts). Default
+   * null: off (the image as without it).
+   */
+  loadGrid?: { cell: number; line: number; strength: number } | null;
 }
 
 /**
@@ -896,6 +906,7 @@ export class CompactRelitPath {
       reflectSubTerms: 4,
       coatFold: true,
       polishField: true,
+      loadGrid: null,
       ...options,
       frame: options.frame ?? null,
     };
@@ -1007,6 +1018,15 @@ export class CompactRelitPath {
     }
     this.listCopy = owned ? indices : indices.slice();
     this.listVersion += 1;
+    if (this.options.loadGrid) {
+      // A fading entry: frames keep coming until its half second is over
+      // (the stamp is at most now; the worker sends a list without it then).
+      let fading = false;
+      for (let k = 0; k < indices.length && !fading; k++) {
+        fading = (indices[k] & K.kCompactGridFading) !== 0;
+      }
+      if (fading) this.gridFadeUntil = performance.now() + 550;
+    }
     const need = (this.projWords + indices.length) * 4;
     if (this.frame.size < need) {
       this.frame.destroy();
@@ -1026,6 +1046,9 @@ export class CompactRelitPath {
     }
     this.listCount = indices.length;
   }
+
+  /** The load grid: frames are needed until then (a fade under way), ms. */
+  gridFadeUntil = 0;
 
   /** The list kept (owned or copied), to recycle when replaced. */
   get drawListHeld(): Uint32Array | null {
@@ -1054,6 +1077,7 @@ export class CompactRelitPath {
       (o.coatFold ? K.kCompactCoatFold : 0) |
       (o.polishField ? K.kCompactPolishField : 0) |
       (o.sharp && !o.plain ? K.kCompactSharp | K.kCompactEnvAtlas : 0) |
+      (o.loadGrid && this.listCount >= 0 ? K.kCompactLoadGrid : 0) |
       (this.listCount >= 0 ? K.kCompactDrawList : 0)
     );
   }
@@ -1163,6 +1187,10 @@ export class CompactRelitPath {
         (height / 2) * (1 + p[9]),
       ],
       viewport: [width, height, o.coatFloor, o.debugBits],
+      // Now (the draw's own, set in draw(): not part of the frame's key).
+      loadGrid: o.loadGrid
+        ? [o.loadGrid.cell, o.loadGrid.line, o.loadGrid.strength, 0]
+        : [0, 0, 0, 0],
     });
   }
 
@@ -1453,6 +1481,16 @@ export class CompactRelitPath {
         },
       );
       this.pipelineFormat = format;
+    }
+    const grid = this.options.loadGrid;
+    if (grid) {
+      const ticks = (gridClockMs() * K.kCompactGridTicks) / 1000;
+      params.set("loadGrid", [
+        grid.cell,
+        grid.line,
+        grid.strength,
+        ticks - 64 * Math.floor(ticks / 64),
+      ]);
     }
     this.device.queue.writeBuffer(this.drawUniform, 0, params.data);
     const groups = createBindGroups(this.device, this.pipeline, {

@@ -209,7 +209,7 @@ public struct CompactParams {
     public float4 view2;
     public float4 focal;       ///< pixels: focal x, focal y (negative: rows go down), centre x, centre y
     public float4 viewport;    ///< width, height; checks: z coatFloor, w debugBits
-    public float4 loadFx;      ///< kCompactLoadFx: the largest block (px), its scale (0..1), -, now (ticks, mod 64)
+    public float4 loadFx;      ///< kCompactLoadFx: the largest block (px), its scale (0..1), the tint (0..1), now (ticks, mod 64)
 };
 
 StructuredBuffer<uint>              compactData;
@@ -1925,6 +1925,7 @@ float splatAlphaOf(float a, float z2) {
 float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
     float z2 = dot(v.uv, v.uv);
     float2 shift = float2(0.0);
+    float tile = 0.0;
     if (hasFlag(kCompactLoadFx)) {
         // The splat's own coordinates are affine on screen: at the centre
         // of the pixel's block they are its own plus the screen steps.
@@ -1934,6 +1935,8 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
         if (block >= 2.0) {
             const float2 p = v.position.xy;
             shift = (floor(p / block) + 0.5) * block - p;
+            // How near the block's edge (0 centre, 1 edge): a bevel.
+            tile = 2.0 * max(abs(shift.x), abs(shift.y)) / block;
             const float2 uvb = v.uv + ux * shift.x + uy * shift.y;
             z2 = dot(uvb, uvb);
         }
@@ -1970,6 +1973,18 @@ float4 atheneaCompactFragment(CompactVertexOut v) : SV_Target {
                 rgb += polish * atlasRadiance(mirror, pr * pr, side);
             }
         }
+    }
+    if (hasFlag(kCompactLoadFx) && v.load > 0.0) {
+        // The tint (loadFx.z): a pixelated part, still loading, in a cool
+        // steel blue at its own luminance, its tiles rimmed, both fading
+        // with the blocks as the detail lands.
+        const float w = compactParams.loadFx.z * compactParams.loadFx.y * v.load;
+        const float lum = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+        const float3 steel = float3(0.55, 0.78, 1.15);
+        // A thin light rim on each tile (read on the dark paint too).
+        const float rim = smoothstep(0.8, 0.97, tile);
+        const float3 tinted = (lum * 1.1 + 0.015) * steel * (1.0 - 0.25 * rim) + 0.035 * rim * steel;
+        rgb = lerp(rgb, tinted, w);
     }
     return float4(rgb * a, a);
 }

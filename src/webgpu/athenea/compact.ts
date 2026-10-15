@@ -748,9 +748,11 @@ export interface CompactPathOptions {
    * screen blocks of up to `block` px times `scale` (0..1, the caller's
    * progress), shrinking to a pixel over half a second once the detail
    * lands. The list's entries then carry the marks in their top byte
-   * (nodeWorker.ts). Default null: off (the image as without it).
+   * (nodeWorker.ts); `tint` (0..1, default 0) tints them steel blue, the
+   * tiles bevelled, fading with them. Default null: off (the image as
+   * without it).
    */
-  loadFx?: { block: number; scale: number } | null;
+  loadFx?: { block: number; scale: number; tint?: number } | null;
 }
 
 /**
@@ -1493,7 +1495,7 @@ export class CompactRelitPath {
       params.set("loadFx", [
         load.block,
         load.scale,
-        0,
+        load.tint ?? 0,
         ticks - 64 * Math.floor(ticks / 64),
       ]);
     }

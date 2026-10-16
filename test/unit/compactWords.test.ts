@@ -17,6 +17,7 @@
 // nodes, and the bytes before and after (download, GPU, CPU).
 
 import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import * as THREE from "three";
 import { describe, expect, it, vi } from "vitest";
@@ -430,7 +431,7 @@ async function prove(
 
 describe("compact traversal words, v1 against v2", () => {
   it("CN's fixture: the same cut", async () => {
-    const dir = new URL("../fixtures/athc/", import.meta.url).pathname;
+    const dir = fileURLToPath(new URL("../fixtures/athc/", import.meta.url));
     const a = openPiece(`${dir}compact_pages.v1.athc`, "fixture");
     const b = openPiece(`${dir}compact_pages.athc`, "fixture");
     // The fixture's views: its own box, near and far.

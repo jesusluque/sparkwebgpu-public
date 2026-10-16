@@ -1,1 +1,10 @@
-["blur", "cornerpin", "crop", "generate", "grade", "invert", "merge", "transform"]
+[
+  "blur",
+  "cornerpin",
+  "crop",
+  "generate",
+  "grade",
+  "invert",
+  "merge",
+  "transform"
+]

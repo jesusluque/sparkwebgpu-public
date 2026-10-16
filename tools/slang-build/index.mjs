@@ -67,7 +67,11 @@ const AOFX_LIST = path.join(SLANG_DIR, "fx/aofx.json");
 function listSources() {
   const own = listSlang(SLANG_DIR).map((file) => ({
     file,
-    rel: path.relative(SLANG_DIR, file).replace(/\.slang$/, "").split(path.sep).join("/"),
+    rel: path
+      .relative(SLANG_DIR, file)
+      .replace(/\.slang$/, "")
+      .split(path.sep)
+      .join("/"),
   }));
   const names = fs.existsSync(AOFX_LIST)
     ? JSON.parse(fs.readFileSync(AOFX_LIST, "utf8"))

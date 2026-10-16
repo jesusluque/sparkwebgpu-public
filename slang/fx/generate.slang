@@ -1,1 +1,0 @@
-../../aopenfx/examples/generate/generate.slang

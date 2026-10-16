@@ -1,1 +1,0 @@
-../../aopenfx/examples/blur/blur.slang

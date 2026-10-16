@@ -1,1 +1,0 @@
-../../aopenfx/examples/invert/invert.slang

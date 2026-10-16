@@ -23,6 +23,8 @@ jobs:
 
       - name: Checkout Repo
         uses: actions/checkout@v7
+        with:
+          submodules: true
 
       - name: Install dependencies
         run: npm install

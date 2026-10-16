@@ -1,1 +1,0 @@
-../../aopenfx/examples/cornerpin/cornerpin.slang

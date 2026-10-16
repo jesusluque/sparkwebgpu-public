@@ -1,1 +1,0 @@
-../../aopenfx/examples/grade/grade.slang

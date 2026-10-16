@@ -1,1 +1,0 @@
-../../aopenfx/examples/merge/merge.slang

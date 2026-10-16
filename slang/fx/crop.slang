@@ -1,1 +1,0 @@
-../../aopenfx/examples/crop/crop.slang

@@ -59,6 +59,28 @@ function listSlang(dir) {
   });
 }
 
+// aofx's effect kernels are built from the aopenfx submodule as they are
+// (slang/fx/aofx.json lists them; each is generated as fx/<name>). Without
+// the submodule they are skipped: their WGSL is committed.
+const AOFX_DIR = path.join(ROOT, "aopenfx/examples");
+const AOFX_LIST = path.join(SLANG_DIR, "fx/aofx.json");
+function listSources() {
+  const own = listSlang(SLANG_DIR).map((file) => ({
+    file,
+    rel: path.relative(SLANG_DIR, file).replace(/\.slang$/, "").split(path.sep).join("/"),
+  }));
+  const names = fs.existsSync(AOFX_LIST)
+    ? JSON.parse(fs.readFileSync(AOFX_LIST, "utf8"))
+    : [];
+  const aofx = names
+    .map((name) => ({
+      file: path.join(AOFX_DIR, name, `${name}.slang`),
+      rel: `fx/${name}`,
+    }))
+    .filter((s) => fs.existsSync(s.file));
+  return [...own, ...aofx];
+}
+
 // An entry is a function under a run of attributes that includes either
 // [shader("stage")] or, as in the aofx kernels (where CMake names the entries),
 // [numthreads(...)], which means compute. Modules without one are import-only.
@@ -335,7 +357,7 @@ export function workgroupStorageBytes(wgsl) {
   return total;
 }
 
-function compileOne(exe, file) {
+function compileOne(exe, file, rel) {
   const source = fs.readFileSync(file, "utf8");
   // A wrapper that #includes a vendored kernel (slang/tests) has its entries.
   const included = [...source.matchAll(/^#include\s+"(athenea\/[^"]+)"/gm)].map(
@@ -343,7 +365,6 @@ function compileOne(exe, file) {
   );
   const entries = findEntries([source, ...included].join("\n"));
   if (entries.length === 0) return null;
-  const rel = path.relative(SLANG_DIR, file).replace(/\.slang$/, "");
   return compileEntries(exe, file, rel, entries);
 }
 
@@ -645,10 +666,9 @@ export function buildAll({ check = false, log = console.log } = {}) {
   const stale = [];
   const constants = [];
   let count = 0;
-  for (const file of listSlang(SLANG_DIR)) {
-    const rel = path.relative(SLANG_DIR, file).replace(/\.slang$/, "");
+  for (const { file, rel } of listSources()) {
     constants.push([rel, findConstants(fs.readFileSync(file, "utf8"))]);
-    const out = compileOne(exe, file);
+    const out = compileOne(exe, file, rel);
     if (!out) continue;
     count += 1;
     const dest = path.join(OUT_DIR, `${out.rel}.ts`);
@@ -690,7 +710,7 @@ export function buildAll({ check = false, log = console.log } = {}) {
 // True when no .slang file is newer than the oldest generated module, so a
 // build can skip slangc. Modules import each other, hence the global check.
 export function upToDate() {
-  const sources = listSlang(SLANG_DIR);
+  const sources = listSources().map((s) => s.file);
   if (fs.existsSync(PRESETS_FILE)) sources.push(PRESETS_FILE);
   const outputs = fs.existsSync(OUT_DIR)
     ? fs

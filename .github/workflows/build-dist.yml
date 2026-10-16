@@ -10,6 +10,8 @@ on:
 
 jobs:
   build-dist:
+    # Spark's bot (its app secrets): only in sparkjsdev/spark.
+    if: github.repository == 'sparkjsdev/spark'
     runs-on: ubuntu-latest
 
     steps:

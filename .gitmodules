@@ -1,0 +1,3 @@
+[submodule "aopenfx"]
+	path = aopenfx
+	url = https://github.com/jesusluque/aopenfx

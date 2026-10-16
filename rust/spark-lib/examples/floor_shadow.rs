@@ -1,7 +1,6 @@
 //! A shadow catcher's .athc (athenea mesh2splat --shadow-catcher: black
 //! gaussians on the ground plane, each with its open-direction cells) to a
-//! small floor-shadow file for the compact pages (thread CW,
-//! examples/webgpu-site/ground-shadow.js), which draw no SplatMesh: each
+//! small floor-shadow file for the compact pages (thread CW), which draw no SplatMesh: each
 //! gaussian's centre and its footprint on the floor (the covariance's XY
 //! block in the stage, Z up), its opacity and its cells. Gaussians whose
 //! cells above the horizon are all open never darken anything under any

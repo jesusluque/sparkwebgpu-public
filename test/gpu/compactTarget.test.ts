@@ -52,8 +52,7 @@ import { createReadback, readAndDestroy } from "../../src/webgpu/gpuBuffers";
 import { placeCamera, readImage } from "./compactHarness";
 import { wideDevice } from "./device";
 
-// The stress page's display pass (examples/webgpu-site/stress.js,
-// DISPLAY_WGSL), verbatim but for the backdrop's name.
+// A stress page's display pass (DISPLAY_WGSL), verbatim but for the backdrop's name.
 const BACKDROP = [0.06, 0.065, 0.08] as const;
 const DISPLAY_WGSL = /* wgsl */ `
 @group(0) @binding(0) var src: texture_2d<f32>;

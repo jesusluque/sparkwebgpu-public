@@ -325,7 +325,9 @@ pub struct Scene {
     pub cut_levels: Vec<(u32, f32, Vec<Splat>)>,
 }
 
-const R2: &str = "/Users/muriel/luc/sparkwebGPU/publish-r2/sparkwebgpu";
+// The published sets' folder (ATHC_MEASURE_ROOT).
+static R2: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| std::env::var("ATHC_MEASURE_ROOT").unwrap_or_else(|_| "publish-r2/sparkwebgpu".into()));
 
 fn yup_to_zup(v: [f32; 3]) -> [f32; 3] {
     [v[0], -v[2], v[1]]
@@ -385,7 +387,7 @@ impl Scene {
             "corvette-hd" | "corvette-light" => {
                 let d = if asset == "corvette-hd" { "corvette-v2-hd" } else { "corvette-v5-light" };
                 (
-                    format!("{R2}/{d}"),
+                    format!("{}/{d}", *R2),
                     corvette_parts.iter().map(|p| (p.to_string(), format!("{p}-t16-gz.athc"))).collect(),
                     corvette_cam,
                     false,
@@ -393,7 +395,7 @@ impl Scene {
             }
             "corvette-lights" | "corvette-lights-hd" => {
                 let d = if asset == "corvette-lights" { "corvette-lights-light" } else { "corvette-lights-hd" };
-                let dir = format!("{R2}/{d}");
+                let dir = format!("{}/{d}", *R2);
                 let mut files = Vec::new();
                 for e in std::fs::read_dir(&dir)? {
                     let name = e?.file_name().to_string_lossy().to_string();
@@ -409,7 +411,7 @@ impl Scene {
                 let v = 39.59775f32.to_radians();
                 let aspect = 16.0 / 9.0;
                 (
-                    format!("{R2}/sparrow"),
+                    format!("{}/sparrow", *R2),
                     vec![("bird".into(), f.into())],
                     CamSpec {
                         eye: [0.38, -0.48, 0.2],
@@ -422,7 +424,7 @@ impl Scene {
                 )
             }
             "pawn" => (
-                format!("{R2}/pawn"),
+                format!("{}/pawn", *R2),
                 vec![("body".into(), "body-t16-gz.athc".into()), ("top".into(), "top-t16-gz.athc".into())],
                 CamSpec { eye: [0.0, 0.048, 0.18], target: [0.0, 0.048, 0.0], up: [0.0, 1.0, 0.0], hfov: 39.6f32.to_radians(), aspect: 1.0 },
                 true,

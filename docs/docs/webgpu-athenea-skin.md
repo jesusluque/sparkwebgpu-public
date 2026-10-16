@@ -64,8 +64,6 @@ it plays it (`fetchAthcClip`, `decodeAthcClip` in `@sparkjsdev/spark/webgpu`)
 and pushes it onto the skeleton's `clips` before `skin.set({ clip })`. The
 report gives each clip's length, its seam (how far its last pose is from its
 first: zero for the loops) and how far it carries the bird.
-`scripts/build-sparrow.mjs` makes the sparrow demo's data this way in one
-command (examples/webgpu-site/sparrow.html).
 
 ## What runs, and when
 

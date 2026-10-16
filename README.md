@@ -1,3 +1,13 @@
+# sparkwebgpu
+
+A fork of [Spark](https://github.com/sparkjsdev/spark) with a WebGPU backend: the GPU code is written in [Slang](https://shader-slang.org) and compiled offline to WGSL (`slang/`, `tools/slang-build`, generated WGSL in `src/webgpu/generated/`), with GPU sort, LoD and paging on storage buffers, a generic per-gaussian attribute schema, a WGSL backend for dyno, post effects from [aofx](https://github.com/jesusluque/aopenfx) and athenea's relighting (`.athc`). WebGL2 stays the default; `new SparkRenderer({ backend: "webgpu" })` turns WebGPU on. See `docs/docs/webgpu*.md`.
+
+aofx is a git submodule (`aopenfx/`): its effect kernels in `slang/fx/` link into it, so clone with `git clone --recursive` (or `git submodule update --init`) before `npm run build:slang`. `npm run build` alone uses the committed WGSL.
+
+Same license as Spark: MIT (`LICENSE`).
+
+---
+
 <p align="center">
 
   ![Spark logo](https://github.com/user-attachments/assets/5287631a-083c-4c86-80f6-4dca24aa263f#gh-light-mode-only)
